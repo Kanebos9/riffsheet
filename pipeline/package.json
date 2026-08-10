@@ -1,0 +1,31 @@
+{
+  "name": "@riffsheet/pipeline",
+  "version": "0.1.0",
+  "description": "Riffsheet notation pipeline: performed notes + beats -> RiffsheetIR -> MusicXML / MIDI / alphaTab model. Pure functions, zero DOM deps.",
+  "license": "GPL-3.0-only",
+  "type": "module",
+  "main": "./src/index.ts",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "files": [
+    "src",
+    "IR.md",
+    "README.md",
+    "ATTRIBUTIONS.md"
+  ],
+  "scripts": {
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "typecheck": "tsc --noEmit",
+    "typecheck:src": "tsc --noEmit -p tsconfig.src.json"
+  },
+  "devDependencies": {
+    "typescript": "^5.6.0",
+    "vitest": "^2.1.0"
+  },
+  "sideEffects": [
+    "./test/**/*.ts",
+    "./scripts/**/*.ts"
+  ]
+}

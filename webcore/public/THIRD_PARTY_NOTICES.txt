@@ -1,0 +1,53 @@
+RIFFSHEET — LICENSING AND THIRD-PARTY NOTICES
+
+Copyright © 2026 Oğuzhan Yazıcı.
+
+Unless a file or directory says otherwise, Riffsheet is licensed under the GNU
+Affero General Public License, version 3 only (AGPL-3.0-only). The full license
+text and complete corresponding source are in the matching public source release.
+
+The notation pipeline is GPL-3.0-only and contains work derived from MuseScore 4.
+GPLv3 section 13 permits it to be combined with the AGPLv3 application. See
+pipeline/ATTRIBUTIONS.md in the source distribution for details.
+
+THIRD-PARTY WORK
+
+alphaTab 1.8.4
+  Mozilla Public License 2.0
+  Copyright © Daniel Kuschny and Contributors.
+  Its distribution also credits TinySoundFont (MIT), SFZero (MIT), the Haxe
+  standard library (MIT), SharpZipLib (MIT), NVorbis (MIT), and libvorbis-derived
+  code (BSD-3-Clause). Exact notices are included in alphaTab's package.
+
+JUCE 8.0.13
+  Used under JUCE's AGPLv3 option.
+  Copyright Raw Material Software Limited and contributors.
+
+Bravura music font
+  SIL Open Font License 1.1.
+  Copyright © Steinberg Media Technologies GmbH.
+  Full text: font/Bravura-OFL.txt
+
+FluidR3 GM playback samples
+  MIT License. Copyright © 2000-2002, 2008, 2013 Frank Wen.
+  Full texts are stored as samples/finger-bass/LICENSE.txt,
+  samples/electric-piano/LICENSE.txt, samples/electric-guitar/LICENSE.txt, and
+  samples/steel-guitar/LICENSE.txt.
+
+Versilian Community Sample Library playback samples
+  Creative Commons CC0 1.0 public-domain dedication.
+  Full texts are stored as samples/upright-piano/LICENSE.txt and
+  samples/marimba/LICENSE.txt.
+
+Escala
+  MIT License. Copyright © 2022 Gabriel Allegretti.
+  Riffsheet credits the editing command pattern; see webcore/CREDITS.md in the
+  source distribution for the adaptation notes.
+
+Audiveris is an optional, separately installed AGPL application and is not
+included in Riffsheet releases. MuScriptor model weights are not bundled; their
+separate terms apply if a user installs them.
+
+The source distribution's NOTICE.md and webcore/CREDITS.md contain the complete
+project attribution record. Asset license files shipped beside fonts and samples
+remain authoritative.

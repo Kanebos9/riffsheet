@@ -1,0 +1,359 @@
+/**
+ * PDF export.
+ *
+ * A hidden, second alphaTab instance configured for print (LayoutMode.Page, lazy loading
+ * OFF — mandatory, or partials never render into a hidden host) engraves the score once.
+ * Its SVGs then feed two consumers:
+ *
+ *   buildPrintDocument()  -> a standalone HTML document (browser printing, and the harness)
+ *   renderScorePdf()      -> real PDF bytes, in-page, for bridge.exportFile()
+ *
+ * WHY THE FONT INLINE IS NOT OPTIONAL: alphaTab renders glyphs as <text> in a webfont, not
+ * as paths. A naked alphaTab <svg> dropped into a fresh document — or into an <img> — draws
+ * blank noteheads. The data-URI @font-face fixes it in both.
+ *
+ * WHY BYTES AND NOT window.print(): the print popup is blocked in a plugin WebView, so the
+ * PDF button was simply dead there. `printScore()` survives as a browser-only fallback and
+ * is never called in plugin mode. The rasterise-and-embed decision behind the byte path is
+ * argued in ./pdfWriter.ts — short version: Bravura is a CFF font, so no JS PDF library can
+ * embed it, and substitute glyphs would be worse than a crisp raster.
+ */
+
+import * as alphaTab from '@coderline/alphatab';
+import { createPrintSettings, FONT_DIRECTORY } from '../view/atSettings';
+import { buildAlphaTabScore } from '../score/fromPipeline';
+import { A4_HEIGHT_PT, A4_WIDTH_PT, PX_PER_PT, canvasesToPdf, mmToPx } from './pdfWriter';
+import type { RiffScore } from '../pipeline';
+
+let cachedFontCss: string | null = null;
+
+/** Fetch Bravura once and turn it into an inline @font-face rule. */
+async function bravuraFontFace(): Promise<string> {
+  if (cachedFontCss) return cachedFontCss;
+  const response = await fetch(new URL('Bravura.woff2', FONT_DIRECTORY).href);
+  if (!response.ok) throw new Error(`Could not load Bravura for printing (${response.status}).`);
+  const buffer = await response.arrayBuffer();
+
+  let binary = '';
+  const bytes = new Uint8Array(buffer);
+  const CHUNK = 0x8000;
+  for (let i = 0; i < bytes.length; i += CHUNK) {
+    binary += String.fromCharCode(...bytes.subarray(i, i + CHUNK));
+  }
+  const base64 = btoa(binary);
+
+  cachedFontCss = `@font-face{font-family:alphaTab;src:url(data:font/woff2;base64,${base64}) format('woff2');font-weight:normal;font-style:normal;}`;
+  return cachedFontCss;
+}
+
+export interface PrintOptions {
+  title?: string;
+  subtitle?: string;
+}
+
+/**
+ * Engrave the score in a hidden print instance and hand the SVGs to `use`.
+ *
+ * The instance is always torn down, including when `use` throws — a leaked AlphaTabApi
+ * keeps a font-loading listener and a detached 820px host alive for the session.
+ */
+async function withPrintRender<T>(
+  score: RiffScore,
+  use: (svgs: SVGSVGElement[]) => Promise<T>
+): Promise<T> {
+  const host = document.createElement('div');
+  host.style.cssText = 'position:fixed;left:-10000px;top:0;width:820px;background:#fff;';
+  document.body.appendChild(host);
+
+  const settings = createPrintSettings();
+  const api = new alphaTab.AlphaTabApi(host, settings);
+
+  try {
+    await new Promise<void>((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error('Print render timed out.')), 30000);
+      api.postRenderFinished.on(() => {
+        clearTimeout(timer);
+        resolve();
+      });
+      const built = buildAlphaTabScore(score.data, settings);
+      api.renderScore(built.score, [0]);
+    });
+
+    const svgs = Array.from(host.querySelectorAll('svg'));
+    for (const svg of svgs) inlineTextStyles(svg);
+    return await use(svgs);
+  } finally {
+    api.destroy();
+    host.remove();
+  }
+}
+
+/**
+ * Write each `<text>`'s computed font onto the element itself.
+ *
+ * THIS IS WHAT MAKES THE NOTEHEADS APPEAR. alphaTab does not put the music font on the
+ * glyphs it emits — the SVG it produces contains the string "alphaTab" exactly zero times.
+ * The family and size arrive by inheritance from a rule in the *document's* stylesheet onto
+ * `<g class="at">`. Lift that SVG out of the document (serialise it into a print file, clone
+ * it into an `<img>`) and the rule does not come with it, so every notehead, clef and rest
+ * falls back to a text font that has nothing at U+E000 and up, and renders as an empty box.
+ *
+ * The page looks *almost* right when this is wrong — staff lines, stems and beams are plain
+ * shapes and survive — which is exactly why it went unnoticed in the HTML print path.
+ *
+ * Reading the computed value rather than hard-coding `36px alphaTab` keeps this correct
+ * across alphaTab's own scale settings and its mixed sizes (grace notes, bar numbers in
+ * Arial, the tempo mark), and it cannot drift when alphaTab changes its CSS.
+ */
+function inlineTextStyles(svg: SVGSVGElement): void {
+  for (const text of Array.from(svg.querySelectorAll('text'))) {
+    const computed = getComputedStyle(text);
+    text.style.fontFamily = computed.fontFamily;
+    text.style.fontSize = computed.fontSize;
+    text.style.fontWeight = computed.fontWeight;
+    text.style.fontStyle = computed.fontStyle;
+    // Same story one level down: a fill that came from CSS rather than an attribute would
+    // be lost too, and a black bar number is less obvious than a missing notehead.
+    text.style.fill = computed.fill;
+  }
+}
+
+/**
+ * Render the score into a hidden print instance and hand back a standalone HTML document.
+ * Exposed separately from `printScore` so it can be unit-tested and so a future
+ * bridge-side "save as PDF" can take the HTML without touching the DOM twice.
+ */
+export async function buildPrintDocument(score: RiffScore, options: PrintOptions = {}): Promise<string> {
+  return withPrintRender(score, async (elements) => {
+    const svgs = elements.map((svg) => svg.outerHTML).join('\n');
+    const fontCss = await bravuraFontFace();
+
+    return `<!doctype html>
+<html><head><meta charset="utf-8"><title>${escapeHtml(options.title ?? 'Riffsheet')}</title>
+<style>
+${fontCss}
+@page { size: A4 portrait; margin: 14mm; }
+html,body { margin:0; padding:0; background:#fff; color:#000;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif; }
+h1 { font-size: 18pt; margin: 0 0 2mm; }
+h2 { font-size: 11pt; font-weight: 400; color:#555; margin: 0 0 6mm; }
+svg { max-width: 100%; height: auto; page-break-inside: avoid; }
+footer { margin-top: 8mm; font-size: 8pt; color:#888; }
+</style></head>
+<body>
+${options.title ? `<h1>${escapeHtml(options.title)}</h1>` : ''}
+${options.subtitle ? `<h2>${escapeHtml(options.subtitle)}</h2>` : ''}
+${svgs}
+<footer>Made with Riffsheet</footer>
+</body></html>`;
+  });
+}
+
+/**
+ * Print the score. Uses a same-origin iframe rather than a popup window: popups are
+ * blocked in a WKWebView and would be the wrong shape inside a plugin anyway.
+ *
+ * BROWSER ONLY. In the plugin even the iframe route dead-ends — WKWebView gives the page no
+ * print dialog at all, which is exactly the bug the user reported. Plugin mode uses
+ * `renderScorePdf()`.
+ */
+export async function printScore(score: RiffScore, options: PrintOptions = {}): Promise<void> {
+  const html = await buildPrintDocument(score, options);
+
+  const frame = document.createElement('iframe');
+  frame.style.cssText = 'position:fixed;right:0;bottom:0;width:0;height:0;border:0;';
+  document.body.appendChild(frame);
+
+  const doc = frame.contentDocument;
+  if (!doc) {
+    frame.remove();
+    throw new Error('Could not open a print view.');
+  }
+  doc.open();
+  doc.write(html);
+  doc.close();
+
+  // Wait for the inlined font to be ready, or the first print draws blank noteheads.
+  try {
+    await frame.contentDocument?.fonts?.ready;
+  } catch {
+    /* fonts API unavailable — proceed anyway */
+  }
+  await new Promise((ok) => setTimeout(ok, 120));
+
+  frame.contentWindow?.focus();
+  frame.contentWindow?.print();
+
+  // Leave it around briefly; removing it immediately can cancel the print dialog.
+  setTimeout(() => frame.remove(), 60000);
+}
+
+// ---------------------------------------------------------------------------
+// PDF bytes — the path the export button actually uses
+// ---------------------------------------------------------------------------
+
+const PAGE_MARGIN_MM = 14;
+/** Breathing room between systems, as a fraction of an inch. */
+const SYSTEM_GAP_MM = 4;
+
+/**
+ * Engrave the score and return a finished PDF, without a print dialog anywhere.
+ *
+ * Layout mirrors the print stylesheet on purpose — A4 portrait, 14 mm margins, systems
+ * fitted to the text width and never split across a page break — so "print" and "save PDF"
+ * cannot drift apart.
+ */
+export async function renderScorePdf(score: RiffScore, options: PrintOptions = {}): Promise<Uint8Array> {
+  const fontCss = await bravuraFontFace();
+
+  const pageW = Math.round(A4_WIDTH_PT * PX_PER_PT);
+  const pageH = Math.round(A4_HEIGHT_PT * PX_PER_PT);
+  const margin = mmToPx(PAGE_MARGIN_MM);
+  const contentW = pageW - margin * 2;
+  const gap = mmToPx(SYSTEM_GAP_MM);
+
+  const systems = await withPrintRender(score, async (elements) => {
+    if (elements.length === 0) throw new Error('The sheet came out empty.');
+    const out: HTMLImageElement[] = [];
+    for (const svg of elements) out.push(await svgToImage(svg, fontCss, contentW));
+    return out;
+  });
+
+  const pages: HTMLCanvasElement[] = [];
+  let cursorY = 0;
+
+  const newPage = (): CanvasRenderingContext2D => {
+    const canvas = document.createElement('canvas');
+    canvas.width = pageW;
+    canvas.height = pageH;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) throw new Error('This browser would not give us a canvas to draw the PDF on.');
+    ctx.fillStyle = '#ffffff';
+    ctx.fillRect(0, 0, pageW, pageH);
+    ctx.fillStyle = '#000000';
+    ctx.textBaseline = 'top';
+    pages.push(canvas);
+    cursorY = margin;
+    return ctx;
+  };
+
+  let page = newPage();
+
+  // Heading, page 1 only — same sizes as the print stylesheet's h1/h2.
+  if (options.title) {
+    page.font = `600 ${Math.round(18 * PX_PER_PT)}px -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif`;
+    page.fillText(options.title, margin, cursorY, contentW);
+    cursorY += Math.round(24 * PX_PER_PT);
+  }
+  if (options.subtitle) {
+    page.fillStyle = '#555555';
+    page.font = `${Math.round(11 * PX_PER_PT)}px -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif`;
+    page.fillText(options.subtitle, margin, cursorY, contentW);
+    page.fillStyle = '#000000';
+    cursorY += Math.round(18 * PX_PER_PT);
+  }
+
+  for (const image of systems) {
+    let w = image.width;
+    let h = image.height;
+    // A system taller than a whole page can only be shrunk; it must not be cropped.
+    const maxH = pageH - margin * 2;
+    if (h > maxH) {
+      w = Math.round(w * (maxH / h));
+      h = maxH;
+    }
+    if (cursorY + h > pageH - margin) {
+      page = newPage();
+    }
+    page.drawImage(image, margin, cursorY, w, h);
+    cursorY += h + gap;
+  }
+
+  // Footer on the last page, matching the print document's line.
+  const footerSize = Math.round(8 * PX_PER_PT);
+  const last = pages[pages.length - 1].getContext('2d');
+  if (last) {
+    last.fillStyle = '#888888';
+    last.font = `${footerSize}px -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif`;
+    last.fillText('Made with Riffsheet', margin, pageH - margin - footerSize);
+  }
+
+  return canvasesToPdf(pages, { title: options.title });
+}
+
+/**
+ * One engraved SVG -> a decoded raster at `targetWidth` pixels.
+ *
+ * Two details make or break this:
+ *
+ *  1. The @font-face goes INSIDE the SVG. An `<img>` renders SVG in a sandbox with no
+ *     access to the parent document's stylesheets or fonts and no network at all, so a
+ *     document-level rule would be ignored and every glyph would come out blank. The
+ *     data-URI src is not "external" and does load.
+ *  2. The width/height ATTRIBUTES are set to the final pixel size, with a viewBox holding
+ *     the original coordinate system. Browsers rasterise an SVG image at its intrinsic
+ *     size and only then scale the bitmap, so passing a bigger size to `drawImage` would
+ *     give a blurry stave. Making the intrinsic size the target size renders it sharp.
+ */
+async function svgToImage(svg: SVGSVGElement, fontCss: string, targetWidth: number): Promise<HTMLImageElement> {
+  const clone = svg.cloneNode(true) as SVGSVGElement;
+  const naturalWidth = numeric(svg.getAttribute('width')) || svg.getBoundingClientRect().width || targetWidth;
+  const naturalHeight = numeric(svg.getAttribute('height')) || svg.getBoundingClientRect().height || 1;
+
+  if (!clone.getAttribute('viewBox')) {
+    clone.setAttribute('viewBox', `0 0 ${naturalWidth} ${naturalHeight}`);
+  }
+  const scale = targetWidth / naturalWidth;
+  clone.setAttribute('width', String(Math.round(naturalWidth * scale)));
+  clone.setAttribute('height', String(Math.round(naturalHeight * scale)));
+  clone.setAttribute('xmlns', 'http://www.w3.org/2000/svg');
+
+  // Only the @font-face. The per-element fonts and fills are already inline by now
+  // (`inlineTextStyles`), and a blanket `text{fill:#000}` here would quietly recolour the
+  // red bar numbers.
+  const style = document.createElementNS('http://www.w3.org/2000/svg', 'style');
+  style.textContent = fontCss;
+  clone.insertBefore(style, clone.firstChild);
+
+  const markup = new XMLSerializer().serializeToString(clone);
+  const image = new Image();
+  // A data: URI rather than a blob: URL — it is unambiguously same-origin, so the canvas
+  // it is drawn onto is never tainted and getImageData() keeps working.
+  image.src = `data:image/svg+xml;base64,${base64Utf8(markup)}`;
+  await imageReady(image);
+  return image;
+}
+
+function imageReady(image: HTMLImageElement): Promise<void> {
+  if (typeof image.decode === 'function') {
+    return image.decode().catch(() => waitForLoad(image));
+  }
+  return waitForLoad(image);
+}
+
+function waitForLoad(image: HTMLImageElement): Promise<void> {
+  return new Promise((resolve, reject) => {
+    if (image.complete && image.naturalWidth > 0) return resolve();
+    image.onload = () => resolve();
+    image.onerror = () => reject(new Error('The engraved page could not be rasterised.'));
+  });
+}
+
+function numeric(value: string | null): number {
+  const n = value ? parseFloat(value) : NaN;
+  return Number.isFinite(n) ? n : 0;
+}
+
+function base64Utf8(text: string): string {
+  const bytes = new TextEncoder().encode(text);
+  let binary = '';
+  const CHUNK = 0x8000;
+  for (let i = 0; i < bytes.length; i += CHUNK) {
+    binary += String.fromCharCode(...bytes.subarray(i, i + CHUNK));
+  }
+  return btoa(binary);
+}
+
+function escapeHtml(s: string): string {
+  return s.replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' })[c]!);
+}

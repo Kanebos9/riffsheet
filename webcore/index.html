@@ -1,0 +1,21 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <title>Riffsheet</title>
+    <!-- The engine test panel is a separate, self-contained page (public/debug.html).
+         The shell appends ?debug=1 when RIFFSHEET_DEBUG=1 is set (see
+         shell/Source/ui/PluginEditor.cpp) and getShellInfo().debug carries the same flag,
+         so this one URL check covers both routes. Classic inline script, deliberately not
+         deferred: it runs before the bundle so the app never boots just to be replaced. -->
+    <script>
+      if (/[?&]debug=1(?:&|$)/.test(location.search)) location.replace('./debug.html');
+    </script>
+    <link rel="stylesheet" href="./src/ui/styles.css" />
+  </head>
+  <body>
+    <div id="app"></div>
+    <script type="module" src="./src/main.ts"></script>
+  </body>
+</html>

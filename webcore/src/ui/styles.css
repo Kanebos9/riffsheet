@@ -1,0 +1,935 @@
+/*
+ * Riffsheet web core styling.
+ *
+ * The palette is deliberately inherited from Basscribe so the two read as siblings:
+ * warm orange on cool near-black, with one warm-white "paper" surface for the engraved
+ * score. That contrast is the visual signature — the sheet is a physical page sitting
+ * inside a dark tool.
+ *
+ * Unlike Basscribe, the canvas layer here reads the tokens instead of duplicating them
+ * as string literals (see ui/tokens.ts), so a light theme stays possible.
+ */
+
+:root {
+  color-scheme: dark;
+  --bg: #16181d;
+  --bg-raised: #1e2128;
+  --bg-panel: #23262e;
+  --border: #2e3340;
+  --text: #e8eaee;
+  --text-dim: #9aa0ab;
+  --accent: #e8734a;
+  --accent-soft: #e8734a33;
+  --paper: #f8f6f0;
+  --ink: #16181d;
+  --danger: #e05252;
+  --warn: #e8b34a;
+  --ok: #57b87b;
+  /*
+   * "The app's own ears heard this."
+   *
+   * The attack ticks under the waveform have used this value for a while, through
+   * `pick('--success', …)` with the literal as a fallback — the token itself never existed, so
+   * two canvases and now a popover were each carrying their own copy of the same colour. It is
+   * declared here at exactly the value they were already falling back to, so nothing changes on
+   * screen and there is one place to change it from.
+   *
+   * Deliberately not the accent: the accent means "selected / active", and this means "here is
+   * some evidence", which is a different thing and must not be mistaken for a selection.
+   */
+  --success: #62d6b5;
+  --radius: 8px;
+
+  /*
+   * The waveform silhouette.
+   *
+   * Was #3a4150, which sat barely above the #1e2128 pane behind it — the player's words were
+   * "background and the wave are both dark colors". Lifted well clear of the pane so the
+   * envelope reads at a glance, which is the strip's whole job now that it is also the thing
+   * you drag a selection out of.
+   */
+  --wave: #7c869b;
+  --wave-played: #e8734a;
+  --playhead: #ffffff;
+
+  /* Piano roll. The note colour is lighter than --wave on purpose: a roll is read as
+     shapes on a dark ground, where the waveform is read as a silhouette. */
+  --roll-row: #191c22;
+  --roll-note: #6b7695;
+}
+
+* { box-sizing: border-box; }
+
+html, body {
+  margin: 0;
+  padding: 0;
+  height: 100%;
+}
+
+body {
+  background: var(--bg);
+  color: var(--text);
+  font: 13px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+  user-select: none;
+  overflow: hidden;
+}
+
+button, input, select, textarea { font: inherit; color: inherit; }
+
+button {
+  background: var(--bg-panel);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 5px 10px;
+  font-size: 12.5px;
+  cursor: pointer;
+}
+button:hover:not(:disabled) { border-color: var(--accent); }
+button:disabled { opacity: 0.45; cursor: default; }
+button.primary { background: var(--accent); border-color: var(--accent); color: #1a1005; font-weight: 600; }
+button.ghost { background: transparent; }
+button.icon { padding: 5px 8px; }
+
+.chip {
+  border-radius: 999px;
+  padding: 4px 11px;
+  background: var(--bg-panel);
+  border: 1px solid var(--border);
+  font-size: 12px;
+  cursor: pointer;
+}
+.chip.on { background: var(--accent); border-color: var(--accent); color: #1a1005; font-weight: 600; }
+
+input[type="range"] { accent-color: var(--accent); }
+input[type="number"], input[type="text"], select {
+  background: var(--bg-panel);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 4px 7px;
+}
+
+.row { display: flex; align-items: center; gap: 8px; }
+.spacer { flex: 1; }
+.dim { color: var(--text-dim); }
+.mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+
+/* ------------------------------------------------------------------ app shell */
+
+#app { display: flex; flex-direction: column; height: 100%; }
+
+.app-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px;
+  background: var(--bg-raised);
+  border-bottom: 1px solid var(--border);
+  flex: 0 0 auto;
+  flex-wrap: wrap;
+}
+/* Shrink before anything else does — the export buttons must never wrap off-screen. */
+.app-header .filename {
+  font-weight: 600;
+  flex: 1 1 6ch;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.app-header .spacer { flex: 0 1 auto; }
+
+.banner {
+  padding: 7px 12px;
+  background: #2b3a4a;
+  border-bottom: 1px solid var(--border);
+  font-size: 12.5px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.banner button { background: transparent; border-color: transparent; text-decoration: underline; }
+
+/* ------------------------------------------------------------------ drop zone */
+
+.dropzone-screen {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  /*
+   * `safe` matters. Plain `center` on an overflowing flex column centres the content and then
+   * puts its overflow on BOTH sides — and the half above the top edge is unreachable, because
+   * a scroll container cannot scroll to a negative offset. The top of this screen therefore
+   * disappeared as soon as it grew taller than the window. `safe` falls back to flex-start the
+   * moment the content does not fit, which is the only state in which centring can hurt.
+   */
+  justify-content: safe center;
+  gap: clamp(10px, 2vh, 18px);
+  padding: clamp(12px, 3vw, 32px);
+  overflow-y: auto;
+}
+
+.dropzone {
+  width: min(640px, 92vw);
+  min-height: min(240px, 34vh);
+  border: 2px dashed var(--border);
+  border-radius: 14px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 14px;
+  padding: 32px;
+  text-align: center;
+  transition: border-color 120ms, background 120ms;
+  cursor: pointer;
+}
+.dropzone:hover { border-color: #3d4454; }
+.dropzone.dragging { border-color: var(--accent); background: var(--accent-soft); }
+.dropzone .headline { font-size: clamp(16px, 2.4vw, 21px); font-weight: 600; }
+.dropzone .explainer { font-size: 13.5px; color: var(--text-dim); max-width: 46ch; line-height: 1.5; }
+
+.recent { width: min(640px, 92vw); }
+.recent h2 { font-size: 12px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--text-dim); margin: 0 0 6px; }
+.recent-item {
+  display: flex; align-items: center; gap: 8px;
+  padding: 6px 9px; border-radius: 6px; cursor: pointer; font-size: 12.5px;
+}
+.recent-item:hover { background: var(--bg-panel); }
+.recent-item .when { margin-left: auto; color: var(--text-dim); font-size: 11.5px; }
+.opening-footer { width: min(640px, 92vw); display: flex; justify-content: center; }
+.legal-link { color: var(--text-dim); text-decoration: underline; text-underline-offset: 2px; }
+
+.current-work {
+  width: min(720px, 94vw); display: flex; align-items: center; gap: 14px;
+  padding: 12px 14px; border: 1px solid var(--border); border-radius: 10px;
+  background: var(--bg-raised);
+}
+.current-work > :first-child { min-width: 0; flex: 1; }
+.current-work strong { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.danger-text { color: #ff8c8c; }
+.new-score-button { min-width: 180px; }
+.blank-score-setup {
+  width: min(720px, 94vw); padding: 14px; border: 1px solid var(--border);
+  border-radius: 10px; background: var(--bg-raised); display: flex; flex-direction: column; gap: 12px;
+}
+.blank-score-setup h2 { margin: 0; font-size: 16px; }
+.blank-score-grid { display: grid; grid-template-columns: repeat(4, minmax(110px, 1fr)); gap: 10px; }
+.blank-score-grid label { display: flex; flex-direction: column; gap: 4px; color: var(--text-dim); font-size: 11.5px; }
+.blank-score-grid input, .blank-score-grid select { width: 100%; color: var(--text); }
+
+.modal-backdrop {
+  position: fixed; inset: 0; z-index: 80; display: grid; place-items: center;
+  padding: 20px; background: #080a0dbb;
+}
+.part-picker {
+  width: min(560px, 94vw); max-height: min(640px, 88vh); overflow-y: auto;
+  display: flex; flex-direction: column; gap: 8px; padding: 18px;
+  border: 1px solid var(--border); border-radius: 12px; background: var(--bg-raised);
+  box-shadow: 0 18px 60px #000c;
+}
+.part-picker h2, .part-picker p { margin: 0 0 4px; }
+/* The in-page yes/no. Borrows `.part-picker`'s box so the two dialogs are one design. */
+.confirm-dialog { width: min(420px, 94vw); gap: 14px; }
+.confirm-dialog p { margin: 0; line-height: 1.45; }
+.confirm-actions { display: flex; justify-content: flex-end; gap: 8px; flex-wrap: wrap; }
+.part-choice { display: flex; flex-direction: column; align-items: flex-start; gap: 2px; padding: 10px 12px; text-align: left; }
+.part-choice.recommended { border-color: var(--accent); }
+
+.about-card {
+  width: min(620px, 94vw); max-height: min(680px, 90vh); overflow-y: auto;
+  padding: 18px; border: 1px solid var(--border); border-radius: 12px;
+  background: var(--bg-raised); box-shadow: 0 18px 60px #000c;
+  user-select: text;
+}
+.about-card > header { display: flex; align-items: flex-start; gap: 12px; }
+.about-card > header > :first-child { flex: 1; }
+.about-card h2 { margin: 0; font-size: 20px; }
+.about-card h3 { margin: 18px 0 6px; font-size: 12px; text-transform: uppercase; letter-spacing: .06em; color: var(--text-dim); }
+.about-card p { margin: 7px 0; }
+.about-card header p { margin: 1px 0 0; }
+.legal-components { margin: 6px 0; padding-left: 20px; }
+.legal-components li { margin: 4px 0; }
+.legal-note { font-size: 12px; }
+.legal-notice-link { display: inline-block; margin-top: 6px; color: #ff9a74; }
+
+/*
+ * Support the makers. Same list idiom as .legal-components — this is the credits screen
+ * continuing, not a second design — with room for the sentence that follows a row when the
+ * project takes no money and something else helps instead.
+ */
+.support-group + .support-group { margin-top: 12px; }
+.support-heading {
+  margin: 0 0 4px; font-size: 11px; font-weight: 600; text-transform: uppercase;
+  letter-spacing: .06em; color: var(--text-dim);
+}
+.support-list { margin: 4px 0; padding-left: 20px; }
+.support-row { margin: 6px 0; }
+.support-link-wrap::before { content: ' '; }
+.support-link { color: #ff9a74; text-decoration: underline; text-underline-offset: 2px; overflow-wrap: anywhere; }
+.support-note { margin-top: 1px; font-size: 12px; line-height: 1.4; }
+.legal-notices {
+  margin: 12px 0 0; padding: 12px; max-height: 260px; overflow: auto;
+  border: 1px solid var(--border); border-radius: 6px; background: var(--bg);
+  color: var(--text); font: 11.5px/1.45 ui-monospace, SFMono-Regular, Menlo, monospace;
+  white-space: pre-wrap; user-select: text;
+}
+
+/* ------------------------------------------------------------------ waveform */
+
+/*
+ * Taller than it was (46px), because it now does three jobs, not one: it shows the recording,
+ * it carries the bar-1 flag and the view bracket in a lane along the top, and it is the surface
+ * you drag a selection out of to ask the tuner what is really there. Forty-six pixels minus an
+ * 11px handle lane left 35px of actual audio, which is not enough to aim at.
+ */
+.waveform {
+  flex: 0 0 auto;
+  height: 72px;
+  background: var(--bg-raised);
+  border-bottom: 1px solid var(--border);
+  cursor: pointer;
+  display: block;
+  width: 100%;
+}
+
+/* ------------------------------------------------------------------ piano roll */
+
+/*
+ * Sits directly under the waveform and shares its ruler, so the canvas spans the full width
+ * and the pitch-label gutter is drawn INSIDE it — with the waveform reserving the identical
+ * column (see view/pianoroll.ts §1). The chip is overlaid on the pane rather than given a row,
+ * which keeps the pane's cost to its own height and keeps the switch reachable when the roll
+ * is collapsed.
+ *
+ * The height here is only what applies before the script runs. The real one is an inline style
+ * the player drags and the app persists — which is also why there are no media-query heights
+ * for this pane any more: an inline style outranks a media query, so those rules would be dead
+ * ones pretending to be policy. `clampRollHeight()` in view/pianoroll.ts is the single place
+ * the minimum, the 40% ceiling and the short-window behaviour live.
+ */
+.pianoroll-pane {
+  position: relative;
+  flex: 0 0 auto;
+  height: 150px;
+  background: var(--bg-raised);
+  border-bottom: 1px solid var(--border);
+}
+.pianoroll-pane.off { height: 24px; }
+
+.pianoroll {
+  display: block;
+  width: 100%;
+  height: 100%;
+  cursor: pointer;
+}
+
+/*
+ * The view chips in the header's middle gap: Piano roll · Reset view · Fit · DAW grid.
+ *
+ * They shrink away before the export buttons do, and scroll rather than wrap, so a narrow
+ * plugin window loses them gracefully instead of pushing Save off the edge.
+ */
+/* Wraps, for the same reason `.notation-toolbar` does: the header itself already wraps, and a
+   chip that scrolled out of sight in here took the roll's own switches with it. */
+.view-tools {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+  flex-wrap: wrap;
+  row-gap: 4px;
+  flex: 0 1 auto;
+}
+.view-tools .chip { font-size: 11px; padding: 2px 9px; white-space: nowrap; }
+.view-tools select.chip {
+  color: var(--text);
+  background: var(--bg-raised);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  cursor: pointer;
+}
+.view-tools .chip-detail { margin-left: 6px; opacity: 0.72; font-size: 10.5px; }
+
+.tuner-host { flex: 0 0 auto; padding: 4px 8px; background: var(--bg-raised); border-bottom: 1px solid var(--border); }
+.tuner-host[hidden] { display: none; }
+
+/*
+ * IT WRAPS. It used to be a horizontal scroller with the scrollbar switched off, and that is
+ * only survivable while the controls happen to fit: the moment Key and Capo were added, Capo
+ * sat 39px past the right edge at 900x600 with nothing on screen saying so. A control you
+ * cannot see and cannot discover a way to reach has been deleted as far as the player is
+ * concerned — which is exactly how it was reported ("the button disappeared").
+ *
+ * Wrapping rather than a visible scrollbar, for the reason already written down under
+ * `.engine-pick .chip-group`: "a horizontally scrolling row of chips hides the ones nobody
+ * knows are there". The header above it has wrapped since day one, so this is the idiom the
+ * screen already uses, not a new one. It costs a second row at narrow widths and gives back
+ * the guarantee that every control on this bar is on screen at 360px.
+ */
+.notation-toolbar {
+  flex: 0 0 auto; display: flex; align-items: center; gap: 7px; min-height: 38px;
+  padding: 5px 10px; background: var(--bg-raised); border-top: 1px solid var(--border);
+  border-bottom: 1px solid var(--border); flex-wrap: wrap; row-gap: 5px;
+}
+.notation-toolbar > * { flex: 0 0 auto; max-width: 100%; }
+.notation-toolbar .toolbar-label { font-weight: 600; }
+.notation-toolbar .custom-tuning { width: 190px; }
+.notation-toolbar .string-count { display: flex; align-items: center; gap: 4px; }
+.notation-toolbar .string-count input { width: 48px; }
+.notation-toolbar .tuning-summary { font-size: 11.5px; color: var(--text-dim); }
+.notation-toolbar .document-bars { display: flex; align-items: center; gap: 6px; margin-left: auto; }
+
+/*
+ * DEAD, kept only so an old stylesheet reference cannot silently restyle something else.
+ * The pane's own controls used to be overlaid here, top right:
+ *
+ * Overlaid rather than given a row of their own, so a pane the player has dragged down to 60px
+ * spends all 60 on music. They sit above the canvas but below the resize handle in z-order —
+ * the handle spans the full width and must stay grabbable at the corners.
+ */
+.pianoroll-tools {
+  position: absolute;
+  top: 4px;
+  right: 8px;
+  z-index: 2;
+  display: flex;
+  gap: 4px;
+  align-items: center;
+}
+.pianoroll-tools .chip {
+  font-size: 10.5px;
+  padding: 1px 8px;
+  opacity: 0.9;
+}
+.pianoroll-pane.off .pianoroll-tools { top: 2px; }
+
+/*
+ * The grab handle on the bottom edge.
+ *
+ * IT IS ALWAYS VISIBLE, and that is the point. The first version only drew its grip on hover,
+ * on the reasoning that a permanent one would compete with the bar lines above it. The player's
+ * verdict was that nobody could tell the pane was resizable at all — an affordance you have to
+ * already know about is not an affordance. So the grip is drawn at rest, dimly, and brightens
+ * on hover, focus and drag. It has its own 9px band with a faint ground of its own, so it reads
+ * as a piece of chrome under the music rather than as a mark on it.
+ */
+.pianoroll-resize {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: -3px;
+  height: 9px;
+  z-index: 3;
+  cursor: ns-resize;
+  touch-action: none;
+  background: linear-gradient(to bottom, transparent, var(--bg));
+}
+.pianoroll-resize::after {
+  content: "";
+  position: absolute;
+  left: 50%;
+  transform: translateX(-50%);
+  bottom: 2px;
+  width: 46px;
+  height: 3px;
+  border-radius: 2px;
+  background: var(--text-dim);
+  /* At rest, not absent. */
+  opacity: 0.45;
+  transition: opacity 100ms linear, width 100ms linear;
+}
+.pianoroll-resize:hover::after,
+.pianoroll-resize:focus-visible::after,
+.pianoroll-resize.dragging::after { opacity: 0.95; width: 64px; }
+.pianoroll-resize:focus-visible { outline: 1px solid var(--accent); outline-offset: -2px; }
+
+/*
+ * Colours the piano roll reads off the document (view/pianoroll.ts readColors).
+ *
+ * `--roll-note-edge` is the outline every rectangle now carries. It exists because two hits on
+ * the same pitch a few milliseconds apart drew as one continuous block, so a fast repeated note
+ * looked like a held one — the player reported exactly that. The edge has to read against both
+ * the note fill and the shaded black-key rows behind it, so it is lighter than either.
+ */
+:root {
+  /*
+   * The time-selection blue. It has to be a fifth colour: orange already means played-so-far,
+   * amber means bar 1, white means the playhead and grey means the viewport bracket. Used by
+   * the waveform's selection band and by the tuner's sequence chips, which must read as the
+   * same thing.
+   */
+  --select: #5aa9e8;
+  --roll-note-edge: #cfd6e4;
+  --roll-key-white: #bcc3cf;
+  --roll-key-black: #1b1e25;
+}
+
+/* ------------------------------------------------------------------ transport */
+
+.transport {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 8px 12px;
+  background: var(--bg-raised);
+  border-bottom: 1px solid var(--border);
+  flex: 0 0 auto;
+  flex-wrap: wrap;
+}
+.transport .position { font-variant-numeric: tabular-nums; min-width: 11ch; white-space: nowrap; }
+
+.fader { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.fader label { font-size: 11.5px; color: var(--text-dim); }
+.fader input[type="range"] { width: clamp(76px, 12vw, 132px); min-width: 0; }
+.fader .end { font-size: 11.5px; }
+.fader .end.active { color: var(--accent); font-weight: 600; }
+
+/*
+ * The numbers on the DAW-grid chip.
+ *
+ * The chip used to read "synced to DAW grid" and nothing else, which is how a sheet at 102 BPM
+ * sat under a lit chip while REAPER was at 222 and nobody could see the disagreement. It now
+ * carries the tempo and meter it is actually applying, dimmed so the chip still reads as one
+ * control rather than two.
+ */
+.chip .chip-detail {
+  margin-left: 6px;
+  opacity: 0.75;
+  font-variant-numeric: tabular-nums;
+  font-size: 10.5px;
+}
+
+/*
+ * The MIDI button is also a drag source — see ui/exportBar.ts. The grip is decoration; the
+ * button owns the gesture, so the grip must never be the pointer's target.
+ */
+button[data-drag="midi"] { cursor: grab; -webkit-user-drag: none; user-select: none; }
+button[data-drag="midi"]:active { cursor: grabbing; }
+button[data-drag="midi"] .drag-grip {
+  margin-left: 6px;
+  opacity: 0.55;
+  font-size: 11px;
+  line-height: 1;
+  vertical-align: middle;
+  pointer-events: none;
+}
+button[data-drag="midi"]:hover .drag-grip { opacity: 0.9; }
+
+/* ------------------------------------------------------------------ tri-view */
+
+.triview { flex: 1; min-height: 0; background: var(--paper); position: relative; }
+
+.triview-scroll {
+  width: 100%;
+  height: 100%;
+  overflow-x: auto;
+  overflow-y: auto;
+  /*
+   * The native bar is hidden because it sits at the very bottom of the window and does not read
+   * as governing the piano roll two rows above it — and the roll and the sheet share one x-axis,
+   * so there must be exactly ONE bar for both. `.hscroll` below is it. Scrolling itself is
+   * untouched: wheel, drag-pan and keep-the-playhead-visible all still work through this element.
+   */
+  scrollbar-width: none;
+}
+.triview-scroll::-webkit-scrollbar { display: none; }
+
+/*
+ * The one horizontal scrollbar, for the sheet AND the linked piano roll.
+ * Sits between the roll and the transport, where it is next to both things it moves.
+ */
+.hscroll {
+  position: relative;
+  flex: 0 0 auto;
+  height: 12px;
+  background: var(--bg);
+  border-bottom: 1px solid var(--border);
+  cursor: pointer;
+  touch-action: none;
+}
+.hscroll-thumb {
+  position: absolute;
+  top: 3px;
+  height: 6px;
+  min-width: 24px;
+  border-radius: 3px;
+  background: var(--text-dim);
+  opacity: 0.55;
+}
+.hscroll:hover .hscroll-thumb { opacity: 0.85; }
+
+.triview-stack {
+  position: relative;
+  display: inline-block;
+  min-width: 100%;
+}
+
+.at-host { position: relative; }
+
+.names-row {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+}
+
+.note-name {
+  position: absolute;
+  top: 0;
+  left: 0;
+  font: 600 10.5px/1 ui-monospace, SFMono-Regular, Menlo, monospace;
+  color: #6b5a4a;
+  background: rgba(248, 246, 240, 0.85);
+  padding: 1px 2px;
+  border-radius: 2px;
+  white-space: nowrap;
+  pointer-events: auto;
+  cursor: pointer;
+}
+.note-name.uncertain { color: var(--danger); }
+.note-name:hover { color: var(--accent); }
+
+/*
+ * Octave-fold markers on the tab (IRNote.tabOctaveShift). Warning-coloured, because the
+ * position under them does NOT sound the pitch on the staff above — that is the whole
+ * reason the marker exists.
+ */
+.tabmarks-row {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+}
+
+.tab-mark {
+  position: absolute;
+  top: 0;
+  left: 0;
+  font: 700 7.5px/1 ui-monospace, SFMono-Regular, Menlo, monospace;
+  color: #a8761a;
+  background: rgba(248, 246, 240, 0.9);
+  padding: 1px 2px;
+  border-radius: 2px;
+  white-space: nowrap;
+  pointer-events: auto;
+  cursor: help;
+}
+.tab-mark:hover { color: var(--accent); }
+
+.triview-overlay {
+  position: absolute;
+  top: 0;
+  left: 0;
+  pointer-events: none;
+}
+.triview-overlay .playhead {
+  stroke: var(--accent);
+  stroke-width: 1.5;
+  opacity: 0;
+}
+.triview-overlay .sel-rect {
+  fill: var(--accent-soft);
+  stroke: var(--accent);
+  stroke-width: 1;
+}
+
+/* ------------------------------------------------------------------ popover */
+
+.popover {
+  position: fixed;
+  z-index: 40;
+  background: var(--bg-panel);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  box-shadow: 0 8px 28px #000a;
+  padding: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 168px;
+}
+.popover .pop-title { font-size: 11.5px; color: var(--text-dim); }
+.popover .pop-row { display: flex; align-items: center; gap: 6px; }
+.popover .pop-row .label { font-size: 11.5px; color: var(--text-dim); width: 52px; }
+.popover .pop-value { font-variant-numeric: tabular-nums; min-width: 4ch; text-align: center; }
+
+/*
+ * "Split by Riffsheet — Keep / Revert".
+ *
+ * The review step for an edit the app made on its own evidence. It borrows `.popover` whole
+ * and adds two things: a title that is a STATEMENT rather than a label (the player has to be
+ * able to tell an automatic edit from their own at a glance), and a line of plain language
+ * saying what was heard. Its edge is the same accent the halo on the roll and the tint on the
+ * waveform use, so the three read as one thing pointing at one note.
+ */
+.auto-popover { border-color: var(--success, #62d6b5); max-width: 260px; }
+.auto-popover .pop-title { color: var(--success, #62d6b5); font-weight: 600; font-size: 12px; }
+.auto-popover .auto-popover-why { font-size: 11.5px; line-height: 1.35; }
+
+/*
+ * The counter in the roll's controls.
+ *
+ * Outlined in the same accent rather than filled with it: a filled chip in that row means "this
+ * mode is ON" (see `.chip.on`), and this is a count with somewhere to go, not a switch.
+ */
+.auto-edits-chip { border-color: var(--success, #62d6b5); color: var(--success, #62d6b5); }
+.auto-edits-chip:hover:not(:disabled) { background: var(--success, #62d6b5); color: #06131f; }
+
+/*
+ * The export menu (MIDI -> Quantized / As played / Both).
+ *
+ * Same surface as .popover so the two read as one idiom, but a list rather than a form.
+ * Items are full-width rows: at 360px — REAPER's smallest docked FX window — a horizontal
+ * row of three chips would not fit, and this one still does.
+ */
+.menu-popover {
+  position: fixed;
+  z-index: 45;
+  background: var(--bg-panel);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  box-shadow: 0 8px 28px #000a;
+  padding: 5px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 196px;
+  max-width: min(280px, 94vw);
+}
+.menu-popover .menu-item {
+  display: flex;
+  align-items: baseline;
+  gap: 7px;
+  width: 100%;
+  padding: 6px 8px;
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  text-align: left;
+}
+.menu-popover .menu-item:hover:not(:disabled) { background: var(--bg-raised); border-color: var(--border); }
+.menu-popover .menu-item.on .menu-label { color: var(--accent); font-weight: 600; }
+/* Fixed tick column, so the labels do not jump when the remembered choice moves. */
+.menu-popover .tick { width: 1em; flex: 0 0 auto; color: var(--accent); }
+.menu-popover .menu-label { flex: 0 0 auto; }
+/* The sampled-bass status sits between two controls; without this it reads as a caption
+   for the one below it. */
+.settings-row + .status-row { margin: -2px 0 9px; }
+
+.menu-popover .menu-hint {
+  margin-left: auto;
+  font-size: 11px;
+  color: var(--text-dim);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  min-width: 0;
+}
+
+/* ------------------------------------------------------------------ settings */
+
+.settings-panel {
+  position: fixed;
+  top: 0; right: 0; bottom: 0;
+  width: min(340px, 92vw);
+  z-index: 30;
+  background: var(--bg-raised);
+  border-left: 1px solid var(--border);
+  padding: 14px;
+  overflow-y: auto;
+  box-shadow: -8px 0 28px #0007;
+}
+.settings-panel h2 { font-size: 14px; margin: 0 0 12px; }
+.settings-group { margin-bottom: 18px; }
+.settings-group > h3 {
+  font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em;
+  color: var(--text-dim); margin: 0 0 7px; font-weight: 600;
+}
+.settings-row { display: flex; align-items: center; gap: 8px; margin-bottom: 7px; flex-wrap: wrap; }
+.settings-row > .label { font-size: 12.5px; min-width: 96px; }
+.chip-group { display: flex; gap: 5px; flex-wrap: wrap; }
+
+.switch { display: flex; align-items: center; gap: 7px; cursor: pointer; }
+
+.status-row { font-size: 11.5px; color: var(--text-dim); line-height: 1.5; }
+.status-row .dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%; margin-right: 5px; }
+.status-row .dot.ok { background: var(--ok); }
+.status-row .dot.warn { background: var(--warn); }
+.status-row .dot.off { background: var(--text-dim); }
+.status-row.dim { opacity: 0.85; }
+
+/* --------------------------------------------------------------- engine setup */
+/* Instructions somebody is going to type out of, so: numbered, roomy enough to read a
+   command off, and the paths never wrap mid-path — a broken path is a broken install. */
+.engine-setup .setup-steps { margin: 6px 0 10px; padding-left: 18px; font-size: 12px; line-height: 1.5; }
+.engine-setup .setup-steps > li { margin-bottom: 7px; }
+.engine-setup .setup-steps .dim { color: var(--text-dim); font-size: 11.5px; }
+.engine-setup .setup-paths {
+  margin: 6px 0 10px; padding-left: 20px;
+  font-size: 11px; line-height: 1.6; color: var(--text-dim);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  max-height: 190px; overflow-y: auto; overflow-x: auto;
+}
+.engine-setup .setup-paths > li { white-space: nowrap; }
+.engine-setup code.path {
+  font-size: 11px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  background: var(--bg-panel); border-radius: 4px; padding: 3px 6px;
+  overflow-x: auto; white-space: nowrap; max-width: 100%;
+}
+
+/* ------------------------------------------------------------- engine cards */
+/*
+ * One card per engine. The border is the only thing separating them, because a panel this
+ * narrow cannot afford a second level of indentation and a card that boxes itself in twice
+ * ends up with about 250px of usable width at the 360px floor.
+ */
+.engine-card {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 9px 10px;
+  margin-bottom: 9px;
+  background: var(--bg-panel);
+  /* Long names, long paths and long URLs all live in here. Nothing may push the panel wide. */
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+/* The engine actually doing the listening, not merely the one that was chosen. */
+.engine-card.on { border-color: var(--accent); background: var(--accent-soft); }
+.engine-card header {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  flex-wrap: wrap;
+  margin-bottom: 5px;
+}
+.engine-card .engine-name { font-size: 12.5px; font-weight: 600; }
+/* The tier chip is a LABEL, not a button — no hover, no pointer, and it never looks pressed. */
+.engine-card .chip.tier {
+  font-size: 10.5px;
+  padding: 2px 8px;
+  cursor: default;
+  color: var(--text-dim);
+}
+.engine-card .chip.tier:hover { border-color: var(--border); }
+/* `.dot` is styled under `.status-row` everywhere else; the header is the one place it is not. */
+.engine-card header .dot {
+  width: 7px; height: 7px; border-radius: 50%; margin-left: auto; flex: 0 0 auto;
+}
+.engine-card header .dot.ok { background: var(--ok); }
+.engine-card header .dot.warn { background: var(--warn); }
+.engine-card header .dot.off { background: var(--text-dim); }
+.engine-card .row { flex-wrap: wrap; margin: 7px 0 2px; }
+/* An install bar, inline with the sentence that says what stage it is at. */
+.engine-card .progress {
+  display: inline-block;
+  vertical-align: middle;
+  width: 64px;
+  height: 5px;
+  margin-right: 6px;
+  border-radius: 3px;
+  background: var(--bg-raised);
+  overflow: hidden;
+}
+.engine-card .progress > i { display: block; height: 100%; width: 0; background: var(--accent); transition: width 160ms linear; }
+
+/* ------------------------------------------------------ main-menu engine pick */
+/*
+ * The picker on the opening screen. Same width as the drop zone under it so the two read as
+ * one column, and centred text nowhere — this is a control, not a hero.
+ */
+.engine-pick {
+  width: min(640px, 92vw);
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
+}
+.engine-pick h2 {
+  font-size: 12px; text-transform: uppercase; letter-spacing: 0.06em;
+  color: var(--text-dim); margin: 0;
+}
+/* The chips wrap rather than scroll: at 360px a row of four engine names cannot fit on one
+   line, and a horizontally scrolling row of chips hides the ones nobody knows are there. */
+.engine-pick .chip-group { flex-wrap: wrap; }
+.engine-pick [data-role="engine-pick-more"] { align-self: flex-start; }
+
+/* ------------------------------------------------------------------ progress */
+
+.progress-overlay {
+  position: absolute;
+  inset: 0;
+  z-index: 20;
+  background: rgba(22, 24, 29, 0.86);
+  display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 12px;
+}
+.progress-bar { width: min(420px, 70vw); height: 6px; background: var(--bg-panel); border-radius: 3px; overflow: hidden; }
+.progress-bar > i { display: block; height: 100%; background: var(--accent); width: 0; transition: width 200ms linear; }
+.progress-note { font-size: 12.5px; color: var(--text-dim); }
+
+/* ------------------------------------------------------------------ tooltips */
+
+.riff-tooltip {
+  position: fixed;
+  z-index: 100;
+  max-width: 270px;
+  background: var(--bg-panel);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 7px 9px;
+  font-size: 12px;
+  line-height: 1.45;
+  color: var(--text);
+  box-shadow: 0 8px 28px #000a;
+  pointer-events: none;
+}
+
+/* ------------------------------------------------------------------ toasts */
+
+.toasts { position: fixed; right: 14px; bottom: 14px; z-index: 60; display: flex; flex-direction: column; gap: 8px; }
+.toast {
+  background: var(--bg-panel);
+  border: 1px solid var(--border);
+  border-left-width: 3px;
+  border-radius: 6px;
+  padding: 8px 10px;
+  font-size: 12.5px;
+  max-width: 340px;
+  display: flex; gap: 8px; align-items: flex-start;
+  box-shadow: 0 8px 28px #000a;
+}
+.toast.danger { border-left-color: var(--danger); }
+.toast.info { border-left-color: var(--accent); }
+.toast button { background: none; border: none; padding: 0 2px; cursor: pointer; color: var(--text-dim); }
+
+/* ------------------------------------------------------------------ narrow */
+
+/*
+ * The product's floor is 900x600 (a plugin window a user can actually make small).
+ * Nothing above uses a fixed pixel width that cannot shrink; these rules buy the last
+ * bit of room by trimming chrome rather than by clipping content.
+ */
+@media (max-width: 1000px) {
+  .transport { gap: 9px; padding: 7px 10px; }
+  .app-header { padding: 7px 10px; }
+  button { padding: 5px 8px; }
+  .fader label, .fader .end { font-size: 11px; }
+}
+
+@media (max-width: 720px) {
+  .blank-score-grid { grid-template-columns: repeat(2, minmax(110px, 1fr)); }
+  .current-work { align-items: stretch; flex-direction: column; }
+  .current-work .row { flex-wrap: wrap; }
+}
+
+@media (max-height: 660px) {
+  .waveform { height: 52px; }
+  .dropzone { padding: 18px; gap: 9px; }
+  .dropzone .explainer { font-size: 12.5px; }
+}
+
+/*
+ * The piano roll used to shrink here too, and at the 360x280 floor. It still does — but from
+ * `clampRollHeight()` in view/pianoroll.ts, because its height is now an inline style the
+ * player drags, and no media query can outrank one. Same behaviour at the floor (46px), and
+ * the player's own choice honoured everywhere there is room for it.
+ */

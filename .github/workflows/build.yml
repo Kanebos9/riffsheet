@@ -1,0 +1,689 @@
+name: Build Riffsheet
+
+# Builds Riffsheet for macOS, Windows and Linux on every push and uploads the
+# three zips as downloadable artefacts. When you PUBLISH a GitHub Release it
+# also attaches them to that Release.
+#
+# Descended from the workflow of BASAMAK, an earlier JUCE project by the same
+# author, with the differences Riffsheet forces:
+#
+#   1. There is a WEB APP to build first. webcore/dist is not in the repo, so a
+#      test job builds and browser-verifies it once, then the three native jobs
+#      download that exact bundle. CMake embeds whatever it finds there.
+#   2. -DRIFFSHEET_REQUIRE_WEBCORE=ON. Without it, a webcore build that failed
+#      would leave no dist/, CMake would quietly embed the shell's placeholder
+#      test panel, and the run would go green having shipped a plugin with no
+#      app in it. That trap is why the flag exists.
+#   3. Windows needs the WebView2 SDK from NuGet. BASAMAK never did, because
+#      BASAMAK draws its own UI (JUCE_WEB_BROWSER=0). Riffsheet's entire editor
+#      is a WebView, so on Windows the configure hard-fails without it.
+#   4. Linux needs libwebkit2gtk-4.1-dev for the same reason.
+#
+# WHAT A GREEN RUN MEANS: the pure notation and web regressions passed, the app
+# opened in headless Chrome, and all native targets compiled and staged. Nothing
+# here loads the plugin in a DAW. See BUILDING.md, "What CI proves".
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+  release:
+    types: [published]
+
+# Free Actions minutes are finite and these legs are not cheap. Pushing twice in
+# a minute should not run the whole matrix twice: a newer run on the same ref
+# cancels the older one. Release runs are NOT cancellable - the zips a published
+# Release is waiting for must not vanish because something else was pushed.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'push' || github.event_name == 'pull_request' }}
+
+env:
+  # Same JUCE the user's Mac builds against (BUILDING.md §1, "What you need").
+  # JUCE 8.0.1+ is a hard floor: the WebView native-integration API this whole
+  # project sits on does not exist before it.
+  JUCE_TAG: 8.0.13
+  # Vite 7 and the local toolchain are on Node 22 (v22.23.2 on the user's Mac).
+  NODE_VERSION: 22
+  # The version JUCE's own FindWebView2.cmake tells you to install.
+  WEBVIEW2_VERSION: 1.0.3485.44
+  # ONNX Runtime, statically linked, for the built-in Basic Pitch engine. MUST
+  # stay equal to RIFFSHEET_ORT_VERSION in shell/cmake/OnnxRuntime.cmake; it is
+  # also the cache key, so bumping one without the other rebuilds against the
+  # wrong runtime rather than failing.
+  ORT_VERSION: 1.28.0
+
+jobs:
+  # Build the platform-independent web bundle exactly once. macOS runners carry
+  # Google Chrome at the path used by scripts/verify.mjs; the resulting dist/
+  # is ordinary HTML/JS/assets and is safe to reuse in all three native jobs.
+  web-tests:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: |
+            webcore/package-lock.json
+            pipeline/package-lock.json
+
+      - name: Test notation pipeline
+        working-directory: pipeline
+        run: |
+          npm ci
+          npm run typecheck:src
+          npm test
+
+      - name: Install webcore dependencies
+        working-directory: webcore
+        run: npm ci
+
+      # These tests use scripts/run-ts-tests.mjs rather than shell-specific
+      # node_modules/.bin paths or /tmp output, so the same npm commands also
+      # work unchanged on Windows and Linux developer machines.
+      - name: Test webcore regressions
+        working-directory: webcore
+        run: npm run test:regressions
+
+      # verify builds the one shipping app bundle, starts it in the runner's
+      # Chrome, and exercises the UI/export/edit paths against real DOM output.
+      - name: Build and browser-verify webcore
+        timeout-minutes: 12
+        working-directory: webcore
+        run: npm run verify
+
+      - name: Check webcore actually produced a bundle
+        run: |
+          test -f webcore/dist/index.html || { echo "webcore/dist/index.html missing"; exit 1; }
+          if grep -qE '<script[^>]*type=["'"'"']module["'"'"']' webcore/dist/index.html; then
+            echo "webcore/dist/index.html loads ES modules - the plugin WebView will not run it."
+            echo "See shell/BRIDGE.md section 0, and BUILDING.md for how the bundle is embedded."
+            exit 1
+          fi
+
+      - name: Upload verified webcore bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: Riffsheet-webcore-bundle
+          path: webcore/dist/
+          if-no-files-found: error
+          retention-days: 7
+
+  build:
+    needs: web-tests
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: macos-latest,   name: macOS }
+          - { os: windows-latest, name: Windows }
+          # Build release binaries on the oldest Ubuntu version we claim as a
+          # baseline. Using ubuntu-latest currently produces binaries against
+          # Ubuntu 24.04's newer glibc, which needlessly excludes 22.04 users.
+          - { os: ubuntu-22.04,   name: Linux }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # Every native package embeds the identical browser-tested app. Keeping
+      # npm/esbuild out of the matrix saves two redundant builds and prevents
+      # platform-specific bundles from drifting between release archives.
+      - name: Download verified webcore bundle
+        uses: actions/download-artifact@v4
+        with:
+          name: Riffsheet-webcore-bundle
+          path: webcore/dist
+
+      # ---- Linux system libraries -------------------------------------------
+      # libwebkit2gtk-4.1-dev is the one that matters: JUCE's Linux
+      # WebBrowserComponent is WebKitGTK, and Riffsheet's editor IS the web view,
+      # so without it the plugin has no UI at all. The rest is JUCE's standard
+      # Linux set, straight from BASAMAK. libgtk-3-dev is listed explicitly
+      # because JUCE asks pkg-config for gtk+-x11-3.0 separately from webkit.
+      - name: Install Linux dependencies
+        if: matrix.name == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libasound2-dev libjack-jackd2-dev \
+            libfreetype6-dev libfontconfig1-dev libgl1-mesa-dev libx11-dev \
+            libxext-dev libxrandr-dev libxinerama-dev libxcursor-dev \
+            libcurl4-openssl-dev libgtk-3-dev libwebkit2gtk-4.1-dev ninja-build lsof
+
+      # ---- Windows WebView2 SDK ---------------------------------------------
+      # NEEDS_WEBVIEW2 in shell/CMakeLists.txt makes JUCE run
+      # find_package(WebView2 REQUIRED), and that find script only looks in a
+      # NuGet package folder - there is no system-wide SDK. Installing with
+      # nuget.exe into a known directory and pointing
+      # JUCE_WEBVIEW2_PACKAGE_LOCATION at it is more predictable in CI than the
+      # Install-Package/PackageManagement route, which has to bootstrap a
+      # provider first.
+      - name: Install WebView2 SDK (Windows)
+        if: matrix.name == 'Windows'
+        shell: pwsh
+        run: |
+          # The runner images ship nuget.exe, but that is an image detail rather
+          # than a promise, and this step failing would take the whole Windows
+          # leg with it. Fetch it if it is not there.
+          $nuget = "nuget"
+          if (-not (Get-Command nuget -ErrorAction SilentlyContinue)) {
+            $nuget = "$env:RUNNER_TEMP\nuget.exe"
+            Invoke-WebRequest https://dist.nuget.org/win-x86-commandline/latest/nuget.exe -OutFile $nuget
+          }
+          & $nuget install Microsoft.Web.WebView2 -Version ${{ env.WEBVIEW2_VERSION }} `
+                  -OutputDirectory "${{ github.workspace }}\webview2" -NonInteractive
+          $pkg = Get-ChildItem "${{ github.workspace }}\webview2" -Directory `
+                 | Where-Object { $_.Name -like "*Microsoft.Web.WebView2*" } | Select-Object -First 1
+          if (-not $pkg) { throw "WebView2 NuGet package did not install" }
+          if (-not (Test-Path "$($pkg.FullName)\build\native\x64\WebView2LoaderStatic.lib")) {
+            throw "WebView2 package has no x64 static loader - JUCE links WebView2LoaderStatic.lib"
+          }
+
+      - name: Get JUCE
+        uses: actions/checkout@v4
+        with:
+          repository: juce-framework/JUCE
+          ref: ${{ env.JUCE_TAG }}
+          path: JUCE
+
+      # ---- ONNX Runtime ------------------------------------------------------
+      # Riffsheet's built-in engine is an ONNX graph and JUCE has no inference,
+      # so ORT is a hard build dependency on every platform. Nothing Microsoft
+      # publishes is usable: macOS and Linux are dynamic-only, and the Windows
+      # binaries are /MD while this project links the static CRT. So it is built
+      # from source - which takes tens of minutes - and then CACHED, keyed on the
+      # version and the runner image. A cold cache costs one slow run per
+      # platform per ORT bump; a warm one costs a download.
+      #
+      # If a cache restore ever has to be forced, bump RIFFSHEET_ORT_VERSION in
+      # shell/cmake/OnnxRuntime.cmake and here together - they are asserted equal
+      # by the configure, which fails loudly rather than linking the wrong ORT.
+      # RESTORE AND SAVE ARE SEPARATE STEPS ON PURPOSE. actions/cache@v4 declares
+      # `post-if: success()`, so its save runs only when the whole job succeeded.
+      # An ORT build costs tens of minutes and is the FIRST expensive thing here;
+      # with the combined action, one failure anywhere later in the job - a unit
+      # test, the size audit, staging - throws that build away and the next push
+      # rebuilds it from scratch. That is how a run that fails at the last step
+      # still costs an hour, every time, on all three platforms. Saving right
+      # after the build banks it regardless of what happens afterwards.
+      - name: Restore ONNX Runtime from cache
+        id: ort-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ort-dist
+          key: ort-${{ env.ORT_VERSION }}-${{ matrix.name }}-${{ runner.arch }}-v1
+
+      # ---- the MSVC command line, and why it is a whole step -----------------
+      # ORT is built with -G Ninja, and Ninja has no idea where a compiler is:
+      # CMake picks one off PATH. The GitHub Windows image has MinGW on PATH, so
+      # without this step CMake selects C:/mingw64/bin/cc.exe (GNU) and then
+      # build.py's MSVC flags land on it - "cc.exe: error: /MP: linker input file
+      # not found" - and the configure dies before compiling a single file. The
+      # plugin build itself is unaffected because it uses the Visual Studio
+      # generator, which finds its own toolchain; only the Ninja build needs the
+      # developer environment set up explicitly.
+      #
+      # This action exports the environment to the steps that follow and does
+      # nothing at all on macOS and Linux, but it is gated anyway so the log says
+      # what it is for. CC/CXX are pinned in the ORT step below as well, so a
+      # future image whose PATH puts something else first still cannot win.
+      - name: Set up the MSVC command line (Windows)
+        if: matrix.name == 'Windows' && steps.ort-cache.outputs.cache-hit != 'true'
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: amd64
+
+      - name: Build ONNX Runtime (cache miss only)
+        if: steps.ort-cache.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --depth 1 --branch "v${ORT_VERSION}" --recurse-submodules --shallow-submodules \
+              https://github.com/microsoft/onnxruntime ort-src
+
+          # `python3` is a POSIX spelling. The Windows runner image installs
+          # CPython as python.exe and does not promise a python3 alias, so this
+          # step ran on macOS and Linux and died with "python3: command not
+          # found" on Windows before it reached a compiler at all. Resolve the
+          # interpreter instead of assuming its name; on macOS and Linux the
+          # first branch still wins and nothing changes.
+          PY="$(command -v python3 || command -v python)"
+          "$PY" --version
+
+          # re2 has to be asked for by name. ORT only pulls it in through the
+          # shared-library target, which a static build never builds, so without
+          # this the link dies on RegexFullMatch and the contrib Tokenizer with
+          # undefined re2:: symbols and nothing else to go on.
+          build_one () {   # $1 = build dir, $2... = extra build.py args
+            local dir="$1"; shift
+            "$PY" ort-src/tools/ci_build/build.py \
+              --build_dir "$dir" --config Release --parallel \
+              --skip_tests --compile_no_warning_as_error \
+              --cmake_generator Ninja --disable_ml_ops \
+              --cmake_extra_defines onnxruntime_BUILD_UNIT_TESTS=OFF \
+              "$@"
+            cmake --build "$dir/Release" --target re2
+          }
+
+          case "${{ matrix.name }}" in
+            macOS)
+              # CI builds universal (see the configure step), so ORT has to be
+              # universal too. One build per architecture, merged per
+              # architecture, then joined with lipo - a universal static library
+              # cannot be produced in one pass.
+              for arch in arm64 x86_64; do
+                build_one "ort-build-$arch" --osx_arch "$arch" --apple_deploy_target 11.0 \
+                          --cmake_extra_defines CMAKE_IGNORE_PREFIX_PATH=/opt/homebrew \
+                                                CMAKE_IGNORE_PATH=/opt/homebrew
+                mkdir -p "ort-merge/$arch"
+                libtool -static -no_warning_for_no_symbols -o "ort-merge/$arch/libonnxruntime.a" \
+                        $(find "ort-build-$arch/Release" -name '*.a' -not -path '*CMakeFiles*' | sort)
+              done
+              mkdir -p ort-dist/lib ort-dist/include
+              lipo -create ort-merge/arm64/libonnxruntime.a ort-merge/x86_64/libonnxruntime.a \
+                   -output ort-dist/lib/libonnxruntime.a
+              lipo -archs ort-dist/lib/libonnxruntime.a
+              ;;
+            Windows)
+              # /MT, to match CMAKE_MSVC_RUNTIME_LIBRARY in shell/CMakeLists.txt.
+              # The published ORT binaries are /MD and simply will not link here.
+              #
+              # The compiler is named twice on purpose. CC/CXX is what CMake's
+              # own compiler search reads first, and CMAKE_C_COMPILER/
+              # CMAKE_CXX_COMPILER is what it reads if something ever stops
+              # reading CC. Either alone would be enough; both together mean the
+              # MinGW cc.exe that sits on the runner's PATH cannot be selected
+              # however the search order changes. The MSVC environment itself
+              # comes from the step above.
+              export CC=cl CXX=cl
+              build_one ort-build --enable_msvc_static_runtime \
+                        --cmake_extra_defines CMAKE_C_COMPILER=cl CMAKE_CXX_COMPILER=cl
+              mkdir -p ort-dist/lib ort-dist/include
+              find ort-build/Release -name '*.lib' -not -path '*CMakeFiles*' \
+                   -exec cp {} ort-dist/lib/ \;
+              ;;
+            Linux)
+              build_one ort-build
+              mkdir -p ort-dist/lib ort-dist/include
+              find ort-build/Release -name '*.a' -not -path '*CMakeFiles*' \
+                   -exec cp {} ort-dist/lib/ \;
+              ;;
+          esac
+
+          cp ort-src/include/onnxruntime/core/session/*.h ort-dist/include/
+          cp ort-src/include/onnxruntime/core/session/*.inc ort-dist/include/ 2>/dev/null || true
+          # The notice we redistribute alongside the statically linked runtime
+          # must be the notice for the runtime we actually linked. Checked, not
+          # overwritten: a mismatch means somebody bumped ORT_VERSION without
+          # re-vendoring the notices, and quietly fixing that in the artefact
+          # would leave the repository saying something untrue.
+          #
+          # --strip-trailing-cr, because the two files arrive through different
+          # checkouts. .gitattributes here says `* text=auto`, so on Windows this
+          # repository's copy lands with CRLF endings while ONNX Runtime's own
+          # checkout follows ITS attributes - and a byte comparison would then
+          # accuse the user of shipping the wrong notice on Windows only, which
+          # is both false and impossible to act on. Line endings are not what
+          # this check is about.
+          if ! diff --strip-trailing-cr -q ort-src/ThirdPartyNotices.txt \
+                       third-party/onnxruntime/THIRD-PARTY-NOTICES.txt > /dev/null; then
+            echo "third-party/onnxruntime/THIRD-PARTY-NOTICES.txt is not ONNX Runtime"
+            echo "${ORT_VERSION}'s. Re-vendor it from ort-src/ThirdPartyNotices.txt."
+            exit 1
+          fi
+          rm -rf ort-src ort-build ort-build-arm64 ort-build-x86_64 ort-merge
+          du -sh ort-dist
+
+      # Banked here rather than in a post step: see the restore step above.
+      # cache-primary-key is the key the restore MISSED on, so save and restore
+      # cannot drift apart the way two hand-written key expressions can.
+      - name: Cache the ONNX Runtime that was just built
+        if: steps.ort-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ort-dist
+          key: ${{ steps.ort-cache.outputs.cache-primary-key }}
+
+      # github.workspace is a NATIVE path: on Windows it is D:\a\riffsheet\
+      # riffsheet, so the literal expansion wrote a mixed D:\a\...\riffsheet/
+      # ort-dist into the environment. CMake wants forward slashes, and a
+      # backslash inside a quoted CMake string is an escape character - the
+      # failure mode is OnnxRuntime.cmake's "there is no onnxruntime_cxx_api.h
+      # under ..." on a directory that is plainly there. GITHUB_WORKSPACE is the
+      # same value as an environment variable, so bash can normalise it; on
+      # macOS and Linux the substitution finds nothing to replace.
+      - name: Point the build at ONNX Runtime
+        shell: bash
+        run: echo "RIFFSHEET_ORT_DIR=${GITHUB_WORKSPACE//\\//}/ort-dist" >> "$GITHUB_ENV"
+
+      # ---- Configure ---------------------------------------------------------
+      # macOS uses the Xcode generator because that is what scripts/build.sh uses
+      # locally, so CI and the shipping build go through the same path. Windows
+      # uses the default Visual Studio generator (x64), Linux uses Ninja.
+      # Everything gets RIFFSHEET_RELEASE=ON: clean product name, no auto-install.
+      - name: Configure (macOS)
+        if: matrix.name == 'macOS'
+        run: |
+          cmake -S shell -B shell/build -G Xcode \
+                -DCMAKE_OSX_ARCHITECTURES="arm64;x86_64" \
+                -DJUCE_DIR="${{ github.workspace }}/JUCE" \
+                -DRIFFSHEET_RELEASE=ON \
+                -DRIFFSHEET_REQUIRE_WEBCORE=ON
+
+      - name: Configure (Windows)
+        if: matrix.name == 'Windows'
+        shell: pwsh
+        run: |
+          # JUCE_WEBVIEW2_PACKAGE_LOCATION is the DIRECTORY CONTAINING the
+          # package folder, not the package folder itself - FindWebView2.cmake
+          # globs "*Microsoft.Web.WebView2*" inside whatever it is given.
+          cmake -S shell -B shell/build -A x64 `
+                -DJUCE_DIR="${{ github.workspace }}/JUCE" `
+                -DJUCE_WEBVIEW2_PACKAGE_LOCATION="${{ github.workspace }}/webview2" `
+                -DRIFFSHEET_RELEASE=ON `
+                -DRIFFSHEET_REQUIRE_WEBCORE=ON
+
+      - name: Configure (Linux)
+        if: matrix.name == 'Linux'
+        run: |
+          cmake -S shell -B shell/build -G Ninja \
+                -DCMAKE_BUILD_TYPE=Release \
+                -DJUCE_DIR="${{ github.workspace }}/JUCE" \
+                -DRIFFSHEET_RELEASE=ON \
+                -DRIFFSHEET_REQUIRE_WEBCORE=ON
+
+      # --config Release matters on the two multi-config generators (Xcode,
+      # Visual Studio) and is harmlessly ignored by Ninja, which took its
+      # configuration from CMAKE_BUILD_TYPE above.
+      - name: Build
+        shell: bash
+        run: cmake --build shell/build --config Release --parallel
+
+      # ---- Release audit -----------------------------------------------------
+      # Every file under shell/Resources/models must be declared in
+      # MANIFEST.sha256 with a matching digest. It is what stops non-commercial
+      # or gated weights being dropped into Resources/ and shipped by accident,
+      # and it is cheap enough to run on every leg rather than only at release.
+      # RIFFSHEET_RELEASE=ON already makes it a dependency of the plugin above;
+      # naming it here means a failure says which check failed.
+      - name: Release audit (declared models only)
+        shell: bash
+        run: cmake --build shell/build --target riffsheet_release_audit --config Release
+
+      # ---- C++ unit tests ----------------------------------------------------
+      # A green badge used to mean only "it compiles". The engine work adds a
+      # manifest with licensing invariants, a settings file two processes share
+      # and a resolver that decides which engine runs - code that is silently
+      # wrong rather than loudly broken - so it gets tests, on all three legs
+      # because the float and file-system paths are exactly where platforms
+      # disagree.
+      #
+      # Its own build directory: RIFFSHEET_BUILD_TESTS adds a console app, and
+      # only that target is built, so the release build above is neither
+      # reconfigured nor rebuilt. JUCE_WEBVIEW2_PACKAGE_LOCATION is passed on
+      # every platform because the shared CMakeLists still configures the plugin
+      # target (JUCE only reads the variable on Windows).
+      - name: Unit tests (C++)
+        shell: bash
+        run: |
+          cmake -S shell -B shell/build_tests \
+                -DRIFFSHEET_BUILD_TESTS=ON \
+                -DCMAKE_BUILD_TYPE=Release \
+                -DJUCE_DIR="${{ github.workspace }}/JUCE" \
+                -DJUCE_WEBVIEW2_PACKAGE_LOCATION="${{ github.workspace }}/webview2"
+          cmake --build shell/build_tests --target RiffsheetTests --config Release --parallel
+          ctest --test-dir shell/build_tests -C Release --output-on-failure
+
+      # ---- Stage the package -------------------------------------------------
+      # macOS and Linux share one step. Windows gets its own, because the file
+      # attributes described there have to be dealt with before anything copies
+      # the bundle, and that is Windows-only surgery.
+      - name: Stage package (macOS / Linux)
+        if: matrix.name != 'Windows'
+        shell: bash
+        run: |
+          VER=$(grep -m1 'project(Riffsheet VERSION' shell/CMakeLists.txt | sed -E 's/.*VERSION ([0-9.]+).*/\1/')
+          ART="shell/build/Riffsheet_artefacts/Release"
+
+          # Linux packages the staged folder directly. macOS stages once and then
+          # SPLITS BY ARCHITECTURE below, so its staging folder is scratch and
+          # never becomes a zip under this name.
+          if [ "${{ matrix.name }}" = "macOS" ]; then
+            OUT="Riffsheet-$VER-macOS-staging"
+          else
+            OUT="Riffsheet-$VER-${{ matrix.name }}"
+          fi
+          mkdir -p "$OUT"
+
+          cp -R "$ART"/VST3/Riffsheet.vst3           "$OUT/" 2>/dev/null || true
+          cp -R "$ART"/AU/Riffsheet.component        "$OUT/" 2>/dev/null || true   # macOS only
+          cp -R "$ART"/Standalone/Riffsheet.app      "$OUT/" 2>/dev/null || true   # macOS only
+          cp    "$ART"/Standalone/Riffsheet          "$OUT/" 2>/dev/null || true   # Linux standalone
+
+          # HARD-VERIFY. A green run once shipped a zip that held an empty
+          # bundle; a copy that silently did nothing must never pass again.
+          if [ "${{ matrix.name }}" = "macOS" ]; then
+            [ -d "$OUT/Riffsheet.vst3/Contents" ]      || { echo "STAGING FAILED: Riffsheet.vst3 empty"; exit 1; }
+            [ -d "$OUT/Riffsheet.component/Contents" ] || { echo "STAGING FAILED: Riffsheet.component empty"; exit 1; }
+            [ -d "$OUT/Riffsheet.app/Contents" ]       || { echo "STAGING FAILED: Riffsheet.app empty"; exit 1; }
+            # Signing is deliberately NOT done here: lipo rewrites these binaries
+            # a few steps down and would invalidate any signature made now. Each
+            # thinned copy is signed after it is thinned.
+          else
+            [ -e "$OUT/Riffsheet.vst3/Contents/x86_64-linux/Riffsheet.so" ] \
+              || { echo "STAGING FAILED: Riffsheet.vst3 has no .so"; exit 1; }
+            [ -f "$OUT/Riffsheet" ] || { echo "STAGING FAILED: standalone binary missing"; exit 1; }
+          fi
+
+          echo "$VER" > "$OUT/VERSION"
+          cp BUILDING.md "$OUT/" 2>/dev/null || true
+          cp LICENSE "$OUT/"
+          cp NOTICE.md "$OUT/"
+          cp webcore/CREDITS.md "$OUT/CREDITS.md"
+          cp pipeline/ATTRIBUTIONS.md "$OUT/PIPELINE-ATTRIBUTIONS.md"
+
+          # The licences of everything statically linked into these binaries.
+          # NOTICE.md names these paths, so shipping the notice without the texts
+          # would be a promise the zip does not keep.
+          mkdir -p "$OUT/third-party/basic-pitch" "$OUT/third-party/neuralnote" \
+                   "$OUT/third-party/beat-this" "$OUT/third-party/onnxruntime"
+          cp third-party/basic-pitch/LICENSE "$OUT/third-party/basic-pitch/LICENSE"
+          cp third-party/neuralnote/LICENSE  "$OUT/third-party/neuralnote/LICENSE"
+          # beat_this's checkpoint is compiled into these binaries, and MIT
+          # requires its notice to travel with them.
+          cp third-party/beat-this/LICENSE   "$OUT/third-party/beat-this/LICENSE"
+          cp third-party/onnxruntime/LICENSE "$OUT/third-party/onnxruntime/LICENSE"
+          cp third-party/onnxruntime/THIRD-PARTY-NOTICES.txt \
+             "$OUT/third-party/onnxruntime/THIRD-PARTY-NOTICES.txt"
+
+          # THE SIZE BUDGET, enforced rather than hoped for: no product zip over
+          # 35 MB, no bundle over 100 MB. Statically linked ONNX Runtime is paid
+          # once per product and macOS ships three, so this is exactly where a
+          # careless build option shows up.
+          if [ "${{ matrix.name }}" != "macOS" ]; then
+            cmake -DMODE=sizes -DSTAGE_DIR="$PWD/$OUT" -P shell/cmake/ReleaseAudit.cmake
+
+            # Zip on the native runner so executable bits and the .app's symlinks
+            # survive - downloading the raw artefact folder loses both on macOS.
+            zip -r -y "$OUT.zip" "$OUT"
+            exit 0
+          fi
+
+          # ---- macOS: one zip per architecture ---------------------------------
+          # WHY THIS EXISTS. The build above is universal (arm64 + x86_64), and a
+          # universal product CANNOT fit the budget. ~21.4 MB of what
+          # juce_add_binary_data embeds (webcore.zip 11.1 MB + beat_this
+          # small0.onnx 10.1 MB) is already-compressed data: it is carried once
+          # PER SLICE, does not compress again in the zip, and does not dedupe.
+          # MEASURED 2026-08-10: universal products zip to 55.7 MB against a
+          # 35 MB ceiling and ~168 MB of bundle against 100 - a guaranteed red
+          # macOS leg. The same build thinned to ONE slice zips to 27.8 MB per
+          # product and 83.6 MB per bundle, inside both numbers.
+          #
+          # So the universal build stays (one compile, both slices), and staging
+          # splits it with `lipo -thin` into two packages. Every user downloads
+          # half of what a universal zip would have cost them, which is the point.
+          # Each set is audited against the SAME budget on its own, so the
+          # per-product and whole-bundle ceilings both still mean something.
+          staged=0
+          for ARCH in arm64 x86_64; do
+            case "$ARCH" in
+              arm64)  LABEL="Apple Silicon (M1 and later)" ;;
+              x86_64) LABEL="Intel" ;;
+            esac
+
+            THIN="Riffsheet-$VER-macOS-$ARCH"
+            rm -rf "$THIN"
+            cp -R "$OUT" "$THIN"
+
+            # Thin every Mach-O in the package. `lipo -archs` doubles as the
+            # Mach-O detector: it fails on ordinary resource files, which is the
+            # `continue`. A file that is already thin and already this slice is
+            # left alone rather than round-tripped through lipo.
+            missing=0
+            while IFS= read -r -d '' f; do
+              archs=$(lipo -archs "$f" 2>/dev/null) || continue
+              [ -n "$archs" ] || continue
+              case " $archs " in
+                *" $ARCH "*) ;;
+                *) echo "::warning::${f#$THIN/} has no $ARCH slice (has: $archs)"; missing=1; break ;;
+              esac
+              [ "$archs" = "$ARCH" ] && continue
+              mode=$(stat -f '%Lp' "$f")
+              lipo -thin "$ARCH" "$f" -output "$f.thin" || { echo "lipo failed on $f"; exit 1; }
+              mv -f "$f.thin" "$f"
+              chmod "$mode" "$f"
+            done < <(find "$THIN" -type f -print0)
+
+            # A slice that is not in the build cannot be packaged. Warn and move
+            # on rather than fail, so a deliberately single-architecture build
+            # still produces its one package; the "nothing at all" case is caught
+            # after the loop, where it is a real failure.
+            if [ "$missing" = 1 ]; then
+              echo "SKIPPING $ARCH: this build has no $ARCH slice."
+              rm -rf "$THIN"
+              continue
+            fi
+
+            echo "$LABEL" > "$THIN/ARCHITECTURE.txt"
+
+            # Ad-hoc signing, the same thing scripts/build.sh does locally, so
+            # macOS will actually load the downloaded bundles. It happens HERE,
+            # after lipo, because thinning rewrites the binary and invalidates any
+            # earlier signature. This is NOT notarisation and NOT a Developer ID
+            # signature - a machine other than the builder's will still show
+            # Gatekeeper warnings.
+            #
+            # The verify is a HARD failure, not a note. `cmd && echo OK` cannot
+            # fail a step - bash's -e does not trigger on the left of a && - so a
+            # bundle whose signature did not take would have sailed through and
+            # shipped a plugin macOS refuses to load.
+            for b in "$THIN"/Riffsheet.vst3 "$THIN"/Riffsheet.component "$THIN"/Riffsheet.app; do
+              xattr -cr "$b"
+              codesign --force --deep --sign - --timestamp=none "$b"
+              codesign --verify --strict "$b" \
+                || { echo "SIGNING FAILED: $(basename "$b") does not verify after thinning to $ARCH"; exit 1; }
+              echo "    OK  $(basename "$b") ($ARCH)"
+            done
+
+            echo "Size audit, macOS $ARCH ($LABEL):"
+            cmake -DMODE=sizes -DSTAGE_DIR="$PWD/$THIN" -P shell/cmake/ReleaseAudit.cmake
+
+            # Zip on the native runner so executable bits and the .app's symlinks
+            # survive - downloading the raw artefact folder loses both on macOS.
+            zip -r -y "$THIN.zip" "$THIN"
+            staged=$((staged + 1))
+          done
+
+          rm -rf "$OUT"
+          [ "$staged" -gt 0 ] || { echo "STAGING FAILED: no macOS architecture produced a package."; exit 1; }
+
+      - name: Stage package (Windows)
+        if: matrix.name == 'Windows'
+        shell: pwsh
+        run: |
+          $ver = (Select-String -Path shell/CMakeLists.txt -Pattern 'project\(Riffsheet VERSION ([0-9.]+)').Matches[0].Groups[1].Value
+          $out = "Riffsheet-$ver-Windows"
+          New-Item -ItemType Directory -Force $out | Out-Null
+
+          # A VST3 on Windows is a FOLDER, and JUCE can mark its contents
+          # HIDDEN/SYSTEM (folder-icon decoration). PowerShell's Copy-Item and
+          # Compress-Archive silently SKIP such files - that is how BASAMAK once
+          # shipped a zip containing nothing but desktop.ini. Strip the
+          # attributes first, copy from the known path, then prove the binary is
+          # really there.
+          $vst3src = "shell/build/Riffsheet_artefacts/Release/VST3/Riffsheet.vst3"
+          if (!(Test-Path $vst3src)) { throw "VST3 bundle not found at $vst3src" }
+          attrib -S -H "$vst3src" /S /D
+          Copy-Item $vst3src "$out\Riffsheet.vst3" -Recurse -Force
+          if (!(Test-Path "$out\Riffsheet.vst3\Contents\x86_64-win\Riffsheet.vst3")) {
+            throw "STAGING FAILED: the plugin binary is missing from the staged Riffsheet.vst3"
+          }
+
+          $exe = Get-ChildItem -Recurse -File shell/build -Filter Riffsheet.exe | Select-Object -First 1
+          if (!$exe) { throw "STAGING FAILED: no Riffsheet.exe (Standalone)" }
+          Copy-Item $exe.FullName "$out\Riffsheet.exe"
+
+          Set-Content -Path "$out\VERSION" -Value $ver
+          Copy-Item BUILDING.md "$out\" -ErrorAction SilentlyContinue
+          Copy-Item LICENSE "$out\LICENSE"
+          Copy-Item NOTICE.md "$out\NOTICE.md"
+          Copy-Item webcore/CREDITS.md "$out\CREDITS.md"
+          Copy-Item pipeline/ATTRIBUTIONS.md "$out\PIPELINE-ATTRIBUTIONS.md"
+
+          # The licences of everything statically linked into Riffsheet.exe and
+          # the VST3. NOTICE.md names these paths by name.
+          New-Item -ItemType Directory -Force "$out\third-party\basic-pitch" | Out-Null
+          New-Item -ItemType Directory -Force "$out\third-party\neuralnote"  | Out-Null
+          New-Item -ItemType Directory -Force "$out\third-party\beat-this"   | Out-Null
+          New-Item -ItemType Directory -Force "$out\third-party\onnxruntime" | Out-Null
+          Copy-Item third-party/basic-pitch/LICENSE "$out\third-party\basic-pitch\LICENSE"
+          Copy-Item third-party/neuralnote/LICENSE  "$out\third-party\neuralnote\LICENSE"
+          # beat_this's checkpoint is compiled into these binaries, and MIT
+          # requires its notice to travel with them.
+          Copy-Item third-party/beat-this/LICENSE   "$out\third-party\beat-this\LICENSE"
+          Copy-Item third-party/onnxruntime/LICENSE "$out\third-party\onnxruntime\LICENSE"
+          Copy-Item third-party/onnxruntime/THIRD-PARTY-NOTICES.txt `
+                    "$out\third-party\onnxruntime\THIRD-PARTY-NOTICES.txt"
+
+          # The same size budget the other two legs are held to. STAGE_DIR is
+          # handed over with forward slashes: "$PWD\$out" is a Windows path, and
+          # CMake reads backslashes in a -D value as escapes, so \a and \r in
+          # D:\a\riffsheet\... are not the characters they look like.
+          $stage = "$($PWD.Path.Replace('\','/'))/$out"
+          cmake -DMODE=sizes -DSTAGE_DIR="$stage" -P shell/cmake/ReleaseAudit.cmake
+          if ($LASTEXITCODE -ne 0) { throw "size audit failed" }
+
+          Compress-Archive -Path $out -DestinationPath "$out.zip" -Force
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Riffsheet-${{ matrix.name }}
+          # macOS produces TWO zips (…-macOS-arm64.zip, …-macOS-x86_64.zip), so
+          # the platform name is matched in the middle rather than at the end.
+          # Windows and Linux still match their single …-Windows.zip / …-Linux.zip.
+          path: Riffsheet-*${{ matrix.name }}*.zip
+          # Default is `warn`: a leg that staged nothing would upload nothing and
+          # still go green, which is the exact class of failure the staging
+          # hard-verifies exist to prevent. Make an empty upload an error.
+          if-no-files-found: error
+
+  # Publishing a GitHub Release builds all three and attaches the zips to it, so
+  # there is no manual download-and-reupload step.
+  release:
+    needs: build
+    if: github.event_name == 'release'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download the built zips
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+      - name: Attach zips to the Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/**/*.zip

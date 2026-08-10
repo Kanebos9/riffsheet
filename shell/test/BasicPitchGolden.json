@@ -1,0 +1,140 @@
+{
+ "source": "spotify/basic-pitch v0.4.0 note_creation.output_to_notes_polyphonic, run by scratchpad/make_golden.py against nmp.onnx via onnxruntime-python",
+ "audio": "BasicPitchFixture.wav",
+ "sampleRate": 22050,
+ "windows": 3,
+ "frames": 369,
+ "bins": 88,
+ "params": {
+  "onsetThreshold": 0.5,
+  "frameThreshold": 0.3,
+  "minNoteLengthFrames": 11,
+  "inferOnsets": true,
+  "melodiaTrick": true,
+  "energyThreshold": 11
+ },
+ "defaultBounds": [
+  {
+   "startFrame": 1,
+   "endFrame": 56,
+   "pitch": 28,
+   "amplitude": 0.617831
+  },
+  {
+   "startFrame": 3,
+   "endFrame": 54,
+   "pitch": 40,
+   "amplitude": 0.406042
+  },
+  {
+   "startFrame": 67,
+   "endFrame": 124,
+   "pitch": 33,
+   "amplitude": 0.719038
+  },
+  {
+   "startFrame": 68,
+   "endFrame": 94,
+   "pitch": 45,
+   "amplitude": 0.392072
+  },
+  {
+   "startFrame": 106,
+   "endFrame": 120,
+   "pitch": 45,
+   "amplitude": 0.398606
+  },
+  {
+   "startFrame": 133,
+   "endFrame": 157,
+   "pitch": 47,
+   "amplitude": 0.384845
+  },
+  {
+   "startFrame": 141,
+   "endFrame": 190,
+   "pitch": 35,
+   "amplitude": 0.767771
+  },
+  {
+   "startFrame": 173,
+   "endFrame": 185,
+   "pitch": 47,
+   "amplitude": 0.407281
+  },
+  {
+   "startFrame": 198,
+   "endFrame": 216,
+   "pitch": 52,
+   "amplitude": 0.400614
+  },
+  {
+   "startFrame": 198,
+   "endFrame": 274,
+   "pitch": 40,
+   "amplitude": 0.735239
+  },
+  {
+   "startFrame": 283,
+   "endFrame": 355,
+   "pitch": 60,
+   "amplitude": 0.737312
+  }
+ ],
+ "bassBounds150Hz": [
+  {
+   "startFrame": 1,
+   "endFrame": 56,
+   "pitch": 28,
+   "amplitude": 0.617831
+  },
+  {
+   "startFrame": 12,
+   "endFrame": 54,
+   "pitch": 40,
+   "amplitude": 0.451146
+  },
+  {
+   "startFrame": 67,
+   "endFrame": 124,
+   "pitch": 33,
+   "amplitude": 0.719038
+  },
+  {
+   "startFrame": 75,
+   "endFrame": 94,
+   "pitch": 45,
+   "amplitude": 0.45352
+  },
+  {
+   "startFrame": 106,
+   "endFrame": 120,
+   "pitch": 45,
+   "amplitude": 0.398606
+  },
+  {
+   "startFrame": 139,
+   "endFrame": 157,
+   "pitch": 47,
+   "amplitude": 0.440382
+  },
+  {
+   "startFrame": 141,
+   "endFrame": 190,
+   "pitch": 35,
+   "amplitude": 0.767771
+  },
+  {
+   "startFrame": 173,
+   "endFrame": 185,
+   "pitch": 47,
+   "amplitude": 0.407281
+  },
+  {
+   "startFrame": 198,
+   "endFrame": 274,
+   "pitch": 40,
+   "amplitude": 0.735239
+  }
+ ]
+}

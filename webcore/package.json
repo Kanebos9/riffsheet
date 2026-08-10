@@ -1,0 +1,31 @@
+{
+  "name": "riffsheet-webcore",
+  "version": "0.1.0",
+  "private": true,
+  "license": "AGPL-3.0-only",
+  "type": "module",
+  "description": "Riffsheet web core \u2014 tri-view (staff + note names + tab) UI, rendering and editing. Runs in a JUCE WebView or a plain browser.",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc --noEmit && vite build",
+    "preview": "vite preview",
+    "typecheck": "tsc --noEmit",
+    "verify": "npm run build && node scripts/verify.mjs",
+    "test:midi-import": "node scripts/run-ts-tests.mjs scripts/midi-import-test.ts",
+    "test:grand-staff": "node scripts/run-ts-tests.mjs scripts/grand-staff-test.ts",
+    "test:sampler-loop": "node scripts/run-ts-tests.mjs scripts/sampler-loop-test.ts",
+    "test:transport-clock": "node scripts/run-ts-tests.mjs scripts/transport-clock-test.ts",
+    "test:regressions": "node scripts/run-ts-tests.mjs scripts/midi-import-test.ts scripts/grand-staff-test.ts scripts/sampler-loop-test.ts scripts/transport-clock-test.ts",
+    "build:debug": "RIFFSHEET_SOURCEMAP=1 vite build"
+  },
+  "dependencies": {
+    "@coderline/alphatab": "1.8.4"
+  },
+  "devDependencies": {
+    "@coderline/alphatab-vite": "^1.8.4",
+    "@types/node": "^26.2.0",
+    "esbuild": "^0.28.2",
+    "typescript": "^5.7.2",
+    "vite": "^7.3.6"
+  }
+}

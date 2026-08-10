@@ -1,0 +1,295 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Riffsheet shell</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; height: 100vh;
+    font: 13px/1.5 -apple-system, "Segoe UI", system-ui, sans-serif;
+    background: #14161a; color: #e8eaed;
+    display: flex; flex-direction: column;
+  }
+  header { padding: 0; border-bottom: 1px solid #262a31; }
+  #banner { background: #4a2c00; border-bottom: 2px solid #ff9f2e; padding: 14px 24px; }
+  #banner h1 { margin: 0; font-size: 19px; font-weight: 700; color: #ffc978; letter-spacing: .2px; }
+  #banner p { margin: 5px 0 0; font-size: 13px; color: #ffdcaa; max-width: 70ch; }
+  #banner h1 { overflow-wrap: anywhere; }
+  #meta { padding: 9px 24px; }
+  #status { color: #8a919c; font-size: 11.5px; }
+  .hint { margin: 2px 0 8px; color: #7d848f; font-size: 11px; font-style: italic; }
+  /* Fluid down to the hard minimum (560x380): the columns collapse to rows
+     rather than the page keeping a fixed width and getting clipped. */
+  main { flex: 1; display: grid; grid-template-columns: minmax(0, 290px) minmax(0, 1fr);
+         min-height: 0; min-width: 0; }
+  #panel { padding: 16px 18px; border-right: 1px solid #262a31; overflow-y: auto; min-width: 0; }
+  @media (max-width: 760px) {
+    main { grid-template-columns: minmax(0, 1fr); grid-template-rows: auto minmax(120px, 1fr); }
+    #panel { border-right: none; border-bottom: 1px solid #262a31; max-height: 45vh; }
+  }
+  @media (max-height: 520px) {
+    #banner { padding: 8px 16px; }
+    #banner h1 { font-size: 15px; }
+    #banner p { display: none; }
+  }
+  #log { margin: 0; padding: 14px 18px; overflow: auto; min-width: 0;
+         white-space: pre-wrap; overflow-wrap: anywhere;
+         font: 11.5px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; color: #b9c0cb; }
+  button { display: block; width: 100%; margin-bottom: 7px; padding: 7px 11px;
+           font: inherit; text-align: left; color: #e8eaed; background: #1e222a;
+           border: 1px solid #333a45; border-radius: 6px; cursor: pointer; }
+  button:hover:not(:disabled) { background: #262c36; border-color: #4a5462; }
+  button:disabled { opacity: .45; cursor: default; }
+  label { display: block; margin: 13px 0 6px; color: #8a919c; font-size: 11px;
+          text-transform: uppercase; letter-spacing: .6px; }
+  input[type=range] { width: 100%; }
+  .kv { display: flex; justify-content: space-between; gap: 10px; padding: 2px 0; }
+  .kv span:first-child { color: #8a919c; }
+  .kv span:last-child { font-variant-numeric: tabular-nums; }
+  .err { color: #ff8a8a; } .ok { color: #8ae6a8; } .warn { color: #ffd08a; }
+  #drop { position: fixed; inset: 0; background: rgba(20,22,26,.92); display: none;
+          align-items: center; justify-content: center; font-size: 18px;
+          border: 2px dashed #4a5462; z-index: 9; }
+  #drop.on { display: flex; }
+</style>
+</head>
+<body>
+  <header>
+    <div id="banner">
+      <h1>ENGINE TEST PANEL &mdash; not the Riffsheet interface</h1>
+      <p>This is the scaffolding the engine is built on. The real Riffsheet
+         interface &mdash; the sheet music and tab &mdash; is still being built and will
+         replace this screen. Nothing here is the finished product; the buttons
+         below just prove the machinery underneath works.</p>
+    </div>
+    <div id="meta"><span id="status">connecting to the engine&hellip;</span></div>
+  </header>
+  <main>
+    <div id="panel">
+      <label>Engine checks</label>
+      <p class="hint">Asks the engine questions and prints the raw answer on the right.</p>
+      <button id="b-shell">getShellInfo()</button>
+      <button id="b-host">getHostInfo()</button>
+      <button id="b-pick">pickAudioFile()</button>
+      <button id="b-transcribe" disabled>transcribe()</button>
+      <button id="b-export">exportFile()</button>
+
+      <label>Record from the DAW track</label>
+      <p class="hint">Grabs audio straight off the track, no exporting. "armed" waits for you to press play in the DAW.</p>
+      <button id="b-cap-now">captureStart() now</button>
+      <button id="b-cap-arm">captureStart() armed</button>
+      <button id="b-cap-stop">captureStop()</button>
+
+      <label>Play the loaded recording</label>
+      <p class="hint">Plays the original audio back through the plugin. The slider is its volume.</p>
+      <button id="b-play" disabled>play</button>
+      <button id="b-pause" disabled>pause</button>
+      <button id="b-stop" disabled>stop</button>
+      <input id="gain" type="range" min="0" max="1.5" step="0.01" value="1">
+
+      <label>Live readouts</label>
+      <p class="hint">Updates on its own, 20 times a second, straight from the audio engine.</p>
+      <div class="kv"><span>position</span><span id="v-pos">&mdash;</span></div>
+      <div class="kv"><span>length</span><span id="v-len">&mdash;</span></div>
+      <div class="kv"><span>capture</span><span id="v-cap">&mdash;</span></div>
+      <div class="kv"><span>host bpm</span><span id="v-bpm">&mdash;</span></div>
+      <div class="kv"><span>host sig</span><span id="v-sig">&mdash;</span></div>
+      <div class="kv"><span>viewport</span><span id="v-vp">&mdash;</span></div>
+    </div>
+    <pre id="log"></pre>
+  </main>
+  <div id="drop">Drop an audio or MIDI file</div>
+
+<!-- Classic script, NOT type="module": WKWebView will not load ES modules over
+     the juce:// scheme. See BRIDGE.md - this is the one hard constraint on how
+     the webcore bundle has to be built. -->
+<script src="./juce/juce-global.js"></script>
+<script>
+(function () {
+  "use strict";
+  var logEl = document.getElementById("log");
+  var $ = function (id) { return document.getElementById(id); };
+
+  function log(label, value, cls) {
+    var time = new Date().toTimeString().slice(0, 8);
+    var body = (value === undefined) ? ""
+             : " " + (typeof value === "string" ? value : JSON.stringify(value, null, 2));
+    var line = document.createElement("div");
+    if (cls) line.className = cls;
+    line.textContent = "[" + time + "] " + label + body;
+    logEl.appendChild(line);
+    logEl.scrollTop = logEl.scrollHeight;
+  }
+
+  window.addEventListener("error", function (e) {
+    log("window error", (e.message || "script failed") +
+        (e.filename ? " @ " + e.filename + ":" + e.lineno : ""), "err");
+  }, true);
+  window.addEventListener("unhandledrejection", function (e) {
+    log("unhandled rejection", String((e.reason && e.reason.stack) || e.reason), "err");
+  });
+
+  if (typeof window.Juce === "undefined") {
+    log("FATAL", "juce-global.js did not load - no bridge available.", "err");
+    return;
+  }
+
+  function call(name) {
+    var args = Array.prototype.slice.call(arguments, 1);
+    return Juce.getNativeFunction(name).apply(null, args).then(function (result) {
+      log(name + " ->", result, (result && result.ok === false) ? "err" : "ok");
+      return result;
+    }, function (e) {
+      log(name + " threw", String(e), "err");
+      throw e;
+    });
+  }
+
+  var token = null;
+
+  function adoptAudio(result) {
+    if (!result || !result.ok) return Promise.resolve(result);
+    token = result.token;
+
+    // Samples come over as binary, not JSON: one fetch, no parsing.
+    var t0 = performance.now();
+    return fetch(result.pcmUrl).then(function (r) { return r.arrayBuffer(); })
+      .then(function (buf) {
+        var pcm = new Float32Array(buf), peak = 0;
+        for (var i = 0; i < pcm.length; i++) { var a = Math.abs(pcm[i]); if (a > peak) peak = a; }
+        log("pcm fetched", pcm.length + " samples @ " + result.sampleRate + " Hz, peak " +
+            peak.toFixed(4) + ", " + (performance.now() - t0).toFixed(1) + " ms", "ok");
+        return call("playbackLoad", token);
+      })
+      .then(function () {
+        ["b-play", "b-pause", "b-stop", "b-transcribe"].forEach(function (id) {
+          $(id).disabled = false;
+        });
+      });
+  }
+
+  $("b-shell").onclick = function () { call("getShellInfo"); };
+  $("b-host").onclick  = function () { call("getHostInfo"); };
+  $("b-pick").onclick  = function () { call("pickAudioFile", {}).then(adoptAudio); };
+  $("b-export").onclick = function () {
+    call("exportFile", "riffsheet-test.txt", btoa("exported from the Riffsheet shell placeholder"));
+  };
+  $("b-transcribe").onclick = function () {
+    call("transcribe", { token: token, instruments: ["electric_bass"], preciseBeats: false });
+  };
+  $("b-cap-now").onclick  = function () { call("captureStart", { maxSeconds: 300 }); };
+  $("b-cap-arm").onclick  = function () { call("captureStart", { armToTransport: true }); };
+  $("b-cap-stop").onclick = function () { call("captureStop").then(adoptAudio); };
+
+  $("b-play").onclick  = function () { call("playbackTransport", "play"); };
+  $("b-pause").onclick = function () { call("playbackTransport", "pause"); };
+  $("b-stop").onclick  = function () { call("playbackTransport", "stop"); };
+  $("gain").oninput = function (e) {
+    Juce.getNativeFunction("playbackSetGain")(Number(e.target.value));
+  };
+
+  // ---- events pushed from the native side ----------------------------------
+  var backend = window.__JUCE__.backend;
+
+  backend.addEventListener("playbackPosition", function (p) {
+    $("v-pos").textContent = p.positionSec.toFixed(2) + " s";
+    $("v-len").textContent = p.lengthSec.toFixed(2) + " s";
+  });
+  backend.addEventListener("captureState", function (c) {
+    $("v-cap").textContent = c.mode + " " + c.secondsCaptured.toFixed(1) + " s";
+  });
+  backend.addEventListener("hostInfo", function (h) {
+    $("v-bpm").textContent = (h.hostBpm == null) ? "—" : h.hostBpm.toFixed(2);
+    $("v-sig").textContent = (h.hostTimeSigNumerator == null)
+      ? "—" : h.hostTimeSigNumerator + "/" + h.hostTimeSigDenominator;
+  });
+  backend.addEventListener("transcribeProgress", function (p) { log("progress", p); });
+  backend.addEventListener("transcribeResult", function (r) {
+    if (!r.ok) { log("transcribeResult FAILED", r.error, "err"); return; }
+    log("transcribeResult", r.notes.length + " notes in " + r.elapsedMs + " ms, beatGrid " +
+        (r.beatGrid ? JSON.stringify(r.beatGrid) : "null"), "ok");
+    log("first notes", r.notes.slice(0, 4));
+  });
+  backend.addEventListener("inputFileDropped", function (d) {
+    log("inputFileDropped (native)", d, d.ok === false ? "err" : "ok");
+    if (d.ok && d.token) adoptAudio(d);
+  });
+
+  // ---- HTML5 drop: the path that actually fires inside the WebView ----------
+  var drop = $("drop");
+  ["dragenter", "dragover"].forEach(function (t) {
+    window.addEventListener(t, function (e) { e.preventDefault(); drop.classList.add("on"); });
+  });
+  ["dragleave", "drop"].forEach(function (t) {
+    window.addEventListener(t, function (e) { e.preventDefault(); drop.classList.remove("on"); });
+  });
+  window.addEventListener("drop", function (e) {
+    var file = e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files[0];
+    if (!file) return;
+    log("HTML5 drop", file.name + " (" + file.size + " bytes)");
+    var reader = new FileReader();
+    reader.onload = function () {
+      var bytes = new Uint8Array(reader.result), binary = "";
+      for (var i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
+      call("importDroppedFile", file.name, btoa(binary), {}).then(adoptAudio);
+    };
+    reader.readAsArrayBuffer(file);
+  });
+
+  // Live viewport readout: if this does not change when the plugin window is
+  // dragged, the editor is not passing the resize down to the WebView.
+  function showViewport() {
+    $("v-vp").textContent = window.innerWidth + "x" + window.innerHeight;
+  }
+  window.addEventListener("resize", showViewport);
+  // The shell pushes this whenever the editor bounds change - a belt-and-braces
+  // signal for layouts that need to recompute on resize (canvas, score engraving)
+  // in case WKWebView is slow to fire its own resize event.
+  backend.addEventListener("viewportResized", showViewport);
+  showViewport();
+
+  // ---- WebView capability self-test ----------------------------------------
+  // Team B: these are the constraints the bundle has to live within.
+  function selfTest() {
+    log("origin", location.href);
+    log("classic script", "OK (this page is one)", "ok");
+
+    // new Function(...) so this file itself stays parseable as a classic script.
+    new Function("return import('./juce/index.js')")()
+      .then(function () { log("ES module import", "OK", "ok"); })
+      .catch(function (e) {
+        log("ES module import", "BLOCKED - " + ((e && e.message) || e) +
+            "  ->  the bundle must use classic scripts", "warn");
+      });
+
+    try {
+      var w = new Worker("./worker-probe.js");
+      w.onmessage = function (ev) { log("Web Worker", "OK (" + ev.data + ")", "ok"); w.terminate(); };
+      w.onerror = function () { log("Web Worker", "FAILED", "err"); };
+      w.postMessage("ping");
+    } catch (e) { log("Web Worker", "threw " + e, "err"); }
+
+    log("AudioContext", typeof (window.AudioContext || window.webkitAudioContext), "ok");
+  }
+
+  // ---- boot ----------------------------------------------------------------
+  call("getShellInfo").then(function (info) {
+    // Deliberately does NOT relabel the banner: this page must never look like
+    // the product, however well the engine is running.
+    $("status").textContent = "engine v" + info.version + " · " + info.juce + " · " +
+      info.platform + " · page source: " + info.webcoreSource +
+      (info.debug ? " · debug route" : "");
+    return call("getHostInfo");
+  }).then(function () {
+    Juce.getNativeFunction("log")("info", "placeholder webcore booted");
+    selfTest();
+  }).catch(function (e) {
+    log("BOOT FAILED", String((e && e.stack) || e), "err");
+  });
+})();
+</script>
+</body>
+</html>

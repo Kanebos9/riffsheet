@@ -1,0 +1,52 @@
+* text=auto
+
+# Scripts and source must keep Unix line endings on every platform.
+*.sh text eol=lf
+*.py text eol=lf
+*.cmake text eol=lf
+CMakeLists.txt text eol=lf
+*.cpp text eol=lf
+*.h text eol=lf
+*.ts text eol=lf
+*.mjs text eol=lf
+*.js text eol=lf
+*.json text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+*.md text eol=lf
+*.html text eol=lf
+*.css text eol=lf
+*.xml text eol=lf
+*.musicxml text eol=lf
+*.gpif text eol=lf
+*.riffsheet text eol=lf
+*.svg text eol=lf
+
+# Do not run binary assets through line-ending conversion or text diffs.
+*.wav binary
+*.aif binary
+*.aiff binary
+*.caf binary
+*.flac binary
+*.mp3 binary
+*.m4a binary
+*.mid binary
+*.midi binary
+*.mxl binary
+*.gp binary
+*.gp3 binary
+*.gp4 binary
+*.gp5 binary
+*.gpx binary
+*.sf2 binary
+*.sf3 binary
+*.otf binary
+*.woff binary
+*.woff2 binary
+*.eot binary
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.pdf binary
+*.zip binary

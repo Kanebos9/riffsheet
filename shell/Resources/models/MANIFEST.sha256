@@ -1,0 +1,38 @@
+# Every model file Riffsheet ships, with its digest and where it came from.
+#
+# shell/cmake/ReleaseAudit.cmake refuses to build a release if a file under this
+# directory is missing from this list, if a digest does not match, or if a line
+# here names a file that is not there. That is what stops non-redistributable
+# weights being dropped into Resources/ and shipped by accident.
+#
+# nmp.onnx  -  Spotify Basic Pitch, Apache-2.0. Byte-for-byte the file at
+#              basic_pitch/saved_models/icassp_2022/nmp.onnx in spotify/basic-pitch
+#              v0.4.0 (model blob added in commit dfb20ef559dff1792e11e022f3f0c7008c1dee6d;
+#              git blob sha1 c30e5f9438e798604b7177aa26be1fe64482f767). Unmodified.
+#              Licence text ships at third-party/basic-pitch/LICENSE.
+#
+# beat-this/small0.onnx  -  CPJKU Beat This!, MIT, code AND published weights.
+#              The repository's README says so in as many words: "The code and the
+#              published model weights are released under the MIT license." (It
+#              adds that some TRAINING files are copyrighted, which is a statement
+#              about the data, not about the weights.) That is the licence gate of
+#              engine-architecture.md section 6.6 answered from the project itself,
+#              not from a summary; the text ships at third-party/beat-this/LICENSE.
+#
+#              It is the `small0` checkpoint - 2.1 M parameters - and NOT `final0`,
+#              which is 20.3 M and 77 MB of fp32 weights: three products x 77 MB
+#              blows both the 35 MB per-product and the 100 MB bundle budget on its
+#              own. The accuracy paid for that is in NOTICE.md and BUILDING.md.
+#
+#              Riffsheet EXPORTED this file; there is no official ONNX release. It
+#              is torch.onnx.export of beat_this 1.1.0's BeatThis module loaded
+#              from beat_this-small0.ckpt (sha256
+#              6074be2c4d490c5f6101fcc374a1ec72ae93456e23bb6019783b849f5dc7d47b -
+#              recorded again in shell/test/golden/beats-clicks.json, which is the
+#              digest the golden was captured with), opset 17, dynamic time. The
+#              exact invocation is in BUILDING.md section 5 so it can be repeated.
+#
+# Format is sha256sum's, so it can be checked by hand:
+#     cd shell/Resources/models && shasum -a 256 -c MANIFEST.sha256
+2c3c1d144bfa61ad236e92e169c13535c880469a12a047d4e73451f2c059a0ec  basic-pitch/nmp.onnx
+9fa72ac17486ae137ee05ad0ef6a3dba63001c5aa6ada1ecb81c819870d67713  beat-this/small0.onnx

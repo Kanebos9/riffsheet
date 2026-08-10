@@ -1,7 +1,7 @@
 #!/bin/bash
 # Run the vitest suite WITHOUT Node.js.
 #
-# This machine has no node, so `vitest run` cannot start. This script bundles the same
+# Where Node is not installed, `vitest run` cannot start. This script bundles the same
 # test/*.test.ts files with esbuild (a native binary) and runs them under JavaScriptCore
 # (`jsc`, which ships with macOS), aliasing the `vitest` import to scripts/jsc-shim.ts.
 #

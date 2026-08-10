@@ -9,6 +9,10 @@ algorithms are facts, not protected expression. Everything below in the "re-impl
 was written fresh in TypeScript from the cited papers and upstream sources. GPL-3.0 is declared
 regardless, because the algorithmic debt to MuseScore is real and worth acknowledging plainly.
 
+The full GPL-3.0 text this package is under is in [`LICENSE`](LICENSE), beside this file. The rest
+of Riffsheet is AGPL-3.0-only; GPLv3 section 13 is what lets the two be combined, and `pipeline/`
+stays GPL-3.0-only when distributed on its own (see the root `NOTICE.md`).
+
 ---
 
 ## Per-module record
@@ -35,6 +39,17 @@ phrases. No third-party corpus note lists, beat grids or audio are redistributed
 
 Measurements quoted in code comments and the README (rest density and note-value distributions)
 come from FiloBass (Riley & Dixon, QMUL, ISMIR 2023), GuitarSet v1.1 (CC BY 4.0) and babySlakh.
+
+## Licence texts kept in the tree
+
+- **GPL-3.0-only** — [`LICENSE`](LICENSE), beside this file: the licence this package is under, the
+  official Free Software Foundation text from <https://www.gnu.org/licenses/gpl-3.0.txt>.
+- **music21, BSD-3-Clause** — `third-party/music21/LICENSE`, copied verbatim from
+  <https://raw.githubusercontent.com/cuthbertLab/music21/v10.5.0/LICENSE> (identical to `master` at
+  the time of copying). Copyright © 2006-2026 Michael Scott Asato Cuthbert. BSD-3 asks that the
+  copyright notice, the three conditions and the disclaimer be retained by anything carrying the
+  code forward, which the `spelling.ts` display half and the `key.ts` Bellman–Budge weights above
+  do; that file is the retained copy.
 
 ## Referenced but not vendored
 

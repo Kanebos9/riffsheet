@@ -101,6 +101,34 @@ Abseil, Protocol Buffers, RE2, FlatBuffers, cpuinfo, Eigen and KleidiAI, under
 Apache-2.0, BSD and MPL-2.0 terms. Their complete notices ship unmodified at
 `third-party/onnxruntime/THIRD-PARTY-NOTICES.txt`.
 
+## Where the test fixtures came from
+
+Three binary fixtures are committed under `shell/test/`. None of them is third-party data: all
+three were produced by this project, on this project's own machine, and they are recorded here so
+that no reader has to wonder whose bytes they are.
+
+`shell/test/BasicPitchFixture.wav` is **synthesised, not recorded** — a 4.3-second synthetic bass
+riff of five notes, written out by the project's own `make_golden.py` generator script (named in
+`shell/test/BasicPitchTests.cpp`). No recording of anybody's playing is committed anywhere in this
+repository.
+
+`shell/test/BasicPitchGolden.bin` and `shell/test/BasicPitchGolden.json` are **captured from this
+project's own runs**. They hold the posteriorgrams and the notes that spotify/basic-pitch's own
+reference code produced from that synthetic wav — `nmp.onnx` through onnxruntime's Python
+bindings, then upstream's `note_creation.py` — when the same generator script ran it here. They
+are the numeric output of a local run over Riffsheet's own audio, not files copied out of the
+upstream repository, and they exist so that the C++ can be held to the reference implementation
+rather than only to itself.
+
+`shell/test/SidecarMidiFixture.mid` was **written by this project's own tooling**: it is the MIDI
+file that a local Instrument-Agnostic AMT run (`best_model_bass_v2.pth`) left behind when driven
+by Riffsheet's `shell/Resources/engines/amt_sidecar.py`, over a local take. It is committed so the
+sidecar reader is tested against what an engine actually writes rather than only against what JUCE
+writes. It carries note events, not audio.
+
+The beat goldens `shell/test/golden/beats-*.json` are covered above: reference outputs produced
+locally with madmom, which is itself not redistributed.
+
 ## Engines Riffsheet can install for you
 
 Two engines are offered as a one-click install. **Nothing about them is in a

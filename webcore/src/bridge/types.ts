@@ -626,6 +626,22 @@ export interface NativeBridge {
   loadAudioPath?(path: string): Promise<AudioFileRef | null>;
 
   /**
+   * Mint a take from bytes the page already holds, with no path involved.
+   *
+   * The companion to `loadAudioPath` for a v2 `.riffsheet`, which carries its recording
+   * inside it: on another machine, or after the original file moved, there is no path left to
+   * re-open but the audio itself is right there. Everything that only reads SAMPLES already
+   * worked from the embedded bytes; this is what re-transcription needs, because that runs in
+   * the shell and the shell addresses audio by token.
+   *
+   * `name` must keep the original extension — the shell picks its decoder from it.
+   *
+   * Optional: a shell older than this simply has no such function, and the caller falls back
+   * to today's behaviour (path only) with an honest message.
+   */
+  loadAudioBytes?(name: string, bytes: Uint8Array): Promise<AudioFileRef | null>;
+
+  /**
    * Tell the shell which files are on this app's own Recent list.
    *
    * The shell only re-opens a path by name if this user chose that file in Riffsheet at some

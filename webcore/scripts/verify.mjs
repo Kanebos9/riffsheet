@@ -1115,6 +1115,15 @@ async function main() {
     result.dragProbe = await evalJson(DRAG_PROBE);
     result.ties = await evalJson(TIE_PROBE);
 
+    // --- #36/#41: the Quantize menu writes the SHEET and nothing else -------------------
+    // The probe walks the menu through four values and dumps, at each one, what the roll is
+    // drawing and what the synth would play. It puts every setting back before it returns, so
+    // it is safe to run in the middle of the take everything below is still looking at.
+    result.snapFeed = await evalJson(
+      `JSON.stringify(window.__RIFFSHEET_SNAPFEED__ ? window.__RIFFSHEET_SNAPFEED__() : null)`
+    );
+    await settle(600);
+
     // --- the two grids are actually two ------------------------------------------------
     // Driven through the real controls, because the whole failure being guarded against was
     // a UI wire: one <select> that reached both the roll and the quantizer.
@@ -1686,7 +1695,18 @@ async function main() {
       useHostGrid:
         'only exists when a DAW does — driven below, in simulated-plugin mode, where there is a grid to follow',
       anchorFret:
-        'only exists for one fingering style — the box appears beside the Tab menu when "Around fret N" is chosen, and a number that governs nothing is what this pass removed everywhere else'
+        'only exists for one fingering style — the box appears beside the Tab menu when "Around fret N" is chosen, and a number that governs nothing is what this pass removed everywhere else',
+      // The three that stopped being switches in settings v9. The FIELDS survive so an older
+      // blob still round-trips and is normalised rather than merely spread back (see their
+      // comments in app/state.ts), but there is no control for them anywhere any more and there
+      // is not meant to be: the roll names every row and is always editable, and the drifting
+      // tempo pass is off for good. `migrate()` forces all three.
+      rollAllNoteNames:
+        'dead: forced true by the v9 migration — naming every row is simply what the roll does, and renderMain passes the literal rather than the field',
+      rollEditing:
+        'dead: forced true by the v9 migration — the roll is always editable, and renderMain passes setEditable(true) outright',
+      preciseBeats:
+        'dead: forced false by the v9 migration — the second listening pass it bought cost minutes a take and returned bar lines that followed the player\'s drift'
     };
 
     /** Every `[data-setting]` on screen right now, counted. */
@@ -2812,17 +2832,20 @@ async function main() {
         (result.notationGridOptions ?? []).includes('auto') && result.notationGridView === 'auto'
       ],
       [
-        // FREE IS NOT OFFERED FOR AN AUDIO TAKE (#21), and this is a measured decision rather
-        // than a taste. After the pipeline's rest-filler removal, 'free' stopped inventing long
-        // overlapping notes — its longest written value now matches 'auto' — but the tie chains
-        // remain and are inherent: 64 played notes engrave as 64 glyphs / 0 ties under 'auto'
-        // and as 192 glyphs / 192 ties under 'free', plus 64 rests nobody played. A symbolic
-        // import is the opposite case (the notes carry their own written ticks and the pipeline
-        // forces 'free' anyway), so the option stays there — which is why this is a check about
-        // the AUDIO fixture specifically.
-        'grids: Free is not offered for an audio take',
-        !(result.notationGridOptions ?? []).includes('free') &&
-          (result.notationGridOptions ?? []).length >= 5
+        // FREE IS OFFERED FOR EVERY TAKE, and is the default from settings v10.
+        //
+        // This check asserted the OPPOSITE until #36, on a measurement that has since stopped
+        // being true: 'free' used to engrave 64 played notes as 192 glyphs with 192 ties, which
+        // was a trap rather than a setting. The pipeline's 'free' is a 1:1 pass-through now —
+        // re-measured at 64 played -> 64 glyphs / 0 rests / 0 ties on the straight fixture,
+        // identical to 'auto' — so the reason for hiding it is gone, and a default the player
+        // cannot select again after moving off it would be incoherent.
+        //
+        // `scripts/roll-snap-test.ts` §8 holds the numbers, so a regression in the pipeline's
+        // 'free' fails there with an arithmetic reason rather than here with a missing option.
+        'grids: Free is offered, and is the default',
+        (result.notationGridOptions ?? []).includes('free') &&
+          (result.notationGridOptions ?? []).length >= 6
       ],
       [
         // And the roll must NOT offer it: its grid is a stated cell size for drawing into.
@@ -4150,6 +4173,36 @@ async function main() {
         !!result.roll?.roll && result.roll.roll.irDeltaSec !== null &&
           result.roll.roll.irDeltaSec < 0.002 && result.roll.roll.notes === result.roll.roll.irNotes
       ],
+      // --- #36: the roll shows the PERFORMANCE, so the Quantize menu cannot move it -----
+      [
+        // THE ACCEPTANCE TEST for #36, and the reason the roll stopped walking the engraving:
+        // choosing 1/4 visibly re-timed the player's own recording in the one view that is
+        // supposed to be a picture of it. Byte-identical note list at four Quantize values.
+        'snap feed: the roll draws the same notes at every Quantize value',
+        !!result.snapFeed && !result.snapFeed.error && result.snapFeed.feedStableAcrossGrids === true
+      ],
+      [
+        // ...and the SHEET is not identical, or the line above would be true for the wrong
+        // reason (a menu that reaches nothing at all passes a stability check trivially).
+        'snap feed: ...while the sheet does change',
+        !!result.snapFeed && result.snapFeed.sheetChangedAcrossGrids === true
+      ],
+      [
+        // PLAYBACK UNCHANGED, by identity rather than by comparison: with Snap off,
+        // `performanceFeed()` hands `scoreToSynthNotes` the take's own array — the same
+        // object it got before this feature existed, not merely an equal one.
+        'snap feed: with snap off, playback gets the take’s own array',
+        !!result.snapFeed && result.snapFeed.feedIsRawObjectWhenSnapOff === true
+      ],
+      [
+        // #41: and the snap layer itself — on moves the feed, finer moves it further, and
+        // switching it off returns the raw take rather than a re-snapped approximation of it.
+        'snap feed: snapping on/finer/off round-trips to the raw take',
+        !!result.snapFeed && result.snapFeed.snapMovesTheFeed === true &&
+          result.snapFeed.finerGridDiffers === true && result.snapFeed.resnapFromRaw === true &&
+          result.snapFeed.snapRoundTripsToRaw === true
+      ],
+
       [
         // THE REPORTED BUG. Pitch a note up on the sheet; its rectangle must move up here.
         'edit sync: a pitch change moves the rectangle',

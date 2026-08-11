@@ -36,6 +36,7 @@ import {
   tabStaveIndex,
   type StaveKind
 } from './staveKinds';
+import { countRendererCredits, stripRendererCredit } from './watermark';
 import { t, TIPS } from '../ui/tips';
 import type { RiffScore } from '../pipeline';
 
@@ -116,6 +117,18 @@ export interface TriViewOptions {
    * at the end of every overlay rebuild. Only fired when something actually changed.
    */
   onViewportChange?: (v: TriViewViewport) => void;
+  /**
+   * CROSS-HIGHLIGHT (#30d), outward: the pointer is over this note's glyph, so the roll can
+   * ring the matching rectangle. Null when it leaves the glyph, or the sheet entirely.
+   *
+   * Coalesced to one call per CHANGED note — the hit test already runs at most once an
+   * animation frame, and the other end of this is a canvas repaint. Silent during a drag: the
+   * interesting note then is the one being dragged, and it is already highlighted.
+   *
+   * The exact counterpart of `PianoRoll`'s option of the same name, and the two are wired to
+   * each other's `setHover`. Never echo one into the other's report or the pair will loop.
+   */
+  onNoteHover?: (noteId: string | null) => void;
 }
 
 export interface NoteHit {
@@ -196,9 +209,16 @@ const LEFT_INSET_PX = TIMELINE_GUTTER_PX;
  */
 let leftInkOverhangPerScale = 9;
 
-/** alphaTab display scale limits. 1.0 is the default; below 0.4 the tab digits stop being readable. */
-const MIN_ZOOM = 0.4;
-const MAX_ZOOM = 3.0;
+/**
+ * alphaTab display scale limits. 1.0 is the default; below 0.4 the tab digits stop being readable.
+ *
+ * Exported because Align's coupled zoom is computed OUTSIDE this class — `coupledSheetScale`
+ * needs the clamps to work against, and a caller that guessed them would either fight `setZoom`'s
+ * own clamp (asking for 6 and getting 3 every notch, so the roll and the sheet drift apart) or
+ * stop short of a zoom the sheet would have allowed.
+ */
+export const MIN_ZOOM = 0.4;
+export const MAX_ZOOM = 3.0;
 
 /** We only ever render track 0. Hoisted so a per-note query does not allocate a Set. */
 const TRACK_ZERO = new Set([0]);
@@ -278,6 +298,8 @@ export class TriView {
   private renderStartedAt = 0;
   private playheadLine: SVGLineElement;
   private selectionGroup: SVGGElement;
+  /** The cross-highlight ring layer (#30d). Never the selection — see `setHover`. */
+  private hoverGroup: SVGGElement;
   private ghostGroup: SVGGElement;
   private lastRenderInfo: RenderInfo | null = null;
   private namesPlacement: NamesPlacement;
@@ -295,6 +317,8 @@ export class TriView {
    * stronger statement than "I was at tick 0" and should survive exactly.
    */
   private scrollAnchorTick: number | null = null;
+  /** ALIGN's pending anchor: the tick that must be at the music column's left edge (#30). */
+  private alignAnchorTick: number | null = null;
   private scrollAnchorAtStart = false;
   /** True while a left-inset correction is being rendered — the hard stop on any loop. */
   private insetTuneInFlight = false;
@@ -309,6 +333,12 @@ export class TriView {
   private lastDragCommit: NoteDragCommit | null = null;
   private lastDragPreview: NoteDragPreview | null = null;
   private cursorFrame = 0;
+  /** Notes the ROLL says the pointer is over. Rings only — never the selection (#30d). */
+  private hoveredIds: string[] = [];
+  /** The last note reported OUTWARD, so the same one is not reported twice. */
+  private hoverReported: string | null = null;
+  /** How many "rendered by alphaTab" nodes have been removed since this view was built (#40). */
+  private creditsRemoved = 0;
 
   constructor(opts: TriViewOptions) {
     this.opts = opts;
@@ -324,6 +354,9 @@ export class TriView {
           <div class="tabmarks-row" aria-hidden="true"></div>
           <div class="stringletters-row" aria-hidden="true"></div>
           <svg class="triview-overlay" xmlns="http://www.w3.org/2000/svg">
+            <!-- Under the selection on purpose: a note can be both, and the answer
+                 ("selected") must be the one you see. See drawHover(). -->
+            <g class="hover"></g>
             <g class="selection"></g>
             <line class="playhead" x1="0" y1="0" x2="0" y2="0" />
             <g class="drag-ghost"></g>
@@ -340,6 +373,7 @@ export class TriView {
     this.overlay = opts.container.querySelector('.triview-overlay')!;
     this.playheadLine = this.overlay.querySelector('.playhead')!;
     this.selectionGroup = this.overlay.querySelector('.selection')!;
+    this.hoverGroup = this.overlay.querySelector('.hover')!;
     this.ghostGroup = this.overlay.querySelector('.drag-ghost')!;
     this.maxFret = opts.maxFret ?? DEFAULT_MAX_FRET;
 
@@ -366,6 +400,7 @@ export class TriView {
     // anybody tries it. The drag itself listens on window, so it survives the pointer
     // leaving the element mid-gesture.
     this.scroller.addEventListener('pointermove', this.onHoverMove, { passive: true });
+    this.scroller.addEventListener('pointerleave', this.onHoverLeave, { passive: true });
   }
 
   // -------------------------------------------------------------------------
@@ -378,6 +413,12 @@ export class TriView {
     this.keyFifths = score.ir.key.fifths ?? 0;
     this.accidentals = accidentalsForKey(score.ir.key.fifths);
     this.cancelDrag();
+    // A hover names a note in the score being replaced. Carrying it over would ring whatever
+    // note in the NEW score happened to be given the same id.
+    this.hoveredIds = [];
+    this.reportHover(null);
+    // Same for a pending Align anchor: a tick in the old score is not the same moment in this one.
+    this.alignAnchorTick = null;
     this.tabShifts = collectTabOctaveShifts(score);
     const built = buildAlphaTabScore(score.data, this.api.settings);
     this.index = built.index;
@@ -516,6 +557,13 @@ export class TriView {
     // definition. Thrown away rather than rebuilt: most renders are never asked for an x.
     this.axis = null;
 
+    // #40: alphaTab's "rendered by alphaTab" credit, out of the emitted SVG. FIRST, before
+    // anything below measures the host: the credit is centred over the score and its box would
+    // otherwise be included in `scrollWidth` and in `measureLeftInk()`'s union — so removing it
+    // afterwards would leave the overlay sized to ink that is no longer there. See view/watermark.ts
+    // for why this is a DOM removal rather than a setting (there is no setting).
+    this.creditsRemoved += stripRendererCredit(this.host);
+
     const lookup = this.api.renderer.boundsLookup;
     if (!lookup) return { beatCount: 0, hasStaffTabSplit: false };
 
@@ -624,6 +672,8 @@ export class TriView {
     // The highlight rectangles were drawn against the OLD geometry. Redraw them from the
     // new bounds, or a zoom (or any edit) would leave the selection behind.
     this.drawSelection();
+    // Same argument, same frame: the hover ring is bounds-derived too.
+    this.drawHover();
     return { beatCount, hasStaffTabSplit };
   }
 
@@ -749,6 +799,15 @@ export class TriView {
      * scroll 0 the sheet draws nothing in the column the roll uses for its pitch names.
      */
     contentLeftInset: number;
+    /**
+     * "rendered by alphaTab" nodes STILL in the engraving. Must be 0 — see view/watermark.ts.
+     *
+     * Counted rather than assumed: the credit is re-emitted by every render, so this is a claim
+     * about the DOM as it stands right now, not about a call having been made once.
+     */
+    rendererCredits: number;
+    /** How many have been removed since this view was built. Non-zero once anything is drawn. */
+    rendererCreditsRemoved: number;
   } | null {
     const lookup = this.api.renderer.boundsLookup;
     if (!lookup) return null;
@@ -802,7 +861,9 @@ export class TriView {
         octaveMarksOnTab: marksOnTab,
         octaveMarkTexts: markTexts,
         systems,
-        contentLeftInset
+        contentLeftInset,
+        rendererCredits: countRendererCredits(this.host),
+        rendererCreditsRemoved: this.creditsRemoved
       };
     }
 
@@ -872,7 +933,9 @@ export class TriView {
       octaveMarksOnTab: marksOnTab,
       octaveMarkTexts: markTexts,
       systems,
-      contentLeftInset
+      contentLeftInset,
+      rendererCredits: countRendererCredits(this.host),
+      rendererCreditsRemoved: this.creditsRemoved
     };
   }
 
@@ -1123,12 +1186,52 @@ export class TriView {
    */
   resetView(): void {
     this.scrollAnchorTick = null;
+    // "Back to the beginning" outranks any Align anchor still waiting for a render.
+    this.alignAnchorTick = null;
     this.scrollAnchorAtStart = true;
     this.setZoom(1);
     this.setScrollLeft(0);
   }
 
+  /**
+   * ALIGN (#30): put this tick at the left edge of the MUSIC column — now, and again after the
+   * next re-engrave finishes.
+   *
+   * The "and again" is the whole point, and it is why this exists instead of the caller simply
+   * computing an x and calling `setScrollLeft`. A coupled zoom is TWO steps: the roll's window
+   * changes, and the sheet is re-engraved at a new `display.scale` to match (see
+   * `coupledSheetScale`). Every content x moves during that render, and it is asynchronous — a
+   * scroll applied by the caller beforehand is computed against the old engraving and a scroll
+   * applied afterwards needs the caller to have listened for the right event. A TICK survives
+   * the re-engrave, so the anchor is stated once and honoured on the far side of it.
+   *
+   * The gutter comes off because Align matches the two MUSIC edges, not the two element edges:
+   * the roll spends its first `TIMELINE_GUTTER_PX` on pitch names and the sheet is padded by
+   * the same column, so the window's first second is at the same screen x in both panes. This
+   * is exactly `timeAxis.sheetScrollForSec`, in ticks and against the live engraving.
+   *
+   * Pass null to drop a pending anchor — switching Align off, for instance — and leave the
+   * plain zoom anchor (`setZoom`'s own, which keeps the left edge where it was) in charge.
+   */
+  alignScrollToTick(tick: number | null): void {
+    this.alignAnchorTick = tick;
+    if (tick === null) return;
+    const x = this.tickToContentX(tick);
+    if (x !== null) this.setScrollLeft(x - LEFT_INSET_PX);
+  }
+
   private restoreScrollAnchor(): void {
+    // Align outranks the zoom anchor: when both are set, the caller has asked for a specific
+    // moment at the left edge and `setZoom` only ever asked for "wherever we were".
+    const aligned = this.alignAnchorTick;
+    if (aligned !== null) {
+      this.alignAnchorTick = null;
+      this.scrollAnchorTick = null;
+      this.scrollAnchorAtStart = false;
+      const alignedX = this.tickToContentX(aligned);
+      if (alignedX !== null) this.setScrollLeft(alignedX - LEFT_INSET_PX);
+      return;
+    }
     if (this.scrollAnchorAtStart) {
       this.scrollAnchorAtStart = false;
       this.scrollAnchorTick = null;
@@ -1342,11 +1445,84 @@ export class TriView {
     // ours on every render.
     this.selectedIds = [...noteIds];
     this.drawSelection();
+    // A note that has just BECOME selected must lose its hover ring in the same frame, or the
+    // click leaves two rings around one notehead until the pointer moves.
+    this.drawHover();
   }
 
   /** Which notes are highlighted right now. Lets the piano roll round-trip a selection. */
   get selection(): string[] {
     return [...this.selectedIds];
+  }
+
+  // -------------------------------------------------------------------------
+  // Cross-highlight (#30d)
+  // -------------------------------------------------------------------------
+
+  /**
+   * The roll says the pointer is over these notes, so ring them here.
+   *
+   * DELIBERATELY NOT THE SELECTION, and the distinction is the whole reason this is a second
+   * layer rather than a call to `setSelection`. A hover is a question — "is this the note I
+   * mean?" — and a selection is an answer. Drawing them the same way would make pointing at a
+   * rectangle on the roll look as though it had already changed what Delete would remove.
+   *
+   * Never echoed back through `onNoteHover`: this is the INWARD half, and reporting what we
+   * were just told is how a two-view highlight becomes a loop.
+   */
+  setHover(noteIds: ReadonlyArray<string>): void {
+    if (noteIds.length === this.hoveredIds.length && noteIds.every((id, i) => this.hoveredIds[i] === id)) return;
+    this.hoveredIds = [...noteIds];
+    this.drawHover();
+  }
+
+  /** Which notes are ringed right now. The counterpart of `selection`. */
+  get hovered(): string[] {
+    return [...this.hoveredIds];
+  }
+
+  /**
+   * The OUTWARD half: tell the caller which note is under the pointer, once per change.
+   *
+   * Private and funnelled, because every route that can change it (a move, a leave, the start
+   * of a drag) has to go through the same "has it actually changed" test — a pointermove fires
+   * dozens of times a second and the far end of this repaints a canvas.
+   */
+  private reportHover(noteId: string | null): void {
+    if (noteId === this.hoverReported) return;
+    this.hoverReported = noteId;
+    this.opts.onNoteHover?.(noteId);
+  }
+
+  /**
+   * The rings themselves: lighter than the selection's, and no fill.
+   *
+   * A note that is ALREADY SELECTED is skipped rather than ringed twice. Two rings around one
+   * notehead reads as a third state that does not exist, and the selection's is the one that
+   * means something you can act on.
+   *
+   * Weights inline for the same reason `drawSelection` sets its own — `styles.css` belongs to
+   * the integrator — but the class is kept so the accent colour still comes from there.
+   */
+  private drawHover(): void {
+    this.hoverGroup.replaceChildren();
+    const lookup = this.api.renderer.boundsLookup;
+    if (!lookup || !this.index) return;
+    const selected = new Set(this.selectedIds);
+
+    for (const id of this.hoveredIds) {
+      if (selected.has(id)) continue;
+      // Every notehead of the note, as in `drawSelection`: one held note is several tied
+      // glyphs sharing one id, and ringing one of them looks like the others are a different note.
+      const notes = this.index.idToNotes?.get(id) ?? [];
+      const single = notes.length === 0 ? this.index.idToNote.get(id) : null;
+      const chain = notes.length > 0 ? notes : single ? [single] : [];
+      for (const r of chain.flatMap((n) => this.noteGlyphRects(n))) {
+        this.hoverGroup.appendChild(
+          selectionRect(r, 5, { fill: 'none', strokeWidth: '1.75', opacity: '0.65' }, 'sel-rect hover-rect')
+        );
+      }
+    }
   }
 
   /**
@@ -1474,9 +1650,17 @@ export class TriView {
     /** The last preview emitted, and the last commit — both survive pointerup. */
     lastPreview: NoteDragPreview | null;
     lastCommit: NoteDragCommit | null;
+    /** Cross-highlight (#30d): what the roll told us, and what we told the roll. */
+    hoverIds: string[];
+    hoverReported: string | null;
+    /** Rings actually in the overlay. Zero while the only hovered note is also selected. */
+    hoverRings: number;
   } {
     const d = this.drag;
     return {
+      hoverIds: [...this.hoveredIds],
+      hoverReported: this.hoverReported,
+      hoverRings: this.hoverGroup.childNodes.length,
       dragging: !!d && d.moved,
       noteId: d?.noteId ?? null,
       dragKind: d ? (d.staff === 'notation' ? 'pitch' : 'string') : null,
@@ -1493,6 +1677,10 @@ export class TriView {
   /** Begin a possible drag. Nothing is committed to until the pointer actually moves. */
   private beginDrag(hit: NoteHit, e: PointerEvent): void {
     if (!hit.note || !hit.noteId || !hit.staff || !this.index) return;
+    // A drag has started, so hovering is over: the note that matters is the one in the hand,
+    // and it is about to be highlighted as the drag's own. `onHoverMove` stays silent for the
+    // duration; this is what closes the report that was already open.
+    this.reportHover(null);
     // The note has a glyph on each staff. The ghost has to follow the one the pointer is
     // actually on, so pick the nearest by y rather than the first in the list.
     const heads = this.noteGlyphRects(hit.note);
@@ -1754,7 +1942,20 @@ export class TriView {
       if (this.drag) return;
       const hit = this.hitTest(clientX, clientY);
       this.scroller.style.cursor = hit?.note ? 'ns-resize' : '';
+      // The SAME hit test the cursor is decided from, so the ring on the roll and the shape of
+      // the pointer can never disagree about which note is under the hand (#30d).
+      this.reportHover(hit?.note ? hit.noteId : null);
     });
+  };
+
+  /**
+   * The pointer left the sheet, so nothing is hovered.
+   *
+   * Needed as its own event: a pointer that leaves fires no final `pointermove` over empty
+   * space, so without this the last note stays ringed on the roll after the hand has gone.
+   */
+  private onHoverLeave = (): void => {
+    this.reportHover(null);
   };
 
   // -------------------------------------------------------------------------
@@ -1941,6 +2142,7 @@ export class TriView {
     this.scroller.removeEventListener('pointerdown', this.onPointerDown);
     this.scroller.removeEventListener('scroll', this.onScroll);
     this.scroller.removeEventListener('pointermove', this.onHoverMove);
+    this.scroller.removeEventListener('pointerleave', this.onHoverLeave);
     this.api.destroy();
   }
 }
@@ -2072,7 +2274,8 @@ function readOverlayColors(): { accent: string; danger: string; paper: string } 
 function selectionRect(
   r: { x: number; y: number; w: number; h: number },
   pad: number,
-  style: { fill?: string; strokeWidth: string; opacity?: string }
+  style: { fill?: string; strokeWidth: string; opacity?: string },
+  className = 'sel-rect'
 ): SVGRectElement {
   const rect = document.createElementNS('http://www.w3.org/2000/svg', 'rect');
   rect.setAttribute('x', String(r.x - pad));
@@ -2080,7 +2283,7 @@ function selectionRect(
   rect.setAttribute('width', String(r.w + pad * 2));
   rect.setAttribute('height', String(r.h + pad * 2));
   rect.setAttribute('rx', String(Math.min(4, pad)));
-  rect.setAttribute('class', 'sel-rect');
+  rect.setAttribute('class', className);
   if (style.fill) rect.style.fill = style.fill;
   rect.style.strokeWidth = style.strokeWidth;
   if (style.opacity) rect.style.opacity = style.opacity;

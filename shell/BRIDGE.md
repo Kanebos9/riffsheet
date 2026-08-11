@@ -254,6 +254,8 @@ every other unreported field.
 pickAudioFile(options?: { sampleRate?: number }): Promise<AudioRef>
 pickInputFile(options?: { sampleRate?: number }): Promise<AudioRef | InputBytes>
 loadAudioPath(path: string, options?: { sampleRate?: number }): Promise<AudioRef>
+loadAudioBytes(name: string, base64: string,
+               options?: { sampleRate?: number }): Promise<AudioRef>
 importDroppedFile(name: string, base64: string,
                   options?: { sampleRate?: number }): Promise<AudioRef>
 ```
@@ -292,6 +294,22 @@ before its `AudioRef.path` is returned. `loadAudioPath` accepts one of those own
 path this user has chosen in Riffsheet **at some point on this machine**. This is a trust boundary:
 a DAW project file can contain an untrusted web-state blob, so restore must never turn a string in
 that blob into an arbitrary filesystem read/upload.
+
+`loadAudioBytes` is the path-free twin of `loadAudioPath`, for a v2 `.riffsheet` document, which
+carries its recording inside it. Restoring one gives the page samples but no `token`, so everything
+that runs in the SHELL — `transcribe` above all — was still tied to the original file being where
+the document said it was, which is the assumption embedding the audio existed to remove. This mints
+a take from the bytes instead: staged under a random name in the system temp directory, decoded
+exactly like `importDroppedFile` (with which it shares `NativeBridge::stageBytesAndReply`), and
+promoted to the durable `takes` directory before the `AudioRef` is returned; the staging file is
+owned by the `PcmStore::Entry` and dies with it.
+
+It is deliberately **not** gated the way `loadAudioPath` is, and that is not an exception to the
+trust boundary above — it is outside it. The gate exists because a *path* names something this
+process can reach and the page cannot. Bytes are the opposite: the page must already hold every one
+of them, so the worst it can obtain is audio it could already read. Nothing on disk is named, opened
+or authorized here. `name` is used only for the staging file's extension, which is how the format
+manager picks a decoder — pass the original file name, not a bare title.
 
 "At some point", not "in this editor". The editor is destroyed and rebuilt on every track click, so
 a per-editor set is empty almost always, and gating on it made the app's own Recent list — which is

@@ -52,6 +52,7 @@ private:
     void fnPickAudioFile     (const juce::Array<juce::var>&, Completion);
     void fnPickInputFile     (const juce::Array<juce::var>&, Completion);
     void fnLoadAudioPath     (const juce::Array<juce::var>&, Completion);
+    void fnLoadAudioBytes    (const juce::Array<juce::var>&, Completion);
     void fnAuthorizeRecentPaths (const juce::Array<juce::var>&, Completion);
     void fnTranscribe        (const juce::Array<juce::var>&, Completion);
     void fnTrackBeats        (const juce::Array<juce::var>&, Completion);
@@ -96,6 +97,18 @@ private:
     void decodeAndReply (const juce::File& file, double targetRate, Completion completion,
                          bool fileIsOurTemp = false, juce::String displayNameOverride = {},
                          bool forceOwnedCopy = false);
+
+    /** Bytes in, AudioRef out: stages base64 audio under a unique name in the
+        system temp directory and hands it to decodeAndReply() as our own temp.
+
+        The staging file is never in a user folder and never outlives the take -
+        decodeAndReply() promotes the decoded audio to durable app-support
+        storage, and the staging file stays entry-owned so ~PcmStore::Entry
+        deletes it. Shared by importDroppedFile() and loadAudioBytes() so the
+        two cannot drift; `stageTag` only distinguishes them in /tmp listings. */
+    void stageBytesAndReply (const juce::String& displayName, const juce::String& base64,
+                             double targetRate, Completion completion,
+                             const juce::String& stageTag);
 
     /** Describes an entry for the page AND registers the shell's automatic hold
         on it (RiffsheetAudioProcessor::noteHandedOut).

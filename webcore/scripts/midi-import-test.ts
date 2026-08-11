@@ -163,6 +163,17 @@ const rollCtx: RollEditContext = {
   newNoteId: () => 'added1'
 };
 
+/**
+ * IR ticks per quarter note, as the pipeline itself reports it.
+ *
+ * Read from the score rather than hardcoded, because the assertions below are written in IR
+ * ticks and that resolution is not a constant of the format: it went 12 -> 24 in the tick/tie
+ * migration and silently invalidated every baseline in this file. Reading it back means a
+ * future change to it re-derives the arithmetic instead of failing on it, and the assertions
+ * keep testing what they were written to test — where the notes are and what they are worth.
+ */
+let irDivisions = 0;
+
 const engraveEdited = (notes: InputNote[]): string[] => {
   const built = buildRiffScore(
     // A fixed, generous audio length for every run: the past-end guard drops notes starting at
@@ -170,6 +181,7 @@ const engraveEdited = (notes: InputNote[]): string[] => {
     { notes, audioDurationSec: 8, startOffsetSec: 0, title: 'import' },
     { ...DEFAULT_SETTINGS, grid: 'quarter', useHostGrid: false, tempoBpm: sixteenths.tempoBpm }
   );
+  irDivisions = built.ir.divisions;
   const out: string[] = [];
   for (const bar of built.ir.bars) {
     for (const voice of bar.voices) {
@@ -188,22 +200,39 @@ const roll = (edit: Parameters<typeof applyRollEditToNotes>[1], notes = sixteent
   return result.notes;
 };
 
-// 4 sixteenths at 96 ppq / 120 bpm: source ticks 0/24/48/72, IR (12 divisions) ticks 0/3/6/9.
+// 4 sixteenths at 96 ppq / 120 bpm: source ticks 0/24/48/72, one sixteenth apart in the IR too.
 const editBaseline = engraveEdited(sixteenths.notes);
+
+// Note VALUES, in the IR's own units — see `irDivisions`. Everything below is written in these
+// rather than in literal tick counts, because the tick counts are an artefact of the IR's
+// resolution and were never the thing under test.
+assert(irDivisions > 0 && irDivisions % 4 === 0, `implausible IR divisions: ${irDivisions}`);
+const QUARTER = irDivisions;
+const EIGHTH = irDivisions / 2;
+const SIXTEENTH = irDivisions / 4;
+/** `absoluteTick:writtenDuration:pitch`, the shape `engraveEdited` returns. */
+const at = (tick: number, dur: number, midi: number): string => `${tick}:${dur}:${midi}`;
+
 assert(
-  editBaseline.join(' ') === '0:3:60 3:3:62 6:3:64 9:3:65',
+  editBaseline.join(' ') ===
+    [
+      at(0, SIXTEENTH, 60),
+      at(SIXTEENTH, SIXTEENTH, 62),
+      at(2 * SIXTEENTH, SIXTEENTH, 64),
+      at(3 * SIXTEENTH, SIXTEENTH, 65)
+    ].join(' '),
   `unexpected baseline engraving: ${editBaseline.join(' ')}`
 );
 
-// MOVE — one sixteenth (0.125 s) later. Source tick 72 -> 96, IR tick 9 -> 12.
+// MOVE — one sixteenth (0.125 s) later. Source tick 72 -> 96, so the last note lands on beat 2.
 const movedOne = engraveEdited(roll({ kind: 'move', noteId: 'm3', deltaSec: 0.125, deltaSemitones: 0 }));
 assert(
   movedOne.slice(0, 3).join(' ') === editBaseline.slice(0, 3).join(' '),
   `moving one note disturbed the others: ${movedOne.join(' ')}`
 );
 assert(
-  movedOne[3] === '12:3:65',
-  `a move on a symbolic import was not engraved: ${movedOne.join(' ')} (expected the last note at 12)`
+  movedOne[3] === at(QUARTER, SIXTEENTH, 65),
+  `a move on a symbolic import was not engraved: ${movedOne.join(' ')} (expected the last note at ${QUARTER})`
 );
 
 // MOVE, whole selection — the `*Many` variant shares the code path and the bug.
@@ -211,11 +240,18 @@ const movedMany = engraveEdited(
   roll({ kind: 'moveMany', noteIds: ['m2', 'm3'], deltaSec: 0.25, deltaSemitones: 0 })
 );
 assert(
-  movedMany.join(' ') === '0:3:60 3:3:62 12:3:64 15:3:65',
+  movedMany.join(' ') ===
+    [
+      at(0, SIXTEENTH, 60),
+      at(SIXTEENTH, SIXTEENTH, 62),
+      at(QUARTER, SIXTEENTH, 64),
+      at(QUARTER + SIXTEENTH, SIXTEENTH, 65)
+    ].join(' '),
   `moveMany on a symbolic import was not engraved: ${movedMany.join(' ')}`
 );
 
-// RESIZE — to a quarter (0.5 s). 3 IR ticks of written value become 12, tie splits included.
+// RESIZE — to a quarter (0.5 s). The written value becomes a quarter note's worth of ticks,
+// summed across any tie split rather than read off one beat.
 const resized = engraveEdited(roll({ kind: 'resize', noteId: 'm3', newDurationSec: 0.5 }));
 assert(
   resized.slice(0, 3).join(' ') === editBaseline.slice(0, 3).join(' '),
@@ -225,18 +261,18 @@ const resizedWritten = resized
   .filter((entry) => entry.endsWith(':65'))
   .reduce((total, entry) => total + Number(entry.split(':')[1]), 0);
 assert(
-  resizedWritten === 12,
-  `a resize on a symbolic import was not engraved: ${resized.join(' ')} (written ${resizedWritten}/12)`
+  resizedWritten === QUARTER,
+  `a resize on a symbolic import was not engraved: ${resized.join(' ')} (written ${resizedWritten}/${QUARTER})`
 );
 
-// ADD — a written eighth at written second 0.5 (source tick 96, IR tick 12, IR value 6).
+// ADD — a written eighth at written second 0.5, i.e. source tick 96, i.e. beat 2 of the IR.
 const added = engraveEdited(roll({ kind: 'add', midi: 67, startSec: 0.5, durationSec: 0.25 }));
 assert(
   added.slice(0, 4).join(' ') === editBaseline.join(' '),
   `adding a note requantized the rest of the import: ${added.join(' ')}`
 );
 assert(
-  added.length === 5 && added[4] === '12:6:67',
+  added.length === 5 && added[4] === at(QUARTER, EIGHTH, 67),
   `the added note is not at its roll-grid position: ${added.join(' ')}`
 );
 

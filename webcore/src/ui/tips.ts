@@ -245,13 +245,19 @@ export const TIPS = {
    * every caller and this one is read by the notation toolbar under a name nothing else uses.
    */
   grid:
-    'How much the sheet rounds what you played. Auto works it out bar by bar and is the only setting that can write straight notes and triplets in the same piece — leave it there unless the page comes out fussier than you played. Naming a size instead forbids everything finer, so a triplet played against 1/8 loses a note; 1/32 is there for fast picked figures that 1/16 rounds into each other, and Triplet (1/12) for music that swings in threes. Free writes exactly what you played, with no tidying at all.',
+    'How much the sheet rounds what you played. This never changes the piano roll — only how the sheet rounds it. Free is where it starts, and it writes exactly what you played with no tidying at all. Auto works it out bar by bar and is the only setting that can write straight notes and triplets in the same piece, so it is the one to reach for when Free comes out cluttered. Naming a size instead forbids everything finer, so a triplet played against 1/8 loses a note; 1/32 is there for fast picked figures that 1/16 rounds into each other, and Triplet (1/12) for music that swings in threes.',
   /**
    * The roll's own ruler, and it keeps the plain name "Grid" on screen. The menu that used to
    * be called Notation is "Quantize" now, so the two no longer read as the same word twice.
    */
   rollGrid:
-    'The columns drawn on the piano roll, and the size of a note you add by hand: with 1/4 selected, double-clicking an empty spot puts a quarter note there, on the nearest quarter-note line. It never re-writes what the app heard — changing it does not move a single note on the sheet. Hold Option while dragging to ignore it.',
+    'The columns drawn on the piano roll, and the size of a note you add by hand: with 1/4 selected, double-clicking an empty spot puts a quarter note there, on the nearest quarter-note line. On its own it never re-writes what the app heard — changing it does not move a single note. Hold Option while dragging to ignore it.',
+  /**
+   * Snap to grid. The one control in the app that MOVES the player's notes, so its tip has to
+   * say both halves out loud: what it does, and that it is undoable by switching it off.
+   */
+  rollSnap:
+    'Line every note up with the grid columns. Each note starts on the nearest line and keeps the length it had. Your recording is kept underneath exactly as you played it, so switching this off puts every note straight back — and changing the grid size measures again from the original, never from the last snap. While it is on, the sheet, the playback and anything you export all follow the lined-up version.',
   clef:
     'Auto chooses one stable clef for the whole part. Treble and Bass force one clef; Grand stacks treble and bass for music that genuinely needs both ranges.',
   fingering:
@@ -304,6 +310,12 @@ export const TIPS = {
     'Return to the main menu to open a file, capture the DAW track, create a blank score, or resume current work.',
   rollZoom:
     'How tall the piano-roll rows are. The wheel over the keyboard on the left does the same, a trackpad pinch does it anywhere on the roll, and a double-click on the keyboard fits every note in the take on screen at once.',
+  rollTimeZoom:
+    'How much of the recording the piano roll shows across its width. The wheel over the time ' +
+    'ruler at the top of the roll does the same. With Align on, the sheet music magnifies to ' +
+    'match, so both views keep showing the same stretch of the take.',
+  rollTimeFit:
+    'Show the whole recording across the roll again, from the first sound to the last.',
   rollFit:
     'Zoom the piano roll out until every note in the take fits. Useful once, to see the shape of ' +
     'the whole thing — but it is not how the roll opens any more, because fitting a wide-ranging ' +

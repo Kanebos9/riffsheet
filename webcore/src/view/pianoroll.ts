@@ -184,6 +184,7 @@ import type * as alphaTab from '@coderline/alphatab';
 import { scoreOriginSec, type RiffScore } from '../pipeline';
 import { soundingMidi, type ScoreIndex } from '../score/fromPipeline';
 import {
+  ALIGN_GUTTER_PX,
   barGrid,
   clampWindow,
   fracToSec,
@@ -220,6 +221,36 @@ export interface PianoRollNote {
    * drag than a drag that edits the wrong note.
    */
   noteId: string | null;
+  /**
+   * 0..1, and only ever set by `setPerformanceNotes`. Nothing paints it yet.
+   *
+   * Carried rather than dropped at the door because the caller measured it and this is the
+   * record of what was played; a later "loud notes darker" pass reads it from here and needs no
+   * second channel from the app to do it.
+   */
+  velocity?: number;
+}
+
+/**
+ * ONE NOTE AS IT WAS PLAYED — the input to `setPerformanceNotes`.
+ *
+ * Times are RECORDING seconds (what the microphone heard), not the written seconds every other
+ * note in this file carries. That is the entire point of the mode: a performance roll shows the
+ * take, so a note rushed by 40 ms is drawn 40 ms early, which is a thing you cannot see on a
+ * roll derived from the engraving because the engraving has already quantized it away.
+ *
+ * `id` is whatever the caller identifies a note by, and it is the ONLY thing that ties a
+ * rectangle back to the caller's world: edits and hovers come back naming it. Numbers are
+ * allowed because a detector's note index usually is one; they are stringified once, here, so
+ * that everything downstream keeps the single `string` id it already has.
+ */
+export interface PerformanceNote {
+  id: string | number;
+  midi: number;
+  startSec: number;
+  endSec: number;
+  /** 0..1 if known. Optional, and currently carried rather than drawn — see `PianoRollNote`. */
+  velocity?: number;
 }
 
 /**
@@ -477,8 +508,13 @@ export interface PianoRollOptions {
  * Exported because `ui/waveform.ts` reserves the identical column — see invariant 1 — and
  * because alphaTab is given a matching left padding, so at scroll 0 nothing is engraved
  * underneath it either.
+ *
+ * Defined as `ALIGN_GUTTER_PX` rather than as a second 34: Align's arithmetic in `timeAxis.ts`
+ * takes this column off both viewports before it compares them, so the two numbers are not
+ * merely equal, they are the same fact. `timeAxis.ts` is pure and must not import this file,
+ * hence the dependency runs this way round.
  */
-export const TIMELINE_GUTTER_PX = 34;
+export const TIMELINE_GUTTER_PX = ALIGN_GUTTER_PX;
 
 /**
  * What a fresh install gets.
@@ -946,7 +982,16 @@ export class PianoRoll {
   /** Kept only to derive the origin and the tick->second mapping from. */
   private score: RiffScore | null = null;
   private live: PianoRollLiveModel | null = null;
-  private source: 'model' | 'ir' = 'ir';
+  /**
+   * The performed take, when the app has one. Null = derive the rectangles from the score.
+   *
+   * Held in the caller's RECORDING seconds rather than converted once, because the conversion
+   * subtracts `originSec` and the origin moves — dragging the bar-1 marker on the waveform is a
+   * statement about where the SCORE starts, not about when anything was played. Converting on
+   * every rebuild keeps that from silently rewriting the performance.
+   */
+  private performance: PerformanceNote[] | null = null;
+  private source: 'model' | 'ir' | 'performance' = 'ir';
   /** Worst disagreement between the two walks at load, in seconds. Null = not comparable. */
   private irDeltaSec: number | null = null;
   private irNotes = 0;
@@ -1137,6 +1182,11 @@ export class PianoRoll {
     this.barOneSec = sec;
     // The bar grid is expressed on the recording's clock, so moving bar 1 moves every line.
     this.rebuildBars();
+    // Performed rectangles are stored on the recording's clock and converted through the origin,
+    // so they have to be re-derived here — otherwise moving bar 1 would slide the bar lines out
+    // from under a performance that stayed exactly where it was. Score-derived rectangles are
+    // already written-clock and must NOT be rebuilt: for them, moving the origin is the point.
+    if (this.performance) this.rebuildNotes();
     this.draw();
   }
 
@@ -1149,6 +1199,44 @@ export class PianoRoll {
   setLiveModel(live: PianoRollLiveModel | null): void {
     this.live = live;
     if (this.score) this.rebuildNotes();
+    this.draw();
+  }
+
+  /**
+   * DRAW THE TAKE, not the print (#36).
+   *
+   * Hand over the notes as they were PLAYED and every rectangle comes from them and from
+   * nothing else — the score walk is not consulted at all while this is set. Pass `null` (or
+   * never call it) and the roll is exactly what it was: rectangles derived from the score, live
+   * model first and the IR behind it.
+   *
+   * WHY IT REPLACES RATHER THAN OVERLAYS. Two sets of rectangles on one pitch row is two answers
+   * to "which note is under my pointer", and every gesture in this file starts with that
+   * question. A performance roll and a score roll are two PICTURES of the same music; the app
+   * switches between them, and the one on screen is the one you can edit.
+   *
+   * WHAT IS UNCHANGED, deliberately:
+   *   - gestures. A drag still emits today's `RollEdit`, still naming ids — the ones handed in
+   *     here, stringified. The app maps them back to its own notes; this file does not care what
+   *     they mean. Deltas are unaffected by the clock change because a delta is a difference and
+   *     the two clocks differ by a constant.
+   *   - hover, both ways. `onNoteHover` reports these ids and `setHover` takes them, so the
+   *     sheet's cross-highlight works against a performance the same way it does against a score.
+   *   - the time window, the grid and the bar ruler, which are already on the recording's clock.
+   *
+   * The array is copied, so a caller may keep mutating theirs.
+   */
+  setPerformanceNotes(notes: ReadonlyArray<PerformanceNote> | null): void {
+    this.performance = notes ? notes.map((note) => ({ ...note })) : null;
+    if (this.performance) {
+      // A performance can arrive before any audio duration has been measured, and an axis with
+      // no length puts every rectangle in the same column. The last note played is a true lower
+      // bound on how long the take is, so use it — but only as a floor, never to shorten a
+      // duration the app has already measured off the actual recording.
+      const end = this.performance.reduce((max, note) => Math.max(max, note.endSec), 0);
+      if (end > this.durationSec) this.durationSec = end;
+    }
+    this.rebuildNotes();
     this.draw();
   }
 
@@ -1391,7 +1479,9 @@ export class PianoRoll {
   refresh(): void {
     this.pending = null;
     this.pendingIds = new Set();
-    if (!this.score) {
+    // A performance is rebuildable without a score — it IS the notes — so it counts as
+    // something to refresh.
+    if (!this.score && !this.performance) {
       this.draw();
       return;
     }
@@ -1402,6 +1492,9 @@ export class PianoRoll {
   clear(): void {
     this.score = null;
     this.live = null;
+    // A performance belongs to one take. Kept across `clear()` it would be drawn over the next
+    // one, at seconds that mean nothing there.
+    this.performance = null;
     this.notes = [];
     this.bars = [];
     this.source = 'ir';
@@ -1429,6 +1522,29 @@ export class PianoRoll {
   }
 
   private rebuildNotes(): void {
+    // #36: a performance replaces the walk outright. First, and before the score is even
+    // looked at, so that the rectangles cannot be a mixture of the two.
+    if (this.performance) {
+      this.notes = sortByStart(
+        this.performance.map((note) => ({
+          startSec: note.startSec - this.originSec,
+          endSec: Math.max(note.startSec, note.endSec) - this.originSec,
+          midi: note.midi,
+          noteId: String(note.id),
+          velocity: note.velocity
+        }))
+      );
+      this.source = 'performance';
+      // The IR cross-check is a comparison between two walks of the same score. There is only
+      // one walk here and it is not of the score, so there is no delta to report — null rather
+      // than a stale number from before the performance arrived.
+      this.irDeltaSec = null;
+      this.irNotes = this.score ? pianoRollNotes(this.score).length : 0;
+      this.measureContentRange();
+      if (this.fitLocked) this.applyFit();
+      return;
+    }
+
     const score = this.score;
     if (!score) return;
 
@@ -3328,8 +3444,11 @@ export class PianoRoll {
     /** Where that rect is drawn. An edit that changes a pitch MUST move this. */
     firstNoteY: number | null;
     firstNoteX: number | null;
-    /** 'model' once the sheet exists; 'ir' only before it does. */
-    source: 'model' | 'ir';
+    /**
+     * 'model' once the sheet exists; 'ir' only before it does; 'performance' whenever
+     * `setPerformanceNotes` is holding a take, in which case neither walk was consulted.
+     */
+    source: 'model' | 'ir' | 'performance';
     /** Worst |Δstart| between the live walk and the IR walk. Must be ~0 before any edit. */
     irDeltaSec: number | null;
     irNotes: number;
@@ -3572,14 +3691,19 @@ export class PianoRoll {
    * can recomputing the position from the same map the roll drew with — that would be
    * comparing a number with itself.
    *
-   * Canvas coordinates, so a caller can dispatch a pointer event straight at one.
+   * Canvas coordinates, so a caller can dispatch a pointer event straight at one — hence the
+   * `rulerH` on the y. `this.rects` is in PLOT space, which is what `draw()` works in after
+   * its `translate(0, rulerH)` and what `localPoint()` hands the hit test; a y taken straight
+   * from there lands one ruler-height too high, which since the time axis grew a ruler (#29)
+   * meant every synthetic click aimed at a rectangle missed it.
    */
   paintedRects(): Array<{ noteId: string | null; midi: number; x: number; y: number; w: number; h: number }> {
+    const rulerH = this.rulerH;
     return this.rects.map((r) => ({
       noteId: r.note.noteId,
       midi: r.midi,
       x: Number(r.x.toFixed(2)),
-      y: Number(r.y.toFixed(2)),
+      y: Number((r.y + rulerH).toFixed(2)),
       w: Number(r.w.toFixed(2)),
       h: Number(r.h.toFixed(2))
     }));
@@ -3601,7 +3725,9 @@ export class PianoRoll {
       if (busy.has(midi)) continue;
       const y = yFor(midi) + rowH / 2;
       if (y < 1 || y > ph - 1) continue;
-      return Number(y.toFixed(2));
+      // Inside the plot is what the bounds check above means; CANVAS is what the answer is in,
+      // for the same reason as `paintedRects()` — the caller turns it straight into a clientY.
+      return Number((y + this.rulerH).toFixed(2));
     }
     return null;
   }

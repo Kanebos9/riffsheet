@@ -150,6 +150,79 @@ describe('ROBUSTNESS — degenerate inputs must produce a valid score, not an ex
   });
 
   /**
+   * THE TWO DEGENERATE GRAND-STAFF SHAPES.
+   *
+   * A grand staff is emitted by projecting the single voice onto two staves and then walking the
+   * cursor back with a <backup>. Both halves of that are only exercised when both staves have
+   * material, so the interesting cases are the ones where one of them has none: the projection
+   * turns every beat into a rest, and the backup still has to be the distance staff 1 ACTUALLY
+   * advanced. Get it wrong and `assertMeasureLength` throws — or worse, it does not, and the file
+   * renders voice 2 in the wrong horizontal position while staying schema-valid. That is the
+   * failure §G.4 exists to catch, so the balance check is the real assertion in both tests.
+   */
+  it('a grand staff whose upper staff is empty still balances both cursors', () => {
+    const built = buildScore(
+      {
+        notes: [40, 43, 45, 47].map((midi, i) => ({
+          id: `low${i}`,
+          startSec: i * 0.5,
+          endSec: i * 0.5 + 0.45,
+          midi
+        })),
+        ...grid(2)
+      },
+      // Forced, not inferred: every pitch is below middle C, so nothing lands on staff 1.
+      settings({ instrument: 'staff', tuningMidi: [], clefMode: 'grand' })
+    );
+    expect(built.ir.grandStaff).toBe(true);
+
+    const data = built.toAlphaTabModelData();
+    expect(data.tracks[0].staves).toHaveLength(2);
+    const notesOn = (staff: number): unknown[] =>
+      data.tracks[0].staves[staff].bars.flatMap((bar) =>
+        bar.voices.flatMap((voice) => voice.beats.flatMap((beat) => beat.notes))
+      );
+    expect(notesOn(0)).toHaveLength(0);
+    expect(notesOn(1).length).toBeGreaterThan(0);
+    // The empty staff keeps its bars and its clef rather than collapsing away.
+    expect(data.tracks[0].staves[0].bars).toHaveLength(built.ir.bars.length);
+    expect(data.tracks[0].staves.map((staff) => staff.bars[0].clef)).toEqual(['G2', 'F4']);
+
+    const xml = built.toMusicXML();
+    expect(xml).toContain('<staves>2</staves>');
+    const read = readMusicXml(xml);
+    read.measureLengths.forEach((m, i) => expect(m.length).toBe(built.ir.bars[i].durTicks));
+    // Staff 1 is present and entirely silent; staff 2 carries every pitch.
+    expect(read.notes.filter((n) => n.staff === 1 && !n.isRest)).toHaveLength(0);
+    expect(read.notes.filter((n) => n.staff === 2 && !n.isRest).length).toBeGreaterThan(0);
+  });
+
+  it('an empty document on a grand staff emits both staves as full-bar rests', () => {
+    const built = buildScore(
+      { notes: [], blankBars: 2 },
+      settings({ instrument: 'staff', tuningMidi: [], clefMode: 'grand' })
+    );
+    expect(built.ir.bars.filter((bar) => !bar.implicit)).toHaveLength(2);
+    expect(built.ir.stats.noteGlyphs).toBe(0);
+
+    const data = built.toAlphaTabModelData();
+    for (const staff of data.tracks[0].staves) {
+      expect(staff.bars).toHaveLength(built.ir.bars.length);
+      for (const bar of staff.bars) {
+        for (const voice of bar.voices) for (const beat of voice.beats) expect(beat.isEmpty).toBe(true);
+      }
+    }
+
+    const xml = built.toMusicXML();
+    const read = readMusicXml(xml);
+    read.measureLengths.forEach((m, i) => expect(m.length).toBe(built.ir.bars[i].durTicks));
+    expect(read.notes.filter((n) => !n.isRest)).toHaveLength(0);
+    expect(read.notes.length).toBeGreaterThan(0);
+    // A blank document is still a valid MIDI file.
+    expect(String.fromCharCode(...built.toMidi(false).slice(0, 4))).toBe('MThd');
+  });
+
+  /**
    * THE ACCEPTANCE CASE FOR THE DELETED REST KILLER.
    *
    * The complaint that killed it: a realistic take came back with long notes that ran over their

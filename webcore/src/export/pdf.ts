@@ -22,6 +22,7 @@
 import * as alphaTab from '@coderline/alphatab';
 import { createPrintSettings, FONT_DIRECTORY } from '../view/atSettings';
 import { stringLettersFromBounds, tuningLowToHighFromScore, type StringLetter } from '../view/stringLetters';
+import { stripRendererCredit, stripRendererCreditFromMarkup } from '../view/watermark';
 import { buildAlphaTabScore } from '../score/fromPipeline';
 import { A4_HEIGHT_PT, A4_WIDTH_PT, PX_PER_PT, canvasesToPdf, mmToPx } from './pdfWriter';
 import type { RiffScore } from '../pipeline';
@@ -94,6 +95,13 @@ async function withPrintRender<T>(
       api.renderScore(result.score, [0]);
     });
 
+    // #40: alphaTab's "rendered by alphaTab" credit, out of the PRINTED sheet as well as the
+    // screen one. Removed BEFORE the rectangles below are measured, because the credit is
+    // centred over the score and would otherwise widen the box a page is laid out against —
+    // and before `inlineTextStyles`, so there is one fewer <text> to walk. See view/watermark.ts
+    // for why this is a DOM removal and not a setting.
+    stripRendererCredit(host);
+
     const svgs = Array.from(host.querySelectorAll('svg'));
     for (const svg of svgs) inlineTextStyles(svg);
 
@@ -120,7 +128,12 @@ async function withPrintRender<T>(
  * Write each `<text>`'s computed font onto the element itself.
  *
  * THIS IS WHAT MAKES THE NOTEHEADS APPEAR. alphaTab does not put the music font on the
- * glyphs it emits — the SVG it produces contains the string "alphaTab" exactly zero times.
+ * glyphs it emits — the SVG it produces carries no `font-family` of its own anywhere.
+ * (It did once say "the SVG contains the string 'alphaTab' exactly zero times", which was
+ * never quite true and is now plainly false: the renderer emits a "rendered by alphaTab"
+ * credit line as a `<text>` node. `stripRendererCredit` above removes it before we get here,
+ * so by this point the claim holds again — but the reason it holds is that we deleted it, not
+ * that alphaTab never wrote it. See view/watermark.ts.)
  * The family and size arrive by inheritance from a rule in the *document's* stylesheet onto
  * `<g class="at">`. Lift that SVG out of the document (serialise it into a print file, clone
  * it into an `<img>`) and the rule does not come with it, so every notehead, clef and rest
@@ -153,7 +166,12 @@ function inlineTextStyles(svg: SVGSVGElement): void {
  */
 export async function buildPrintDocument(score: RiffScore, options: PrintOptions = {}): Promise<string> {
   return withPrintRender(score, async (elements) => {
-    const svgs = elements.map((svg) => svg.outerHTML).join('\n');
+    // The DOM strip in `withPrintRender` has already run, so this normally changes nothing and
+    // returns the same string. It is here because THIS is the document that leaves the app —
+    // saved, mailed, printed — and it is the last point at which the credit could be caught if
+    // a future alphaTab emitted one after the strip (from a re-layout on resize, say). Cheap:
+    // one `includes` on markup we have just built.
+    const svgs = elements.map((svg) => stripRendererCreditFromMarkup(svg.outerHTML)).join('\n');
     const fontCss = await bravuraFontFace();
 
     return `<!doctype html>

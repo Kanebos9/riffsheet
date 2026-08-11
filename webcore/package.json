@@ -15,7 +15,10 @@
     "test:grand-staff": "node scripts/run-ts-tests.mjs scripts/grand-staff-test.ts",
     "test:sampler-loop": "node scripts/run-ts-tests.mjs scripts/sampler-loop-test.ts",
     "test:transport-clock": "node scripts/run-ts-tests.mjs scripts/transport-clock-test.ts",
-    "test:regressions": "node scripts/run-ts-tests.mjs scripts/midi-import-test.ts scripts/grand-staff-test.ts scripts/sampler-loop-test.ts scripts/transport-clock-test.ts",
+    "test:roll-snap": "node scripts/run-ts-tests.mjs scripts/roll-snap-test.ts",
+    "test:riffsheet-doc": "node scripts/run-ts-tests.mjs scripts/riffsheet-doc-test.ts",
+    "test:view-units": "node scripts/run-ts-tests.mjs scripts/view-units-test.ts",
+    "test:regressions": "node scripts/run-ts-tests.mjs scripts/midi-import-test.ts scripts/grand-staff-test.ts scripts/sampler-loop-test.ts scripts/transport-clock-test.ts scripts/roll-snap-test.ts scripts/riffsheet-doc-test.ts scripts/view-units-test.ts",
     "build:debug": "RIFFSHEET_SOURCEMAP=1 vite build"
   },
   "dependencies": {

@@ -148,6 +148,42 @@ export function buildAlphaTabScore(
     masterBar.tempoAutomations.push(automation);
   }
 
+  /**
+   * THE FRETBOARD THIS SCORE IS ABOUT — chosen, not left to whichever staff happens to be last.
+   *
+   * `index.stringCount`, `index.tuningLowToHigh` and `index.capo` are ONE answer for the whole
+   * score: `edit/actions.ts` reaches for them to place a fret when a note is dragged, and
+   * `view/stringLetters.ts` draws them down the left of the tab. They used to be assigned inside
+   * the staff loop below, so the last staff of the last track overwrote every earlier one.
+   *
+   * For the shapes this app builds itself that was right by accident — the pipeline emits the tab
+   * staff last (`pipeline/src/alphatab.ts`), including on a grand staff, where the two notation
+   * staves carry an empty tuning. It is wrong the moment a score has more than one track, which
+   * a symbolic import routinely does: a guitar track followed by a piano track left the index
+   * holding the piano's empty tuning, and with no tuning `assignFret` declines to move anything,
+   * so dragging a note on the tab did nothing at all.
+   *
+   * So the tab staff is picked by what it IS. First a staff that shows tablature and has strings
+   * to show; failing that any staff with a tuning (a score that carries a fretboard without
+   * printing one still edits like a fretted instrument); failing that the first staff there is,
+   * which is where a capo with no strings under it comes from and keeps the old answer for every
+   * single-track shape.
+   *
+   * Nothing here touches the MODEL: each staff is still built from its own `staffData` below,
+   * and no note's string, fret or pitch is derived from this choice. Playback dumps either side
+   * of this change are identical for every fixture, which is the condition it was made under.
+   */
+  const allStaves = data.tracks.flatMap((trackData) => trackData.staves);
+  const tabStaff =
+    allStaves.find((staffData) => staffData.showTablature && staffData.tuningsHighToLow.length > 0) ??
+    allStaves.find((staffData) => staffData.tuningsHighToLow.length > 0) ??
+    allStaves[0];
+  if (tabStaff) {
+    index.stringCount = tabStaff.tuningsHighToLow.length;
+    index.tuningLowToHigh = [...tabStaff.tuningsHighToLow].sort((a, b) => a - b);
+    index.capo = tabStaff.capo;
+  }
+
   for (const trackData of data.tracks) {
     const track = new alphaTab.model.Track();
     track.name = trackData.name;
@@ -164,14 +200,11 @@ export function buildAlphaTabScore(
       staff.showTablature = staffData.showTablature;
       staff.stringTuning.tunings = [...staffData.tuningsHighToLow]; // already alphaTab's order
       staff.capo = staffData.capo;
-      const stringCount = staffData.tuningsHighToLow.length;
       // Bass and guitar are conventionally written an octave above sounding pitch. The
       // universal staff is concert pitch: applying this to an imported piano/violin/etc.
       // would move every note by an octave merely because an old bass tuning was remembered.
       staff.displayTranspositionPitch = staffData.displayTranspositionPitch;
-      index.stringCount = stringCount;
-      index.tuningLowToHigh = [...staffData.tuningsHighToLow].sort((a, b) => a - b);
-      index.capo = staffData.capo;
+      // (index.stringCount / tuningLowToHigh / capo are NOT set here — see `tabStaff` above.)
 
       for (const barData of staffData.bars) {
         const bar = new alphaTab.model.Bar();

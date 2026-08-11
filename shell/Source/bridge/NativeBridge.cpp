@@ -440,6 +440,7 @@ juce::WebBrowserComponent::Options NativeBridge::configure (juce::WebBrowserComp
         .withNativeFunction ("pickAudioFile",     bind (&NativeBridge::fnPickAudioFile))
         .withNativeFunction ("pickInputFile",     bind (&NativeBridge::fnPickInputFile))
         .withNativeFunction ("loadAudioPath",     bind (&NativeBridge::fnLoadAudioPath))
+        .withNativeFunction ("loadAudioBytes",    bind (&NativeBridge::fnLoadAudioBytes))
         .withNativeFunction ("authorizeRecentPaths", bind (&NativeBridge::fnAuthorizeRecentPaths))
         .withNativeFunction ("transcribe",        bind (&NativeBridge::fnTranscribe))
         // The beat tracker on its own, for the engine that runs in the page and
@@ -772,6 +773,42 @@ void NativeBridge::fnLoadAudioPath (const juce::Array<juce::var>& args, Completi
     const auto forceOwnedCopy = ! file.isAChildOf (SystemProbe::takesDirectory());
     decodeAndReply (file, optionalRate (args, 1), std::move (completion),
                     false, {}, forceOwnedCopy);
+}
+
+/**
+    The same take, from bytes instead of a path.
+
+    WHY IT EXISTS. A .riffsheet document carries its recording inside it, so a
+    document that travelled to another machine - or whose original file simply
+    moved - can still show the waveform, play the Original side and drive the
+    tuner, all from bytes the page already holds. What it could NOT do is
+    transcribe: fnTranscribe needs a PcmStore token, and until now the only way
+    to mint one was loadAudioPath, which by definition needs the original file
+    to still be where the document says it is. "Listen again" therefore died
+    with the file path even though the audio itself was right there.
+
+    WHY IT IS NOT A NEW HOLE. loadAudioPath is gated because a PATH is a
+    reference to something this process can reach and the page cannot - a shared
+    project blob naming /etc/anything is the threat that put the gate there.
+    Bytes are the opposite: the page must already possess every one of them, so
+    it can only ever get back audio it could already read. Nothing on disk is
+    named, read or authorized here; the bytes are staged under a random name in
+    the system temp directory and decoded exactly like a dropped file.
+*/
+void NativeBridge::fnLoadAudioBytes (const juce::Array<juce::var>& args, Completion completion)
+{
+    const auto name   = stringArg (args, 0);
+    const auto base64 = stringArg (args, 1);
+
+    if (base64.isEmpty())
+    {
+        completion (makeError ("loadAudioBytes needs (name, base64Contents)"));
+        return;
+    }
+
+    stageBytesAndReply (name.isNotEmpty() ? name : juce::String ("recording"),
+                        base64, optionalRate (args, 2), std::move (completion),
+                        "embedded");
 }
 
 /**
@@ -3271,29 +3308,36 @@ void NativeBridge::fnImportDroppedFile (const juce::Array<juce::var>& args, Comp
         return;
     }
 
+    stageBytesAndReply (name, base64, optionalRate (args, 2), std::move (completion), "drop");
+}
+
+void NativeBridge::stageBytesAndReply (const juce::String& displayName, const juce::String& base64,
+                                       double targetRate, Completion completion,
+                                       const juce::String& stageTag)
+{
     juce::MemoryOutputStream decoded;
 
-    if (! juce::Base64::convertFromBase64 (decoded, base64))
+    if (! juce::Base64::convertFromBase64 (decoded, base64) || decoded.getDataSize() == 0)
     {
-        completion (makeError ("the dropped file's contents were not valid base64"));
+        completion (makeError ("the audio contents were not valid base64"));
         return;
     }
 
     const auto temp = juce::File::getSpecialLocation (juce::File::tempDirectory)
-                          .getChildFile ("riffsheet-drop-"
+                          .getChildFile ("riffsheet-" + stageTag + "-"
                                          + juce::String::toHexString (juce::Random::getSystemRandom().nextInt64())
-                                         + "-" + juce::File::createLegalFileName (name));
+                                         + "-" + juce::File::createLegalFileName (displayName));
 
     if (! temp.replaceWithData (decoded.getData(), decoded.getDataSize()))
     {
-        completion (makeError ("could not stage the dropped file at " + temp.getFullPathName()));
+        completion (makeError ("could not stage the audio at " + temp.getFullPathName()));
         return;
     }
 
     // The original name is carried separately from the random staging name.
     // decodeAndReply promotes the decoded audio to durable app-support storage
     // before returning, while the entry cleans up this temporary input file.
-    decodeAndReply (temp, optionalRate (args, 2), std::move (completion), true, name);
+    decodeAndReply (temp, targetRate, std::move (completion), true, displayName);
 }
 
 void NativeBridge::fnOmrStatus (const juce::Array<juce::var>&, Completion completion)

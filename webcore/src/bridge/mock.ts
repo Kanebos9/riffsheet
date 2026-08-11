@@ -955,6 +955,22 @@ export function createMockBridge(options: MockOptions = {}): NativeBridge {
     },
 
     /**
+     * The same, from bytes the page already has — the route a travelled `.riffsheet` takes.
+     *
+     * The shell stages the bytes and decodes them; the mock just adopts them under a
+     * synthetic path, so a later `loadAudioPath` for the same take answers too. Kept here
+     * rather than left `undefined` so "Listen again" on an opened document is exercisable in
+     * a browser, which is the whole reason the mock has `loadAudioPath` at all.
+     */
+    async loadAudioBytes(name: string, bytes: Uint8Array): Promise<AudioFileRef | null> {
+      if (bytes.byteLength === 0) return null;
+      const copy = bytes.slice().buffer as ArrayBuffer;
+      const path = `mock-embedded/${name}`;
+      audioBytes.set(path, copy);
+      return { path, name, token: `mock:${path}`, bytes: copy.slice(0) };
+    },
+
+    /**
      * Abandon a transcription that is running. Nothing to do when none is.
      *
      * `{ cancelled: n }` is the shell's shape — how many jobs this actually stopped — and the

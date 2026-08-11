@@ -34,11 +34,13 @@ import {
   type TranscribeResult
 } from '../bridge';
 import { buildRiffScore, scoreOriginSec, type InputNote, type RiffScore } from '@pipeline';
-import { TriView, type NoteHit } from '../view/triview';
+import { TriView, MIN_ZOOM, MAX_ZOOM, type NoteHit } from '../view/triview';
+import { coupledSheetScale } from '../view/timeAxis';
 import {
   PianoRoll,
   rollEditNoteIds,
   setTransientReserve,
+  timeWindowAnchors,
   type RollVerticalView,
   TIMELINE_GUTTER_PX,
   type PianoRollLiveModel,
@@ -100,14 +102,25 @@ import {
   encodeSource,
   hasRestorableTake,
   isRiffsheetFile,
+  audioMimeForName,
+  encodeWavPcm16,
   portableAudioRef,
   readRiffsheetDocument,
+  stagingNameForAudio,
   RIFFSHEET_DOCUMENT_VERSION,
   writeRiffsheetDocument,
+  type EmbeddedAudio,
   type PersistedAudio,
   type PersistedSession,
   type RiffsheetDocument
 } from '../app/persist';
+// The snap layer's pure half. `App.performanceFeed()` is the only caller — see the tap point.
+import {
+  mergeEditedOntoRaw,
+  rollSnapUnitSec,
+  snapPerformanceToGrid,
+  type RollPerformanceNote
+} from '../app/snap';
 import {
   ChangePitchAction,
   ChangeStringAction,
@@ -275,6 +288,20 @@ class App {
   private audioRef: PersistedAudio | null = null;
   /** Exact original playback for symbolic imports; used by the As played MIDI export. */
   private sourceMidi: Uint8Array | null = null;
+  /**
+   * The imported file's OWN bytes, kept so a `.riffsheet` can contain the recording (#34).
+   *
+   * Only ever set from bytes the app was actually handed — a browser drop, a picker, a document
+   * that already had audio inside it. A native open gives a path and a token instead, and this
+   * stays null there; `embeddedAudio()` falls back to encoding the decoded samples, so the
+   * document is still self-contained, just re-encoded rather than copied.
+   *
+   * Held for the life of the take. That is a real cost — a 40 MB import is 40 MB resident — and
+   * it is the price of being able to write the file at any moment without going back to disk for
+   * something the user may since have moved.
+   */
+  private audioBytes: Uint8Array | null = null;
+  private audioMime = '';
   /** True while rehydrating, so the restore cannot save over the blob it is reading. */
   private restoring = false;
   private restored = false;
@@ -989,6 +1016,7 @@ class App {
     this.transport.setOriginalAvailable(false, 0);
     this.setPcm(null, 0);
     this.audioRef = null;
+    this.forgetAudioBytes();
     this.sourceMidi = null;
     this.selection = null;
     this.undoStack.clear();
@@ -1115,6 +1143,7 @@ class App {
       detected: { notes: [] }
     });
     this.audioRef = { kind: 'midi', name: title, path: '', durationSec };
+    this.forgetAudioBytes();
     this.setPcm(null, 0);
     await this.bridge.unloadOriginal?.().catch(() => undefined);
     await this.bridge.pcmRetain?.(null).catch(() => undefined);
@@ -1131,6 +1160,114 @@ class App {
    * REAL thing. A probe that assembled its own object would keep passing after this one
    * stopped carrying a field.
    */
+  /**
+   * Put a document's embedded recording back exactly as an import would have left it.
+   *
+   * Returns null — not a failure — when there is nothing embedded or it will not decode, which
+   * is the signal for the caller to try the v1 path instead. A document whose audio is corrupt
+   * should open as a document that has lost its audio, never as a document that will not open.
+   *
+   * WHAT THIS DOES NOT RESTORE, said plainly: a native TOKEN. Everything that reads the
+   * SAMPLES — the waveform, the Original side of the fader, the tuner — works from here with
+   * no file at all, which is the part that was lost when a `.riffsheet` travelled. Anything
+   * that runs in the SHELL still needs a token, which is minted lazily and only when asked
+   * for: `takeFromEmbeddedAudio()` hands these same bytes to `loadAudioBytes` the first time
+   * "Listen again" is pressed without a live token or a findable path. Doing it here instead
+   * would re-stage and re-decode the whole recording on every open, for a button most opens
+   * never press.
+   */
+  private async restoreEmbeddedAudio(
+    embedded: EmbeddedAudio | null | undefined,
+    durationSec: number
+  ): Promise<{ available: boolean; message?: string } | null> {
+    if (!embedded) return null;
+    try {
+      const bytes = base64ToBytes(embedded.bytes);
+      if (bytes.byteLength === 0) return null;
+      const name = embedded.name || this.audioRef?.name || 'recording';
+      const ref: AudioFileRef = {
+        path: this.audioRef?.path ?? '',
+        name,
+        bytes: bytes.buffer as ArrayBuffer,
+        durationSec: embedded.durationSec || durationSec,
+        ...(embedded.sampleRate ? { sampleRate: embedded.sampleRate } : {})
+      };
+      const decoded = await this.toPcm(ref);
+      if (decoded.pcm.length === 0) return null;
+
+      this.rememberAudioBytes(bytes, name);
+      this.setPcm(decoded.pcm, decoded.sampleRate);
+      await this.bridge.loadOriginal(ref);
+      // The take is genuinely here, so it must not keep the 'midi' stub the caller assigned for
+      // a document with no `audio` block — that stub is what greys out everything audio-shaped.
+      this.audioRef = {
+        kind: 'file',
+        name,
+        path: this.audioRef?.path ?? '',
+        durationSec: decoded.durationSec || durationSec
+      };
+      this.originalRestoredBy = 'embedded';
+      return { available: true };
+    } catch (e) {
+      // Named rather than swallowed: "the document had audio and it did not work" is a
+      // different fault from "the document had none", and `sessionProbe` reports which.
+      this.originalRestoredBy = `embedded-failed: ${(e as Error).message}`;
+      return null;
+    }
+  }
+
+  private rememberAudioBytes(bytes: Uint8Array, name: string): void {
+    this.audioBytes = bytes.byteLength > 0 ? bytes : null;
+    this.audioMime = this.audioBytes ? audioMimeForName(name) : '';
+  }
+
+  private forgetAudioBytes(): void {
+    this.audioBytes = null;
+    this.audioMime = '';
+  }
+
+  /**
+   * The recording, ready to go inside the document (#34).
+   *
+   * Two sources, in order of honesty:
+   *
+   *  1. THE IMPORTED FILE ITSELF, byte for byte, whenever the app was given it. Copying beats
+   *     re-encoding for the obvious reason — a document that quietly downgrades somebody's flac
+   *     to 16-bit wav is a document that has lost something — and for a subtler one: the bytes
+   *     that come back out decode to exactly what the transcription was run against.
+   *  2. THE DECODED SAMPLES as WAV, for a recorded take (which never had a file of its own) and
+   *     for a native open (where the shell holds the path and the page holds only samples).
+   *
+   * Null for a MIDI or score import, where there is no recording, and null when neither source
+   * has anything — in both cases the document falls back to being a v1-style reference.
+   */
+  private embeddedAudio(): EmbeddedAudio | null {
+    if (this.audioRef?.kind === 'midi') return null;
+    const durationSec = this.runtime.get().source?.durationSec ?? 0;
+    const name = this.audioRef?.name ?? this.runtime.get().source?.name ?? 'audio';
+
+    if (this.audioBytes && this.audioBytes.byteLength > 0) {
+      return {
+        name,
+        mime: this.audioMime,
+        encoding: 'base64',
+        bytes: bytesToBase64(this.audioBytes),
+        durationSec
+      };
+    }
+    if (this.pcm && this.pcm.length > 0 && this.pcmRate > 0) {
+      return {
+        name: name.replace(/\.[^.]+$/, '') + '.wav',
+        mime: 'audio/wav',
+        encoding: 'base64',
+        bytes: bytesToBase64(encodeWavPcm16(this.pcm, this.pcmRate)),
+        durationSec,
+        sampleRate: this.pcmRate
+      };
+    }
+    return null;
+  }
+
   private buildRiffsheetDocument(): RiffsheetDocument | null {
     const source = this.runtime.get().source;
     if (!source) return null;
@@ -1150,7 +1287,10 @@ class App {
       // behind it: the fader has nothing on its Original side and Listen again is dead.
       // `portableAudioRef` drops the token and the sample URL, which name a decode inside the
       // process that wrote the file and are a lie anywhere else.
-      audio: portableAudioRef(this.audioRef)
+      audio: portableAudioRef(this.audioRef),
+      // …and the take itself, so the document does not merely NAME a recording it cannot reach.
+      // This is what makes the file portable in the sense users meant by the word.
+      audioData: this.embeddedAudio()
     };
   }
 
@@ -1190,9 +1330,14 @@ class App {
     await this.bridge.unloadOriginal?.().catch(() => undefined);
     await this.bridge.pcmRetain?.(null).catch(() => undefined);
 
-    // The same recovery the session restore uses: token first, then path. It answers rather
-    // than throws for every way this can fail, so a missing recording still opens the sheet.
-    const original = await this.reopenOriginal(this.audioRef);
+    // v2 FIRST: the recording is inside the file, so there is nothing to go looking for and
+    // nothing that can have moved since it was saved. A v1 document — and a v2 one whose
+    // embedded audio will not decode — falls straight through to the old token-then-path
+    // recovery, which is unchanged and still the only route for a document that never carried
+    // its take.
+    const original =
+      (await this.restoreEmbeddedAudio(document.audioData, source.durationSec)) ??
+      (await this.reopenOriginal(this.audioRef));
     this.transport.setOriginalAvailable(original.available, source.durationSec);
 
     this.goMain(source.name);
@@ -1421,6 +1566,7 @@ class App {
     // canonical score instead of quietly restoring the unshifted source MIDI.
     this.sourceMidi = reinterpretedOctave ? null : parsed.midi();
     this.audioRef = { kind: 'midi', name: displayName, path: '', durationSec: parsed.durationSec };
+    this.forgetAudioBytes();
     this.setPcm(null, 0);
     await this.bridge.unloadOriginal?.().catch(() => {});
     await this.bridge.pcmRetain?.(null).catch(() => {});
@@ -1617,6 +1763,7 @@ class App {
         // A MIDI import has no audio behind it, so there is nothing to reopen on a restore
         // — the notes ARE the take, and they are in the blob.
         this.audioRef = { kind: 'midi', name, path: input.path, durationSec: parsed.durationSec };
+        this.forgetAudioBytes();
         this.sourceMidi = new Uint8Array(input.bytes.slice(0));
         this.setPcm(null, 0);
         // Tell the shell to let the previous recording GO. Saying "there is no original" to our
@@ -1701,6 +1848,12 @@ class App {
       // makes "what is ACTUALLY here?" answerable over a stretch the transcriber heard nothing
       // in, which is the entire point of the feature.
       this.setPcm(pcm.pcm, pcm.sampleRate);
+      // The file's OWN bytes, when the app was handed them rather than a path, so a saved
+      // document can carry the recording verbatim — an mp3 stays an mp3. A native open has only
+      // a path here and leaves this null; `embeddedAudio()` re-encodes the decoded samples in
+      // that case, which is a bigger file but still a self-contained one.
+      if (!('pcm' in input) && input.bytes) this.rememberAudioBytes(new Uint8Array(input.bytes), name);
+      else this.forgetAudioBytes();
 
       await this.bridge.loadOriginal(input);
       // Declare the take we are using. The shell no longer owns decoded audio — it keeps a take
@@ -1844,16 +1997,60 @@ class App {
     if (!audio.token && audio.path && this.bridge.loadAudioPath) {
       ref = await this.bridge.loadAudioPath(audio.path).catch(() => null);
     }
+    // Neither handle answered, but a v2 document brought its recording WITH it — so the audio
+    // is here even though the path is not (the file moved, or this is not the machine it was
+    // made on). The path is still tried first because it is far cheaper than shipping tens of
+    // megabytes across the bridge to re-stage bytes the shell may already hold.
+    if (!ref?.token) ref = (await this.takeFromEmbeddedAudio()) ?? ref;
     if (!ref?.token) {
+      const haveBytes = (this.audioBytes?.byteLength ?? 0) > 0;
       this.toast(
         'danger',
         'Cannot listen again',
-        'The original recording is not available any more, so there is nothing to re-read. Drop the file in again.'
+        haveBytes && !this.bridge.loadAudioBytes
+          ? 'This document still holds its recording, but this version of the app can only re-read a take from its original file, which could not be found. Update the app, or drop the file in again.'
+          : 'The original recording is not available any more, so there is nothing to re-read. Drop the file in again.'
       );
       return;
     }
 
     await this.runTranscription(ref, source.durationSec);
+  }
+
+  /**
+   * Mint a native take from the recording the document brought with it.
+   *
+   * THE GAP THIS CLOSES. A v2 `.riffsheet` embeds its audio, and everything that reads only
+   * SAMPLES — waveform, the Original side of the fader, the tuner — has worked from those
+   * bytes since. Transcription could not: it runs in the shell, the shell addresses audio by
+   * token, and the only way to mint one was `loadAudioPath`. So "Listen again" still needed
+   * the original file to be where the document said it was, which is precisely the assumption
+   * embedding the audio existed to remove.
+   *
+   * Returns null — never throws — for all three ways this legitimately does not apply: no
+   * embedded bytes, a shell too old to have the function, or bytes the shell will not decode.
+   * The caller reports it; a failure here is a feature that is unavailable, not a broken app.
+   */
+  private async takeFromEmbeddedAudio(): Promise<AudioFileRef | null> {
+    const bytes = this.audioBytes;
+    // Feature-detected rather than assumed: the webview and the native shell are versioned
+    // separately and skew in both directions.
+    if (!bytes || bytes.byteLength === 0 || !this.bridge.loadAudioBytes) return null;
+
+    const name = stagingNameForAudio(
+      this.audioRef?.name || this.runtime.get().source?.name || 'recording',
+      this.audioMime
+    );
+    const ref = await this.bridge.loadAudioBytes(name, bytes).catch(() => null);
+    if (!ref?.token) return null;
+
+    // A brand-new token, declared exactly as `reopenOriginal` declares the one it gets back
+    // from a path reopen — otherwise nothing in the page holds the take we just made and it
+    // could be swept out from under the transcription that is about to read it.
+    await this.bridge.pcmRetain?.(ref.token).catch(() => {});
+    // Remember it, so pressing Listen again twice does not re-ship the whole recording.
+    if (this.audioRef) this.audioRef = { ...this.audioRef, token: ref.token, pcmUrl: ref.pcmUrl };
+    return ref;
   }
 
   /**
@@ -2448,6 +2645,7 @@ class App {
     this.editLog = [];
     this.editCursor = -1;
     this.audioRef = null;
+    this.forgetAudioBytes();
     this.sourceMidi = null;
     // A different take has a different pitch range; keeping the old scroll position would open
     // the roll looking at empty air.
@@ -2802,6 +3000,7 @@ class App {
         showNoteNames: s.showNoteNames,
         grid: s.grid,
         rollGrid: s.rollGrid,
+        rollSnapToGrid: s.rollSnapToGrid,
         tabMode: s.tabMode,
         tuningId: s.tuningId,
         customTuningMidi: [...s.customTuningMidi],
@@ -2888,6 +3087,90 @@ class App {
      * that makes sound — so this is not a model of playback, it is playback's own input. The
      * signature is put back before returning, so the probe leaves the take as it found it.
      */
+    /**
+     * THE CLAIM (#36): the Quantize menu writes the SHEET and touches nothing else.
+     *
+     * It is checked the only way a claim about "and nothing else" can be: by walking the menu
+     * through four values and dumping, at each one, the exact three things that could have
+     * moved — what the roll is drawing, what the synth would play, and what the sheet came out
+     * as. The first must not change, the third must, and the middle one is reported rather than
+     * asserted (see `scheduleByGrid` below).
+     *
+     * `feedIsRawObjectWhenSnapOff` is the playback-unchanged proof, and it is a stronger one
+     * than comparing two dumps: with Snap to grid off, `performanceFeed()` returns the take's
+     * own array BY IDENTITY, so the fourth argument reaching `scoreToSynthNotes` is not merely
+     * equal to what it was before this feature existed — it is the same object.
+     *
+     * Everything is put back before returning, so the probe leaves the take as it found it.
+     */
+    (window as unknown as Record<string, unknown>).__RIFFSHEET_SNAPFEED__ = () => {
+      try {
+        const source = this.runtime.get().source;
+        if (!source?.detected || !this.runtime.get().score) return { error: 'no take' };
+        const s = this.settings.get();
+        const original = { grid: s.grid, rollGrid: s.rollGrid, rollSnapToGrid: s.rollSnapToGrid };
+        const r6 = (n: number) => Number(n.toFixed(6));
+
+        const readOut = () => {
+          const score = this.runtime.get().score;
+          return {
+            feed: this.rollFeedNotes()
+              .map((n) => `${n.id}@${r6(n.startSec)}-${r6(n.endSec)}:${n.midi}`)
+              .join('|'),
+            schedule: score
+              ? this.synthNotesFor(score)
+                  .map((n) => `${r6(n.startSec)}-${r6(n.endSec)}:${n.midi}`)
+                  .join('|')
+              : '',
+            sheet: score ? `${score.ir.stats.noteGlyphs}/${score.ir.stats.restGlyphs}/${score.ir.bars.length}` : ''
+          };
+        };
+        const at = (next: Partial<AppSettings>) => {
+          this.settings.set(next);
+          this.rebuildNotation({ keepEdits: true });
+          return readOut();
+        };
+
+        // --- #36: four Quantize values over one performance ----------------------
+        this.settings.set({ rollSnapToGrid: false });
+        const grids = ['auto', 'quarter', 'free', 'thirtysecond'] as const;
+        const byGrid = grids.map((grid) => ({ grid, ...at({ grid }) }));
+        const feedIsRawObjectWhenSnapOff =
+          this.performanceFeed() === this.runtime.get().source?.detected?.notes;
+
+        // --- #41: the snap layer, switched on and off and re-sized ---------------
+        const snapOff = at({ grid: original.grid, rollGrid: 'eighth', rollSnapToGrid: false });
+        const snapOn = at({ rollSnapToGrid: true });
+        const snapFine = at({ rollGrid: 'sixteenth' });
+        const snapBack = at({ rollGrid: 'eighth' });
+        const snapOffAgain = at({ rollSnapToGrid: false });
+
+        this.settings.set(original);
+        this.rebuildNotation({ keepEdits: true });
+
+        return {
+          // THE ACCEPTANCE TEST: the roll's note list is byte-identical at every Quantize value.
+          feedStableAcrossGrids: new Set(byGrid.map((g) => g.feed)).size === 1,
+          // …and the sheet is not, or the line above would be true for the wrong reason.
+          sheetChangedAcrossGrids: new Set(byGrid.map((g) => g.sheet)).size > 1,
+          // REPORTED, NOT ASSERTED. Playback is assembled from the engraved score and retimed to
+          // the performance, so a Quantize value that engraves a different set of notes can
+          // legitimately schedule a different set — that was true before #36 and is unchanged by
+          // it. The invariant that IS asserted is the identity check below.
+          scheduleByGrid: byGrid.map((g) => ({ grid: g.grid, schedule: g.schedule })),
+          feedIsRawObjectWhenSnapOff,
+          byGrid,
+          snapMovesTheFeed: snapOn.feed !== snapOff.feed,
+          snapChangesPlayback: snapOn.schedule !== snapOff.schedule,
+          finerGridDiffers: snapFine.feed !== snapOn.feed,
+          resnapFromRaw: snapBack.feed === snapOn.feed,
+          snapRoundTripsToRaw: snapOffAgain.feed === snapOff.feed
+        };
+      } catch (e) {
+        return { error: (e as Error).message };
+      }
+    };
+
     (window as unknown as Record<string, unknown>).__RIFFSHEET_TEMPOUNIT__ = (
       numerator: number,
       denominator: number
@@ -5010,31 +5293,137 @@ class App {
     return this.runtime.get().source?.hostGrid ?? liveHostGrid(this.runtime.get().host);
   }
 
+  /**
+   * One performance in, one sheet out. Both the real rebuild and the snap's measuring pass go
+   * through here so they cannot disagree about anything except the notes they were handed.
+   */
+  private buildScoreFrom(source: SourceAudio, notes: InputNote[]): RiffScore {
+    return buildRiffScore(
+      {
+        notes,
+        beats: source.detected?.beats,
+        downbeats: source.detected?.downbeats,
+        audioDurationSec: source.durationSec,
+        blankBars: source.documentBars,
+        // The pipeline anchors bar 1 / beat 1 here and KEEPS anything before it as an
+        // anacrusis, so auto-trim and the user's marker are the same knob.
+        startOffsetSec: source.barOneSec,
+        hostGrid: this.effectiveHostGrid(),
+        title: source.name.replace(/\.[^.]+$/, '')
+      },
+      {
+        ...this.settings.get(),
+        tempoBpm: source.tempoBpm,
+        timeSignature: source.timeSignature,
+        keyFifths: source.keyFifths
+      }
+    );
+  }
+
+  /**
+   * What the snap measures against: a tempo and a written origin, taken from a build of the
+   * RAW take and never of a snapped one.
+   *
+   * This is the loop-breaker. The snap needs a tempo; the tempo comes out of a build; the build
+   * is fed by the snap. Feeding that build the snapped notes would let a snap change the tempo
+   * that decides the snap — different lines on the second pass, different notes on the third.
+   * Measuring the basis off the recording makes it a property of the PERFORMANCE, so it is the
+   * same number whether the switch is on or off and however many times the grid is changed.
+   *
+   * Memoised on the take rather than recomputed per call: `setPerformance` replaces the notes
+   * array on every edit, so reference identity is exactly the right invalidation signal, and
+   * the scalars beside it are the other inputs that can move a bar line.
+   */
+  private snapBasisNotes: InputNote[] | null = null;
+  private snapBasisKey = '';
+  private snapBasisValue: { tempoBpm: number; originSec: number } | null = null;
+
+  private snapBasis(source: SourceAudio, raw: InputNote[]): { tempoBpm: number; originSec: number } | null {
+    const hostGrid = this.effectiveHostGrid();
+    const key = JSON.stringify([
+      source.barOneSec,
+      source.durationSec,
+      source.tempoBpm ?? null,
+      source.timeSignature ?? null,
+      source.documentBars ?? null,
+      hostGrid ? [hostGrid.hostBpm, hostGrid.hostTimeSig, hostGrid.barStartsSec?.length ?? 0] : null,
+      source.detected?.beats?.length ?? 0
+    ]);
+    if (this.snapBasisNotes === raw && this.snapBasisKey === key && this.snapBasisValue) {
+      return this.snapBasisValue;
+    }
+    try {
+      const score = this.buildScoreFrom(source, raw);
+      this.snapBasisNotes = raw;
+      this.snapBasisKey = key;
+      this.snapBasisValue = { tempoBpm: score.tempoBpm, originSec: this.originSec(score) };
+      return this.snapBasisValue;
+    } catch {
+      // A take the pipeline cannot build is a take with no grid to snap to. The raw notes are
+      // still perfectly drawable, so this costs the snap and nothing else.
+      return null;
+    }
+  }
+
+  /**
+   * ============================ THE TAP POINT ============================
+   *
+   * The performance layer as everything downstream should see it: raw when Snap to grid is off,
+   * snapped when it is on. The roll draws this, the sheet is built from this, playback is
+   * retimed to this, and every export comes off the sheet — so there is exactly ONE arrow out
+   * of the performance and no way for the page to disagree with the file.
+   *
+   * TWO THINGS THIS DELIBERATELY IS NOT.
+   *
+   * It is not where the Quantize menu lives. Quantize (`AppSettings.grid`) is handed to the
+   * pipeline inside `buildScoreFrom` and reaches the SHEET only; it cannot touch this value, so
+   * changing it repaints the page and leaves every rectangle on the roll exactly where it was.
+   * That is #36, and the check is that this function does not read `settings.grid`.
+   *
+   * It is not a mutation. `source.detected.notes` stays the recording, whatever the switch says,
+   * which is what makes switching the snap off restore the take to the bit rather than to
+   * something that has been rounded and un-rounded.
+   */
+  private performanceFeed(): InputNote[] {
+    const source = this.runtime.get().source;
+    const raw = source?.detected?.notes ?? [];
+    const s = this.settings.get();
+    // The same reference when the switch is off, so nothing downstream can tell this function
+    // was added — see the playback-unchanged proof in `__RIFFSHEET_SNAPFEED__`.
+    if (!s.rollSnapToGrid || s.rollGrid === 'free' || raw.length === 0 || !source) return raw;
+    const basis = this.snapBasis(source, raw);
+    if (!basis) return raw;
+    const unitSec = rollSnapUnitSec(s.rollGrid, basis.tempoBpm);
+    return snapPerformanceToGrid(raw, unitSec, basis.originSec, basis.tempoBpm);
+  }
+
+  /**
+   * The same feed in the roll's own shape.
+   *
+   * A note with no id keeps its rectangle but gets a prefixed stand-in, so it is drawable and
+   * simply not selectable — the roll's own rule for an unresolvable id (see `PianoRollNote`).
+   * The prefix contains a colon, which neither the engine's `n<index>` nor the app's `add<N>`
+   * can produce, so a stand-in can never collide with a real identity.
+   */
+  private rollFeedNotes(): RollPerformanceNote[] {
+    return this.performanceFeed().map((n, i) => ({
+      id: n.id ?? `raw:${i}`,
+      midi: n.midi,
+      startSec: n.startSec,
+      endSec: n.endSec,
+      ...(n.velocity !== undefined ? { velocity: n.velocity } : {})
+    }));
+  }
+
   private rebuildNotation(options?: { keepEdits?: boolean }): void {
     const source = this.runtime.get().source;
     if (!source?.detected) return;
 
     try {
-      const score = buildRiffScore(
-        {
-          notes: source.detected.notes,
-          beats: source.detected.beats,
-          downbeats: source.detected.downbeats,
-          audioDurationSec: source.durationSec,
-          blankBars: source.documentBars,
-          // The pipeline anchors bar 1 / beat 1 here and KEEPS anything before it as an
-          // anacrusis, so auto-trim and the user's marker are the same knob.
-          startOffsetSec: source.barOneSec,
-          hostGrid: this.effectiveHostGrid(),
-          title: source.name.replace(/\.[^.]+$/, '')
-        },
-        {
-          ...this.settings.get(),
-          tempoBpm: source.tempoBpm,
-          timeSignature: source.timeSignature,
-          keyFifths: source.keyFifths
-        }
-      );
+      // THE FEED, not the raw notes. With the snap off these are the same array; with it on the
+      // sheet is written from what the roll is showing, which is the whole of "the sheet follows
+      // the roll" and the reason there is no second path from the performance to the pipeline.
+      const score = this.buildScoreFrom(source, this.performanceFeed());
       this.runtime.set({ score, selection: [] });
 
       // The undo stack keys on note ids, but the alphaTab objects those ids resolved to have
@@ -5223,7 +5612,16 @@ class App {
     const anchors = w ? this.alignAnchors(w) : null;
     this.alignedAnchors = anchors;
     this.pianoRoll?.setTimeAnchors(anchors);
-    this.waveform?.setTimeAnchors(anchors);
+    // THE STRIP TAKES THE ROLL'S WINDOW, not the sheet's, and the difference is a clamp.
+    //
+    // The window derived from the sheet can start before the recording does — a count-in puts
+    // written second 0 a tenth of a second into the file, so the sheet's left edge maps to a
+    // NEGATIVE audio second. The roll refuses that (`clampWindow`, against the take's own
+    // length); the strip, handed the raw anchors, did not, and the two ended up drawing rulers
+    // 0.1 s apart while both believed they were aligned. Reading back what the roll actually
+    // applied is what makes "all three panes show the same seconds" true rather than intended.
+    const applied = anchors && this.pianoRoll ? timeWindowAnchors(this.pianoRoll.getTimeWindow()) : anchors;
+    this.waveform?.setTimeAnchors(applied);
   }
 
   /**
@@ -5299,11 +5697,15 @@ class App {
    * human until you edited a note and mechanical afterwards. See `scoreToSynthNotes`.
    */
   private synthNotesFor(score: RiffScore): ReturnType<typeof scoreToSynthNotes> {
+    // `performanceFeed()` returns the raw array ITSELF while the snap is off, so this is the
+    // same argument it has always been and playback is unchanged to the last bit — proved by
+    // `__RIFFSHEET_SNAPFEED__`, which dumps this schedule either side of a Quantize change.
+    // With the snap on it is the snapped take, because playback must agree with the page.
     return scoreToSynthNotes(
       score,
       this.originSec(score),
       this.liveSheet(),
-      this.runtime.get().source?.detected?.notes ?? null
+      this.runtime.get().source?.detected ? this.performanceFeed() : null
     );
   }
 
@@ -5325,6 +5727,20 @@ class App {
     // once for nothing. `load()` builds the graph synchronously, so it exists by now.
     this.pianoRoll?.setLiveModel(this.liveSheet());
     this.pianoRoll?.setScore(score);
+    // #36: THE ROLL SHOWS THE PERFORMANCE, NOT THE PAGE.
+    //
+    // The two calls above still happen and still matter — the roll takes its bar lines, its
+    // tempo and its origin from the score, and the live model is what it falls back to if this
+    // third call is not there. What changes is where the RECTANGLES come from: handed the feed,
+    // the roll draws the notes at the seconds they were played, so the Quantize menu — which
+    // reaches the pipeline and nothing else — cannot move one of them. Before this, every
+    // rectangle was a walk of the engraved sheet, and choosing 1/4 visibly re-timed the
+    // player's own recording in the one view that is supposed to be a picture of it.
+    //
+    // `RollPerformanceNote` (app/snap.ts) is the app's half of this contract and the roll's
+    // `PerformanceNote` is the other; they are structurally compatible on purpose, so the two
+    // files agree without either importing the other's types.
+    this.pianoRoll?.setPerformanceNotes(this.rollFeedNotes());
     // `score.durationSec` is already on the recording's clock (the pipeline's beat times
     // are), so it takes no shift — only the notes do.
     this.transport.setScoreNotes(
@@ -5446,6 +5862,38 @@ class App {
             'aria-label': 'Bigger rows',
             title: t(TIPS.rollZoom),
             onClick: () => this.pianoRoll?.zoomVerticalIn()
+          }),
+          // TIME, the other axis (#29). The pair above makes the ROWS taller; this one makes
+          // the recording WIDER, which is the zoom anybody actually means when they say they
+          // cannot see where a note starts. Same reasoning as the vertical pair for being
+          // visible at all: the wheel over the ruler does it, and a wheel is invisible.
+          //
+          // "Fit" is a button here rather than a double-click, unlike the vertical axis: the
+          // time window is the one Align keeps in step with the sheet, so getting back to the
+          // whole take is a thing players reach for repeatedly rather than once a session.
+          el('button', {
+            class: 'chip icon',
+            text: '−',
+            'data-role': 'roll-time-zoom-out',
+            'aria-label': 'Show more time',
+            title: t(TIPS.rollTimeZoom),
+            onClick: () => this.pianoRoll?.zoomTimeOut()
+          }),
+          el('button', {
+            class: 'chip icon',
+            text: '+',
+            'data-role': 'roll-time-zoom-in',
+            'aria-label': 'Show less time',
+            title: t(TIPS.rollTimeZoom),
+            onClick: () => this.pianoRoll?.zoomTimeIn()
+          }),
+          el('button', {
+            class: 'chip icon',
+            text: 'Fit',
+            'data-role': 'roll-time-fit',
+            'aria-label': 'Fit the whole take',
+            title: t(TIPS.rollTimeFit),
+            onClick: () => this.pianoRoll?.fitTime()
           })
         ),
       // How many edits the app made on its own evidence and nobody has looked at yet.
@@ -5495,12 +5943,43 @@ class App {
               const rollGrid = (e.target as HTMLSelectElement).value as AppSettings['rollGrid'];
               this.settings.set({ rollGrid });
               this.pianoRoll?.setEditGrid(rollGrid);
+              // …UNLESS the notes are standing on it. With Snap to grid on, the columns ARE the
+              // note positions, so a new size has to re-derive them — from the RAW take, which
+              // is what `performanceFeed()` measures and why changing size repeatedly cannot
+              // walk a note further and further from where it was played.
+              if (this.settings.get().rollSnapToGrid) this.rebuildNotation({ keepEdits: true });
             }
           },
           ...(['quarter', 'eighth', 'sixteenth', 'triplet', 'free'] as const).map((value) =>
             el('option', { value, text: `Grid: ${ROLL_GRID_LABELS[value]}`, selected: s.rollGrid === value })
           )
         ),
+      // SNAP TO GRID (#41) — the second half of the roll's grid control. The menu above says
+      // where the columns are; this says whether the notes stand on them.
+      //
+      // Its own chip rather than another section inside that menu, because the menu answers
+      // "how big is a cell" with ONE value, and a second unrelated answer sharing the widget
+      // would make the value it displays a lie about one of the two. It also has to stay a
+      // plain list of grid words: `scripts/verify.mjs` drives it by value.
+      //
+      // Everything it changes goes through `performanceFeed()`, so one rebuild moves the roll,
+      // the sheet, the playback and every export together — and switching it back off restores
+      // the recording exactly, because nothing was ever written over.
+      rollOn &&
+        el('span', {
+          class: `chip${s.rollSnapToGrid ? ' on' : ''}`,
+          role: 'switch',
+          'aria-checked': String(s.rollSnapToGrid),
+          'data-role': 'roll-snap',
+          'data-setting': 'rollSnapToGrid',
+          text: 'Snap to grid',
+          title: t(TIPS.rollSnap),
+          onClick: () => {
+            this.settings.set({ rollSnapToGrid: !s.rollSnapToGrid });
+            this.rebuildNotation({ keepEdits: true });
+            this.renderMain();
+          }
+        }),
       // Appears whenever there is a grid to be had — a captured take's measured bar lines, or
       // simply the tempo the DAW is set to right now — and it says WHICH and with what numbers,
       // because "synced to DAW grid" with no numbers is exactly the label that let a sheet sit
@@ -5594,11 +6073,10 @@ class App {
     const s = this.settings.get();
     const source = this.runtime.get().source;
     const tabOn = s.tabMode !== 'off';
-    // A SYMBOLIC import: every note knows its own written position in the source file's ticks.
-    // That is exactly the case 'free' is for, and exactly the case the pipeline already forces
-    // it in. An audio take has no such thing. See the grid <select> below.
-    const detected = source?.detected?.notes ?? [];
-    const freeGridUsable = detected.length > 0 && detected.every((n) => !!n.sourceTiming);
+    // `freeGridUsable` stood here — "every note carries source ticks, so this is a symbolic
+    // import and 'free' is safe" — and it gated the Quantize menu's Free option. It is gone with
+    // the gate: Free is offered for every take now and is the default. See the <select> below
+    // for the re-measurement that retired it.
     const presets = TUNING_PRESETS.filter((preset) => preset.instrument === s.tabMode);
 
     const rebuild = (patch: Partial<AppSettings>) => {
@@ -5668,29 +6146,29 @@ class App {
           onChange: (e: Event) => rebuild({ grid: (e.target as HTMLSelectElement).value as AppSettings['grid'] })
         },
         ...(['auto', 'quarter', 'eighth', 'sixteenth', 'thirtysecond', 'triplet', 'free'] as const)
-          // FREE IS FOR IMPORTS, NOT FOR AUDIO — and this is a measurement, not a preference.
+          // FREE IS OFFERED FOR EVERYTHING NOW, and it is the default (settings v10).
           //
-          // 'free' means "write exactly what was played, snapped to nothing". For a MIDI,
-          // MusicXML or Guitar Pro import that is the RIGHT answer and the pipeline already
-          // forces it: every note carries its source ticks and the page comes out as the file
-          // was written.
+          // It used to be hidden from audio takes, and the reasoning was a measurement rather
+          // than a taste: 'free' meant "write exactly what was played, snapped to nothing", and
+          // for a performance — which has no exact note values — that produced a chain of tied
+          // fragments per note. The number recorded here was 64 played notes coming out as 192
+          // GLYPHS WITH 192 TIES, three noteheads each, plus 64 rests nobody played. Offering
+          // that beside five settings that work was offering a trap, and hiding it was right.
           //
-          // For AUDIO it is a trap. A performance has no exact note values, so every notehead
-          // becomes a chain of tied fragments. Measured on the demo fixtures after the
-          // pipeline's rest-filler removal landed: 64 played notes come out as 64 glyphs and 0
-          // ties under 'auto', and as 192 GLYPHS WITH 192 TIES under 'free' — three noteheads
-          // per note, all tied, plus 64 rests that were not in the performance. Human timing
-          // makes it no better (±35 ms: 179 glyphs, 169 tied). That is not a sheet anybody can
-          // read, and offering it beside five settings that work is offering a trap.
+          // THAT MEASUREMENT IS NO LONGER TRUE. The pipeline's 'free' is a 1:1 pass-through now:
+          // it never mutates its input and writes the simplest symbol that fits. Re-measured on
+          // the same fixtures (`scripts/roll-snap-test.ts` §8 keeps this honest):
           //
-          // The rest-filler removal DID fix the other half: 'free' no longer invents long
-          // overlapping notes — its longest written value now matches 'auto' exactly. It is
-          // the tie chains that remain, and they are inherent to writing unquantized audio.
+          //     straight riff — auto: 64 played -> 64 glyphs, 0 rests, 0 ties
+          //                     free: 64 played -> 64 glyphs, 0 rests, 0 ties   (identical)
+          //     triplet riff  — auto: 77 played -> 70 glyphs, 0 rests, 2 ties
+          //                     free: 77 played -> 78 glyphs, 38 rests, 34 ties
           //
-          // Still OFFERED when it is already the stored value, because a <select> that cannot
-          // show its own setting silently snaps to the first option and reads as if the app
-          // had thrown the choice away.
-          .filter((value) => value !== 'free' || freeGridUsable || s.grid === 'free')
+          // Straight material is now indistinguishable from 'auto'. Triplet material is busier
+          // under 'free' — the rests are the real gaps between notes and the ties are held notes
+          // crossing a beat — but that is a page that is fussier than you played, which is what
+          // the tip tells you to reach for 'auto' about. It is not a trap any more, and a
+          // setting that is the DEFAULT cannot be one the player is unable to return to.
           .map((value) =>
             el('option', { value, text: `Quantize: ${GRID_LABELS[value]}`, selected: s.grid === value })
           )
@@ -6158,7 +6636,63 @@ class App {
         },
 
         // --- editing ---------------------------------------------------------------------
-        onEdit: (edit) => this.applyRollEdit(edit)
+        onEdit: (edit) => this.applyRollEdit(edit),
+
+        // #30d: pointing at a rectangle rings the notehead that made it. One direction only
+        // from here — `TriView.setHover` never echoes back through its own `onNoteHover`, and
+        // neither does this, or the pair would loop.
+        onNoteHover: (id) => this.triview?.setHover(id ? [id] : []),
+
+        // #29/#30: THE ROLL'S TIME AXIS MOVED.
+        //
+        // The strip is not optional — it draws the same seconds directly above the roll, so it
+        // follows on every call, cheap and live. The SHEET follows only on `commit` and only
+        // with Align on, because bringing it along means a re-engrave at a new `display.scale`.
+        //
+        // The scale change is `coupledSheetScale`'s inverse-proportionality law against the
+        // PREVIOUS span (`this.alignedWindow`), which is why the new window is remembered here:
+        // without a previous span there is no ratio to apply, and the sheet would jump to an
+        // absolute guess instead of tracking the notch the player just turned.
+        onTimeWindowChange: (win, commit) => {
+          this.waveform?.setTimeAnchors(timeWindowAnchors(win));
+          if (!this.settings.get().alignViews || !commit) return;
+          const tv = this.triview;
+          if (!tv) return;
+          const prev = this.alignedWindow;
+          // THE ECHO GUARD, and without it Align eats itself.
+          //
+          // The sheet writes the roll's window (`setAlignedWindow`) and the roll reports every
+          // window it applies — including that one, on the trailing commit. Answering that
+          // report by scrolling and re-scaling the SHEET closes the circle: the sheet moves,
+          // `syncViewports` derives a slightly different window from its new scroll, hands it
+          // back to the roll, and every rectangle shifts. Measured, before this line: adding
+          // one note moved its five neighbours by 555 px with Align on — the exact reflow the
+          // old linked mode was deleted for, arriving through the new door.
+          //
+          // The test is "is this window already the sheet's?", because if it is there is
+          // nothing to drive. A zoom notch changes the span by a fifth (see TIME_ZOOM_*), so
+          // 2% separates a real gesture from the sheet's own value coming back with a little
+          // clamping on it.
+          if (prev && sameTimeWindow(prev, win)) return;
+          if (prev) {
+            tv.setZoom(
+              coupledSheetScale(
+                tv.getZoom(),
+                prev.toSec - prev.fromSec,
+                win.toSec - win.fromSec,
+                MIN_ZOOM,
+                MAX_ZOOM
+              )
+            );
+          }
+          // `secondsToTick` is the app's own helper and takes the score and the recording
+          // origin explicitly — see its note on the two clocks.
+          const score = this.runtime.get().score;
+          tv.alignScrollToTick(
+            score ? secondsToTick(score, win.fromSec, this.originSec(score)) : null
+          );
+          this.alignedWindow = { ...win };
+        }
       });
       // LITERALS, NOT SETTINGS. Naming every row and being editable are what the roll IS —
       // both switches were taken out of the settings panel (#39) because neither was a question
@@ -6207,7 +6741,10 @@ class App {
       // change its pitch, drag a fret digit on the TAB to move it to another string. Moving a
       // note in time is deliberately not offered here — that is the piano roll's job, where a
       // note has a start and a length rather than a place in a bar.
-      onNoteDragCommit: (p) => this.applySheetDrag(p)
+      onNoteDragCommit: (p) => this.applySheetDrag(p),
+      // #30d, the other half: pointing at a notehead lights the rectangle that made it. The
+      // roll's `setHover` is the inward door and never reports back — see the roll's option.
+      onNoteHover: (id) => this.pianoRoll?.setHover(id ? [id] : [])
     });
     this.transport.attachAlphaTab(this.triview.api);
     if (rt.score) this.applyScoreToViews(rt.score);
@@ -6612,6 +7149,14 @@ class App {
     this.pianoRoll?.setEditGrid(s.rollGrid);
     const rollGridChip = this.root.querySelector<HTMLSelectElement>('[data-role="roll-grid"]');
     if (rollGridChip && rollGridChip.value !== s.rollGrid) rollGridChip.value = s.rollGrid;
+    // The snap chip is the one view control that is NOT just a redraw — it moves notes — so it
+    // is restated here for the same reason the grid menu is, and no more than that: the value
+    // is pushed onto the chip, and the rebuild that acts on it belongs to whoever changed it.
+    const rollSnapChip = this.root.querySelector<HTMLElement>('[data-role="roll-snap"]');
+    if (rollSnapChip) {
+      rollSnapChip.classList.toggle('on', s.rollSnapToGrid);
+      rollSnapChip.setAttribute('aria-checked', String(s.rollSnapToGrid));
+    }
   }
 
   // =========================================================================
@@ -6917,7 +7462,13 @@ class App {
     const score = this.runtime.get().score;
     if (!source?.detected || !score) return;
 
-    const result = applyRollEditToNotes(source.detected.notes, edit, {
+    const raw = source.detected.notes;
+    // APPLIED TO WHAT THE PLAYER WAS LOOKING AT. A drag is a delta from the rectangle under the
+    // pointer, and while the snap is on that rectangle is at a snapped second — so applying the
+    // delta to the raw note would land it a fraction of a beat from where it was dropped. With
+    // the snap off the feed IS the raw take and this is the call it always was.
+    const feed = this.performanceFeed();
+    const result = applyRollEditToNotes(feed, edit, {
       originSec: this.originSec(score),
       tempoBpm: score.tempoBpm,
       newNoteId: () => `add${++this.addedNoteCount}`
@@ -6926,9 +7477,14 @@ class App {
 
     // The player has now decided about these notes, so the auto-edit pass leaves them alone
     // from here on. See `userTouchedIds`.
-    for (const id of rollEditNoteIds(edit)) this.userTouchedIds.add(id);
+    const touched = new Set(rollEditNoteIds(edit));
+    for (const id of touched) this.userTouchedIds.add(id);
 
-    this.commitPerformance(result.notes, result.label);
+    // Only the notes the gesture NAMED keep their edited position; every other note goes back
+    // to the recording. Committing `result.notes` wholesale would quietly promote the snapped
+    // position of every untouched note into the raw take, and one drag would cost the player
+    // the ability to ever switch the snap off again.
+    this.commitPerformance(feed === raw ? result.notes : mergeEditedOntoRaw(raw, result.notes, touched), result.label);
   }
 
   // -------------------------------------------------------------------------
@@ -7705,6 +8261,21 @@ class App {
  *     not defaulted: v1.1 shipped with it silently missing, and the cursor led the audio,
  *     the waveform and the piano roll by the whole count-in.
  */
+/**
+ * Are these two time windows the same stretch of recording, to within a clamp?
+ *
+ * Used by exactly one caller — the roll's `onTimeWindowChange` echo guard — and the tolerance
+ * is relative because the only thing it has to separate is "the value we just pushed, come
+ * back with the roll's own clamping on it" from "the player turned a zoom notch", and a notch
+ * is a fifth of the span. Absolute seconds would be wrong at both ends of the zoom range.
+ */
+function sameTimeWindow(a: { fromSec: number; toSec: number }, b: { fromSec: number; toSec: number }): boolean {
+  const span = a.toSec - a.fromSec;
+  if (!(span > 0)) return false;
+  const slack = span * 0.02;
+  return Math.abs(a.fromSec - b.fromSec) < slack && Math.abs(a.toSec - b.toSec) < slack;
+}
+
 function secondsToTick(score: RiffScore, audioSec: number, originSec: number): number {
   return (((audioSec - originSec) * score.tempoBpm) / 60) * ALPHATAB_QUARTER_TICKS;
 }
@@ -7753,6 +8324,7 @@ function tickToSeconds(score: RiffScore, tick: number, originSec: number): numbe
  *     ticks ARE the truth and there is no performance behind them to prefer;
  *   - anything whose as-played span came out degenerate, which would cost the note its attack.
  */
+
 function scoreToSynthNotes(
   score: RiffScore,
   originSec: number,

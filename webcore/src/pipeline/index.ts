@@ -72,7 +72,12 @@ export interface RiffScore {
  */
 export function scoreOriginSec(score: RiffScore, barOneSec: number): number {
   const bar = score.ir.bars.find((b) => !b.implicit) ?? score.ir.bars[0];
-  const secPerTick = 60 / (score.tempoBpm || 100) / (score.ir.divisions || 12);
+  // 24, not 12: the IR's `DIVISIONS` was doubled to carry a real 1/32 (#31), and this fallback
+  // was left behind at the old value. It only fires for an IR with no `divisions` at all, but a
+  // wrong one halves every tick-to-seconds conversion here — it is the score's origin, so the
+  // whole take would sit at the wrong offset. The facade does not re-export DIVISIONS, hence
+  // the literal; see the IR module for the one that is authoritative.
+  const secPerTick = 60 / (score.tempoBpm || 100) / (score.ir.divisions || 24);
   return barOneSec - (bar ? bar.startTick * secPerTick : 0);
 }
 
@@ -155,6 +160,15 @@ const GRID_MAP: Record<AppSettings['grid'], BuildSettings['grid']> = {
   quarter: '1/4',
   eighth: '1/8',
   sixteenth: '1/16',
+  // 1/32. The finest straight override the quantizer offers. `NotationGrid` grew this word and
+  // this map did not, and a `Record<NotationGrid, …>` missing a key is an error rather than a
+  // gap — it was the one typecheck failure webcore was carrying.
+  //
+  // The only entry whose two sides are the SAME word. Every other line here translates the
+  // app's vocabulary into Team C's ('sixteenth' -> '1/16'), but their `GridSetting` spells this
+  // one 'thirtysecond' rather than '1/32', so the identity mapping is correct and not a
+  // copy-paste slip. Check `pipeline/src/types.ts` before "fixing" it.
+  thirtysecond: 'thirtysecond',
   triplet: '1/8T',
   free: 'free'
 };

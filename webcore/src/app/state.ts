@@ -108,6 +108,24 @@ export interface AppSettings {
    * absent from `toBuildSettings()`, and there is a browser check that keeps it that way.
    */
   rollGrid: RollGrid;
+  /**
+   * Snap the roll's notes to the roll's own grid — a LAYER over the performance, not surgery.
+   *
+   * OFF by default, which is the only honest default for anything that moves somebody's notes.
+   *
+   * The raw performance is always kept underneath. Switching this on DERIVES a snapped copy —
+   * every note's START moved to the nearest `rollGrid` line, its length carried over intact —
+   * and switching it off throws that copy away and shows the recording again, to the bit.
+   * Nothing is ever rewritten in place, so the round trip is lossless by construction rather
+   * than by care.
+   *
+   * While it is on, the snapped copy is what the roll draws, what the sheet is built from, what
+   * plays and what exports. That is one arrow and exactly one — `App.performanceFeed()` — so
+   * the page cannot show one thing while the file contains another. Changing `rollGrid` while
+   * it is on re-derives the copy FROM THE RAW performance, so 1/8 -> 1/16 -> 1/8 cannot
+   * accumulate drift the way a chain of in-place roundings would.
+   */
+  rollSnapToGrid: boolean;
   fingering: FingeringStyle;
   /**
    * Where the hand sits for `fingering: 'around-fret'`. Ignored by every other style.
@@ -257,7 +275,7 @@ export interface AppSettings {
 }
 
 /** Raise this AND add a case in `migrate()` when a default has to change under people. */
-export const SETTINGS_VERSION = 9;
+export const SETTINGS_VERSION = 10;
 
 export const DEFAULT_SETTINGS: AppSettings = {
   // 'auto', NOT 'bass'. This is sent to the model as a HARD CONSTRAINT on what it is allowed to
@@ -272,13 +290,25 @@ export const DEFAULT_SETTINGS: AppSettings = {
   tuningId: DEFAULT_TUNING.id,
   customTuningMidi: [40, 45, 50, 55, 59, 64],
   clefMode: 'auto',
-  // 'auto', NOT a named note value. See `NotationGrid`: a named value is an override that
-  // FORBIDS the quantizer everything else, and the one thing a default must never do is
-  // forbid a subdivision the player actually played.
-  grid: 'auto',
+  // 'free', NOT 'auto'. Every other value in this enum ROUNDS, and the argument against
+  // defaulting to a named size — that an override forbids the quantizer everything finer, so a
+  // triplet played against 1/8 loses a note — turns out to be an argument against defaulting to
+  // rounding at all. 'auto' does not forbid anything, but it still decides per beat which
+  // subdivision the player MEANT, and every one of those decisions is a place the page can
+  // disagree with the recording.
+  //
+  // 'free' is a truthful pass-through now: 1:1 content, the input never mutated, the simplest
+  // symbol that fits what was played. So the sheet starts as a picture of the performance, and
+  // tidying it is something the player asks for rather than something they have to notice and
+  // switch off. See the v10 case in `migrate()`.
+  grid: 'free',
   // A stated size, because a manually added note has to come out some length and 1/8 is the
   // one that makes a riff. It is only ever consulted for hand edits and for drawing the ruler.
   rollGrid: 'eighth',
+  // OFF. The roll's job is to show what was played; a default that quietly moved every note
+  // onto a grid line would make the one view that is supposed to be a picture of the recording
+  // into a second opinion about it. See the field comment for why it is safe to switch on.
+  rollSnapToGrid: false,
   fingering: 'low-positions',
   // First position. The pipeline's own default for the same reason: it is where a hand goes
   // when nobody has said otherwise.
@@ -602,6 +632,29 @@ function migrate(settings: AppSettings, stored: Partial<AppSettings>): AppSettin
     settings.preciseBeats = false;
   }
 
+  // v9 -> v10: the transcription quantizer stops rounding by default.
+  //
+  // 'auto' had been the default since v6 and it is the cleverest setting rather than the most
+  // honest one — see DEFAULT_SETTINGS.grid. 'free' only became a real answer once the pipeline
+  // made it one (1:1 content, input never mutated), and once it was, the default it replaced
+  // was rounding nobody had asked for.
+  //
+  // FORCED, and that is the entire reason this needs a version number: a stored 'auto' written
+  // because it WAS the default is indistinguishable from an 'auto' somebody chose, so merging
+  // would pin exactly the people who never touched the menu to the old behaviour forever.
+  // Everybody is moved once. Whatever they pick afterwards — including picking 'auto' straight
+  // back — is written with settingsVersion 10 and is never re-flipped by this case again.
+  //
+  // `rollSnapToGrid` is additive and would arrive false by construction (mergeStoredSettings
+  // spreads over DEFAULT_SETTINGS), but it is stated here anyway: it is a switch that MOVES
+  // NOTES, and a value that moves notes should be a decision on the record rather than a
+  // side effect of a spread. Stored JSON is untrusted, and a stray `true` in an old dev blob
+  // must not be able to snap somebody's take on first launch.
+  if (from < 10) {
+    settings.grid = 'free';
+    settings.rollSnapToGrid = DEFAULT_SETTINGS.rollSnapToGrid;
+  }
+
   const sampled = new Set([
     'finger-bass',
     'upright-piano',
@@ -640,6 +693,9 @@ function migrate(settings: AppSettings, stored: Partial<AppSettings>): AppSettin
   }
   if (typeof settings.autoSplitAtAttacks !== 'boolean') {
     settings.autoSplitAtAttacks = DEFAULT_SETTINGS.autoSplitAtAttacks;
+  }
+  if (typeof settings.rollSnapToGrid !== 'boolean') {
+    settings.rollSnapToGrid = DEFAULT_SETTINGS.rollSnapToGrid;
   }
 
   if (!(FINGERING_STYLES as readonly string[]).includes(settings.fingering)) {

@@ -215,7 +215,43 @@ function validTimeSignature(value: unknown): { numerator: number; denominator: n
 // Portable .riffsheet documents
 // ---------------------------------------------------------------------------
 
-export const RIFFSHEET_DOCUMENT_VERSION = 1;
+/**
+ * What this build WRITES. Readers accept anything from v1 up to this — see
+ * `readRiffsheetDocument` — so a document made before the audio moved inside still opens.
+ */
+export const RIFFSHEET_DOCUMENT_VERSION = 2;
+
+/**
+ * The take's actual audio, inside the document (#34).
+ *
+ * v1 documents carried only a REFERENCE — a path and a name — which made a `.riffsheet` a note
+ * about a recording rather than a copy of one. Mail it to somebody, open it on another machine,
+ * or simply move the wav, and the sheet arrived with a silent Original fader and a dead "Listen
+ * again". v2 puts the bytes in the file, so the document is the whole document.
+ *
+ * BASE64 IN JSON, deliberately, and the cost is real: about 4/3 of the audio's size on top of
+ * the audio itself. The document goes through the JUCE bridge as a STRING (`exportFile` takes
+ * bytes, but the session blob beside it is `JSON.stringify`d and handed over as text), and a
+ * JSON string cannot hold arbitrary bytes — a raw 0x00..0xFF run is not valid UTF-16 and does
+ * not survive the round trip. Base64 is the representation that is safe in every hop of that
+ * chain, and 33% of a wav is a price worth paying for a file that actually contains the music.
+ *
+ * `bytes` is the ORIGINAL FILE verbatim wherever there was one, so an mp3 stays an mp3 and
+ * re-opening it decodes exactly what the player imported. Only a recorded take, which never had
+ * a container of its own, is encoded here — as WAV, by `encodeWavPcm16`.
+ */
+export interface EmbeddedAudio {
+  /** The original file's name, so a re-export can offer it back under the name it came in as. */
+  name: string;
+  /** The container actually stored, e.g. 'audio/wav'. Empty when the import did not say. */
+  mime: string;
+  /** Only 'base64' exists; named so a future raw form can be told apart rather than guessed. */
+  encoding: 'base64';
+  bytes: string;
+  durationSec: number;
+  /** Present for takes this app encoded itself; absent for a verbatim copy of an import. */
+  sampleRate?: number;
+}
 
 export interface RiffsheetDocument {
   app: 'riffsheet-document';
@@ -227,6 +263,15 @@ export interface RiffsheetDocument {
   edits: EditSpec[];
   editCursor: number;
   sourceMidi?: string;
+  /**
+   * The take itself, when it could be got. Absent in every v1 document and in one written from
+   * a symbolic import, where there is no recording to embed.
+   *
+   * `audio` below stays as well and is still worth writing: it names WHERE the take came from,
+   * which is what lets a re-opened document offer the original path, and it is the only thing a
+   * v1 reader would have understood.
+   */
+  audioData?: EmbeddedAudio | null;
   /**
    * Which take this document is OF, so reopening it can find the audio again.
    *
@@ -253,6 +298,119 @@ export function portableAudioRef(audio: PersistedAudio | null | undefined): Pers
   return { kind: audio.kind, name: audio.name, path: audio.path, durationSec: audio.durationSec };
 }
 
+/**
+ * A container type for a file name, for the embedded-audio block.
+ *
+ * Only used as a LABEL — nothing decodes by it, since `decodeAudioData` sniffs the bytes — so an
+ * unknown extension is answered with '' rather than a guess that would be wrong more often than
+ * the empty string is unhelpful.
+ */
+export function audioMimeForName(name: string): string {
+  const ext = /\.([a-z0-9]+)$/i.exec(name)?.[1]?.toLowerCase() ?? '';
+  switch (ext) {
+    case 'wav':
+    case 'wave':
+      return 'audio/wav';
+    case 'mp3':
+      return 'audio/mpeg';
+    case 'flac':
+      return 'audio/flac';
+    case 'ogg':
+    case 'oga':
+      return 'audio/ogg';
+    case 'm4a':
+    case 'mp4':
+      return 'audio/mp4';
+    case 'aif':
+    case 'aiff':
+      return 'audio/aiff';
+    default:
+      return '';
+  }
+}
+
+/**
+ * A file name the SHELL can decode by, for embedded bytes handed to `loadAudioBytes`.
+ *
+ * The page decodes audio by sniffing the bytes, so a name is only a label to it (see
+ * `audioMimeForName`). The shell does not: it stages the bytes as a file and JUCE's format
+ * manager picks its reader from the extension, so a document whose embedded block was named
+ * "recording" or "Take 3" would be handed to no decoder at all and come back "unsupported".
+ *
+ * So: keep the name whenever it already carries an extension — the original one is the most
+ * accurate thing available — and otherwise borrow one from the stored mime type, falling back
+ * to `.wav`, which is what `encodeWavPcm16` writes for every recorded take.
+ */
+export function stagingNameForAudio(name: string, mime: string): string {
+  const base = name.trim() || 'recording';
+  if (/\.[a-z0-9]+$/i.test(base)) return base;
+  const ext =
+    { 'audio/wav': 'wav', 'audio/mpeg': 'mp3', 'audio/flac': 'flac', 'audio/ogg': 'ogg',
+      'audio/mp4': 'm4a', 'audio/aiff': 'aiff' }[mime] ?? 'wav';
+  return `${base}.${ext}`;
+}
+
+/**
+ * Mono 16-bit PCM WAV from the decoded samples.
+ *
+ * For RECORDED takes only. An imported file is copied verbatim instead — re-encoding somebody's
+ * audio to store it would make the document's copy quietly worse than the original, and this
+ * format exists to make the document complete rather than approximate.
+ *
+ * 16-bit because it is the format every decoder on every platform reads without negotiation.
+ * The samples reaching here are the mono mixdown the app already works from, so nothing is lost
+ * at this step that was not already lost when the take was decoded.
+ */
+export function encodeWavPcm16(pcm: Float32Array, sampleRate: number): Uint8Array {
+  const rate = Math.max(1, Math.round(sampleRate) || 44100);
+  const frames = pcm.length;
+  const out = new Uint8Array(44 + frames * 2);
+  const view = new DataView(out.buffer);
+  const ascii = (at: number, text: string) => {
+    for (let i = 0; i < text.length; i++) out[at + i] = text.charCodeAt(i);
+  };
+  ascii(0, 'RIFF');
+  view.setUint32(4, 36 + frames * 2, true);
+  ascii(8, 'WAVE');
+  ascii(12, 'fmt ');
+  view.setUint32(16, 16, true); // PCM header length
+  view.setUint16(20, 1, true); // format: integer PCM
+  view.setUint16(22, 1, true); // channels: mono
+  view.setUint32(24, rate, true);
+  view.setUint32(28, rate * 2, true); // byte rate
+  view.setUint16(32, 2, true); // block align
+  view.setUint16(34, 16, true); // bits per sample
+  ascii(36, 'data');
+  view.setUint32(40, frames * 2, true);
+  for (let i = 0; i < frames; i++) {
+    // Clamped before scaling: a sample outside -1..1 is already broken, and wrapping it would
+    // turn a peak into a full-scale click in the opposite direction.
+    const clamped = Math.max(-1, Math.min(1, pcm[i]));
+    view.setInt16(44 + i * 2, Math.round(clamped * 32767), true);
+  }
+  return out;
+}
+
+/**
+ * The embedded take, made safe to use. Null for anything malformed, which costs the document
+ * its audio and nothing else — the sheet and the edits are independent of it.
+ */
+function decodeEmbeddedAudio(value: unknown): EmbeddedAudio | null {
+  if (!value || typeof value !== 'object') return null;
+  const v = value as Partial<EmbeddedAudio>;
+  if (v.encoding !== 'base64' || typeof v.bytes !== 'string' || v.bytes.length === 0) return null;
+  return {
+    name: typeof v.name === 'string' ? v.name : '',
+    mime: typeof v.mime === 'string' ? v.mime : '',
+    encoding: 'base64',
+    bytes: v.bytes,
+    durationSec: Number.isFinite(Number(v.durationSec)) ? Math.max(0, Number(v.durationSec)) : 0,
+    ...(Number.isFinite(Number(v.sampleRate)) && Number(v.sampleRate) > 0
+      ? { sampleRate: Number(v.sampleRate) }
+      : {})
+  };
+}
+
 function decodeAudioRef(value: unknown): PersistedAudio | null {
   if (!value || typeof value !== 'object') return null;
   const v = value as Partial<PersistedAudio>;
@@ -275,21 +433,44 @@ export function writeRiffsheetDocument(document: RiffsheetDocument): Uint8Array 
 }
 
 export function readRiffsheetDocument(bytes: Uint8Array): RiffsheetDocument {
-  if (bytes.byteLength > 32 * 1024 * 1024) throw new Error('That Riffsheet document is too large.');
+  // 512 MB. It was 32 MB, which was generous for a document holding a few thousand notes and
+  // far too small for one holding a recording: base64 inflates the audio by about a third, so
+  // the old ceiling turned away any take over roughly 24 MB — a few minutes of wav. There is no
+  // product reason for a cap at all now; this one exists so a corrupt or hostile file cannot ask
+  // the process to allocate without limit, and it says what it is rather than "too large".
+  if (bytes.byteLength > 512 * 1024 * 1024) {
+    throw new Error(
+      'That Riffsheet document is over 512 MB, which is larger than a document with a recording inside it should ever be. It may be damaged.'
+    );
+  }
   let parsed: Partial<RiffsheetDocument>;
   try {
     parsed = JSON.parse(new TextDecoder().decode(bytes)) as Partial<RiffsheetDocument>;
   } catch {
     throw new Error('That is not a readable Riffsheet document.');
   }
-  if (parsed.app !== 'riffsheet-document' || parsed.version !== RIFFSHEET_DOCUMENT_VERSION) {
-    throw new Error('That Riffsheet document was made by an incompatible version.');
+  // A RANGE, not an equality. The old check refused anything that was not exactly the current
+  // number, which meant every version bump silently orphaned every document already written —
+  // the reason `audio` had to be smuggled in as an optional field rather than versioned. v2 adds
+  // one optional key, so a v1 document is a v2 document with no recording in it and is read as
+  // such. Only a FUTURE version is refused, because that one genuinely may contain something
+  // this build would misread.
+  const version = Number(parsed.version);
+  if (parsed.app !== 'riffsheet-document' || !Number.isInteger(version) || version < 1) {
+    throw new Error('That is not a readable Riffsheet document.');
+  }
+  if (version > RIFFSHEET_DOCUMENT_VERSION) {
+    throw new Error(
+      'That Riffsheet document was made by a newer version of Riffsheet. Update Riffsheet to open it.'
+    );
   }
   const source = decodeSource(parsed.source);
   if (!source || !parsed.source) throw new Error('That Riffsheet document has no score data.');
   return {
     app: 'riffsheet-document',
-    version: RIFFSHEET_DOCUMENT_VERSION,
+    // The version READ, not the version this build writes. A caller that needs to know whether
+    // there is a recording in here should not have to infer it from a field being undefined.
+    version,
     savedAt: Number(parsed.savedAt) || 0,
     name: typeof parsed.name === 'string' && parsed.name.trim() ? parsed.name.trim() : 'Untitled',
     source: encodeSource(source)!,
@@ -299,7 +480,10 @@ export function readRiffsheetDocument(bytes: Uint8Array): RiffsheetDocument {
     sourceMidi: typeof parsed.sourceMidi === 'string' ? parsed.sourceMidi : undefined,
     // Null for a document written before this field existed, and for one saved from a symbolic
     // import. Both mean the same thing to the caller: there is no take to go looking for.
-    audio: decodeAudioRef(parsed.audio)
+    audio: decodeAudioRef(parsed.audio),
+    // Null for every v1 document. The caller falls back to `audio` above and reopens by path,
+    // which is exactly what it did before this field existed.
+    audioData: decodeEmbeddedAudio(parsed.audioData)
   };
 }
 

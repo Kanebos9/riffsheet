@@ -792,6 +792,18 @@ export function createJuceBridge(): NativeBridge {
         }
       : undefined,
 
+    // The path-free twin of loadAudioPath, for a document that carries its own recording.
+    // Feature-detected like everything else here: webview and native skew across versions,
+    // and an older shell must degrade to "no re-transcription", not to a hung promise.
+    loadAudioBytes: hasNativeFunction('loadAudioBytes')
+      ? async (name: string, bytes: Uint8Array): Promise<AudioFileRef | null> => {
+          const ref = await call<ShellAudioRef>('loadAudioBytes', name, toBase64(bytes), {
+            sampleRate: 44100
+          });
+          return ref ? toAudioFileRef(ref) : null;
+        }
+      : undefined,
+
     authorizeRecentPaths: hasNativeFunction('authorizeRecentPaths')
       ? async (paths: string[]): Promise<number> => {
           const result = await call<{ authorized: number }>('authorizeRecentPaths', paths);

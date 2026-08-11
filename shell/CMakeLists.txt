@@ -15,6 +15,25 @@ if(MSVC)
     set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 endif()
 
+# /utf-8 FOR OUR OWN TARGETS, AND IT IS NOT COSMETIC. Every source file here is
+# UTF-8, and the engine manifest holds user-visible prose in it. Without this
+# flag MSVC reads the source in the machine's ANSI code page and re-encodes
+# narrow literals into the execution code page, so an em dash in the MuScriptor
+# install guide would reach the binary as something else entirely - the same
+# class of bug EngineManifest.h's manifestText() fixes on the JUCE side,
+# arriving one layer earlier and on one platform only. Both halves are needed:
+# this makes the bytes in the binary UTF-8, manifestText() makes juce::String
+# read them as UTF-8.
+#
+# Applied per target rather than with add_compile_options(), which would also
+# reach JUCE - added as a subdirectory below - and changing how a third-party
+# library compiles is not this fix's business.
+function(riffsheet_use_utf8_source target)
+    if(MSVC)
+        target_compile_options(${target} PRIVATE /utf-8)
+    endif()
+endfunction()
+
 # ---- Locate JUCE. Same resolution order BASAMAK uses: -DJUCE_DIR, env JUCE_DIR,
 # ~/JUCE, %USERPROFILE%\JUCE. On this Mac ~/JUCE is 8.0.13 (has the WebView
 # native-integration API this project is built on - JUCE >= 8.0.1 required).
@@ -352,11 +371,29 @@ target_include_directories(Riffsheet PRIVATE
 # so they keep JUCE_USE_CURL=0 and nothing about the existing localhost HTTP
 # client changes on the platforms that were working. The Linux CI leg installs
 # libcurl4-openssl-dev for exactly this.
+#
+# AND TURNING THE DEFINE ON IS ONLY HALF OF IT. JUCE_USE_CURL=1 makes juce_core
+# CALL curl_easy_init(); it does not make anything LINK libcurl. JUCE links it
+# itself only for targets built through its own module system with the flag
+# already set, which the plugin's shared-code target is not - so the Linux CI
+# leg compiled cleanly and then died at the Standalone and VST3 link steps with
+# undefined references to curl_easy_init/curl_easy_setopt/curl_easy_perform.
+# find_package + the link below is the missing half. REQUIRED on purpose: a
+# Linux build that quietly falls back to the TLS-less socket is exactly what
+# this block exists to prevent, so a missing libcurl-dev must stop the configure
+# and say so, not produce a plugin whose https installer fails obscurely at
+# runtime. (The CI Linux leg already apt-installs libcurl4-openssl-dev.)
+#
+# The TEST binary is deliberately not part of this - it sets JUCE_USE_CURL=0 for
+# itself and never fetches over TLS; see the block at the bottom of this file.
 if(UNIX AND NOT APPLE)
     set(RIFFSHEET_USE_CURL 1)
+    find_package(CURL REQUIRED)
 else()
     set(RIFFSHEET_USE_CURL 0)
 endif()
+
+riffsheet_use_utf8_source(Riffsheet)
 
 target_compile_definitions(Riffsheet PUBLIC
     JUCE_WEB_BROWSER=1                    # <- the whole point; BASAMAK had this at 0
@@ -391,6 +428,15 @@ PUBLIC
     juce::juce_recommended_lto_flags
     juce::juce_recommended_warning_flags
 )
+
+# The other half of JUCE_USE_CURL=1 above. `Riffsheet` is juce_add_plugin's
+# shared-code STATIC library, and CMake records a static library's PRIVATE link
+# dependencies as $<LINK_ONLY:...> in its interface - so this reaches the
+# Standalone and VST3 link lines, which is where the undefined symbols were.
+# Same mechanism riffsheet::onnxruntime already relies on.
+if(UNIX AND NOT APPLE)
+    target_link_libraries(Riffsheet PRIVATE CURL::libcurl)
+endif()
 
 # A release must not be assembled out of undeclared bytes. RIFFSHEET_RELEASE=ON
 # is the flag scripts/build.sh --release and every CI leg pass, so this makes the
@@ -427,6 +473,10 @@ if(RIFFSHEET_BUILD_TESTS)
 
     juce_add_console_app(RiffsheetTests PRODUCT_NAME "RiffsheetTests")
     juce_generate_juce_header(RiffsheetTests)
+
+    # The encoding test in EngineCatalogTests.cpp is only meaningful if the
+    # bytes it reads are the bytes the source file holds.
+    riffsheet_use_utf8_source(RiffsheetTests)
 
     target_sources(RiffsheetTests PRIVATE
         test/TestMain.cpp

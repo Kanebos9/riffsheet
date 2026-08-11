@@ -149,6 +149,109 @@ describe('ROBUSTNESS — degenerate inputs must produce a valid score, not an ex
     expect(xml).toContain('<staff>2</staff>');
   });
 
+  /**
+   * THE ACCEPTANCE CASE FOR THE DELETED REST KILLER.
+   *
+   * The complaint that killed it: a realistic take came back with long notes that ran over their
+   * neighbours' attacks — sustain nobody played, invented by the engraver stretching each note
+   * toward the next onset, which reads as polyphony on a monophonic line. The fixture is a
+   * staccato riff at a hard 50% gate, so every played length lands exactly on the tick lattice
+   * and "engine length" is a number, not a tolerance: an eighth-slot note sounds for 3 ticks and
+   * must be written as 3.
+   *
+   * `grid: 'free'` is the case named in the acceptance criterion. The quantized grids are
+   * checked with it because that is where the lengthening pass actually used to run — under
+   * 'free' it was already switched off, so a 'free'-only test would have passed before the
+   * deletion too and proved nothing.
+   */
+  it('ACCEPTANCE: a staccato take is written at engine lengths, on every grid', () => {
+    const positions = Array.from({ length: 32 }, (_, i) => ({
+      beat: i / 2,
+      midi: [40, 43, 45, 47, 45, 43][i % 6],
+      lengthBeats: 0.5
+    }));
+    // 50% of a half-beat slot at 120 BPM = 62.5 ms = exactly 3 ticks at divisions 12.
+    const notes = playedNotes(positions, 0.5);
+    const PLAYED_TICKS = 3;
+
+    for (const g of ['free', 'auto', '1/8', '1/16'] as const) {
+      const r = buildScore({ notes, ...grid(4) }, settings({ grid: g }));
+      const written = new Map<string, number>();
+      const occupied: { from: number; to: number; id: string }[] = [];
+      for (const bar of r.ir.bars) {
+        for (const beat of bar.voices[0].beats) {
+          if (beat.isRest) continue;
+          const from = bar.startTick + beat.startTick;
+          for (const n of beat.notes) {
+            written.set(n.id, (written.get(n.id) ?? 0) + beat.durTicks);
+            occupied.push({ from, to: from + beat.durTicks, id: n.id });
+          }
+        }
+      }
+      expect(written.size, `grid ${g}: every note reaches the page`).toBe(notes.length);
+      for (const [id, ticks] of written) {
+        expect(ticks, `grid ${g}: ${id} was stretched past its engine length`).toBeLessThanOrEqual(PLAYED_TICKS);
+      }
+      occupied.sort((a, b) => a.from - b.from || a.to - b.to);
+      for (let i = 1; i < occupied.length; i++) {
+        expect(occupied[i - 1].to, `grid ${g}: ${occupied[i - 1].id} runs into ${occupied[i].id}`).toBeLessThanOrEqual(
+          occupied[i].from
+        );
+      }
+      expect(r.ir.stats.gapsAbsorbed, `grid ${g}`).toBe(0);
+      // The silence is on the page instead: one rest per note, minus the final ring-out.
+      expect(r.ir.stats.restGlyphs, `grid ${g}`).toBeGreaterThanOrEqual(notes.length - 1);
+    }
+  });
+
+  it('ACCEPTANCE: the same holds across the whole stress corpus at grid free', async () => {
+    const { SYNTHETIC_FIXTURES, SYNTHETIC_TUNING } = await import('../fixtures/synthetic.js');
+    let checkedNotes = 0;
+    for (const f of SYNTHETIC_FIXTURES) {
+      const r = buildScore(
+        { notes: f.notesRaw, beats: f.beats, downbeats: f.downbeats, audioDurationSec: f.audioDurationSec },
+        settings({ grid: 'free', tuningMidi: SYNTHETIC_TUNING })
+      );
+      const secondsPerTick = 1 / ((r.ir.tempo.displayBpm / 60) * r.ir.divisions);
+      const written = new Map<string, number>();
+      const occupied: { from: number; to: number; id: string }[] = [];
+      for (const bar of r.ir.bars) {
+        for (const beat of bar.voices[0].beats) {
+          if (beat.isRest) continue;
+          const from = bar.startTick + beat.startTick;
+          for (const n of beat.notes) {
+            written.set(n.id, (written.get(n.id) ?? 0) + beat.durTicks);
+            occupied.push({ from, to: from + beat.durTicks, id: n.id });
+          }
+        }
+      }
+
+      // 1. ENGINE LENGTHS ONLY. Nothing is written longer than it sounded, beyond the one tick
+      //    of slack that rounding seconds onto the lattice can cost.
+      f.notesRaw.forEach((note, i) => {
+        const ticks = written.get(`n${i}`);
+        if (ticks === undefined) return;
+        expect(ticks * secondsPerTick, `${f.id} n${i} written longer than played`).toBeLessThan(
+          note.endSec - note.startSec + 2 * secondsPerTick
+        );
+        checkedNotes++;
+      });
+
+      // 2. NO FAKE POLYPHONY. Sort the written spans and check none overlaps the next.
+      occupied.sort((a, b) => a.from - b.from || a.to - b.to);
+      for (let i = 1; i < occupied.length; i++) {
+        if (occupied[i].from === occupied[i - 1].from) continue; // a real chord, one IRBeat
+        expect(occupied[i - 1].to, `${f.id}: ${occupied[i - 1].id} runs into ${occupied[i].id}`).toBeLessThanOrEqual(
+          occupied[i].from
+        );
+      }
+
+      // 3. And nothing was absorbed on the way.
+      expect(r.ir.stats.gapsAbsorbed, f.id).toBe(0);
+    }
+    expect(checkedNotes).toBeGreaterThan(700);
+  });
+
   it('every synthetic stress phrase survives all four grid settings without throwing', async () => {
     const { SYNTHETIC_FIXTURES, SYNTHETIC_TUNING } = await import('../fixtures/synthetic.js');
     for (const f of SYNTHETIC_FIXTURES.slice(0, 4)) {

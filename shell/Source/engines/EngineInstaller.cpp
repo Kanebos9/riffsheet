@@ -383,7 +383,7 @@ namespace EngineInstall
 
         if (engine.install != InstallKind::oneClick)
         {
-            error = juce::String (engine.name) + " is not a one-click engine.";
+            error = manifestText (engine.name) + " is not a one-click engine.";
             return {};
         }
 
@@ -395,21 +395,21 @@ namespace EngineInstall
             return {};
         }
 
-        plan.requirementsName = juce::String (engine.id) + "-requirements-" + platform + ".txt";
+        plan.requirementsName = manifestText (engine.id) + "-requirements-" + platform + ".txt";
 
         int requirementsSize = 0;
 
         if (binaryResource (plan.requirementsName, requirementsSize) == nullptr)
         {
             // Honest, and the card turns into the guide rather than a dead end.
-            error = "Riffsheet has no verified package list for " + juce::String (engine.name)
+            error = "Riffsheet has no verified package list for " + manifestText (engine.name)
                   + " on " + platform + " yet, so it cannot install it for you here.";
             return {};
         }
 
         plan.requirementsResource = plan.requirementsName;
 
-        if (juce::String (engine.id) == "bass-v2")
+        if (manifestText (engine.id) == "bass-v2")
         {
             plan.scriptName = "amt_sidecar.py";
             plan.scriptResource = plan.scriptName;
@@ -432,7 +432,7 @@ namespace EngineInstall
                                      56066197, ArchiveKind::singleFile,
                                      "checkpoints/best_model.pth" });
         }
-        else if (juce::String (engine.id) == "transkun")
+        else if (manifestText (engine.id) == "transkun")
         {
             // Nothing to download: the weights are inside the wheel, and the
             // wheel is hash-pinned in the requirements file like everything else.
@@ -440,7 +440,7 @@ namespace EngineInstall
         }
         else
         {
-            error = "Riffsheet does not know how to install \"" + juce::String (engine.id) + "\".";
+            error = "Riffsheet does not know how to install \"" + manifestText (engine.id) + "\".";
             return {};
         }
 
@@ -511,6 +511,252 @@ juce::int64 EngineInstaller::bytesOnDisk (const juce::File& directory)
         total += item.getFile().getSize();
 
     return total;
+}
+
+//==============================================================================
+// "I already have this one"
+//==============================================================================
+
+namespace
+{
+    juce::File locationRecordFor (const juce::String& id)
+    {
+        return EngineInstaller::enginesRoot().getChildFile (id + ".location");
+    }
+
+    /*  The executable a pip console-script engine IS, under one directory.
+
+        Two shapes, because both are what people actually have: an environment
+        (a folder with bin/ in it - a venv, or a prefix like /usr/local), and a
+        folder holding a venv, which is what Riffsheet's own installer builds. A
+        path pointing straight AT the executable is handled by the caller. */
+    juce::File consoleScriptUnder (const juce::File& directory, const juce::String& name)
+    {
+       #if JUCE_WINDOWS
+        const auto binDir = juce::String ("Scripts");
+        const auto exe = name + ".exe";
+       #else
+        const auto binDir = juce::String ("bin");
+        const auto exe = name;
+       #endif
+
+        for (const auto& candidate : { directory.getChildFile (binDir).getChildFile (exe),
+                                       directory.getChildFile ("venv").getChildFile (binDir).getChildFile (exe) })
+            if (candidate.existsAsFile())
+                return candidate;
+
+        return {};
+    }
+
+    /*  Does this directory hold a checkout of a repo-shaped engine?
+
+        `infer.py` AND a checkpoints folder with something in it. Both, because
+        either alone is a real thing people end up with: the repo cloned but the
+        weights never downloaded, or a folder of checkpoints with no code. */
+    bool repoLooksComplete (const juce::File& directory, juce::String& missing)
+    {
+        if (! directory.getChildFile ("infer.py").existsAsFile())
+        {
+            missing = "there is no infer.py in it";
+            return false;
+        }
+
+        for (const auto& name : { "checkpoints", "checkpoint", "models" })
+        {
+            const auto dir = directory.getChildFile (name);
+
+            // An EMPTY checkpoints folder is the commonest half-install there
+            // is: the repo cloned, the weights never fetched. It must not pass.
+            // Recursive, because weights routinely sit one folder deeper.
+            if (dir.isDirectory())
+            {
+                juce::Array<juce::File> weights;
+                dir.findChildFiles (weights, juce::File::findFiles, true);
+
+                if (! weights.isEmpty())
+                    return true;
+            }
+        }
+
+        missing = "it has infer.py but no checkpoints folder with any weights in it";
+        return false;
+    }
+}
+
+juce::File EngineInstaller::recordedLocation (const juce::String& id)
+{
+    const auto record = locationRecordFor (id);
+
+    if (! record.existsAsFile())
+        return {};
+
+    const juce::File found (record.loadFileAsString().trim());
+    return found.isDirectory() ? found : juce::File();
+}
+
+void EngineInstaller::rememberInstallLocation (const juce::String& id, const juce::File& location)
+{
+    const auto record = locationRecordFor (id);
+
+    if (location == juce::File())
+    {
+        record.deleteFile();
+        return;
+    }
+
+    record.getParentDirectory().createDirectory();
+    record.replaceWithText (location.getFullPathName());
+}
+
+juce::File EngineInstaller::findExistingInstall (const EngineManifest& engine,
+                                                 const juce::String& requestedPath,
+                                                 juce::StringArray& searched,
+                                                 juce::String& detail)
+{
+    const auto name = manifestText (engine.name);
+    const auto pipCli = engine.adapter == AdapterKind::sidecarPipCli;
+
+    // What counts as a working copy at ONE place. Both branches stat and nothing
+    // more - see fnValidateExistingEngineInstall for why nothing is executed.
+    const auto check = [&engine, pipCli] (const juce::File& where, juce::String& why) -> juce::File
+    {
+        if (pipCli)
+        {
+            // The answer is the ENVIRONMENT ROOT - the folder with bin/ in it -
+            // because that is what SidecarAdapter::installDirectory() is, and
+            // handing back the executable would make the two disagree.
+            //
+            // A path pointing straight at the console script is the commonest
+            // thing somebody pastes, because it is what `which` printed.
+            if (where.existsAsFile())
+            {
+                if (where.getFileNameWithoutExtension() != engine.id)
+                {
+                    why = "that file is not the " + juce::String (engine.id) + " program";
+                    return {};
+                }
+
+                return where.getParentDirectory().getParentDirectory();
+            }
+
+            const auto found = consoleScriptUnder (where, engine.id);
+
+            if (found == juce::File())
+            {
+                why = "there is no " + juce::String (engine.id) + " program in it";
+                return {};
+            }
+
+            return found.getParentDirectory().getParentDirectory();
+        }
+
+        if (! where.isDirectory())
+        {
+            why = "that is not a folder";
+            return {};
+        }
+
+        juce::String missing;
+
+        if (repoLooksComplete (where, missing))
+            return where;
+
+        // One level down, because a downloaded zip usually unpacks into a folder
+        // of its own and people point at the folder they unzipped into.
+        for (const auto& child : juce::RangedDirectoryIterator (where, false, "*",
+                                                                juce::File::findDirectories))
+        {
+            juce::String ignored;
+
+            if (repoLooksComplete (child.getFile(), ignored))
+                return child.getFile();
+        }
+
+        why = missing;
+        return {};
+    };
+
+    // ---- VALIDATE ONE PLACE -------------------------------------------------
+    if (requestedPath.isNotEmpty())
+    {
+        const juce::File where (requestedPath);
+        searched.add (where.getFullPathName());
+
+        if (! where.exists())
+        {
+            detail = "There is nothing at " + where.getFullPathName() + ".";
+            return {};
+        }
+
+        juce::String why;
+        const auto found = check (where, why);
+
+        if (found == juce::File())
+        {
+            detail = "That is not a working copy of " + name
+                   + (why.isNotEmpty() ? " - " + why + "." : ".");
+            return {};
+        }
+
+        detail = "Found a working copy of " + name + " at " + found.getFullPathName() + ".";
+        return found;
+    }
+
+    // ---- SNIFF --------------------------------------------------------------
+    //
+    // Riffsheet's own layout first, because a copy it installed is the one it is
+    // surest about, then the places these engines normally end up. PATH is last
+    // and only for the console-script engine, since a repo is not on PATH.
+    juce::Array<juce::File> candidates;
+    candidates.add (engineDirectory (engine.id));
+
+    const auto home = juce::File::getSpecialLocation (juce::File::userHomeDirectory);
+
+    if (pipCli)
+    {
+        candidates.add (home.getChildFile ("." + juce::String (engine.id)));
+        candidates.add (home.getChildFile (juce::String (engine.id)));
+        candidates.add (home.getChildFile (".local"));
+        candidates.add (juce::File ("/usr/local"));
+        candidates.add (juce::File ("/opt/homebrew"));
+
+        // Whatever `which` would answer, without running `which`.
+        const auto pathVar = juce::SystemStats::getEnvironmentVariable ("PATH", {});
+
+        for (const auto& entry : juce::StringArray::fromTokens (pathVar, ":", ""))
+            if (entry.isNotEmpty())
+                candidates.add (juce::File (entry).getParentDirectory());
+    }
+    else
+    {
+        candidates.add (home.getChildFile (juce::String (engine.id)));
+        candidates.add (home.getChildFile ("Downloads").getChildFile (juce::String (engine.id)));
+        candidates.add (home.getChildFile ("src").getChildFile (juce::String (engine.id)));
+    }
+
+    for (const auto& where : candidates)
+    {
+        if (searched.contains (where.getFullPathName()))
+            continue;
+
+        searched.add (where.getFullPathName());
+
+        if (! where.exists())
+            continue;
+
+        juce::String why;
+        const auto found = check (where, why);
+
+        if (found != juce::File())
+        {
+            detail = "Found a working copy of " + name + " at " + found.getFullPathName() + ".";
+            return found;
+        }
+    }
+
+    detail = "No copy of " + name + " was found. Riffsheet looked in "
+           + juce::String (searched.size()) + " places; if it is somewhere else, type the path.";
+    return {};
 }
 
 juce::String EngineInstaller::sha256Of (const juce::File& file)
@@ -1224,7 +1470,8 @@ EngineInstaller::Result EngineInstaller::install (const EngineManifest& engine, 
         juce::StringArray steps;
 
         for (int i = 0; i < engine.guideStepCount; ++i)
-            steps.add (juce::String (engine.guideSteps[i].what) + " - " + engine.guideSteps[i].detail);
+            steps.add (manifestText (engine.guideSteps[i].what) + " - "
+                       + manifestText (engine.guideSteps[i].detail));
 
         return steps;
     };
@@ -1472,7 +1719,7 @@ EngineInstaller::Result EngineInstaller::install (const EngineManifest& engine, 
     // is run. A failure rolls the old one back and the user is where they
     // started - which is the same promise the staging directory was making,
     // kept at the other end.
-    const auto previous = enginesRoot().getChildFile (juce::String (engine.id) + ".previous");
+    const auto previous = enginesRoot().getChildFile (manifestText (engine.id) + ".previous");
     previous.deleteRecursively();
 
     if (engineDir.exists() && ! engineDir.moveFileTo (previous))
@@ -1585,7 +1832,7 @@ EngineInstaller::Result EngineInstaller::install (const EngineManifest& engine, 
         if (! probeOutcome.ok || ! wrote)
             return rollBack (probeOutcome.cancelled
                                  ? juce::String ("cancelled")
-                                 : juce::String (engine.name) + " installed but would not run on this "
+                                 : manifestText (engine.name) + " installed but would not run on this "
                                    "machine: " + lastLines (probeOutcome.output, 6),
                              probeOutcome.cancelled);
     }
@@ -1607,7 +1854,7 @@ EngineInstaller::Result EngineInstaller::uninstall (const EngineManifest& engine
         // Riffsheet did not put the bundled engine or MuScriptor's venv there,
         // so it does not get to remove them - the same principle as never
         // killing a server it did not start.
-        result.error = juce::String (engine.name) + " was not installed by Riffsheet, so Riffsheet "
+        result.error = manifestText (engine.name) + " was not installed by Riffsheet, so Riffsheet "
                                                     "will not remove it.";
         return result;
     }

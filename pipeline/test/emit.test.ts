@@ -97,11 +97,15 @@ describe('STATION 6a — MusicXML round-trip through a real reader', () => {
     expect(read.tempo).toBe(r.ir.tempo.displayBpm);
   });
 
-  it('never emits a rest shorter than an eighth', () => {
-    for (const n of read.notes) {
-      if (!n.isRest) continue;
-      expect(n.duration).toBeGreaterThanOrEqual(6);
-    }
+  it('every rest is a printable value, down to the grid the take was quantized on', () => {
+    // The "no rest shorter than an eighth" floor went with the rest killer: it was only ever
+    // reachable because notes were stretched over the short silences. A sixteenth of measured
+    // silence is now printed as a sixteenth rest. What still holds is that every rest is one of
+    // the eight printable glyph lengths — a rest of 5/16 would be an unprintable file.
+    const printable = new Set([3, 6, 9, 12, 18, 24, 36, 48]);
+    const rests = read.notes.filter((n) => n.isRest);
+    expect(rests.length).toBeGreaterThan(0);
+    for (const n of rests) expect(printable.has(n.duration)).toBe(true);
   });
 
   it('throws loudly if a measure does not add up', () => {

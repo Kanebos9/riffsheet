@@ -100,17 +100,37 @@ export type GridSetting = 'auto' | '1/4' | '1/8' | '1/16' | '1/8T' | 'free';
  * explicitly chosen an instrument and tuning.
  */
 export type Instrument = 'staff' | 'bass4' | 'bass5' | 'bass6' | 'guitar6';
-export type FingeringStyle = 'low' | 'minMovement';
+/**
+ * How the tab assigner picks between the several fretboard positions that produce a pitch.
+ *
+ *  `low`          lowest fret wins — the published baseline, and hard to beat on easy material.
+ *  `minMovement`  the hand stays where it is; edge costs dominate.
+ *  `openStrings`  prefer an open string whenever one sounds the same pitch.
+ *  `aroundFret`   anchor the hand near `anchorFret` and pay for leaving it.
+ */
+export type FingeringStyle = 'low' | 'minMovement' | 'openStrings' | 'aroundFret';
 export type ClefMode = 'auto' | 'treble' | 'bass' | 'grand';
 
 export interface BuildSettings {
   grid: GridSetting;
-  /** false → gaps are written exactly as played (no MuseScore lengthening pass). */
-  fillGaps: boolean;
+  /**
+   * DEPRECATED AND IGNORED. Accepted so existing callers keep compiling; nothing reads it.
+   *
+   * This used to switch on the MuseScore lengthening pass, which pushed each note's off-time
+   * forward to swallow the rest behind it. The pass is deleted (see simplify.ts): a performance
+   * is written at the length it was played, so there is no longer a "fill the gaps" mode to
+   * turn on. Passing `true` does not resurrect it.
+   */
+  fillGaps?: boolean;
   instrument: Instrument;
   /** MIDI note numbers of the open strings, LOW to HIGH. Never guessed (§8.2). */
   tuningMidi: number[];
   fingeringStyle: FingeringStyle;
+  /**
+   * Anchor for `fingeringStyle: 'aroundFret'`, in frets. Ignored by every other style.
+   * Default 5 — first position on a bass, and where a player parks by default.
+   */
+  anchorFret?: number;
   /** One stable generated clef policy. Source clefs take precedence on symbolic imports. */
   clefMode?: ClefMode;
   /** Authoritative MusicXML/alphaTab fifths value, -7..7. Omit to run key detection. */
@@ -122,7 +142,13 @@ export interface BuildSettings {
   capo?: number;
   /** Highest fret the assigner may use. Default 24. */
   maxFret?: number;
-  /** Emit staccato dots from the lengthening pass. Default true (MuseScore `showStaccato`). */
+  /**
+   * DEPRECATED AND IGNORED, for the same reason as `fillGaps`. Staccato dots were INFERRED from
+   * the lengthening pass — a note earned one exactly when >= 30% of its printed value had been
+   * invented. With durations printed as played there is nothing to infer from and nothing to
+   * apologise for, so no articulation is synthesised. `IRNote.staccato` remains in the IR for a
+   * future editing surface; the pipeline never sets it.
+   */
   showStaccato?: boolean;
   /** Score/part titles for the emitters. */
   title?: string;
@@ -140,17 +166,20 @@ export const DEFAULT_TUNINGS: Record<Instrument, number[]> = {
   guitar6: [40, 45, 50, 55, 59, 64]
 };
 
+/** Default anchor for `aroundFret`: first position. */
+export const DEFAULT_ANCHOR_FRET = 5;
+
 export function resolveSettings(s: BuildSettings): Required<
   Pick<
     BuildSettings,
-    'grid' | 'fillGaps' | 'instrument' | 'fingeringStyle' | 'capo' | 'showStaccato' | 'title' | 'clefMode'
+    'grid' | 'instrument' | 'fingeringStyle' | 'capo' | 'anchorFret' | 'title' | 'clefMode'
   >
 > &
   BuildSettings {
   return {
     ...s,
     capo: s.capo ?? 0,
-    showStaccato: s.showStaccato ?? true,
+    anchorFret: s.anchorFret ?? DEFAULT_ANCHOR_FRET,
     clefMode: s.clefMode ?? 'auto',
     title: s.title ?? 'Riff',
     tuningMidi:

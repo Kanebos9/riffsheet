@@ -21,7 +21,7 @@ export type {
   FingeringStyle,
   ClefMode
 } from './types.js';
-export { DEFAULT_TUNINGS, resolveSettings } from './types.js';
+export { DEFAULT_TUNINGS, DEFAULT_ANCHOR_FRET, resolveSettings } from './types.js';
 
 export type {
   RiffsheetIR,
@@ -56,8 +56,8 @@ export {
 } from './meter.js';
 export type { BarMetric, DurationKind, Glyph } from './meter.js';
 
-export { minimizeNumberOfRests, quantForLen, snapLeadingOnset, STACCATO_TOL } from './simplify.js';
-export type { SimplifyEvent, SimplifyResult, SimplifyOptions } from './simplify.js';
+export { clampEventOverlaps, snapLeadingOnset } from './simplify.js';
+export type { SimplifyEvent, SimplifyResult } from './simplify.js';
 
 export { buildTimeSkeleton, compoundEvidence, DOWNBEAT_ANTICIPATION_SEC } from './timeSkeleton.js';
 export type { TimeSkeleton, BarSkeleton, CompoundEvidence } from './timeSkeleton.js';

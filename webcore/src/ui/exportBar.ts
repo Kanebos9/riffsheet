@@ -64,6 +64,14 @@ export interface ExportBarOptions {
   getBaseName: () => string;
   isPlugin: () => boolean;
   toast: (kind: 'info' | 'danger', title: string, message: string) => void;
+  /**
+   * Write the whole document — notes, edits, settings — as a .riffsheet file.
+   *
+   * Owned by `ui/app.ts` (it is the only thing that can serialise the document) and handed
+   * here so the Export menu is the ONE place a file leaves Riffsheet. Absent means the item is
+   * not offered, which is how this stays a drop-in for a caller that has no document to save.
+   */
+  saveDocument?: () => void;
 }
 
 interface MidiChoice {
@@ -137,7 +145,22 @@ export class ExportBar {
     this.menu = new MenuPopover();
   }
 
-  /** The header's export controls, in order. */
+  /**
+   * The header's export control. ONE button.
+   *
+   * It was four: MIDI, MusicXML, PDF in this bar and "Save as Riffsheet" adrift in the main
+   * menu. Four buttons of permanent chrome for something done at the END of a session, on a bar
+   * that also has to hold the filename, the view chips and the settings gear inside 360 px.
+   * They are one menu now — and the .riffsheet item joins them, because "put this somewhere I
+   * can open it again" is the same question as the other three and it was in a different room.
+   *
+   * THE DRAG SURVIVES, and that is why this is still one button rather than a menu of buttons:
+   * dragging MIDI onto a DAW track is a gesture, and a gesture needs something to take hold of.
+   * The Export button IS the MIDI drag source, exactly as the MIDI button was — same
+   * `data-drag`, same grip, same remembered variant — so nothing that worked before stops
+   * working. A press that moves is a drag; a press that does not is a click, and a click opens
+   * the menu.
+   */
   buttons(): HTMLElement[] {
     // The header is rebuilt wholesale on every render, so an open menu would be left
     // pointing at a button that is no longer in the document.
@@ -150,8 +173,8 @@ export class ExportBar {
     this.midiButton = el(
       'button',
       {
-        text: 'MIDI',
-        'data-role': 'export-midi',
+        text: 'Export',
+        'data-role': 'export-menu-button',
         // The button IS the control for `midiExportMode`: the menu it opens is where the
         // remembered choice is made. Named so the settings sweep can find it.
         'data-setting': 'midiExportMode',
@@ -189,23 +212,11 @@ export class ExportBar {
         : null
     );
 
-    this.pdfButton = el('button', {
-      text: 'PDF',
-      'data-role': 'export-pdf',
-      title: t(TIPS.exportPdf),
-      onClick: () => void this.exportPdf()
-    });
+    // Kept as a field because `setPdfBusy` re-labels it while a PDF renders. It is a menu row
+    // now rather than a button on the bar, so the busy state shows on the Export button itself.
+    this.pdfButton = this.midiButton;
 
-    return [
-      this.midiButton,
-      el('button', {
-        text: 'MusicXML',
-        'data-role': 'export-musicxml',
-        title: t(TIPS.exportMusicXml),
-        onClick: () => void this.exportMusicXml()
-      }),
-      this.pdfButton
-    ];
+    return [this.midiButton];
   }
 
   destroy(): void {
@@ -395,6 +406,13 @@ export class ExportBar {
     else button.setAttribute('title', text);
   }
 
+  /**
+   * Everything that can leave Riffsheet, in one list.
+   *
+   * The MIDI variants come first and keep their tick, because that choice is REMEMBERED — it is
+   * what a drag will hand over — and a menu that shows you what it is about to do is the reason
+   * the MIDI button had a menu in the first place. The other three are plain actions.
+   */
   private toggleMidiMenu(): void {
     if (this.menu.isOpen) {
       this.menu.close();
@@ -403,23 +421,40 @@ export class ExportBar {
     if (!this.midiButton) return;
     const current = this.opts.settings.get().midiExportMode;
 
-    this.menu.open(
-      this.midiButton,
-      MIDI_CHOICES.map((choice) => ({
-        label: choice.label,
-        hint: choice.hint,
-        checked: choice.value === current,
-        onPick: () => {
-          // Remembered before the dialog opens, so the choice sticks even if the save is
-          // then cancelled — the user still told us what they want next time.
-          this.opts.settings.set({ midiExportMode: choice.value });
-          // The drag follows the same choice, so the tooltip has to say the new thing even
-          // if nothing re-renders the header.
-          this.refreshMidiTip();
-          void this.exportMidi(choice.value);
-        }
-      }))
-    );
+    const items: MenuItem[] = MIDI_CHOICES.map((choice) => ({
+      label: `MIDI — ${choice.label}`,
+      hint: choice.hint,
+      checked: choice.value === current,
+      onPick: () => {
+        // Remembered before the dialog opens, so the choice sticks even if the save is
+        // then cancelled — the user still told us what they want next time.
+        this.opts.settings.set({ midiExportMode: choice.value });
+        // The drag follows the same choice, so the tooltip has to say the new thing even
+        // if nothing re-renders the header.
+        this.refreshMidiTip();
+        void this.exportMidi(choice.value);
+      }
+    }));
+
+    items.push({
+      label: 'MusicXML',
+      hint: 'For Sibelius, Finale, MuseScore and Dorico.',
+      onPick: () => void this.exportMusicXml()
+    });
+    items.push({
+      label: 'PDF',
+      hint: 'The engraved page, ready to print.',
+      onPick: () => void this.exportPdf()
+    });
+    if (this.opts.saveDocument) {
+      items.push({
+        label: 'Save as Riffsheet',
+        hint: 'The whole document, so you can open it again exactly as it is.',
+        onPick: () => this.opts.saveDocument?.()
+      });
+    }
+
+    this.menu.open(this.midiButton, items);
   }
 
   private async exportMidi(mode: MidiExportMode): Promise<void> {

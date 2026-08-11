@@ -208,6 +208,28 @@ export interface PianoRollLiveModel {
   index: ScoreIndex;
 }
 
+/**
+ * ALIGN's shared ruler: a moment in the RECORDING, and where the sheet puts it.
+ *
+ * `frac` is a fraction of the PLOT (0 at the first pixel after the gutter, 1 at the right
+ * edge), not a pixel, so the roll, the strip and the sheet can be different widths and still
+ * agree about where a beat is.
+ *
+ * A LIST rather than a pair of edges because alphaTab's spacing is deliberately not
+ * proportional to time — a rhythmically dense bar gets more pixels than a sparse one — so two
+ * edges and a straight line between them put a note up to a fifth of the pane away from its own
+ * notehead. One anchor per BEAT brings the two into the same column: the ruler agrees exactly on
+ * every beat and interpolates linearly in between, which is a distance of one beat rather than
+ * one screen.
+ *
+ * The roll is still linear in time BETWEEN anchors, and the anchors are still times, so nothing
+ * here can re-space itself when a note is edited: see `setTimeAnchors`.
+ */
+export interface TimeAnchor {
+  sec: number;
+  frac: number;
+}
+
 /** The visible DAW-style edit grid. It controls drawing and every time edit. */
 export type PianoRollEditGrid = 'quarter' | 'eighth' | 'sixteenth' | 'triplet' | 'free';
 
@@ -509,9 +531,10 @@ const BAND_MIN_PX = 4;
  * note is a 32nd does not draw negative-width rectangles on the way past zero.
  */
 const MIN_PREVIEW_DUR_SEC = 0.03;
-/** Wheel zoom, per notch. Multiplicative, so in-then-out returns to where it started. */
-const ZOOM_IN_FACTOR = 1.1;
-const ZOOM_OUT_FACTOR = 0.9;
+// ZOOM_IN_FACTOR / ZOOM_OUT_FACTOR stood here: the per-notch factors for the SHEET's zoom,
+// which the roll used to forward a ctrl-wheel to through `onZoomRequest`. That branch is gone —
+// a pinch over the roll now zooms the roll, which is the pane under the pointer. The roll's own
+// factors are VZOOM_IN_FACTOR / VZOOM_OUT_FACTOR, below.
 /** The smallest type that is still a pitch name rather than a smudge. */
 const MIN_LABEL_PX = 8;
 const MAX_LABEL_PX = 11;
@@ -818,11 +841,16 @@ export class PianoRoll {
   /** One grid for paint, add, move, resize and keyboard nudge. */
   private editGrid: PianoRollEditGrid = 'eighth';
   private selection = new Set<string>();
-  /** Note id -> was an edit actually made (true) or merely noticed (false). See `setAutoMarks`. */
-  private autoMarks = new Map<string, boolean>();
+  /** Notes the auto-edit pass CHANGED and that are still waiting to be reviewed. */
+  private autoMarks = new Set<string>();
   /** How many of those got their halo painted this frame. `probe()` reports it. */
   private autoMarksDrawn = 0;
   private gesture: Gesture | null = null;
+  /** ALIGN: the sheet's own ruler, in time. Null = the whole take, evenly. `setTimeAnchors`. */
+  private anchors: TimeAnchor[] | null = null;
+  /** Anchors that arrived mid-gesture, waiting for the pointer to come up. Boxed so that a
+   *  deferred `null` (Align switched off during a drag) is distinguishable from "nothing". */
+  private deferredAnchors: { value: TimeAnchor[] | null } | null = null;
   /**
    * The edit just emitted, still drawn where the gesture left it.
    *
@@ -874,9 +902,9 @@ export class PianoRoll {
      * rectangle here and the tick under the waveform are the same piece of evidence, and
      * giving them two colours would hide that they are one claim.
      */
-    autoEdit: '#62d6b5',
-    /** ...and "heard but not acted on", which has to read as a question, not as a change. */
-    autoAttention: '#e8b34a'
+    autoEdit: '#62d6b5'
+    // There was a second token here — `autoAttention`, yellow, for "heard but not acted on".
+    // It is deleted rather than unused. See `setAutoMarks`.
   };
 
   constructor(opts: PianoRollOptions) {
@@ -942,8 +970,7 @@ export class PianoRoll {
       ink: pick('--ink', this.colors.ink),
       keyWhite: pick('--roll-key-white', this.colors.keyWhite),
       keyBlack: pick('--roll-key-black', this.colors.keyBlack),
-      autoEdit: pick('--success', this.colors.autoEdit),
-      autoAttention: pick('--warn', this.colors.autoAttention)
+      autoEdit: pick('--success', this.colors.autoEdit)
     };
   }
 
@@ -989,6 +1016,123 @@ export class PianoRoll {
     if (this.durationSec <= 0) this.durationSec = score.durationSec;
     this.rebuildNotes();
     this.draw();
+  }
+
+  /**
+   * ALIGN: show exactly this stretch of the RECORDING, filling the plot. Null = the whole take.
+   *
+   * This is what "the views line up" is, and what it deliberately is NOT.
+   *
+   * IS: the sheet's visible span, in seconds, handed over so the roll draws the same music in
+   * the same horizontal band. `ui/app.ts` derives it from alphaTab's own bounds — the sheet's
+   * scroll position mapped back through `contentXToWrittenSec` — so scroll the sheet and the
+   * roll and the strip follow, at the sheet's scale, with bar lines in the same columns. The
+   * sheet's left page padding is already sized to this roll's gutter (`TIMELINE_GUTTER_PX`), so
+   * the window's first second is at the same screen x in all three panes.
+   *
+   * IS NOT: the sheet's x-AXIS. Inside the window the ruler stays perfectly linear in time, and
+   * that is the whole of §1's argument surviving intact — alphaTab spaces a dense bar wider
+   * than a sparse one, so borrowing its axis makes the picture of a performance re-space itself
+   * when the performance is edited. A window is a pair of numbers about WHERE TO LOOK; it
+   * cannot do that, because adding a note changes no other note's time.
+   *
+   * FROZEN DURING A GESTURE. A drag or a double-click ends in a re-engrave, which can change
+   * the sheet's content width and therefore this window. Applying that while the player still
+   * has the pointer down would move every other rectangle out from under their hand mid-edit —
+   * the exact failure the old linked mode was deleted for. So a window arriving during a
+   * gesture is remembered and applied when the gesture ends. Re-sync on commit, never live.
+   */
+  setTimeAnchors(anchors: ReadonlyArray<TimeAnchor> | null): void {
+    const clean =
+      anchors && anchors.length >= 2
+        ? anchors
+            .filter((a) => Number.isFinite(a.sec) && Number.isFinite(a.frac))
+            .sort((a, b) => a.sec - b.sec)
+            .filter((a, i, all) => i === 0 || a.sec - all[i - 1].sec > 1e-6)
+        : null;
+    const next = clean && clean.length >= 2 ? clean : null;
+    if (this.gesture) {
+      this.deferredAnchors = { value: next };
+      return;
+    }
+    this.deferredAnchors = null;
+    this.applyTimeAnchors(next);
+  }
+
+  private applyTimeAnchors(next: TimeAnchor[] | null): void {
+    const a = this.anchors;
+    const same =
+      (next === null && a === null) ||
+      (next !== null &&
+        a !== null &&
+        next.length === a.length &&
+        next.every((n, i) => Math.abs(n.sec - a[i].sec) < 1e-4 && Math.abs(n.frac - a[i].frac) < 1e-4));
+    if (same) return;
+    this.anchors = next;
+    this.draw();
+  }
+
+  /** Whatever arrived while the pointer was down. Called from the one place a gesture ends. */
+  private flushDeferredWindow(): void {
+    const deferred = this.deferredAnchors;
+    if (!deferred) return;
+    this.deferredAnchors = null;
+    this.applyTimeAnchors(deferred.value);
+  }
+
+  /**
+   * A RECORDING second -> a fraction of the plot, on the sheet's ruler. Null when there is none.
+   *
+   * Linear inside each pair of anchors and along the slope of the end pair outside them, so a
+   * second before the first beat or after the last still has an answer and the answer is
+   * monotonic. Monotonic matters: a click has to invert this, and a ruler that doubles back is
+   * a ruler where two places on screen mean the same moment.
+   */
+  private anchorFrac(sec: number): number | null {
+    const a = this.anchors;
+    if (!a) return null;
+    if (sec <= a[0].sec) {
+      const span = a[1].sec - a[0].sec;
+      return a[0].frac + (span > 0 ? ((sec - a[0].sec) / span) * (a[1].frac - a[0].frac) : 0);
+    }
+    const last = a.length - 1;
+    if (sec >= a[last].sec) {
+      const span = a[last].sec - a[last - 1].sec;
+      return a[last].frac + (span > 0 ? ((sec - a[last].sec) / span) * (a[last].frac - a[last - 1].frac) : 0);
+    }
+    let lo = 0;
+    let hi = last;
+    while (hi - lo > 1) {
+      const mid = (lo + hi) >> 1;
+      if (a[mid].sec <= sec) lo = mid;
+      else hi = mid;
+    }
+    const span = a[hi].sec - a[lo].sec;
+    return span > 0 ? a[lo].frac + ((sec - a[lo].sec) / span) * (a[hi].frac - a[lo].frac) : a[lo].frac;
+  }
+
+  /** The exact inverse of `anchorFrac`. */
+  private anchorSec(frac: number): number | null {
+    const a = this.anchors;
+    if (!a) return null;
+    if (frac <= a[0].frac) {
+      const span = a[1].frac - a[0].frac;
+      return a[0].sec + (span > 0 ? ((frac - a[0].frac) / span) * (a[1].sec - a[0].sec) : 0);
+    }
+    const last = a.length - 1;
+    if (frac >= a[last].frac) {
+      const span = a[last].frac - a[last - 1].frac;
+      return a[last].sec + (span > 0 ? ((frac - a[last].frac) / span) * (a[last].sec - a[last - 1].sec) : 0);
+    }
+    let lo = 0;
+    let hi = last;
+    while (hi - lo > 1) {
+      const mid = (lo + hi) >> 1;
+      if (a[mid].frac <= frac) lo = mid;
+      else hi = mid;
+    }
+    const span = a[hi].frac - a[lo].frac;
+    return span > 0 ? a[lo].sec + ((frac - a[lo].frac) / span) * (a[hi].sec - a[lo].sec) : a[lo].sec;
   }
 
   /**
@@ -1132,18 +1276,23 @@ export class PianoRoll {
    * than about the music. The roll and the waveform are where the player already goes to
    * argue with what was heard, so that is where the argument is shown.
    *
-   * `applied` distinguishes the two states the feature has: an edit that was made and is
-   * waiting to be reviewed, and a detection that was NOT acted on — either because the
-   * setting is off or because a guardrail refused it. They are drawn in different colours,
-   * because "I changed this" and "I noticed this" are different claims.
+   * ONE KIND OF MARK, AND IT MEANS "THE APP CHANGED THIS". There used to be a second,
+   * yellow kind for a detection the pass NOTICED and did not act on. It is gone — not
+   * unused, unrepresentable: this signature carries no flag that could ask for it.
+   *
+   * Why it went: a highlight the player cannot act on is a highlight they have to learn to
+   * ignore, and a roll speckled with yellow on every take taught exactly that. Worse, it
+   * trained the eye to skim past the green ones, which are the marks that DO need a decision.
+   * The pass still records its refusals — `AutoEditPlan.attention` is unchanged and the
+   * probes still count it — it simply no longer paints them.
    */
-  setAutoMarks(marks: ReadonlyArray<{ noteId: string; applied: boolean }>): void {
-    const next = new Map<string, boolean>();
-    for (const m of marks) if (m.noteId) next.set(m.noteId, m.applied);
+  setAutoMarks(marks: ReadonlyArray<{ noteId: string }>): void {
+    const next = new Set<string>();
+    for (const m of marks) if (m.noteId) next.add(m.noteId);
     if (next.size === this.autoMarks.size) {
       let same = true;
-      for (const [id, applied] of next) {
-        if (this.autoMarks.get(id) !== applied) {
+      for (const id of next) {
+        if (!this.autoMarks.has(id)) {
           same = false;
           break;
         }
@@ -1155,7 +1304,7 @@ export class PianoRoll {
   }
 
   get autoMarkIds(): string[] {
-    return [...this.autoMarks.keys()];
+    return [...this.autoMarks];
   }
 
   /**
@@ -1430,17 +1579,23 @@ export class PianoRoll {
       const cx = m.writtenSecToContentX(sec);
       return cx === null || !Number.isFinite(cx) ? Number.NaN : cx - m.scrollLeft;
     }
+    // ALIGN: the sheet's own ruler, beat by beat. Still a ruler made of TIMES — adding a note
+    // changes no other note's time, so no other rectangle can move. See `setTimeAnchors`.
+    const frac = this.anchorFrac(sec + this.originSec);
+    if (frac !== null) return this.gutterPx + frac * this.plotWidth;
     if (this.durationSec <= 0) return this.gutterPx;
     return this.gutterPx + ((sec + this.originSec) / this.durationSec) * this.plotWidth;
   }
 
-  /** The exact inverse, in both modes. NaN when linked mode cannot answer. */
+  /** The exact inverse, in every mode. NaN when linked mode cannot answer. */
   private xToWritten(x: number): number {
     const m = this.map();
     if (m) {
       const sec = m.contentXToWrittenSec(x + m.scrollLeft);
       return sec === null || !Number.isFinite(sec) ? Number.NaN : sec;
     }
+    const sec = this.anchorSec((x - this.gutterPx) / this.plotWidth);
+    if (sec !== null) return sec - this.originSec;
     if (this.durationSec <= 0) return 0;
     return ((x - this.gutterPx) / this.plotWidth) * this.durationSec - this.originSec;
   }
@@ -2430,6 +2585,10 @@ export class PianoRoll {
     const g = this.gesture;
     if (!g) return;
     this.gesture = null;
+    // ON COMMIT, NEVER LIVE. Any Align window that arrived while the pointer was down has been
+    // waiting here — see `setTimeWindow`. Applied first, so the edit emitted below is drawn on
+    // the ruler the player will be looking at a moment later rather than on a stale one.
+    this.flushDeferredWindow();
     try {
       this.canvas.releasePointerCapture(e.pointerId);
     } catch {
@@ -2495,6 +2654,7 @@ export class PianoRoll {
   private cancelGesture(): void {
     if (!this.gesture) return;
     this.gesture = null;
+    this.flushDeferredWindow();
     this.opts.onEditPreview?.(null);
     this.canvas.style.cursor = 'pointer';
   }
@@ -2519,7 +2679,16 @@ export class PianoRoll {
   private onDoubleClick = (e: MouseEvent): void => {
     if (!this.editingOn) return;
     const { x, y } = this.localPoint(e);
-    if (x < this.gutterPx) return;
+    if (x < this.gutterPx) {
+      // DOUBLE-CLICK THE RULER TO FIT. This is what the "Fit" and "Reset view" chips used to
+      // be, moved onto the thing they act on: the gutter is the pitch axis, and double-clicking
+      // an axis to make everything fit is the same gesture as double-clicking a column edge in
+      // a spreadsheet. Two chips of permanent screen furniture for something done once a
+      // session was a poor trade on a bar that has to survive a 360 px window.
+      e.preventDefault();
+      this.fitVertical();
+      return;
+    }
     const hit = this.hitTest(x, y);
     if (hit?.note.noteId) {
       e.preventDefault();
@@ -2551,26 +2720,39 @@ export class PianoRoll {
   }
 
   /**
-   * The four wheels. Invariant 10.
+   * THE WHEEL, AND NO KEY TO HOLD DOWN.
    *
-   *   Ctrl/Cmd + wheel   the SHEET's zoom — unchanged, and it is also a trackpad pinch
-   *   Alt + wheel        this roll's VERTICAL zoom, about the pointer
-   *   Shift + wheel      time, which is where the plain wheel used to go
-   *   plain wheel        PITCH
+   *   over the GUTTER      zoom the pitch axis, about the pointer
+   *   over the NOTES       scroll the pitch axis
+   *   pinch (ctrl-wheel)   zoom, wherever the pointer is
+   *   Alt + wheel          zoom, wherever the pointer is — kept, because it was shipped
+   *   Shift + wheel        time (a request to the sheet)
    *
-   * The swap in the last two is the reported complaint. A wheel over a piano roll means pitch
-   * in every editor that has one, and the player who said "I wanna be able to scroll up and
-   * down" had a wheel under their hand that was moving the take sideways instead.
+   * WHERE THE POINTER IS, NOT WHICH KEY IS DOWN. Zoom used to need Alt, which is a thing you
+   * have to be told and then remember, and the complaint was exactly that: nothing on screen
+   * says a modifier exists. The gutter is a RULER — it is the pitch axis drawn as a keyboard —
+   * and a wheel over a ruler meaning "zoom that axis" is a convention the player already has
+   * from every DAW, discoverable by trying it once. Over the notes the wheel still scrolls,
+   * which is what a wheel over content means everywhere else.
+   *
+   * A trackpad pinch arrives as a wheel event with `ctrlKey` set, whether or not anybody is
+   * holding ctrl. It is handled as zoom rather than forwarded to the sheet: the roll is under
+   * the pointer, so the roll is what the gesture is about. `preventDefault` is unconditional on
+   * that path — without it the browser zooms the whole page instead.
    *
    * The time half is still a REQUEST: the roll owns neither the sheet's zoom nor its scroll, so
    * it asks and redraws from the sheet's new numbers on the next frame. The pitch half is the
    * roll's own and is applied here.
    */
   private onWheel = (e: WheelEvent): void => {
-    if (e.ctrlKey || e.metaKey) {
-      if (!this.opts.onZoomRequest) return;
+    // A pinch, or a wheel over the ruler. Both are "zoom this axis" and neither asks the player
+    // to know anything.
+    const overGutter = this.gutterPx > 0 && this.localPoint(e).x < this.gutterPx;
+    if (e.ctrlKey || e.metaKey || (overGutter && !e.shiftKey)) {
+      const d = e.deltaY || e.deltaX;
+      if (d === 0) return;
       e.preventDefault();
-      this.opts.onZoomRequest(e.deltaY < 0 ? ZOOM_IN_FACTOR : ZOOM_OUT_FACTOR);
+      this.zoomVerticalAt(d < 0 ? VZOOM_IN_FACTOR : VZOOM_OUT_FACTOR, this.localPoint(e).y);
       return;
     }
 
@@ -2826,6 +3008,20 @@ export class PianoRoll {
     linked: boolean;
     /** True only when linking is on AND the sheet answered. Free mode otherwise. */
     linkedActive: boolean;
+    /**
+     * ALIGN: the stretch of RECORDING on screen, or null for the whole take.
+     *
+     * Deliberately beside `linkedActive`, which stays false: a window says WHERE the roll is
+     * looking and `linkedActive` says whose x-axis it is drawing on. The second is still nobody
+     * else's, which is the invariant that keeps a picture of a performance from re-spacing
+     * itself, and this pair is how a check can tell the two claims apart.
+     */
+    windowFromSec: number | null;
+    windowToSec: number | null;
+    /** How many beats the shared ruler is pinned to. 0 = the roll is on its own even ruler. */
+    anchorCount: number;
+    /** What the middle of the plot means, in RECORDING seconds. The ruler, stated as a number. */
+    midPlotSec: number;
     hasSheetMap: boolean;
     /** The sheet's content width at the current zoom. Null in free mode. */
     zoomedContentWidth: number | null;
@@ -2907,7 +3103,14 @@ export class PianoRoll {
     autoMarkIds: string[];
     /** How many of those actually got a halo painted this frame. */
     autoMarksDrawn: number;
-    /** Of the marked notes, how many are edits the app made rather than things it noticed. */
+    /**
+     * Of the marked notes, how many are edits the app made.
+     *
+     * Equal to `autoMarks` now, and kept as its own field on purpose: it is the number the
+     * harness has always asserted goes to zero when the player reviews an edit, and the claim
+     * it makes ("no unreviewed change is still highlighted") is the one worth keeping. The
+     * two can no longer differ because a mark that is not an applied edit cannot be made.
+     */
     autoMarksApplied: number;
   } {
     const first = this.notes[0] ?? null;
@@ -2941,6 +3144,10 @@ export class PianoRoll {
 
       linked: false,
       linkedActive: m !== null,
+      windowFromSec: this.anchors ? Number((this.anchorSec(0) ?? 0).toFixed(4)) : null,
+      windowToSec: this.anchors ? Number((this.anchorSec(1) ?? 0).toFixed(4)) : null,
+      anchorCount: this.anchors?.length ?? 0,
+      midPlotSec: Number(this.xToSec(this.gutterPx + this.plotWidth / 2).toFixed(4)),
       hasSheetMap: false,
       zoomedContentWidth: m ? Math.round(m.contentWidth) : null,
       sheetScrollLeft: m ? Math.round(m.scrollLeft) : null,
@@ -2976,9 +3183,9 @@ export class PianoRoll {
         : null,
 
       autoMarks: this.autoMarks.size,
-      autoMarkIds: [...this.autoMarks.keys()],
+      autoMarkIds: [...this.autoMarks],
       autoMarksDrawn: this.autoMarksDrawn,
-      autoMarksApplied: [...this.autoMarks.values()].filter(Boolean).length
+      autoMarksApplied: this.autoMarks.size
     };
   }
 
@@ -3353,17 +3560,15 @@ export class PianoRoll {
       ctx.save();
       for (const r of this.rects) {
         const id = r.note.noteId;
-        if (!id) continue;
-        const applied = this.autoMarks.get(id);
-        if (applied === undefined) continue;
+        if (!id || !this.autoMarks.has(id)) continue;
         ctx.globalAlpha = 0.9;
-        ctx.strokeStyle = applied ? this.colors.autoEdit : this.colors.autoAttention;
+        ctx.strokeStyle = this.colors.autoEdit;
         ctx.lineWidth = 2;
         // Outside the rectangle, not inset: an inset stroke would be mistaken for the ordinary
         // note outline every rect already has, and the two mean completely different things.
         ctx.strokeRect(r.x - 1.5, r.y - 1.5, r.w + 3, r.h + 3);
         ctx.globalAlpha = 0.18;
-        ctx.fillStyle = applied ? this.colors.autoEdit : this.colors.autoAttention;
+        ctx.fillStyle = this.colors.autoEdit;
         ctx.fillRect(r.x - 1.5, r.y - 1.5, r.w + 3, r.h + 3);
         this.autoMarksDrawn++;
       }

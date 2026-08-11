@@ -53,7 +53,13 @@ export function glyphFor(len: Rational): Glyph | null {
   return null;
 }
 
-/** `MidiDuration::durationCount`: a dotted duration counts as 1.5 glyphs. */
+/**
+ * `MidiDuration::durationCount`: a dotted duration counts as 1.5 glyphs.
+ *
+ * PUBLIC API ONLY. Its one internal caller was the deleted lengthening search, which scored
+ * candidate off-times by glyph count. Kept exported because "how many symbols does this span
+ * cost?" is the question any engraving decision above this module asks.
+ */
 export function durationCount(list: Rational[]): number {
   let n = 0;
   for (const len of list) {
@@ -71,7 +77,7 @@ export interface BarMetric {
   compound: boolean;
   /** Descending division lengths; index = metric depth (0 = whole bar, larger = weaker). */
   divLengths: Rational[];
-  /** `Meter::beatLength(barFraction)` — the cap named by rule 3 of `minimizeNumberOfRests`. */
+  /** `Meter::beatLength(barFraction)`: the beat of the meter, dotted in compound time. */
   beatLen: Rational;
   /** Bar-relative positions of every beat boundary, ascending, including 0 and barLen. */
   beatPositions: Rational[];
@@ -150,7 +156,11 @@ function strongestInterior(m: BarMetric, s: Rational, e: Rational, minSide?: Rat
   return null;
 }
 
-/** Next beat boundary strictly after `pos` (bar end if none). Rule 3 of the endTime clamp. */
+/**
+ * Next beat boundary strictly after `pos` (bar end if none). PUBLIC API ONLY — it was rule 3 of
+ * the deleted lengthening pass's endTime clamp, and is kept because it is the natural way for a
+ * caller to ask "where does this beat end?" without rebuilding the metric tree.
+ */
 export function nextBeatAfter(m: BarMetric, pos: Rational): Rational {
   for (const b of m.beatPositions) if (b.gt(pos)) return b;
   return m.barLen;
@@ -216,13 +226,22 @@ function splitSpan(m: BarMetric, s: Rational, e: Rational, opts: SplitOptions): 
 }
 
 /**
- * The two conventions §1.4 records as overriding the level test.
- *  (a) a 2/3-bar span at bar start or bar end in TRIPLE meter always splits;
+ * The two conventions §1.4 records as overriding the level test. BOTH ARE REST RULES, and that
+ * qualifier is load-bearing — see below.
+ *  (a) a 2/3-bar REST at bar start or bar end in TRIPLE meter always splits;
  *  (b) the last 2/3 of a beat in COMPOUND meter, when it is a REST, splits into two rests.
+ *
+ * WHY (a) IS REST-ONLY. Gould, *Behind Bars* p.161: "In 3/4 use two crotchet rests, not a minim
+ * rest" — the half rest is banned in triple meter because it hides the third beat. The half
+ * NOTE is not: beats 1-2 and beats 2-3 of a 3/4 bar are written as a half note by every
+ * publisher (any waltz shows both). Applying (a) to notes as well printed a 3/4 half note as
+ * two tied quarters, which is the largest-legal-symbol bug this rule used to cause — and it was
+ * self-evidently a bug even without the textbook, because the SAME half note starting an eighth
+ * later (off the barline, so the override missed it) came out as one half note.
  */
 function hardSplitOverride(m: BarMetric, s: Rational, e: Rational, kind: DurationKind): boolean {
   const len = e.sub(s);
-  if (!m.compound && m.num % 3 === 0 && m.num > 1) {
+  if (kind === 'rest' && !m.compound && m.num % 3 === 0 && m.num > 1) {
     const twoThirds = m.barLen.scale(2, 3);
     if (len.eq(twoThirds) && (s.isZero() || e.eq(m.barLen))) return true;
   }

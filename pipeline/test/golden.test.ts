@@ -36,15 +36,18 @@ describe('GOLDEN FILES — notes + beats in, MusicXML out', () => {
 });
 
 describe('GOLDEN FILES — what each one pins', () => {
-  it('straight-eighths: sixteen eighths at a 60% gate print as eighths, no rests', () => {
+  it('straight-eighths: sixteen eighths at a 60% GATE print at the length they were gated to', () => {
+    // THIS ASSERTION WAS INVERTED WITH THE REST KILLER. It used to read "print as eighths, no
+    // rests", because the lengthening pass pushed every off-time forward to the next onset. The
+    // fixture plays each eighth for 60% of its slot, i.e. a sixteenth, so a sixteenth followed
+    // by a sixteenth rest is what was played and what is now printed.
     const read = readMusicXml(straightEighths);
     const staff1 = read.notes.filter((n) => n.staff === 1);
-    expect(staff1.filter((n) => n.isRest)).toHaveLength(0);
     expect(staff1.filter((n) => !n.isRest)).toHaveLength(16);
-    for (const n of staff1) expect(n.type).toBe('eighth');
-    // and the beams group by beat: two eighths per beam group in 4/4
-    expect(straightEighths).toContain('<beam number="1">begin</beam>');
-    expect(straightEighths).toContain('<beam number="1">end</beam>');
+    expect(staff1.filter((n) => n.isRest)).toHaveLength(15);
+    for (const n of staff1.slice(0, 30)) expect(n.type).toBe('16th');
+    // A sixteenth with a rest on either side has nothing to beam to: it keeps its flag.
+    expect(straightEighths).not.toContain('<beam');
   });
 
   it('external-grid: the host BPM wins over the (deliberately wrong) detected beats', () => {
@@ -52,10 +55,12 @@ describe('GOLDEN FILES — what each one pins', () => {
     expect(read.tempo).toBe(100);
     expect(read.divisions).toBe(12);
     expect(read.timeSig).toEqual([4, 4]);
-    // eight quarter notes across two bars, despite a mid-score tempo change to 80 BPM
+    // eight notes across two bars, despite a mid-score tempo change to 80 BPM. Each is played
+    // for 75% of its beat, so each is a dotted eighth plus a sixteenth of measured silence.
     const staff1 = read.notes.filter((n) => n.staff === 1 && !n.isRest);
     expect(staff1).toHaveLength(8);
-    for (const n of staff1) expect(n.type).toBe('quarter');
+    for (const n of staff1) expect(n.type).toBe('eighth');
+    for (const n of staff1) expect(n.duration).toBe(9);
     for (const m of read.measureLengths) expect(m.length).toBe(48);
   });
 
@@ -76,9 +81,10 @@ describe('GOLDEN FILES — what each one pins', () => {
       const read = readMusicXml(xml);
       expect(read.hasTranspose, name).toBe(false);
       expect(read.hasClefOctaveChange, name).toBe(false);
+      const printable = new Set([3, 6, 9, 12, 18, 24, 36, 48]);
       for (const n of read.notes) {
         if (!n.isRest) expect(n.type, `${name}: every pitched note needs a <type>`).not.toBe('');
-        else expect(n.duration, `${name}: no rest shorter than an eighth`).toBeGreaterThanOrEqual(6);
+        else expect(printable.has(n.duration), `${name}: every rest is a printable value`).toBe(true);
       }
     }
   });

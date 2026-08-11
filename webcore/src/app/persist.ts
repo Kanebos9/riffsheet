@@ -227,6 +227,43 @@ export interface RiffsheetDocument {
   edits: EditSpec[];
   editCursor: number;
   sourceMidi?: string;
+  /**
+   * Which take this document is OF, so reopening it can find the audio again.
+   *
+   * Optional, and deliberately not a version bump: `readRiffsheetDocument` rejects any version
+   * it does not recognise, so raising the number would make every document written before this
+   * field unopenable. A document without it simply has no take to look for.
+   *
+   * Only the durable half of `PersistedAudio` is written — see `portableAudioRef`.
+   */
+  audio?: PersistedAudio | null;
+}
+
+/**
+ * The half of an audio handle that is worth writing into a FILE.
+ *
+ * A session blob lives inside one process and can carry `token`/`pcmUrl`, which are handles
+ * into that process's memory. A `.riffsheet` document outlives the process and can be opened
+ * on another machine entirely, where those two are worse than useless: they name a decode that
+ * no longer exists, and `reopenOriginal` would try the dead token before the path that would
+ * have worked. So they are dropped here rather than at every call site.
+ */
+export function portableAudioRef(audio: PersistedAudio | null | undefined): PersistedAudio | null {
+  if (!audio) return null;
+  return { kind: audio.kind, name: audio.name, path: audio.path, durationSec: audio.durationSec };
+}
+
+function decodeAudioRef(value: unknown): PersistedAudio | null {
+  if (!value || typeof value !== 'object') return null;
+  const v = value as Partial<PersistedAudio>;
+  if (v.kind !== 'file' && v.kind !== 'capture' && v.kind !== 'midi') return null;
+  if (typeof v.name !== 'string' || typeof v.path !== 'string') return null;
+  return {
+    kind: v.kind,
+    name: v.name,
+    path: v.path,
+    durationSec: Number.isFinite(Number(v.durationSec)) ? Math.max(0, Number(v.durationSec)) : 0
+  };
 }
 
 export function isRiffsheetFile(name: string): boolean {
@@ -259,7 +296,10 @@ export function readRiffsheetDocument(bytes: Uint8Array): RiffsheetDocument {
     settings: parsed.settings ?? {},
     edits: Array.isArray(parsed.edits) ? parsed.edits : [],
     editCursor: Number.isInteger(parsed.editCursor) ? (parsed.editCursor as number) : -1,
-    sourceMidi: typeof parsed.sourceMidi === 'string' ? parsed.sourceMidi : undefined
+    sourceMidi: typeof parsed.sourceMidi === 'string' ? parsed.sourceMidi : undefined,
+    // Null for a document written before this field existed, and for one saved from a symbolic
+    // import. Both mean the same thing to the caller: there is no take to go looking for.
+    audio: decodeAudioRef(parsed.audio)
   };
 }
 

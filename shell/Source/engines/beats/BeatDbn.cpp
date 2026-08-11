@@ -330,6 +330,121 @@ void activationsFromLogits (const std::vector<float>& beatLogits,
     }
 }
 
+namespace
+{
+    /** One beat per contiguous run of in-beat frames, placed at the frame with the
+        largest activation in the run. The path says WHERE the beat is to within a
+        sixteenth of a period; the activation says which frame in that window the
+        network actually heard something on.
+
+        The reference takes the argmax over the FLATTENED two-column slice and
+        divides by two, i.e. the largest of either column, first occurrence
+        winning. Comparing the row maximum with `>` is the same thing said
+        forwards. */
+    std::vector<int> pickBeats (const std::vector<uint8_t>& pointers, const float* window, int frames)
+    {
+        std::vector<int> peaks;
+
+        for (int frame = 0; frame < frames;)
+        {
+            if (pointers[(size_t) frame] == 0)
+            {
+                ++frame;
+                continue;
+            }
+
+            auto end = frame;
+
+            while (end < frames && pointers[(size_t) end] != 0)
+                ++end;
+
+            auto peak = frame;
+            auto peakValue = -std::numeric_limits<double>::infinity();
+
+            for (int i = frame; i < end; ++i)
+            {
+                const auto value = juce::jmax ((double) window[(size_t) i * 2],
+                                               (double) window[(size_t) i * 2 + 1]);
+
+                if (value > peakValue)
+                {
+                    peakValue = value;
+                    peak = i;
+                }
+            }
+
+            peaks.push_back (peak);
+            frame = end;
+        }
+
+        return peaks;
+    }
+
+    /** HOW MUCH THE DOWNBEAT COLUMN SUPPORTS A BAR OF `beatsPerBar`, in nats.
+
+        Given the beats the tracker already found, a bar length is a claim that
+        every `beatsPerBar`-th one of them is accented. Score that claim directly:
+        for the best phase, the mean log downbeat activation at the beats the bar
+        WOULD call downbeats, minus the mean at the beats it would not.
+
+        WHY THIS AND NOT THE PATH PROBABILITY. The likelihood of a Viterbi path is
+        not comparable across bar lengths - a longer bar is forced to spend fewer
+        downbeat labels, so it scores higher on material with no downbeat
+        information at all, which is the trap the first attempt at odd metres fell
+        into. This statistic has that bias removed by construction: it is a
+        DIFFERENCE of means over the same beats, so a bar length that lines up
+        with real accents scores high whatever its length, and one that does not
+        scores about zero however long it is.
+
+        Phase is maximised over rather than assumed, because the tracker's beat 1
+        is only meaningful under the bar length that produced it. */
+    double downbeatEvidence (const std::vector<int>& peaks, const float* window, int beatsPerBar)
+    {
+        const auto count = (int) peaks.size();
+
+        if (beatsPerBar < 2 || count < beatsPerBar)
+            return 0.0;
+
+        std::vector<double> logDownbeat ((size_t) count);
+
+        for (int i = 0; i < count; ++i)
+        {
+            // Already floored off zero by activationsFromLogits, so the log is finite.
+            const auto value = (double) window[(size_t) peaks[(size_t) i] * 2 + 1];
+            logDownbeat[(size_t) i] = std::log (juce::jmax (value, 1.0e-9));
+        }
+
+        auto bestScore = -std::numeric_limits<double>::infinity();
+
+        for (int phase = 0; phase < beatsPerBar; ++phase)
+        {
+            auto onSum = 0.0, offSum = 0.0;
+            auto onCount = 0, offCount = 0;
+
+            for (int i = 0; i < count; ++i)
+            {
+                if (i % beatsPerBar == phase)
+                {
+                    onSum += logDownbeat[(size_t) i];
+                    ++onCount;
+                }
+                else
+                {
+                    offSum += logDownbeat[(size_t) i];
+                    ++offCount;
+                }
+            }
+
+            if (onCount == 0 || offCount == 0)
+                continue;
+
+            bestScore = juce::jmax (bestScore, onSum / onCount - offSum / offCount);
+        }
+
+        return std::isfinite (bestScore) ? bestScore : 0.0;
+    }
+}
+
 Result track (const std::vector<float>& activations, const std::function<bool()>& shouldCancel)
 {
     Result result;
@@ -381,16 +496,28 @@ Result track (const std::vector<float>& activations, const std::function<bool()>
     const auto& tempi = intervals();
     const auto transitions = buildTransitionLogProbabilities (tempi);
 
-    // One HMM per candidate bar length; the one with the higher path probability
-    // decides both the beats and the metre.
+    // One HMM per candidate bar length; among the CORE pair the one with the
+    // higher path probability decides both the beats and the metre. This loop is
+    // untouched, and when no odd candidate qualifies below it is the whole answer.
     Decoded best;
+    auto cancelled = false;
 
-    for (const auto beatsPerBar : kBeatsPerBarOptions)
+    const auto decode = [&] (int beatsPerBar) -> Decoded
     {
         const BarSpace space (beatsPerBar, tempi);
         auto decoded = viterbi (space, tempi, transitions, densities, frames, shouldCancel);
 
         if (decoded.cancelled)
+            cancelled = true;
+
+        return decoded;
+    };
+
+    for (const auto beatsPerBar : kBeatsPerBarOptions)
+    {
+        auto decoded = decode (beatsPerBar);
+
+        if (cancelled)
             return {};
 
         if (decoded.logProbability > best.logProbability)
@@ -400,51 +527,71 @@ Result track (const std::vector<float>& activations, const std::function<bool()>
     if (best.beatsPerBar == 0)
         return result;
 
-    result.beatsPerBar = best.beatsPerBar;
+    auto peaks = pickBeats (best.pointers, window, frames);
 
-    // One beat per contiguous run of in-beat frames, placed at the frame with the
-    // largest activation in the run. The path says WHERE the beat is to within a
-    // sixteenth of a period; the activation says which frame in that window the
-    // network actually heard something on.
-    for (int frame = 0; frame < frames;)
+    // ---- the odd metres ---------------------------------------------------
+    //
+    // Everything above is what this file did before odd bars existed. What
+    // follows may only REPLACE that answer, never soften it: if no candidate
+    // clears every gate, `best` and `peaks` go out untouched.
     {
-        if (best.pointers[(size_t) frame] == 0)
+        const auto coreEvidence = downbeatEvidence (peaks, window, best.beatsPerBar);
+
+        auto bestExtended = 0;
+        auto bestEvidence = juce::jmax (coreEvidence + kDownbeatEvidenceMargin, kDownbeatEvidenceMin);
+
+        for (const auto beatsPerBar : kExtendedBeatsPerBarOptions)
         {
-            ++frame;
-            continue;
-        }
+            // GATE 3 first, because it is free and it is the one that protects
+            // sparse material: a take too short to show the pattern repeat
+            // cannot be evidence for the pattern. This is what stops five beats
+            // of a held note from "supporting" a bar of five perfectly.
+            if ((int) peaks.size() < kMinBarsForEvidence * beatsPerBar)
+                continue;
 
-        auto end = frame;
+            // GATES 1 and 2 are both in the initial value of `bestEvidence`:
+            // enough downbeat evidence in absolute terms, AND decisively more
+            // than the metre we already have.
+            const auto evidence = downbeatEvidence (peaks, window, beatsPerBar);
 
-        while (end < frames && best.pointers[(size_t) end] != 0)
-            ++end;
-
-        auto peak = frame;
-        auto peakValue = -std::numeric_limits<double>::infinity();
-
-        for (int i = frame; i < end; ++i)
-        {
-            // The reference takes the argmax over the FLATTENED two-column
-            // slice and divides by two, i.e. the largest of either column, first
-            // occurrence winning. Comparing the row maximum with `>` is the same
-            // thing said forwards.
-            const auto value = juce::jmax ((double) window[(size_t) i * 2],
-                                           (double) window[(size_t) i * 2 + 1]);
-
-            if (value > peakValue)
+            if (evidence > bestEvidence)
             {
-                peakValue = value;
-                peak = i;
+                bestEvidence = evidence;
+                bestExtended = beatsPerBar;
             }
         }
 
+        if (bestExtended > 0)
+        {
+            auto decoded = decode (bestExtended);
+
+            if (cancelled)
+                return {};
+
+            auto candidatePeaks = pickBeats (decoded.pointers, window, frames);
+
+            // GATE 4, and it is the one the reverted widening failed: a longer
+            // bar may re-read the METRE, never lose beats. On weak evidence a
+            // wider bar can always buy a higher path probability by also
+            // slowing down, and a tracker that drops beats to find a metre is
+            // worse than one that cannot find the metre.
+            if (candidatePeaks.size() >= peaks.size())
+            {
+                best = std::move (decoded);
+                peaks = std::move (candidatePeaks);
+            }
+        }
+    }
+
+    result.beatsPerBar = best.beatsPerBar;
+
+    for (const auto peak : peaks)
+    {
         result.beats.push_back ((double) (peak + first) / kFps);
         result.beatNumbers.push_back (best.beatNumbers[(size_t) peak]);
 
         if (best.beatNumbers[(size_t) peak] == 1)
             result.downbeats.push_back ((double) (peak + first) / kFps);
-
-        frame = end;
     }
 
     return result;

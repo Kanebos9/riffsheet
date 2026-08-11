@@ -17,14 +17,15 @@
  * sophistication is not automatically an improvement, and Guitar Pro 8 loses to lowest-fret on
  * all three benchmark datasets. We ship the DAG shortest path anyway, for the reason the
  * research gives: it is ~40 lines, O(n) for a monophonic bass (at most 4-6 candidate positions
- * per pitch), and it is the only place a technique constraint can be expressed. With
- * `fingeringStyle: 'low'` its node costs dominate and it reproduces the baseline; with
- * 'minMovement' the edge costs dominate and it plays in position.
+ * per pitch), and it is the only place a technique constraint can be expressed. It also means a
+ * new fingering preference costs a row in the weight table rather than a new algorithm: `low`
+ * lets the node costs dominate and reproduces the baseline, `minMovement` lets the edge costs
+ * dominate and plays in position, `openStrings` and `aroundFret` re-weight the node cost again.
  *
  * WRITTEN, from the cost-function sketch in §5.4-5.5.
  */
 
-import type { FingeringStyle } from './types.js';
+import { DEFAULT_ANCHOR_FRET, type FingeringStyle } from './types.js';
 
 /** §5.5: legato means no re-pluck — a gap under ~10 ms, or an actual overlap. */
 export const LEGATO_GAP_SEC = 0.01;
@@ -169,14 +170,45 @@ interface StyleWeights {
   openBonus: number;
   moveCost: number;
   stringChangeCost: number;
+  /** Per-fret cost of sitting away from the anchor. 0 for every style that has no anchor. */
+  anchorCost: number;
 }
 
+/**
+ * THE FOUR STYLES ARE FOUR WEIGHTINGS OF ONE COST FUNCTION, not four algorithms. The DAG
+ * shortest path is the same in all of them; what changes is which term dominates.
+ *
+ *   low          node cost, driven by fret number   -> the lowest-fret baseline
+ *   minMovement  edge cost, driven by displacement  -> the hand stays put
+ *   openStrings  node cost, driven by the open-string bonus
+ *   aroundFret   node cost, driven by distance from `anchorFret`
+ */
 const WEIGHTS: Record<FingeringStyle, StyleWeights> = {
   // Node costs dominate: this reproduces the lowest-fret baseline that scores 98.30% on easy
   // material, while still leaving room for the legato discount to break ties.
-  low: { fretCost: 1.0, highFretPenalty: 5, openBonus: 0.5, moveCost: 0.1, stringChangeCost: 0.1 },
-  // Edge costs dominate: the hand stays in position.
-  minMovement: { fretCost: 0.05, highFretPenalty: 5, openBonus: 0.2, moveCost: 1.0, stringChangeCost: 0.6 }
+  low: { fretCost: 1.0, highFretPenalty: 5, openBonus: 0.5, moveCost: 0.1, stringChangeCost: 0.1, anchorCost: 0 },
+  // Edge costs dominate: the hand stays where it is.
+  minMovement: { fretCost: 0.05, highFretPenalty: 5, openBonus: 0.2, moveCost: 1.0, stringChangeCost: 0.6, anchorCost: 0 },
+  /**
+   * OPEN STRINGS. The bonus has to beat what `low` would otherwise choose, and the competition
+   * is real: an open A (string 2, fret 0) and the same pitch at fret 5 of the E string differ by
+   * 5 frets, so under `low`'s own weighting the open string already wins. The case this style
+   * exists for is the opposite one — the fretted alternative is the LOWER fret, e.g. an open D
+   * (string 3) against fret 5 of the A string, where a position-playing solver goes fretted to
+   * avoid a string change. So `openBonus` is set above any fret difference the assigner can
+   * see (25 > maxFret), `fretCost` stays on to order the remaining fretted choices, and the
+   * movement terms stay small so an open string is never rejected for being far from the hand.
+   * "Sounding-equivalent" is exact by construction: every candidate for a note produces that
+   * note's pitch, so preferring one is never a pitch change.
+   */
+  openStrings: { fretCost: 0.5, highFretPenalty: 5, openBonus: 25, moveCost: 0.1, stringChangeCost: 0.05, anchorCost: 0 },
+  /**
+   * AROUND A FRET. Anchor the hand at `anchorFret` and charge per fret of distance from it.
+   * The anchor term dominates node cost (fretCost is off, or a low fret would pull the hand
+   * back down every time), and the movement terms stay light so the anchor — not the previous
+   * note — decides. An open string still costs nothing extra: it needs no hand at all.
+   */
+  aroundFret: { fretCost: 0, highFretPenalty: 2, openBonus: 0.5, moveCost: 0.15, stringChangeCost: 0.3, anchorCost: 1.0 }
 };
 
 /** §5.5: the discount that keeps a detected legato pair on one string. */
@@ -188,6 +220,8 @@ export interface AssignOptions {
   capo?: number;
   /** Highest fret the assigner may use. Default 24. */
   maxFret?: number;
+  /** Anchor for `fingeringStyle: 'aroundFret'`. Ignored by the other styles. Default 5. */
+  anchorFret?: number;
   legatoPairs?: LegatoPair[];
 }
 
@@ -249,8 +283,15 @@ export function assignStrings(notes: TabNoteInput[], opts: AssignOptions): TabAs
     return candidates;
   });
 
+  const anchor = opts.anchorFret ?? DEFAULT_ANCHOR_FRET;
   const nodeCost = (c: Candidate): number =>
-    c.fret * w.fretCost + (c.fret > 12 ? w.highFretPenalty : 0) - (c.fret === 0 ? w.openBonus : 0);
+    c.fret * w.fretCost +
+    (c.fret > 12 ? w.highFretPenalty : 0) -
+    (c.fret === 0 ? w.openBonus : 0) +
+    // An open string is played by no finger, so it is at every anchor and none: charge it
+    // nothing. Charging |0 - anchor| would make `aroundFret: 12` avoid open strings, which is
+    // the opposite of what a player does.
+    (w.anchorCost && c.fret > 0 ? Math.abs(c.fret - anchor) * w.anchorCost : 0);
 
   const edgeCost = (a: Candidate, b: Candidate, fromId: string, toId: string): number => {
     let cost = Math.abs(a.fret - b.fret) * w.moveCost;

@@ -23,7 +23,7 @@ class OrtSession;
     is worth more than 100 ms on a job that lasts seconds. It also keeps the
     steady-state footprint of eight plugin instances at zero.
 
-    NO MACHINE-WIDE LOCK. The manifest says Concurrency::inProcess, so
+    NO MACHINE-WIDE LOCK. The manifest says EngineConcurrency::inProcess, so
     NativeBridge does not take EngineLock for this engine and does not queue it
     behind MuScriptor. What serialises it is EngineRegistry::LocalJob, a
     process-local mutex - see engine-architecture.md §1.3b for why the file lock

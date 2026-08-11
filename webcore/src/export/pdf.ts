@@ -21,6 +21,7 @@
 
 import * as alphaTab from '@coderline/alphatab';
 import { createPrintSettings, FONT_DIRECTORY } from '../view/atSettings';
+import { stringLettersFromBounds, tuningLowToHighFromScore, type StringLetter } from '../view/stringLetters';
 import { buildAlphaTabScore } from '../score/fromPipeline';
 import { A4_HEIGHT_PT, A4_WIDTH_PT, PX_PER_PT, canvasesToPdf, mmToPx } from './pdfWriter';
 import type { RiffScore } from '../pipeline';
@@ -57,9 +58,23 @@ export interface PrintOptions {
  * The instance is always torn down, including when `use` throws — a leaked AlphaTabApi
  * keeps a font-loading listener and a detached 820px host alive for the session.
  */
+/**
+ * What the print render knows beyond the pictures: where each SVG sits in the hidden host, and
+ * the tab's open-string letters in those same host coordinates.
+ *
+ * Both are needed for one reason — the string letters (view/stringLetters.ts) are OUR drawing,
+ * not alphaTab's, so the paper has to place them itself, and it can only do that if it knows
+ * how each rasterised system relates to the coordinates the bounds lookup speaks.
+ */
+interface PrintGeometry {
+  /** Top-left of each SVG inside the hidden host, index-parallel with the svgs array. */
+  offsets: Array<{ x: number; y: number }>;
+  letters: StringLetter[];
+}
+
 async function withPrintRender<T>(
   score: RiffScore,
-  use: (svgs: SVGSVGElement[]) => Promise<T>
+  use: (svgs: SVGSVGElement[], geometry: PrintGeometry) => Promise<T>
 ): Promise<T> {
   const host = document.createElement('div');
   host.style.cssText = 'position:fixed;left:-10000px;top:0;width:820px;background:#fff;';
@@ -69,19 +84,32 @@ async function withPrintRender<T>(
   const api = new alphaTab.AlphaTabApi(host, settings);
 
   try {
-    await new Promise<void>((resolve, reject) => {
+    const built = await new Promise<ReturnType<typeof buildAlphaTabScore>>((resolve, reject) => {
       const timer = setTimeout(() => reject(new Error('Print render timed out.')), 30000);
+      const result = buildAlphaTabScore(score.data, settings);
       api.postRenderFinished.on(() => {
         clearTimeout(timer);
-        resolve();
+        resolve(result);
       });
-      const built = buildAlphaTabScore(score.data, settings);
-      api.renderScore(built.score, [0]);
+      api.renderScore(result.score, [0]);
     });
 
     const svgs = Array.from(host.querySelectorAll('svg'));
     for (const svg of svgs) inlineTextStyles(svg);
-    return await use(svgs);
+
+    // Measured, not assumed: alphaTab may put several systems in one partial SVG, and the
+    // paper decides which letters belong to which picture by comparing rectangles.
+    const hostRect = host.getBoundingClientRect();
+    const offsets = svgs.map((svg) => {
+      const r = svg.getBoundingClientRect();
+      return { x: r.left - hostRect.left, y: r.top - hostRect.top };
+    });
+    const letters = stringLettersFromBounds(
+      api.renderer.boundsLookup,
+      tuningLowToHighFromScore(built.score)
+    );
+
+    return await use(svgs, { offsets, letters });
   } finally {
     api.destroy();
     host.remove();
@@ -192,6 +220,14 @@ export async function printScore(score: RiffScore, options: PrintOptions = {}): 
 // PDF bytes — the path the export button actually uses
 // ---------------------------------------------------------------------------
 
+/**
+ * How big an open-string letter is on paper, in points.
+ *
+ * 6 pt: legible next to a fret digit and quiet enough not to compete with one. It is a legend,
+ * read once per system.
+ */
+const STRING_LETTER_PT = 6;
+
 const PAGE_MARGIN_MM = 14;
 /** Breathing room between systems, as a fraction of an inch. */
 const SYSTEM_GAP_MM = 4;
@@ -212,10 +248,29 @@ export async function renderScorePdf(score: RiffScore, options: PrintOptions = {
   const contentW = pageW - margin * 2;
   const gap = mmToPx(SYSTEM_GAP_MM);
 
-  const systems = await withPrintRender(score, async (elements) => {
+  const systems = await withPrintRender(score, async (elements, geometry) => {
     if (elements.length === 0) throw new Error('The sheet came out empty.');
-    const out: HTMLImageElement[] = [];
-    for (const svg of elements) out.push(await svgToImage(svg, fontCss, contentW));
+    const out: Array<{
+      image: HTMLImageElement;
+      /** Host px -> page px for this picture. */
+      scale: number;
+      /** The letters that belong to it, already in ITS coordinates. */
+      letters: StringLetter[];
+    }> = [];
+    for (let i = 0; i < elements.length; i++) {
+      const svg = elements[i];
+      const image = await svgToImage(svg, fontCss, contentW);
+      const offset = geometry.offsets[i] ?? { x: 0, y: 0 };
+      const rect = svg.getBoundingClientRect();
+      const scale = rect.width > 0 ? image.width / rect.width : 1;
+      // A letter belongs to this picture when its LINE falls inside it. Compared on y alone
+      // because the letters sit in the page padding, a little to the LEFT of the staff, and a
+      // strict x containment would drop every one of them.
+      const letters = geometry.letters
+        .filter((l) => l.y >= offset.y - 1 && l.y <= offset.y + rect.height + 1)
+        .map((l) => ({ ...l, x: l.x - offset.x, y: l.y - offset.y }));
+      out.push({ image, scale, letters });
+    }
     return out;
   });
 
@@ -253,7 +308,8 @@ export async function renderScorePdf(score: RiffScore, options: PrintOptions = {
     cursorY += Math.round(18 * PX_PER_PT);
   }
 
-  for (const image of systems) {
+  for (const system of systems) {
+    const image = system.image;
     let w = image.width;
     let h = image.height;
     // A system taller than a whole page can only be shrunk; it must not be cropped.
@@ -266,6 +322,23 @@ export async function renderScorePdf(score: RiffScore, options: PrintOptions = {
       page = newPage();
     }
     page.drawImage(image, margin, cursorY, w, h);
+
+    // THE TAB'S OWN LEGEND, on every system of the printed page — the whole point of moving it
+    // off the toolbar. Drawn onto the page rather than into the SVG so it lands at exactly the
+    // scale the picture was drawn at, whatever shrinking the page break just imposed.
+    if (system.letters.length > 0) {
+      const shrink = (h / image.height) * system.scale;
+      const size = Math.max(4, STRING_LETTER_PT * PX_PER_PT * shrink);
+      page.save();
+      page.font = `600 ${size}px ui-monospace, SFMono-Regular, Menlo, monospace`;
+      page.fillStyle = '#444444';
+      page.textAlign = 'right';
+      page.textBaseline = 'middle';
+      for (const letter of system.letters) {
+        page.fillText(letter.text, margin + letter.x * shrink, cursorY + letter.y * shrink);
+      }
+      page.restore();
+    }
     cursorY += h + gap;
   }
 

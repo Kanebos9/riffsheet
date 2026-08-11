@@ -10,6 +10,14 @@
     caller has already proved, from our own records plus the process's own
     command line, that it is a MuScriptor server we started.
 
+    ONE CALLER PROVES SOMETHING ELSE, and it is worth knowing about before
+    reading the rest as an absolute: MuScriptorServer::stopExternalServer() ends
+    a server Riffsheet did NOT start. It is reachable only from a button a human
+    presses, and it substitutes a stronger proof for the ownership half - the
+    listening pid, no record of it in ServerRegistry, its own command line, and a
+    live /health answer, all re-taken at the moment of the kill. Nothing in here
+    is loosened for it; the caller simply has more to prove, not less.
+
     None of this is safe on the audio thread and most of it (the ones that shell
     out) is not safe on the message thread either - each one says which.
 */

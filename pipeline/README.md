@@ -7,7 +7,7 @@ import { buildScore } from '@riffsheet/pipeline';
 
 const { ir, toMusicXML, toMidi, toAlphaTabModelData } = buildScore(
   { notes, beats, downbeats, audioDurationSec },
-  { grid: 'auto', fillGaps: true, instrument: 'bass4', tuningMidi: [28, 33, 38, 43], fingeringStyle: 'minMovement' }
+  { grid: 'auto', instrument: 'bass4', tuningMidi: [28, 33, 38, 43], fingeringStyle: 'minMovement' }
 );
 ```
 
@@ -15,24 +15,34 @@ The output contract is [IR.md](IR.md). Start there if you are consuming this pac
 
 ---
 
-## The problem this package exists to solve
+## What this package writes, and what it refuses to write
 
-A performed note stops sounding before the next one starts. The old converter wrote the note at
-its *measured* length and turned every leftover gap into a rest, so a funk line of eighths came
-out as an unbroken chain of 16th/16th-rest pairs.
+A performed note stops sounding before the next one starts. **It is written at the length it was
+played.** The silence after it is a rest, including when that rest is short.
 
-Measured on 17 real bass lines with a realistic 70–90% gate:
+This package used to do the opposite, and the history is worth keeping because the numbers were
+good. It carried a port of MuseScore's `Simplify::lengthenNote` / `minimizeNumberOfRests` — "rests
+are never removed, they are prevented" — which pushed every off-time forward to the endpoint
+minimising (note glyphs + rest glyphs). On 17 real bass lines at a 70–90% gate that took rest
+density from 26.8% to 0.49%, against 0.6% for human transcribers on FiloBass.
 
-| | rest density | rests shorter than an eighth |
-|---|---|---|
-| gaps written as measured (`fillGaps: false`) | **26.8 %** | 426 |
-| this pipeline (`fillGaps: true`) | **0.49 %** | **0** |
-| human transcribers, for reference (FiloBass, 46,281 glyphs) | 0.6 % | 0 |
+It was deleted anyway, for two reasons the measurement could not see:
 
-The fix is MuseScore's: **rests are never removed, they are prevented.** Off-times are pushed
-forward, before any rest object exists, choosing the endpoint that minimises
-(notated note glyphs + notated rest glyphs). There is no gap threshold anywhere in this package —
-the algorithm answers "is the page more readable with or without this rest?" directly.
+- **the staccato dots were lies.** A note earned one precisely *because* its printed value had
+  been inflated past what was played. The page said "hold this, but short" about material that
+  was simply short.
+- **the sustain was invented.** Each note grew toward the next onset, so a staccato line came
+  back reading as a legato one — polyphony nobody played, added by the engraver.
+
+A transcription is a record of a performance. Rest density is now a *description* of the take
+rather than a target: on that same corpus it reads ~19%, and the phrases have not changed —
+only what we claim about them. `fillGaps` is still accepted in `BuildSettings` so existing callers
+compile; nothing reads it, and passing `true` does not bring the pass back.
+
+What the package still refuses to write: a duration that crosses a barline or a tuplet edge
+without a tie, a rest that merges across a metric level, a glyph with no printable `<type>`, or a
+note value that hides the middle of the bar. Those are engraving rules, and they are enforced in
+`meter.ts` where they belong.
 
 ---
 
@@ -43,7 +53,7 @@ the algorithm answers "is the page more readable with or without this rest?" dir
 | 1 | `timeSkeleton.ts` | seconds → beats → ticks. Per-beat tempo track, per-bar tick origin, meter, pickup, host grid |
 | 1b | `quantize.ts` | per-beat whole-division hypotheses, de-trended, Viterbi; tuplet admission |
 | 2a | `meter.ts` | metric division tree; `toDurationList` with the note/rest `tol` asymmetry |
-| 2b | `simplify.ts` | **the rest killer**: `lengthenNote` / `minimizeNumberOfRests`, staccato |
+| 2b | `simplify.ts` | overlap clamp and leading-onset snap. Was the rest killer; see above |
 | 3 | `key.ts`, `spelling.ts`, `clef.ts` | key signature, enharmonic spelling, accidental display, clef |
 | 4 | `chords.ts` | chord grouping (before quantization), overlap clamp |
 | 5 | `tab.ts` | legato pairs (before assignment), string/fret DAG |

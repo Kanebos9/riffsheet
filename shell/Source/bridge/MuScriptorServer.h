@@ -156,6 +156,13 @@ public:
     //      wrote down ourselves - backed up by the process's own command line at
     //      the moment of the kill. An adopted server is disconnected from, never
     //      killed.
+    //
+    //      THE ONE EXCEPTION, and it is not a loophole: stopExternalServer().
+    //      It ends a server Riffsheet did not start, it is reachable only from
+    //      a button a human presses, nothing in the shell calls it on its own,
+    //      and it proves the process's identity four ways before touching it.
+    //      Consent is what makes it different, not a weaker test - its test is
+    //      strictly stronger than this one's.
     //   2. Stop it mid-job, including a job belonging to another Riffsheet on
     //      this machine. Ending a job releases the machine-wide EngineLock
     //      FIRST, so anybody queued behind it takes the engine before the
@@ -174,6 +181,24 @@ public:
         bool   canStop = false;      // stopEngine() would actually do something
         int    memoryMb = -1;        // resident size of the server process, -1 unknown
         int    port = 0;
+
+        /** A server is on the wire and Riffsheet did NOT start it - the user's
+            own START-MEDIUM.command window, usually. `ours` and this are
+            opposites while `running`; both are false when nothing is up. */
+        bool   external = false;
+
+        /** stopExternalEngine() would get as far as actually trying.
+
+            NOT the same question as `canStop`, which is about a server that is
+            ours. This one is "the user has asked to take somebody else's
+            server down, and every check we can answer cheaply says we may": it
+            is external, nothing on this machine is using it, and the last probe
+            read a command line that says muscriptor ... serve. The expensive
+            proofs are re-taken from scratch inside stopExternalServer() at the
+            moment of the kill, because this field is a cached photograph and a
+            kill decision may never rest on one. */
+        bool   canStopExternal = false;
+
         /** Why it cannot be stopped, as a sentence for a human. Empty when it
             can be. */
         juce::String reason;
@@ -185,6 +210,9 @@ public:
     {
         bool stopped = false;
         juce::String reason;         // always a sentence, whichever way it went
+        int  port = 0;               // where it was, 0 when there was nothing
+        int  pid = 0;                // what was ended, 0 when nothing was
+        int  freedMb = -1;           // what it was holding, -1 when unmeasurable
     };
 
     /** Closes the server if - and only if - Riffsheet started it and nothing on
@@ -206,6 +234,45 @@ public:
         adopted), which is the path most windows take. Blocks otherwise.
         Worker threads only. */
     StopOutcome stopAfterJob();
+
+    /**
+        "Stop it anyway" - the one path that may end a server Riffsheet did NOT
+        start, and the only one.
+
+        Everything else in this class refuses such a server on principle, and
+        that refusal is right as a DEFAULT: taking down somebody's process
+        because we happened to borrow it would be theft. But the refusal was
+        also a dead end. A user who force-quits a DAW, leaves a 1.5 GB server on
+        port 8222 and no longer has the Terminal window it came from was told
+        "close that window yourself" about a window that no longer exists. This
+        is that dead end's exit, and it exists only because a human explicitly
+        asked for it - nothing in the shell ever calls it on its own.
+
+        WHAT IT PROVES BEFORE IT KILLS ANYTHING. All of it, freshly, after
+        taking the machine-wide turn so nothing can start using the server
+        underneath the decision:
+
+          1. something is listening on the port we are talking about, and we can
+             read WHICH pid - no pid, no kill;
+          2. ServerRegistry has NO record of that pid. A record would mean it is
+             ours after all, and ours is stopEngine()'s job, not this one;
+          3. the process's OWN command line says `muscriptor ... serve` - the
+             same two-halves test the reaper uses, so a shell sitting in the
+             muscriptor folder or an editor with the source open is never a
+             candidate;
+          4. it is answering /health as a MuScriptor right now.
+
+        Only then SIGTERM, wait, and SIGKILL if it is still there
+        (SystemProbe::terminateProcess). If ANY of the four fails the process is
+        left completely alone and `reason` says which one and why.
+
+        It also refuses while anything on this machine is transcribing or queued
+        to - an external server is exactly the kind another Riffsheet window may
+        be mid-job against, and killing it would destroy their transcription.
+
+        `trigger` goes in the log line beside the outcome. Blocks: probes,
+        shells out and waits on a process. Worker threads only. */
+    StopOutcome stopExternalServer (const juce::String& trigger);
 
     //==============================================================================
     struct TranscribeOptions
@@ -339,6 +406,12 @@ private:
     std::atomic<int>    serverMemoryMb { -1 };      // its resident size, -1 unknown
     std::atomic<bool>   registryOwned { false };    // ServerRegistry says Riffsheet started it
     std::atomic<double> ourServerSinceMs { 0.0 };   // when Riffsheet started it, 0 unknown
+    /** The last probe read a command line saying `muscriptor ... serve`. Kept
+        separately from `registryOwned` because the two proofs are independent:
+        this one is true of the user's own server as well as of ours, which is
+        exactly what makes it the right half to show a "stop it anyway" button
+        from. Never sufficient on its own to kill anything. */
+    std::atomic<bool>   serverLooksLikeMuScriptor { false };
 
     // There is deliberately no timer and no watchdog thread in here any more.
     // The engine's whole life is bracketed by one transcription job on one

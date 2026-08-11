@@ -51,14 +51,22 @@ written octave, the caller may reinterpret once at ingest: canonical MIDI moves 
 interface BuildSettings {
   grid?: 'auto' | '1/4' | '1/8' | '1/16' | '1/8T' | 'free';
   timeSignature?: 'auto' | [number, number];
-  fillGaps?: boolean;
-  showStaccato?: boolean;
+  fillGaps?: boolean;                 // DEPRECATED, ignored — see below
+  showStaccato?: boolean;             // DEPRECATED, ignored — see below
   instrument?: 'staff' | 'bass4' | 'bass5' | 'bass6' | 'guitar6';
   tuningMidi?: number[];              // low to high, exact sounding MIDI
+  fingeringStyle?: 'low' | 'minMovement' | 'openStrings' | 'aroundFret';
+  anchorFret?: number;                // anchor for 'aroundFret'; default 5
   clefMode?: 'auto' | 'treble' | 'bass' | 'grand';
   keyFifths?: number;                 // authoritative override, clamped to -7..7
 }
 ```
+
+`fillGaps` and `showStaccato` are accepted so existing callers keep compiling, and are read by
+nothing. Notes are written at the length they were played; the pass that lengthened them over the
+following silence, and the staccato dots it inferred from having done so, are both deleted.
+`IRNote.staccato` and `IRStats.staccatoNotes` / `IRStats.gapsAbsorbed` stay in the shape — the
+first for a future editing surface to set by hand, the other two pinned at 0.
 
 `instrument` here describes engraving only. The transcription-engine constraint is a separate
 webcore setting. Enabling TAB or changing tuning must never alter staff pitches or clefs.

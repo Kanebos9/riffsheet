@@ -86,8 +86,6 @@ export class ScoreSynth {
   private active: AudioScheduledSourceNode[] = [];
   private notes: SynthNote[] = [];
   private voice: SynthVoice = 'finger-bass';
-  private metronomeOn = false;
-  private beatTimes: number[] = [];
   /** Destination gain requested by the Original/MIDI fader. */
   private targetGain = 0;
 
@@ -123,10 +121,6 @@ export class ScoreSynth {
     this.notes = notes;
   }
 
-  setBeatTimes(times: number[]): void {
-    this.beatTimes = times;
-  }
-
   setVoice(voice: SynthVoice): void {
     if (this.voice === voice) {
       // Still worth a load: the first setVoice() arrives before anything is playing.
@@ -138,10 +132,6 @@ export class ScoreSynth {
     // A sampled voice restarts when its COMPLETE set lands. Restarting immediately would
     // play an oscillator (or whichever one sample decoded first) and switch timbre mid-note.
     if (!isSampledVoice(voice) || this.sampler?.ready) this.restart();
-  }
-
-  setMetronome(on: boolean): void {
-    this.metronomeOn = on;
   }
 
   /**
@@ -216,12 +206,14 @@ export class ScoreSynth {
       const duration = Math.max(0.06, note.endSec - Math.max(note.startSec, fromSec));
       this.scheduleNote(note.midi, when, duration, (note.velocity ?? 96) / 127);
     }
-    if (this.metronomeOn) {
-      for (const beat of this.beatTimes) {
-        if (beat < fromSec) continue;
-        this.scheduleClick(ctxOrigin + (beat - fromSec));
-      }
-    }
+    // THE METRONOME IS GONE, and this loop is where it was. It scheduled a square-wave click on
+    // every entry of a `beatTimes` array, straight to `ctx.destination`, past the crossfade
+    // master. Nothing above it changed when it went: the note loop is untouched, and there is a
+    // schedule dump either side of the removal proving the note events are identical.
+    //
+    // Why remove the feature and not merely the switch: a click track is what a DAW is for, and
+    // this one could only ever tick the beats Riffsheet had guessed at — so it agreed with the
+    // player's session exactly when they did not need it and disagreed when they did.
   }
 
   stop(): void {
@@ -356,25 +348,4 @@ export class ScoreSynth {
     }
   }
 
-  private scheduleClick(when: number): void {
-    const ctx = this.ctx;
-    const osc = ctx.createOscillator();
-    const amp = ctx.createGain();
-    osc.type = 'square';
-    osc.frequency.value = 1600;
-    amp.gain.setValueAtTime(0.0001, when);
-    amp.gain.linearRampToValueAtTime(0.12, when + 0.002);
-    amp.gain.exponentialRampToValueAtTime(0.0001, when + 0.04);
-    osc.connect(amp);
-    // The click bypasses the crossfade master on purpose: it is a reference, and ducking
-    // it when you slide toward the recording would defeat its whole job.
-    amp.connect(ctx.destination);
-    osc.start(when);
-    osc.stop(when + 0.06);
-    osc.onended = () => {
-      osc.disconnect();
-      amp.disconnect();
-    };
-    this.active.push(osc);
-  }
 }

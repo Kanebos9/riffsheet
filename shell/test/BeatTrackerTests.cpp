@@ -84,6 +84,37 @@ public:
         return out;
     }
 
+    /** Framewise logits for a metronome: a beat every `period` frames, `bars`
+        bars of `beatsPerBar`, and — when `accented` — the network's downbeat
+        stream firing on the first beat of each bar.
+
+        The values are the two the sigmoid saturates at, because the point is to
+        put a CLEAN metre in front of the DBN and read back which bar length it
+        says that is. `period` is in frames at kFps, and both 15 and 25 are on the
+        tempo grid exactly, so a wrong answer here is a wrong decision rather than
+        a tempo the state space could not represent. */
+    static void makeMetreLogits (int beatsPerBar, int period, int bars, bool accented,
+                                 std::vector<float>& beatLogits,
+                                 std::vector<float>& downbeatLogits)
+    {
+        const auto beats = beatsPerBar * bars;
+        const auto frames = period * (beats + 1);
+
+        beatLogits.assign ((size_t) frames, -6.0f);
+        downbeatLogits.assign ((size_t) frames, -6.0f);
+
+        for (int i = 0; i < beats; ++i)
+        {
+            // Half a period of lead-in, so the take does not begin on a beat and
+            // the threshold trim has something to do.
+            const auto frame = i * period + period / 2;
+            beatLogits[(size_t) frame] = 6.0f;
+
+            if (accented && i % beatsPerBar == 0)
+                downbeatLogits[(size_t) frame] = 6.0f;
+        }
+    }
+
     /** The synthetic click track, regenerated from the formula the capture used
         (scratchpad/capture_stage1.py, make_clicks). Written out here rather than
         committed as a second .wav: a formula cannot drift out of step with the
@@ -479,6 +510,112 @@ public:
                 expectParity (expected, juce::var (object),
                               juce::String ("DBN over golden logits, ") + name);
             }
+        }
+
+        beginTest ("odd metres are representable, and only on downbeat evidence");
+        {
+            // WHY THIS TEST SYNTHESISES ACTIVATIONS RATHER THAN AUDIO. What
+            // changed is the DBN's choice between bar lengths, and the question
+            // it has to answer is "given these beat and downbeat activations,
+            // which bar length do they support". Feeding it clean activations
+            // asks exactly that. Going through the network as well would make
+            // the test's subject "does beat_this hear 5/4 in a synthetic click
+            // track", which is a question about the model's musical training,
+            // not about the code in this repository - and it would answer it
+            // with a checkpoint that is not ours to fix.
+            struct Metre { int beatsPerBar; int period; int bars; const char* name; };
+
+            for (const auto& metre : { Metre { 5, 25, 8, "5/4 at 120 BPM" },
+                                       Metre { 6, 15, 8, "6/8 on the eighth" },
+                                       Metre { 4, 25, 8, "4/4, the control" },
+                                       Metre { 3, 25, 8, "3/4, the other control" },
+                                       Metre { 7, 20, 6, "7/8" } })
+            {
+                std::vector<float> beatLogits, downbeatLogits;
+                makeMetreLogits (metre.beatsPerBar, metre.period, metre.bars, true,
+                                 beatLogits, downbeatLogits);
+
+                std::vector<float> activations;
+                BeatDbn::activationsFromLogits (beatLogits, downbeatLogits, activations);
+                const auto tracked = BeatDbn::track (activations);
+
+                const auto expectedBeats = metre.beatsPerBar * metre.bars;
+                expectEquals ((int) tracked.beats.size(), expectedBeats,
+                              juce::String (metre.name) + ": beat count");
+                expectEquals (tracked.beatsPerBar, metre.beatsPerBar,
+                              juce::String (metre.name) + ": beats per bar");
+                expectEquals ((int) tracked.downbeats.size(), metre.bars,
+                              juce::String (metre.name) + ": downbeat count");
+
+                // The downbeats must be ON the accented beats, not merely the
+                // right number of them: a bar length with the phase wrong is a
+                // wrong answer that counts correctly.
+                auto misplaced = 0;
+
+                for (int bar = 0; bar < (int) tracked.downbeats.size(); ++bar)
+                {
+                    const auto beatIndex = bar * metre.beatsPerBar;
+
+                    if (beatIndex >= (int) tracked.beats.size()
+                        || std::abs (tracked.downbeats[(size_t) bar]
+                                       - tracked.beats[(size_t) beatIndex]) > 1.0e-9)
+                        ++misplaced;
+                }
+
+                expectEquals (misplaced, 0, juce::String (metre.name) + ": downbeat phase");
+
+                // And the value that actually goes on the wire. BeatTracker does
+                // not read Result::beatsPerBar; it re-derives the number from the
+                // downbeat TIMES, so this is the assertion that the improvement
+                // reaches webcore rather than stopping inside the DBN.
+                const auto onTheWire = BeatTracker::estimateBeatsPerBar (tracked.beats, tracked.downbeats);
+                expect (! onTheWire.isVoid(), juce::String (metre.name) + ": wire value present");
+                expectEquals ((int) onTheWire, metre.beatsPerBar,
+                              juce::String (metre.name) + ": wire beatsPerBar");
+
+                logMessage ("    " + juce::String (metre.name) + ": "
+                              + juce::String ((int) tracked.beats.size()) + " beats, bar of "
+                              + juce::String (tracked.beatsPerBar));
+            }
+        }
+
+        beginTest ("a metre is never bought by losing beats — the reverted widening's failure");
+        {
+            // The same pulses with the accents taken away. There is no downbeat
+            // information at all, which is the shape that made a naive
+            // {2,3,4,5,6,7} decoder drop the held-note fixture from 5 beats to 3:
+            // a longer bar spends fewer expensive downbeat labels, so its raw
+            // path probability rises for a reason that is not musical. Every
+            // beat must survive, and the metre must stay in the core pair.
+            for (const auto period : { 15, 20, 25, 40 })
+            {
+                std::vector<float> beatLogits, downbeatLogits;
+                makeMetreLogits (4, period, 8, false, beatLogits, downbeatLogits);
+
+                std::vector<float> activations;
+                BeatDbn::activationsFromLogits (beatLogits, downbeatLogits, activations);
+                const auto tracked = BeatDbn::track (activations);
+
+                const auto label = "unaccented pulse, period " + juce::String (period);
+                expectEquals ((int) tracked.beats.size(), 32, label + ": every beat survives");
+                expect (tracked.beatsPerBar == 3 || tracked.beatsPerBar == 4,
+                        label + ": stayed in the core pair, got "
+                          + juce::String (tracked.beatsPerBar));
+            }
+
+            // And the sparse case the comment in BeatDbn.h names, in miniature:
+            // five beats is not three bars of anything, so no odd candidate is
+            // even eligible and the beats cannot be traded away for a metre.
+            std::vector<float> beatLogits, downbeatLogits;
+            makeMetreLogits (5, 25, 1, true, beatLogits, downbeatLogits);
+
+            std::vector<float> activations;
+            BeatDbn::activationsFromLogits (beatLogits, downbeatLogits, activations);
+            const auto tracked = BeatDbn::track (activations);
+
+            expectEquals ((int) tracked.beats.size(), 5, "one bar of 5: beats survive");
+            expect (tracked.beatsPerBar == 3 || tracked.beatsPerBar == 4,
+                    "one bar of 5 is not evidence for a bar of 5");
         }
 
         beginTest ("end to end: audio in, the golden's beats out");

@@ -10,7 +10,9 @@ The `pipeline/` package is separately marked `GPL-3.0-only` because it contains
 code derived from MuseScore 4. GPLv3 section 13 permits that package to be
 combined with the AGPLv3 application; the pipeline remains GPLv3-only when
 distributed on its own. See `pipeline/ATTRIBUTIONS.md` (`PIPELINE-ATTRIBUTIONS.md`
-in a release package).
+in a release package). Its GPL-3.0 text is at `pipeline/LICENSE`
+(`PIPELINE-LICENSE` in a release package), and the music21 BSD-3-Clause notice
+it retains is at `third-party/music21/LICENSE`.
 
 Third-party libraries, fonts, and sample assets keep their own licenses. See
 `webcore/CREDITS.md` (`CREDITS.md` in a release package) and the license files

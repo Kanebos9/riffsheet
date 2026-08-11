@@ -240,7 +240,10 @@ interface ShellEngineStatus {
   stopsAfterEachJob?: boolean;
   idleSeconds?: number;
   canStop?: boolean;
+  externalServer?: boolean;
+  canStopExternal?: boolean;
   memoryMb?: number | null;
+  models?: Array<{ name?: string; approxResidentMb?: number; installed?: boolean; fits?: boolean }>;
   searchedPaths?: string[];
   venv?: string;
   executable?: string;
@@ -277,12 +280,15 @@ interface ShellEngineSummary {
   installing?: boolean;
   detail?: string;
   error?: string | null;
+  /** Optional addition — a shell older than the card overhaul does not send it. See types.ts. */
+  license?: string;
 }
 
 interface ShellEngineList {
   configuredEngine?: string;
   resolvedEngine?: string;
   engineReason?: string;
+  nativeFallbackEngine?: string;
   engines?: ShellEngineSummary[];
 }
 
@@ -350,7 +356,23 @@ function toEngineStatus(s: ShellEngineStatus | null): EngineStatus | null {
     stopsAfterEachJob: s.stopsAfterEachJob === true,
     idleSeconds: s.idleSeconds,
     canStop: s.canStop === true,
+    externalServer: s.externalServer === true,
+    canStopExternal: s.canStopExternal === true,
     memoryMb: s.memoryMb ?? null,
+    // Kept only when a row is complete. A size with no name or no figure would draw as
+    // "undefined 0 GB" on the card, and half a size table is worse than none.
+    models: Array.isArray(s.models)
+      ? s.models
+          .filter((m) => typeof m?.name === 'string' && typeof m.approxResidentMb === 'number')
+          .map((m) => ({
+            name: m.name as string,
+            approxResidentMb: m.approxResidentMb as number,
+            installed: m.installed === true,
+            // Absent means "this shell did not say", and the honest reading of that is "no
+            // reason to think it does not fit" — never a warning nobody asked for.
+            fits: m.fits !== false
+          }))
+      : undefined,
     searchedPaths: Array.isArray(s.searchedPaths) ? s.searchedPaths : [],
     venv: s.venv,
     executable: s.executable,
@@ -392,7 +414,11 @@ function toEngineSummary(e: ShellEngineSummary): EngineSummary {
     approxPeakRssMb: typeof e.approxPeakRssMb === 'number' ? e.approxPeakRssMb : 0,
     installing: e.installing === true,
     detail: typeof e.detail === 'string' ? e.detail : '',
-    error: typeof e.error === 'string' && e.error.length > 0 ? e.error : null
+    error: typeof e.error === 'string' && e.error.length > 0 ? e.error : null,
+    // Left UNDEFINED when the shell does not send them, never defaulted to a string. The card
+    // draws a licence line only when it has been told a licence, because the alternative is
+    // printing "Unknown" next to somebody's engine, which is worse than printing nothing.
+    license: typeof e.license === 'string' && e.license.length > 0 ? e.license : undefined
   };
 }
 
@@ -408,6 +434,11 @@ function toEngineList(list: ShellEngineList | null): EngineListResult | null {
         ? list.resolvedEngine
         : (engines.find((e) => e.selected)?.id ?? ''),
     engineReason: typeof list.engineReason === 'string' ? list.engineReason : '',
+    // Carried only when the shell said it. A build that predates the in-page engine sends no
+    // such key, and on that shell nothing ever needs one — see EngineListResult.
+    ...(typeof list.nativeFallbackEngine === 'string' && list.nativeFallbackEngine.length > 0
+      ? { nativeFallbackEngine: list.nativeFallbackEngine }
+      : {}),
     engines
   };
 }
@@ -1010,6 +1041,29 @@ export function createJuceBridge(): NativeBridge {
         }
       : undefined,
 
+    // The beat tracker on its own — what the engine that runs in this page uses instead of
+    // starting a native transcription it does not want. Gated on registration like everything
+    // else here: no `trackBeats` means notes without a grid, never a hung promise.
+    trackBeats: hasNativeFunction('trackBeats')
+      ? async (source: AudioFileRef | CaptureResult) => {
+          const token = 'token' in source ? source.token : undefined;
+          if (!token) throw new Error('That audio has not been handed to the shell yet.');
+          const r = await call<{
+            beats?: number[];
+            downbeats?: number[];
+            bpm?: number | null;
+            beatsPerBar?: number | null;
+          }>('trackBeats', { token });
+          if (!r) throw new Error('Beat tracking was cancelled.');
+          return {
+            beats: Array.isArray(r.beats) ? r.beats : [],
+            downbeats: Array.isArray(r.downbeats) ? r.downbeats : [],
+            bpm: typeof r.bpm === 'number' ? r.bpm : null,
+            beatsPerBar: typeof r.beatsPerBar === 'number' ? r.beatsPerBar : null
+          };
+        }
+      : undefined,
+
     selectEngine: hasNativeFunction('selectEngine')
       ? async (id: string) => {
           // Not `call()`: "I will not swap the engine while it is transcribing" is an answer
@@ -1115,6 +1169,51 @@ export function createJuceBridge(): NativeBridge {
           return {
             stopped: r?.stopped === true,
             reason: typeof r?.reason === 'string' ? r.reason : (r?.error ?? '')
+          };
+        }
+      : undefined,
+
+    /**
+     * Stop a listener Riffsheet did not start. Same answer shape as `stopEngine`, on purpose.
+     *
+     * The shell does not register this name yet, so `hasNativeFunction` answers false and the
+     * "Stop it anyway" button is simply not offered — which is the correct behaviour on an old
+     * shell rather than a button that hangs. When the native side lands, the button appears
+     * with no change here: the capability test IS the wiring.
+     */
+    stopExternalEngine: hasNativeFunction('stopExternalEngine')
+      ? async () => {
+          const fn = await nativeFn('stopExternalEngine');
+          const r = (await fn()) as NativeResult & { stopped?: boolean; reason?: string };
+          return {
+            stopped: r?.stopped === true,
+            reason: typeof r?.reason === 'string' ? r.reason : (r?.error ?? '')
+          };
+        }
+      : undefined,
+
+    /**
+     * Point Riffsheet at an engine that is already on this disk.
+     *
+     * `path === ''` is the sniff and a real path is the check — see the contract in
+     * `types.ts`. Gated identically, and for the same reason: the cards drop the whole
+     * "Use existing installation…" affordance on a shell that cannot answer, rather than
+     * offering a door that opens onto nothing.
+     */
+    validateExistingEngineInstall: hasNativeFunction('validateExistingEngineInstall')
+      ? async (id: string, path: string) => {
+          const fn = await nativeFn('validateExistingEngineInstall');
+          const r = (await fn(id, path)) as NativeResult & {
+            ok?: boolean;
+            detail?: string;
+            path?: string;
+            searched?: string[];
+          };
+          return {
+            ok: r?.ok === true,
+            detail: typeof r?.detail === 'string' ? r.detail : (r?.error ?? ''),
+            path: typeof r?.path === 'string' ? r.path : undefined,
+            searched: Array.isArray(r?.searched) ? r.searched.filter((s) => typeof s === 'string') : undefined
           };
         }
       : undefined,

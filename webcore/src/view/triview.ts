@@ -28,6 +28,7 @@ import { TIMELINE_GUTTER_PX } from './pianoroll';
 import { buildAlphaTabScore, soundingMidi, type ScoreIndex } from '../score/fromPipeline';
 import { midiToName, accidentalsForKey, type Accidentals } from '../score/notes';
 import { assignFret } from '../score/tuning';
+import { stringLettersFromBounds, tuningLowToHighFromScore } from './stringLetters';
 import { t, TIPS } from '../ui/tips';
 import type { RiffScore } from '../pipeline';
 
@@ -253,6 +254,7 @@ export class TriView {
   readonly host: HTMLElement;
   readonly namesRow: HTMLElement;
   readonly tabMarksRow: HTMLElement;
+  readonly stringLettersRow: HTMLElement;
   readonly overlay: SVGSVGElement;
 
   private index: ScoreIndex | null = null;
@@ -262,6 +264,7 @@ export class TriView {
   private accidentals: Accidentals = 'sharps';
   private labels: NameLabel[] = [];
   private tabMarks: NameLabel[] = [];
+  private stringLetters: NameLabel[] = [];
   /** noteId -> semitones the TAB position was folded by. Empty for anything in range. */
   private tabShifts = new Map<string, number>();
   private opts: TriViewOptions;
@@ -312,6 +315,7 @@ export class TriView {
           <div class="at-host"></div>
           <div class="names-row" aria-hidden="true"></div>
           <div class="tabmarks-row" aria-hidden="true"></div>
+          <div class="stringletters-row" aria-hidden="true"></div>
           <svg class="triview-overlay" xmlns="http://www.w3.org/2000/svg">
             <g class="selection"></g>
             <line class="playhead" x1="0" y1="0" x2="0" y2="0" />
@@ -325,6 +329,7 @@ export class TriView {
     this.host = opts.container.querySelector('.at-host')!;
     this.namesRow = opts.container.querySelector('.names-row')!;
     this.tabMarksRow = opts.container.querySelector('.tabmarks-row')!;
+    this.stringLettersRow = opts.container.querySelector('.stringletters-row')!;
     this.overlay = opts.container.querySelector('.triview-overlay')!;
     this.playheadLine = this.overlay.querySelector('.playhead')!;
     this.selectionGroup = this.overlay.querySelector('.selection')!;
@@ -414,6 +419,25 @@ export class TriView {
 
   get score(): RiffScore | null {
     return this.currentScore;
+  }
+
+  /**
+   * The open-string letters currently on screen, per system, top line first.
+   *
+   * The tuning legend used to be one line of prose with a `.tuning-summary` class, and the
+   * harness read that string to prove a custom tuning had really reached the page. It reads
+   * this instead — the same claim, made against what is actually drawn on the staff.
+   */
+  stringLetterTexts(): string[][] {
+    const bySystem: string[][] = [];
+    const letters = stringLettersFromBounds(
+      this.api.renderer.boundsLookup,
+      tuningLowToHighFromScore(this.builtModel)
+    );
+    for (const l of letters) {
+      (bySystem[l.system] ??= []).push(l.text);
+    }
+    return bySystem.map((s) => s ?? []);
   }
 
   get renderInfo(): RenderInfo | null {
@@ -583,6 +607,11 @@ export class TriView {
 
     this.syncLabels(wanted);
     this.syncTabMarks(wantedMarks);
+    // The tab's own legend. Derived from the SAME bounds as everything else above, so it
+    // re-places itself on every render — a zoom, an edit or a re-flow cannot leave it behind.
+    this.syncStringLetters(
+      stringLettersFromBounds(lookup, tuningLowToHighFromScore(this.builtModel))
+    );
     // The highlight rectangles were drawn against the OLD geometry. Redraw them from the
     // new bounds, or a zoom (or any edit) would leave the selection behind.
     this.drawSelection();
@@ -1164,6 +1193,34 @@ export class TriView {
       l.el.style.transform = `translate(${w.x}px, ${w.y}px) translateX(-50%)`;
       l.el.classList.toggle('uncertain', w.uncertain);
       l.x = w.x;
+    }
+  }
+
+  /**
+   * The open-string letters, same reuse discipline as the names row.
+   *
+   * `translate(x, y)` then `translate(-100%, -50%)`: x is the RIGHT edge (the letters are
+   * right-aligned against the staff, so a two-character name and a one-character one end at
+   * the same place) and y is the LINE, so the text is centred on it rather than hanging below.
+   */
+  private syncStringLetters(wanted: Array<{ x: number; y: number; text: string }>): void {
+    while (this.stringLetters.length < wanted.length) {
+      const el = document.createElement('span');
+      el.className = 'string-letter';
+      const tip = t(TIPS.stringLetters);
+      if (tip) el.setAttribute('title', tip);
+      this.stringLettersRow.appendChild(el);
+      this.stringLetters.push({ el, x: 0 });
+    }
+    while (this.stringLetters.length > wanted.length) {
+      this.stringLetters.pop()!.el.remove();
+    }
+    for (let i = 0; i < wanted.length; i++) {
+      const w = wanted[i];
+      const m = this.stringLetters[i];
+      if (m.el.textContent !== w.text) m.el.textContent = w.text;
+      m.el.style.transform = `translate(${w.x}px, ${w.y}px) translate(-100%, -50%)`;
+      m.x = w.x;
     }
   }
 

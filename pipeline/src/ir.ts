@@ -73,7 +73,12 @@ export interface IRNote {
   tabOctaveShift?: number;
   tieStart: boolean;
   tieStop: boolean;
-  /** From the lengthening pass: >= STACCATO_TOL of the written value was invented padding. */
+  /**
+   * Printed articulation. RETAINED IN THE SHAPE, NEVER SET BY THE PIPELINE. It used to be
+   * inferred from the deleted lengthening pass — a note earned a dot precisely because its
+   * printed value had been inflated past what was played. Durations are now written as played,
+   * so there is nothing to infer; the field stays for a future editing surface to set by hand.
+   */
   staccato?: boolean;
   /**
    * Legato pair marker from station 5. v1 emits NO hammer-on/pull-off symbols — this only
@@ -157,13 +162,18 @@ export interface IRRepeatSuspect {
 export interface IRStats {
   noteGlyphs: number;
   restGlyphs: number;
-  /** restGlyphs / (noteGlyphs + restGlyphs). The success criterion of station 2. */
+  /**
+   * restGlyphs / (noteGlyphs + restGlyphs). A DESCRIPTION of the take, not a score to beat —
+   * it used to be station 2's success criterion, back when the pipeline lengthened notes until
+   * the number came down. Sparse material honestly has a high rest density.
+   */
   restDensity: number;
   restsShorterThanEighth: number;
   tupletRests: number;
   tiedGlyphs: number;
+  /** Always 0: no articulation is inferred any more. Kept so the shape does not shift. */
   staccatoNotes: number;
-  /** Gaps the lengthening pass swallowed. */
+  /** Always 0: nothing absorbs gaps any more. Kept so the shape does not shift. */
   gapsAbsorbed: number;
 }
 

@@ -76,17 +76,39 @@ const EngineManifest& SidecarAdapter::manifest() const noexcept { return row; }
 
 juce::File SidecarAdapter::installDirectory() const
 {
-    return EngineInstaller::engineDirectory (row.id);
+    const auto ours = EngineInstaller::engineDirectory (row.id);
+
+    // A copy Riffsheet installed itself always wins: it is the one whose bytes
+    // were hashed and whose venv was built and verified here. The recorded
+    // location is the OTHER door - somebody who already had this engine pointed
+    // us at it (NativeBridge::fnValidateExistingEngineInstall) - and it is only
+    // consulted when there is nothing of ours to prefer. It is re-read rather
+    // than cached because the folder it names can be deleted from under us, and
+    // `recordedLocation` already answers with an invalid File when it has been.
+    if (ours.isDirectory())
+        return ours;
+
+    if (const auto pointed = EngineInstaller::recordedLocation (row.id); pointed != juce::File())
+        return pointed;
+
+    return ours;
 }
 
 juce::File SidecarAdapter::executable() const
 {
-    const auto venv = installDirectory().getChildFile ("venv");
+    const auto base = installDirectory();
+
+    // Normally the venv the installer built, one level down. When the user
+    // pointed us at a copy they already had, `base` may BE the environment
+    // rather than contain one - a plain prefix like /usr/local, or a venv
+    // somebody made by hand. Both are just "a folder with bin/ in it", so the
+    // only question is which of the two we are holding.
+    const auto venv = base.getChildFile ("venv").isDirectory() ? base.getChildFile ("venv") : base;
 
     // A pip console script IS the engine; a script engine is run by the venv's
-    // own interpreter. Either way the answer is inside the venv the installer
-    // built, and never a Python found on PATH at run time - that would be a
-    // different set of packages than the one that was verified.
+    // own interpreter. Either way the answer is inside the environment, and
+    // never a Python found on PATH at run time - that would be a different set
+    // of packages than the one that was verified.
     if (row.adapter == AdapterKind::sidecarPipCli)
         return venvBinary (venv, row.id);
 

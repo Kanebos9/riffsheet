@@ -250,6 +250,7 @@ public:
         testDigest();
         testDownloads();
         testMidiReader();
+        runExistingInstallTests();
     }
 
 private:
@@ -895,6 +896,207 @@ private:
         logMessage ("  " + juce::String ((int) real.notes.size()) + " notes, "
                     + juce::String (real.notes.front().start, 3) + " s to "
                     + juce::String (real.notes.back().end, 3) + " s");
+    }
+
+    //== "I already have this one" =============================================
+    //
+    // The validator behind NativeBridge::fnValidateExistingEngineInstall, driven
+    // against real directories on disk rather than a fake filesystem, because
+    // what it does IS stat files and a fake would only prove that our idea of a
+    // directory matches our idea of a directory.
+    //
+    // Nothing here executes anything, which is the property worth protecting:
+    // running a stranger's script to see whether it is installed is a bigger
+    // promise than this call makes, and on a broken venv it hangs.
+    void runExistingInstallTests()
+    {
+        const auto* repoRow = EngineCatalog::find ("bass-v2");
+        const auto* cliRow = EngineCatalog::find ("transkun");
+        const auto* bundledRow = EngineCatalog::find (EngineCatalog::fallbackId());
+
+        beginTest ("the two one-click engines are still shaped the way the validator assumes");
+        {
+            expect (repoRow != nullptr && cliRow != nullptr && bundledRow != nullptr);
+
+            if (repoRow == nullptr || cliRow == nullptr || bundledRow == nullptr)
+                return;
+
+            expect (repoRow->adapter == AdapterKind::sidecarVenv,
+                    "bass-v2 is validated as a repository checkout");
+            expect (cliRow->adapter == AdapterKind::sidecarPipCli,
+                    "transkun is validated as a pip console script");
+        }
+
+        if (repoRow == nullptr || cliRow == nullptr)
+            return;
+
+        const auto root = scratch().getChildFile ("existing");
+        root.deleteRecursively();
+        root.createDirectory();
+
+        beginTest ("a repo engine needs BOTH its code and its weights");
+        {
+            const auto justCode = root.getChildFile ("code-only");
+            justCode.createDirectory();
+            justCode.getChildFile ("infer.py").replaceWithText ("# nothing here yet\n");
+
+            juce::StringArray searched;
+            juce::String detail;
+            expect (EngineInstaller::findExistingInstall (*repoRow, justCode.getFullPathName(),
+                                                          searched, detail) == juce::File(),
+                    "a checkout with no weights is the commonest half-install there is");
+            expect (detail.containsIgnoreCase ("checkpoint"),
+                    "the useful half of a failed check is knowing what was missing: " + detail);
+            expect (searched.contains (justCode.getFullPathName()),
+                    "every path looked at comes back, in order");
+
+            // ...and an EMPTY checkpoints folder is still no weights.
+            justCode.getChildFile ("checkpoints").createDirectory();
+            searched.clear();
+            detail.clear();
+            expect (EngineInstaller::findExistingInstall (*repoRow, justCode.getFullPathName(),
+                                                          searched, detail) == juce::File(),
+                    "an empty checkpoints folder must not read as installed");
+        }
+
+        beginTest ("a complete repo checkout validates, and says where");
+        {
+            const auto good = root.getChildFile ("bass-repo");
+            good.createDirectory();
+            good.getChildFile ("infer.py").replaceWithText ("# the entry point\n");
+            good.getChildFile ("checkpoints").createDirectory();
+            good.getChildFile ("checkpoints").getChildFile ("model.ckpt").replaceWithText ("weights");
+
+            juce::StringArray searched;
+            juce::String detail;
+            const auto found = EngineInstaller::findExistingInstall (*repoRow, good.getFullPathName(),
+                                                                     searched, detail);
+
+            expectEquals (found.getFullPathName(), good.getFullPathName());
+            expect (detail.containsIgnoreCase (good.getFullPathName()),
+                    "the sentence has to name the place: " + detail);
+        }
+
+        beginTest ("a repo one folder down is found, because that is how a zip unpacks");
+        {
+            const auto outer = root.getChildFile ("downloaded");
+            const auto inner = outer.getChildFile ("instrument-agnostic-amt-2964b39");
+            inner.createDirectory();
+            inner.getChildFile ("infer.py").replaceWithText ("# the entry point\n");
+            inner.getChildFile ("checkpoints").createDirectory();
+            inner.getChildFile ("checkpoints").getChildFile ("a.ckpt").replaceWithText ("weights");
+
+            juce::StringArray searched;
+            juce::String detail;
+            expectEquals (EngineInstaller::findExistingInstall (*repoRow, outer.getFullPathName(),
+                                                                searched, detail)
+                              .getFullPathName(),
+                          inner.getFullPathName());
+        }
+
+        beginTest ("a console-script engine validates a venv, and answers with the environment");
+        {
+            // The answer has to be what SidecarAdapter::installDirectory() is,
+            // not the executable - handing back the program would make the two
+            // disagree and the engine would be "found" and then unrunnable.
+            const auto venv = root.getChildFile ("transkun-venv");
+            const auto bin = venv.getChildFile (
+               #if JUCE_WINDOWS
+                "Scripts"
+               #else
+                "bin"
+               #endif
+            );
+            bin.createDirectory();
+
+            const auto exe = bin.getChildFile (
+               #if JUCE_WINDOWS
+                "transkun.exe"
+               #else
+                "transkun"
+               #endif
+            );
+            exe.replaceWithText ("#!/bin/sh\n");
+
+            juce::StringArray searched;
+            juce::String detail;
+            expectEquals (EngineInstaller::findExistingInstall (*cliRow, venv.getFullPathName(),
+                                                                searched, detail)
+                              .getFullPathName(),
+                          venv.getFullPathName());
+
+            // Pointing straight AT the program is what `which` printed, so it
+            // has to work too, and answer with the same environment.
+            searched.clear();
+            detail.clear();
+            expectEquals (EngineInstaller::findExistingInstall (*cliRow, exe.getFullPathName(),
+                                                                searched, detail)
+                              .getFullPathName(),
+                          venv.getFullPathName());
+        }
+
+        beginTest ("a folder with no engine in it is refused, and says what was looked for");
+        {
+            const auto empty = root.getChildFile ("nothing-here");
+            empty.createDirectory();
+
+            juce::StringArray searched;
+            juce::String detail;
+            expect (EngineInstaller::findExistingInstall (*cliRow, empty.getFullPathName(),
+                                                          searched, detail) == juce::File());
+            expect (detail.containsIgnoreCase ("transkun"), detail);
+            expect (! searched.isEmpty());
+
+            searched.clear();
+            detail.clear();
+            const auto missing = root.getChildFile ("not-even-there");
+            expect (EngineInstaller::findExistingInstall (*cliRow, missing.getFullPathName(),
+                                                          searched, detail) == juce::File());
+            expect (detail.containsIgnoreCase (missing.getFullPathName()), detail);
+        }
+
+        beginTest ("a sniff with no path looks in several places and reports every one");
+        {
+            juce::StringArray searched;
+            juce::String detail;
+            EngineInstaller::findExistingInstall (*repoRow, "", searched, detail);
+
+            expect (searched.size() >= 2, "a sniff that looks in one place is not a sniff");
+            expect (searched.contains (EngineInstaller::engineDirectory (repoRow->id).getFullPathName()),
+                    "Riffsheet's own layout is the first place to look");
+
+            juce::StringArray unique;
+
+            for (const auto& one : searched)
+            {
+                expect (! unique.contains (one), "a path was searched twice: " + one);
+                unique.add (one);
+            }
+        }
+
+        beginTest ("a validated location is remembered, and can be forgotten");
+        {
+            const auto where = root.getChildFile ("bass-repo");
+
+            EngineInstaller::rememberInstallLocation (repoRow->id, where);
+            expectEquals (EngineInstaller::recordedLocation (repoRow->id).getFullPathName(),
+                          where.getFullPathName());
+
+            EngineInstaller::rememberInstallLocation (repoRow->id, juce::File());
+            expect (EngineInstaller::recordedLocation (repoRow->id) == juce::File(),
+                    "forgetting has to actually forget");
+
+            // A remembered folder that has since been deleted reads as absent
+            // rather than as a path that no longer exists.
+            const auto gone = root.getChildFile ("deleted-later");
+            gone.createDirectory();
+            EngineInstaller::rememberInstallLocation (repoRow->id, gone);
+            gone.deleteRecursively();
+            expect (EngineInstaller::recordedLocation (repoRow->id) == juce::File());
+            EngineInstaller::rememberInstallLocation (repoRow->id, juce::File());
+        }
+
+        root.deleteRecursively();
     }
 
     //== a scratch directory this test owns ====================================

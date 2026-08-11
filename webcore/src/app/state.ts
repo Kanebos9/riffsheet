@@ -59,7 +59,25 @@ export const NOTATION_GRIDS: readonly NotationGrid[] = [
 ];
 export const ROLL_GRIDS: readonly RollGrid[] = ['quarter', 'eighth', 'sixteenth', 'triplet', 'free'];
 
-export type FingeringStyle = 'low-positions' | 'minimize-movement';
+/**
+ * How the tab chooses which string and fret to write a note on.
+ *
+ * The musician-facing words, as everywhere in this file — `src/pipeline/index.ts` translates
+ * them into Team C's `FingeringStyle`. All four of the pipeline's styles are offered now; the
+ * last two only became reachable when its tab planner grew them, and a style the engine can
+ * do but the app cannot ask for is a feature nobody has.
+ */
+export type FingeringStyle =
+  | 'low-positions'
+  | 'minimize-movement'
+  | 'open-strings'
+  | 'around-fret';
+export const FINGERING_STYLES: readonly FingeringStyle[] = [
+  'low-positions',
+  'minimize-movement',
+  'open-strings',
+  'around-fret'
+];
 /** Which MIDI file(s) the export button writes. Remembered between exports. */
 export type MidiExportMode = 'quantized' | 'as-played' | 'both';
 export type { TuningPreset };
@@ -79,12 +97,17 @@ export interface AppSettings {
    * absent from `toBuildSettings()`, and there is a browser check that keeps it that way.
    */
   rollGrid: RollGrid;
-  fillGaps: boolean;
   fingering: FingeringStyle;
+  /**
+   * Where the hand sits for `fingering: 'around-fret'`. Ignored by every other style.
+   *
+   * Its own key rather than a reuse of `capo` or `maxFret`, because it answers a different
+   * question: not what the instrument HAS, but where the player wants to be standing.
+   */
+  anchorFret: number;
   /** The playback sound AND the source behind it — see audio/synth.ts §SynthVoice. */
   playbackVoice: SynthVoice;
   midiExportMode: MidiExportMode;
-  metronome: boolean;
   showNoteNames: boolean;
   /** The piano-roll strip under the waveform. Owned by view/pianoroll.ts (W1). */
   showPianoRoll: boolean;
@@ -227,15 +250,16 @@ export const DEFAULT_SETTINGS: AppSettings = {
   // A stated size, because a manually added note has to come out some length and 1/8 is the
   // one that makes a riff. It is only ever consulted for hand edits and for drawing the ruler.
   rollGrid: 'eighth',
-  fillGaps: true,
   fingering: 'low-positions',
+  // First position. The pipeline's own default for the same reason: it is where a hand goes
+  // when nobody has said otherwise.
+  anchorFret: 1,
   // Recorded multisamples only; oscillator voices are no longer user-facing choices.
   playbackVoice: 'finger-bass',
   // Dragging the MIDI button onto a DAW track drops THIS variant, and "exactly what I played" is
   // what somebody reaching for a drag almost always means — they are putting the take back into
   // their session, not filing a tidy chart. The tidied-up one is one click away in the menu.
   midiExportMode: 'as-played',
-  metronome: false,
   showNoteNames: true,
   showPianoRoll: true,
   pianoRollHeight: DEFAULT_ROLL_HEIGHT_PX,
@@ -341,7 +365,22 @@ export interface RuntimeState {
   capturing: boolean;
   captureSec: number;
   captureArmed: boolean;
-  toasts: Array<{ id: number; kind: 'info' | 'danger'; title: string; message: string }>;
+  toasts: Array<{
+    id: number;
+    kind: 'info' | 'danger';
+    title: string;
+    message: string;
+    /**
+     * One thing the notice offers to DO, beyond going away.
+     *
+     * Optional and rare on purpose: a notice with a button in it is an interruption that asks
+     * for a decision, and most of these are simply telling you something. `role` is the
+     * `data-role` the button carries so a check can find it by name; `run` fires after the
+     * notice has dismissed itself, because a button that leaves its own notice on screen
+     * looks like it did not work.
+     */
+    action?: { label: string; role: string; run: () => void };
+  }>;
   busy: string | null;
   /**
    * What the shell said it did to the audio before the last engine heard it, in one sentence.
@@ -546,6 +585,10 @@ function migrate(settings: AppSettings, stored: Partial<AppSettings>): AppSettin
     settings.autoSplitAtAttacks = DEFAULT_SETTINGS.autoSplitAtAttacks;
   }
 
+  if (!(FINGERING_STYLES as readonly string[]).includes(settings.fingering)) {
+    settings.fingering = DEFAULT_SETTINGS.fingering;
+  }
+  settings.anchorFret = Math.max(0, Math.min(24, Math.round(Number(settings.anchorFret)) || DEFAULT_SETTINGS.anchorFret));
   if (!['off', 'bass', 'guitar', 'custom'].includes(settings.tabMode)) settings.tabMode = 'off';
   if (!['auto', 'treble', 'bass', 'grand'].includes(settings.clefMode)) settings.clefMode = 'auto';
   settings.customTuningMidi = sanitizeCustomTuning(settings.customTuningMidi);
@@ -554,6 +597,12 @@ function migrate(settings: AppSettings, stored: Partial<AppSettings>): AppSettin
   // JSON, otherwise they keep being written back forever despite no longer existing in the type.
   delete (settings as unknown as Record<string, unknown>).swing;
   delete (settings as unknown as Record<string, unknown>).rollFollowSheet;
+  // `fillGaps` went with the pipeline stage it drove — Team C's `simplify` no longer reads it,
+  // and a switch that changes nothing is worse than no switch. `metronome` went with the click
+  // itself (audio/synth.ts §start). Both are deleted rather than merely dropped from the type,
+  // for the same reason `swing` is: a spread over stored JSON would keep writing them forever.
+  delete (settings as unknown as Record<string, unknown>).fillGaps;
+  delete (settings as unknown as Record<string, unknown>).metronome;
 
   // Tempo/meter are per-document now. Do not let a preference saved by an older take leak into
   // whatever the user opens next; restoreSession migrates the old values onto its source.

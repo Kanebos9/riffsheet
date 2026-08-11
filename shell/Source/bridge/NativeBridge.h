@@ -54,6 +54,7 @@ private:
     void fnLoadAudioPath     (const juce::Array<juce::var>&, Completion);
     void fnAuthorizeRecentPaths (const juce::Array<juce::var>&, Completion);
     void fnTranscribe        (const juce::Array<juce::var>&, Completion);
+    void fnTrackBeats        (const juce::Array<juce::var>&, Completion);
     void fnExportFile        (const juce::Array<juce::var>&, Completion);
     void fnExportFiles       (const juce::Array<juce::var>&, Completion);
     void fnBeginMidiDrag     (const juce::Array<juce::var>&, Completion);
@@ -80,9 +81,11 @@ private:
     void fnInstallEngine     (const juce::Array<juce::var>&, Completion);
     void fnCancelInstall     (const juce::Array<juce::var>&, Completion);
     void fnUninstallEngine   (const juce::Array<juce::var>&, Completion);
+    void fnValidateExistingEngineInstall (const juce::Array<juce::var>&, Completion);
     void fnOpenEngineSetup   (const juce::Array<juce::var>&, Completion);
     void fnSetEngineModel    (const juce::Array<juce::var>&, Completion);
     void fnStopEngine        (const juce::Array<juce::var>&, Completion);
+    void fnStopExternalEngine (const juce::Array<juce::var>&, Completion);
     void fnTranscribeCancel  (const juce::Array<juce::var>&, Completion);
     void fnHostTimelineProbe (const juce::Array<juce::var>&, Completion);
 

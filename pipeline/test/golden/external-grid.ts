@@ -41,127 +41,239 @@ export default `<?xml version="1.0" encoding="UTF-8" standalone="no"?>
       </direction>
       <note>
         <pitch><step>A</step><octave>1</octave></pitch>
-        <duration>12</duration>
+        <duration>9</duration>
         <voice>1</voice>
-        <type>quarter</type>
+        <type>eighth</type><dot/>
+        <staff>1</staff>
+      </note>
+      <note>
+        <rest/>
+        <duration>3</duration>
+        <voice>1</voice>
+        <type>16th</type>
         <staff>1</staff>
       </note>
       <note>
         <pitch><step>C</step><octave>2</octave></pitch>
-        <duration>12</duration>
+        <duration>9</duration>
         <voice>1</voice>
-        <type>quarter</type>
+        <type>eighth</type><dot/>
+        <staff>1</staff>
+      </note>
+      <note>
+        <rest/>
+        <duration>3</duration>
+        <voice>1</voice>
+        <type>16th</type>
         <staff>1</staff>
       </note>
       <note>
         <pitch><step>D</step><octave>2</octave></pitch>
-        <duration>12</duration>
+        <duration>9</duration>
         <voice>1</voice>
-        <type>quarter</type>
+        <type>eighth</type><dot/>
+        <staff>1</staff>
+      </note>
+      <note>
+        <rest/>
+        <duration>3</duration>
+        <voice>1</voice>
+        <type>16th</type>
         <staff>1</staff>
       </note>
       <note>
         <pitch><step>E</step><octave>2</octave></pitch>
-        <duration>12</duration>
+        <duration>9</duration>
         <voice>1</voice>
-        <type>quarter</type>
+        <type>eighth</type><dot/>
+        <staff>1</staff>
+      </note>
+      <note>
+        <rest/>
+        <duration>3</duration>
+        <voice>1</voice>
+        <type>16th</type>
         <staff>1</staff>
       </note>
       <backup><duration>48</duration></backup>
       <note>
         <pitch><step>A</step><octave>1</octave></pitch>
-        <duration>12</duration>
+        <duration>9</duration>
         <voice>5</voice>
-        <type>quarter</type>
+        <type>eighth</type><dot/>
         <staff>2</staff>
         <notations><technical><string>3</string><fret>0</fret></technical></notations>
       </note>
       <note>
-        <pitch><step>C</step><octave>2</octave></pitch>
-        <duration>12</duration>
+        <rest/>
+        <duration>3</duration>
         <voice>5</voice>
-        <type>quarter</type>
+        <type>16th</type>
+        <staff>2</staff>
+      </note>
+      <note>
+        <pitch><step>C</step><octave>2</octave></pitch>
+        <duration>9</duration>
+        <voice>5</voice>
+        <type>eighth</type><dot/>
         <staff>2</staff>
         <notations><technical><string>3</string><fret>3</fret></technical></notations>
       </note>
       <note>
-        <pitch><step>D</step><octave>2</octave></pitch>
-        <duration>12</duration>
+        <rest/>
+        <duration>3</duration>
         <voice>5</voice>
-        <type>quarter</type>
+        <type>16th</type>
+        <staff>2</staff>
+      </note>
+      <note>
+        <pitch><step>D</step><octave>2</octave></pitch>
+        <duration>9</duration>
+        <voice>5</voice>
+        <type>eighth</type><dot/>
         <staff>2</staff>
         <notations><technical><string>2</string><fret>0</fret></technical></notations>
       </note>
       <note>
-        <pitch><step>E</step><octave>2</octave></pitch>
-        <duration>12</duration>
+        <rest/>
+        <duration>3</duration>
         <voice>5</voice>
-        <type>quarter</type>
+        <type>16th</type>
+        <staff>2</staff>
+      </note>
+      <note>
+        <pitch><step>E</step><octave>2</octave></pitch>
+        <duration>9</duration>
+        <voice>5</voice>
+        <type>eighth</type><dot/>
         <staff>2</staff>
         <notations><technical><string>2</string><fret>2</fret></technical></notations>
+      </note>
+      <note>
+        <rest/>
+        <duration>3</duration>
+        <voice>5</voice>
+        <type>16th</type>
+        <staff>2</staff>
       </note>
     </measure>
     <measure number="2">
       <note>
         <pitch><step>F</step><octave>2</octave></pitch>
-        <duration>12</duration>
+        <duration>9</duration>
         <voice>1</voice>
-        <type>quarter</type>
+        <type>eighth</type><dot/>
+        <staff>1</staff>
+      </note>
+      <note>
+        <rest/>
+        <duration>3</duration>
+        <voice>1</voice>
+        <type>16th</type>
         <staff>1</staff>
       </note>
       <note>
         <pitch><step>E</step><octave>2</octave></pitch>
-        <duration>12</duration>
+        <duration>9</duration>
         <voice>1</voice>
-        <type>quarter</type>
+        <type>eighth</type><dot/>
+        <staff>1</staff>
+      </note>
+      <note>
+        <rest/>
+        <duration>3</duration>
+        <voice>1</voice>
+        <type>16th</type>
         <staff>1</staff>
       </note>
       <note>
         <pitch><step>D</step><octave>2</octave></pitch>
-        <duration>12</duration>
+        <duration>9</duration>
         <voice>1</voice>
-        <type>quarter</type>
+        <type>eighth</type><dot/>
+        <staff>1</staff>
+      </note>
+      <note>
+        <rest/>
+        <duration>3</duration>
+        <voice>1</voice>
+        <type>16th</type>
         <staff>1</staff>
       </note>
       <note>
         <pitch><step>C</step><octave>2</octave></pitch>
-        <duration>12</duration>
+        <duration>9</duration>
         <voice>1</voice>
-        <type>quarter</type>
+        <type>eighth</type><dot/>
+        <staff>1</staff>
+      </note>
+      <note>
+        <rest/>
+        <duration>3</duration>
+        <voice>1</voice>
+        <type>16th</type>
         <staff>1</staff>
       </note>
       <backup><duration>48</duration></backup>
       <note>
         <pitch><step>F</step><octave>2</octave></pitch>
-        <duration>12</duration>
+        <duration>9</duration>
         <voice>5</voice>
-        <type>quarter</type>
+        <type>eighth</type><dot/>
         <staff>2</staff>
         <notations><technical><string>2</string><fret>3</fret></technical></notations>
       </note>
       <note>
-        <pitch><step>E</step><octave>2</octave></pitch>
-        <duration>12</duration>
+        <rest/>
+        <duration>3</duration>
         <voice>5</voice>
-        <type>quarter</type>
+        <type>16th</type>
+        <staff>2</staff>
+      </note>
+      <note>
+        <pitch><step>E</step><octave>2</octave></pitch>
+        <duration>9</duration>
+        <voice>5</voice>
+        <type>eighth</type><dot/>
         <staff>2</staff>
         <notations><technical><string>2</string><fret>2</fret></technical></notations>
       </note>
       <note>
-        <pitch><step>D</step><octave>2</octave></pitch>
-        <duration>12</duration>
+        <rest/>
+        <duration>3</duration>
         <voice>5</voice>
-        <type>quarter</type>
+        <type>16th</type>
+        <staff>2</staff>
+      </note>
+      <note>
+        <pitch><step>D</step><octave>2</octave></pitch>
+        <duration>9</duration>
+        <voice>5</voice>
+        <type>eighth</type><dot/>
         <staff>2</staff>
         <notations><technical><string>2</string><fret>0</fret></technical></notations>
       </note>
       <note>
-        <pitch><step>C</step><octave>2</octave></pitch>
-        <duration>12</duration>
+        <rest/>
+        <duration>3</duration>
         <voice>5</voice>
-        <type>quarter</type>
+        <type>16th</type>
+        <staff>2</staff>
+      </note>
+      <note>
+        <pitch><step>C</step><octave>2</octave></pitch>
+        <duration>9</duration>
+        <voice>5</voice>
+        <type>eighth</type><dot/>
         <staff>2</staff>
         <notations><technical><string>3</string><fret>3</fret></technical></notations>
+      </note>
+      <note>
+        <rest/>
+        <duration>3</duration>
+        <voice>5</voice>
+        <type>16th</type>
+        <staff>2</staff>
       </note>
     </measure>
   </part>

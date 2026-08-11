@@ -225,19 +225,14 @@ export class Transport {
     if (this.mode === 'playing') this.rescheduleSynth();
   }
 
-  setBeatTimes(times: number[]): void {
-    this.synth.setBeatTimes(times);
-  }
-
   setVoice(voice: SynthVoice): void {
     this.synth.setVoice(voice);
     if (this.mode === 'playing') this.rescheduleSynth();
   }
 
-  setMetronome(on: boolean): void {
-    this.synth.setMetronome(on);
-    if (this.mode === 'playing') this.rescheduleSynth();
-  }
+  // `setBeatTimes` and `setMetronome` stood here. The only thing either ever fed was the
+  // metronome click, and that feature is gone — see audio/synth.ts §start(). The beat times
+  // themselves are still very much alive; they simply have no business on the audio path.
 
   // -------------------------------------------------------------------------
   // The fader

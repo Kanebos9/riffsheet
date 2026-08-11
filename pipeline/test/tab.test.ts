@@ -151,3 +151,89 @@ describe('STATION 5 — string assignment', () => {
     expect(out[0].position!.fret).toBeGreaterThanOrEqual(3);
   });
 });
+
+/**
+ * The two styles added alongside `low` and `minMovement`. They are tested on the same shape the
+ * corpus fixtures use — the alternating line across a string boundary — because that is where
+ * the four styles actually disagree; on material that only has one comfortable position they
+ * all return the same tab, and a test that could not tell them apart would prove nothing.
+ */
+describe('STATION 5 — fingering styles: openStrings and aroundFret', () => {
+  const frets = (r: ReturnType<typeof assignStrings>): number[] => r.map((a) => a.position!.fret);
+  const strings = (r: ReturnType<typeof assignStrings>): number[] => r.map((a) => a.position!.string);
+  /** A1 C2 D2 G2 — the corpus's boundary-crossing pattern. A1/D2/G2 are open on BASS4. */
+  const boundary = [n('a', 33, 0, 0.4), n('b', 36, 0.5, 0.9), n('c', 38, 1.0, 1.4), n('d', 43, 1.5, 1.9)];
+  /** The same idea an octave up, where every pitch has a fretted alternative low on a string. */
+  const upper = [n('a', 45, 0, 0.4), n('b', 43, 0.5, 0.9), n('c', 47, 1.0, 1.4), n('d', 43, 1.5, 1.9)];
+
+  it("'openStrings' takes every open string on offer, where 'minMovement' refuses them", () => {
+    const open = assignStrings(boundary, { tuningMidi: BASS4, fingeringStyle: 'openStrings' });
+    const min = assignStrings(boundary, { tuningMidi: BASS4, fingeringStyle: 'minMovement' });
+    // A1, D2 and G2 are open strings on this tuning; C2 is not, at any position.
+    expect(frets(open)).toEqual([0, 3, 0, 0]);
+    expect(open.filter((a) => a.position!.fret === 0).length).toBeGreaterThan(
+      min.filter((a) => a.position!.fret === 0).length
+    );
+  });
+
+  it("'openStrings' never changes a pitch to get one — every position still sounds its note", () => {
+    for (const notes of [boundary, upper]) {
+      const out = assignStrings(notes, { tuningMidi: BASS4, fingeringStyle: 'openStrings' });
+      out.forEach((a, i) => expect(BASS4[a.position!.string - 1] + a.position!.fret).toBe(notes[i].midi));
+    }
+  });
+
+  it("'openStrings' still orders the FRETTED choices sensibly when no open string exists", () => {
+    // C2 (36) has no open string: fret 8 on E, 3 on A. It must take the low one, not wander.
+    const out = assignStrings([n('a', 36, 0, 0.4)], { tuningMidi: BASS4, fingeringStyle: 'openStrings' });
+    expect(out[0].position).toEqual({ string: 2, fret: 3 });
+  });
+
+  it("'aroundFret' parks the hand at its anchor, and the anchor is a real parameter", () => {
+    const at = (anchor: number): number[] =>
+      frets(assignStrings(upper, { tuningMidi: BASS4, fingeringStyle: 'aroundFret', anchorFret: anchor }));
+    const low = at(2);
+    const high = at(9);
+    const meanFretted = (xs: number[]): number => {
+      const f = xs.filter((x) => x > 0);
+      return f.length ? f.reduce((a, b) => a + b, 0) / f.length : 0;
+    };
+    expect(meanFretted(high)).toBeGreaterThan(meanFretted(low));
+    // Every fretted choice sits within a hand span of the anchor it was given.
+    for (const f of high.filter((x) => x > 0)) expect(Math.abs(f - 9)).toBeLessThanOrEqual(5);
+    for (const f of low.filter((x) => x > 0)) expect(Math.abs(f - 2)).toBeLessThanOrEqual(5);
+  });
+
+  it("'aroundFret' defaults to first position when no anchor is given", () => {
+    const explicit = assignStrings(upper, { tuningMidi: BASS4, fingeringStyle: 'aroundFret', anchorFret: 5 });
+    const implicit = assignStrings(upper, { tuningMidi: BASS4, fingeringStyle: 'aroundFret' });
+    expect(frets(implicit)).toEqual(frets(explicit));
+    expect(strings(implicit)).toEqual(strings(explicit));
+  });
+
+  it("'aroundFret' still takes an open string: it costs no hand at all", () => {
+    const out = assignStrings([n('a', 43, 0, 0.4)], {
+      tuningMidi: BASS4,
+      fingeringStyle: 'aroundFret',
+      anchorFret: 12
+    });
+    expect(out[0].position!.fret).toBe(0);
+  });
+
+  it('both new styles honour the pinned-string override, the capo and the octave fold', () => {
+    for (const style of ['openStrings', 'aroundFret'] as const) {
+      const pinned = assignStrings([{ ...n('a', 43, 0, 0.4), stringOverride: 3 }], {
+        tuningMidi: BASS4,
+        fingeringStyle: style
+      });
+      expect(pinned[0].position).toEqual({ string: 3, fret: 5 });
+
+      const capo = assignStrings([n('a', 45, 0, 0.4)], { tuningMidi: BASS4, fingeringStyle: style, capo: 3 });
+      expect(capo[0].position!.fret).toBeGreaterThanOrEqual(3);
+
+      const folded = assignStrings([n('a', 20, 0, 0.4)], { tuningMidi: BASS4, fingeringStyle: style });
+      expect(folded[0].tabOctaveShift).toBe(12);
+      expect(BASS4[folded[0].position!.string - 1] + folded[0].position!.fret).toBe(32);
+    }
+  });
+});

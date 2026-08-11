@@ -379,6 +379,10 @@ input[type="number"], input[type="text"], select {
 .notation-toolbar .string-count { display: flex; align-items: center; gap: 4px; }
 .notation-toolbar .string-count input { width: 48px; }
 .notation-toolbar .tuning-summary { font-size: 11.5px; color: var(--text-dim); }
+/* "1/4 would merge 12 notes". Sits right beside the grid it is about — a warning one control
+   away from its cause is a warning about nothing. Coloured, because it is the one thing in
+   this row that is not a setting but a consequence. */
+.notation-toolbar .warn-row { color: var(--warn); white-space: normal; }
 .notation-toolbar .document-bars { display: flex; align-items: center; gap: 6px; margin-left: auto; }
 
 /*
@@ -479,6 +483,21 @@ input[type="number"], input[type="text"], select {
   flex-wrap: wrap;
 }
 .transport .position { font-variant-numeric: tabular-nums; min-width: 11ch; white-space: nowrap; }
+
+/* Undo / redo. Tight against each other and loose from everything else, so they read as one
+   control with two ends rather than as two more buttons in the row. */
+.undo-redo { display: flex; align-items: center; gap: 4px; }
+.undo-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 4px 7px;
+  line-height: 0;
+}
+.undo-btn svg { display: block; }
+/* Greyed, not hidden. A control that vanishes at the end of the stack takes the answer to
+   "can I undo this?" away at exactly the moment somebody is asking it. */
+.undo-btn:disabled { opacity: 0.35; cursor: default; }
 
 .fader { display: flex; align-items: center; gap: 8px; min-width: 0; }
 .fader label { font-size: 11.5px; color: var(--text-dim); }
@@ -615,6 +634,56 @@ button[data-drag="midi"]:hover .drag-grip { opacity: 0.9; }
   cursor: help;
 }
 .tab-mark:hover { color: var(--accent); }
+
+/* The piano roll's zoom pair. Two chips that read as one control. */
+/*
+ * The settings gear: bigger, and it says what it is.
+ *
+ * It was `button.icon` with a bare glyph, the same size and shape as the three export buttons
+ * beside it. The panel behind it is the one thing in a header people go LOOKING for, so it is
+ * wider, warmer and labelled. The word is the first thing to go when the bar runs out of room
+ * — see the proportional block at the bottom of this file — and the glyph carries on alone.
+ */
+.settings-gear {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 12px;
+  font-weight: 600;
+}
+.settings-gear .gear-glyph { font-size: 15px; line-height: 1; }
+.settings-gear .gear-label { white-space: nowrap; }
+
+.zoom-pair { display: inline-flex; gap: 2px; align-items: center; }
+.zoom-pair .chip { padding: 3px 7px; font-variant-numeric: tabular-nums; }
+
+/*
+ * The open-string letters at the left of every tab staff — the legend the old one-line
+ * "Tuning low → high:" row used to be, put on the lines it describes.
+ *
+ * Drawn into alphaTab's existing left page padding, which the tri-view already sizes to the
+ * piano roll's gutter (LEFT_INSET_PX), so this adds no column of its own and the shared
+ * x-axis is untouched. Quieter than a note name and without its background plate: it is a
+ * fixed label, read once, and it must not compete with the fret digits beside it.
+ */
+.stringletters-row {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+}
+
+.string-letter {
+  position: absolute;
+  top: 0;
+  left: 0;
+  font: 600 9px/1 ui-monospace, SFMono-Regular, Menlo, monospace;
+  color: #7a6a58;
+  letter-spacing: -0.2px;
+  white-space: nowrap;
+  pointer-events: auto;
+  cursor: help;
+}
+.string-letter:hover { color: var(--accent); }
 
 .triview-overlay {
   position: absolute;
@@ -819,6 +888,31 @@ button[data-drag="midi"]:hover .drag-grip { opacity: 0.9; }
 .engine-card header .dot.warn { background: var(--warn); }
 .engine-card header .dot.off { background: var(--text-dim); }
 .engine-card .row { flex-wrap: wrap; margin: 7px 0 2px; }
+
+/*
+ * A CARD IS ~300px WIDE AND EVERYTHING IN IT HAS TO GIVE.
+ *
+ * The panel is a fixed column and the cards are narrower than it, so two things that were
+ * perfectly happy in the settings column overflow once they are inside a card: a `<select>`
+ * takes its intrinsic width from its LONGEST option ("Large — most accurate, slowest, most
+ * memory"), and `.settings-row > .label` reserves 96px before the control even starts. Neither
+ * is wrong in the column it was written for; both push a card sideways.
+ *
+ * So inside a card the label stops reserving, the controls are allowed to shrink, and the
+ * paths and URLs get a flex context — `max-width: 100%` does nothing for a non-replaced inline
+ * element, which is exactly why `code.path` overflowed here and not in the config row.
+ */
+.engine-card .settings-row > .label { min-width: 0; }
+.engine-card select,
+.engine-card input[type="text"] { flex: 1 1 130px; min-width: 0; max-width: 100%; }
+.engine-card [data-role="engine-card-source"] {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+}
+.engine-card [data-role="engine-card-source"] > * { min-width: 0; }
 /* An install bar, inline with the sentence that says what stage it is at. */
 .engine-card .progress {
   display: inline-block;
@@ -900,6 +994,17 @@ button[data-drag="midi"]:hover .drag-grip { opacity: 0.9; }
 .toast.danger { border-left-color: var(--danger); }
 .toast.info { border-left-color: var(--accent); }
 .toast button { background: none; border: none; padding: 0 2px; cursor: pointer; color: var(--text-dim); }
+/* The action button has to look pressable, so it keeps the chip's border and its own colour —
+   the dismissal ✕ above deliberately does not, and the two must not be mistaken for each
+   other when one of them stops somebody's process. */
+.toast .toast-action {
+  margin-top: 7px;
+  padding: 4px 11px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--bg-panel);
+  color: var(--text);
+}
 
 /* ------------------------------------------------------------------ narrow */
 
@@ -913,6 +1018,36 @@ button[data-drag="midi"]:hover .drag-grip { opacity: 0.9; }
   .app-header { padding: 7px 10px; }
   button { padding: 5px 8px; }
   .fader label, .fader .end { font-size: 11px; }
+}
+
+/*
+ * PROPORTIONAL, NOT WRAPPED.
+ *
+ * Below the threshold the shell is SCALED rather than re-flowed. The reasoning is the plugin's:
+ * REAPER's docked FX window bottoms out around 360x280, and the previous answer — flex-wrap
+ * everywhere — spent that height on extra ROWS of chrome, so the narrower the window got the
+ * less of it was the sheet. Scaling keeps the same picture and makes it smaller, which is what
+ * somebody dragging a window edge is asking for.
+ *
+ * `zoom` and not `transform: scale()`. A transform would leave the element laid out at its old
+ * size, so the page would keep a scrollbar for space that is no longer occupied and every
+ * getBoundingClientRect() the app measures (the roll's hit-testing, the sheet's bounds, the
+ * tooltip's clamping) would be reading pre-transform coordinates. `zoom` scales layout as well
+ * as paint, so the measurements stay honest — which is the whole reason a canvas-heavy app can
+ * use it and could not use the other one.
+ *
+ * The step is deliberate rather than continuous: two named sizes are predictable, and a
+ * continuously-scaled UI resizes text under your eyes on every drag frame.
+ */
+@media (max-width: 860px) {
+  #app { zoom: 0.9; }
+}
+@media (max-width: 620px), (max-height: 420px) {
+  #app { zoom: 0.8; }
+  /* The gear keeps its glyph and loses its word — the one place a label is worth the space
+     only while there is space. */
+  .settings-gear .gear-label { display: none; }
+  .settings-gear { padding: 5px 9px; }
 }
 
 @media (max-width: 720px) {

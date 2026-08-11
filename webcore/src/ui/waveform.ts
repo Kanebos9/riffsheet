@@ -171,7 +171,7 @@
 
 import type { TrimResult } from '../audio/trim';
 import type { OnsetResult } from '../audio/onsets';
-import { TIMELINE_GUTTER_PX, type SheetMap } from '../view/pianoroll';
+import { TIMELINE_GUTTER_PX, type SheetMap, type TimeAnchor } from '../view/pianoroll';
 
 /** A stretch of the RECORDING, in recording seconds. `fromSec` is always the earlier one. */
 export interface WaveformSelection {
@@ -250,6 +250,8 @@ export class WaveformStrip {
   /** The slice the sheet and the roll are showing, or null for "no bracket". */
   private viewportFromSec: number | null = null;
   private viewportToSec: number | null = null;
+  /** ALIGN: the sheet's own ruler, in time. Null = the whole take, evenly. */
+  private anchors: TimeAnchor[] | null = null;
   /** The moment the player has picked out to ask about, as a window, or null for none. */
   private selectionFromSec: number | null = null;
   private selectionToSec: number | null = null;
@@ -284,12 +286,12 @@ export class WaveformStrip {
     select: '#5aa9e8',
     onset: '#62d6b5',
     /** Same token the roll haloes an auto-edited note with — one claim, one colour. */
-    autoEdit: '#62d6b5',
-    autoAttention: '#e8b34a'
+    autoEdit: '#62d6b5'
+    // `autoAttention` (yellow) is deleted, not unused. See `setAttentionRegions`.
   };
 
   /** See `setAttentionRegions`. Empty until the auto-edit pass has run. */
-  private attention: Array<{ fromSec: number; toSec: number; applied: boolean }> = [];
+  private attention: Array<{ fromSec: number; toSec: number }> = [];
 
   private static MARKER_HIT_PX = 7;
   /**
@@ -374,8 +376,7 @@ export class WaveformStrip {
       // so the strip is correct whether or not the stylesheet ever gains it.
       select: pick('--select', this.colors.select),
       onset: pick('--success', this.colors.onset),
-      autoEdit: pick('--success', this.colors.autoEdit),
-      autoAttention: pick('--warn', this.colors.autoAttention)
+      autoEdit: pick('--success', this.colors.autoEdit)
     };
   }
 
@@ -406,24 +407,22 @@ export class WaveformStrip {
   }
 
   /**
-   * Stretches of the recording the app has something to say about.
+   * Stretches of the recording where the auto-edit pass CHANGED a note.
    *
-   * Two kinds, and they are different claims. `applied: true` is "I changed a note here on my
-   * own evidence, go and look" — the auto-split/gap-fill pass in `edit/autoEdits.ts`. `applied:
-   * false` is "I heard something here the engine did not, and I did NOT touch it", which is
-   * what the switched-off state shows and what a guardrail refusal leaves behind.
+   * ONE claim, not two. There used to be a second, yellow kind — `applied: false`, "I heard
+   * something here and did NOT touch it" — drawn whenever a guardrail refused or the setting
+   * was off. It is gone, and the flag that selected it is gone with it, so it cannot come
+   * back by accident. A mark the player cannot act on teaches them to ignore marks, and the
+   * ones they must not ignore are these.
    *
    * On the STRIP and on the roll, never on the sheet or the tab. Those two are the result — a
    * player reads them to find out what the music is, and marking them up with what the app
    * thinks of itself would make that harder in exchange for nothing about the music.
    */
-  setAttentionRegions(
-    regions: ReadonlyArray<{ fromSec: number; toSec: number; applied: boolean }>
-  ): void {
+  setAttentionRegions(regions: ReadonlyArray<{ fromSec: number; toSec: number }>): void {
     this.attention = regions.map((r) => ({
       fromSec: Math.min(r.fromSec, r.toSec),
-      toSec: Math.max(r.fromSec, r.toSec),
-      applied: r.applied
+      toSec: Math.max(r.fromSec, r.toSec)
     }));
     this.draw();
   }
@@ -570,8 +569,90 @@ export class WaveformStrip {
     );
   }
 
+  /**
+   * ALIGN: show exactly this stretch of the recording in the BODY. Null = the whole take.
+   *
+   * The strip's half of the same bargain the roll takes (`view/pianoroll.ts §setTimeWindow`):
+   * the sheet's visible span, so a peak in the envelope is directly under the notehead written
+   * from it. The ruler stays linear in time inside the window — the envelope is evidence about
+   * a recording, and a waveform that re-spaces itself when a note is edited is not evidence.
+   *
+   * The OVERVIEW ribbon is unaffected and stays whole-take: it is the map, and a map that
+   * zoomed with the thing it is a map of would be no use.
+   */
+  setTimeAnchors(anchors: ReadonlyArray<TimeAnchor> | null): void {
+    const clean =
+      anchors && anchors.length >= 2
+        ? anchors
+            .filter((a) => Number.isFinite(a.sec) && Number.isFinite(a.frac))
+            .slice()
+            .sort((a, b) => a.sec - b.sec)
+            .filter((a, i, all) => i === 0 || a.sec - all[i - 1].sec > 1e-6)
+        : null;
+    const next = clean && clean.length >= 2 ? clean : null;
+    const a = this.anchors;
+    const same =
+      (next === null && a === null) ||
+      (next !== null &&
+        a !== null &&
+        next.length === a.length &&
+        next.every((n, i) => Math.abs(n.sec - a[i].sec) < 1e-4 && Math.abs(n.frac - a[i].frac) < 1e-4));
+    if (same) return;
+    this.anchors = next;
+    this.draw();
+  }
+
+  /** See view/pianoroll.ts §anchorFrac — the same ruler, so the two strips cannot drift. */
+  private anchorFrac(sec: number): number | null {
+    const a = this.anchors;
+    if (!a) return null;
+    if (sec <= a[0].sec) {
+      const span = a[1].sec - a[0].sec;
+      return a[0].frac + (span > 0 ? ((sec - a[0].sec) / span) * (a[1].frac - a[0].frac) : 0);
+    }
+    const last = a.length - 1;
+    if (sec >= a[last].sec) {
+      const span = a[last].sec - a[last - 1].sec;
+      return a[last].frac + (span > 0 ? ((sec - a[last].sec) / span) * (a[last].frac - a[last - 1].frac) : 0);
+    }
+    let lo = 0;
+    let hi = last;
+    while (hi - lo > 1) {
+      const mid = (lo + hi) >> 1;
+      if (a[mid].sec <= sec) lo = mid;
+      else hi = mid;
+    }
+    const span = a[hi].sec - a[lo].sec;
+    return span > 0 ? a[lo].frac + ((sec - a[lo].sec) / span) * (a[hi].frac - a[lo].frac) : a[lo].frac;
+  }
+
+  private anchorSec(frac: number): number | null {
+    const a = this.anchors;
+    if (!a) return null;
+    if (frac <= a[0].frac) {
+      const span = a[1].frac - a[0].frac;
+      return a[0].sec + (span > 0 ? ((frac - a[0].frac) / span) * (a[1].sec - a[0].sec) : 0);
+    }
+    const last = a.length - 1;
+    if (frac >= a[last].frac) {
+      const span = a[last].frac - a[last - 1].frac;
+      return a[last].sec + (span > 0 ? ((frac - a[last].frac) / span) * (a[last].sec - a[last - 1].sec) : 0);
+    }
+    let lo = 0;
+    let hi = last;
+    while (hi - lo > 1) {
+      const mid = (lo + hi) >> 1;
+      if (a[mid].frac <= frac) lo = mid;
+      else hi = mid;
+    }
+    const span = a[hi].frac - a[lo].frac;
+    return span > 0 ? a[lo].sec + ((frac - a[lo].frac) / span) * (a[hi].sec - a[lo].sec) : a[lo].sec;
+  }
+
   /** RECORDING seconds -> x on the plain even ruler. The overview's axis, and the fallback. */
   private secToEvenX(sec: number): number {
+    const frac = this.anchorFrac(sec);
+    if (frac !== null) return this.gutterPx + frac * this.plotWidth;
     return this.durationSec > 0
       ? this.gutterPx + (sec / this.durationSec) * this.plotWidth
       : this.gutterPx;
@@ -579,6 +660,8 @@ export class WaveformStrip {
 
   /** The exact inverse of `secToEvenX`, unclamped. */
   private evenXToSec(x: number): number {
+    const sec = this.anchorSec((x - this.gutterPx) / this.plotWidth);
+    if (sec !== null) return sec;
     return ((x - this.gutterPx) / this.plotWidth) * this.durationSec;
   }
 
@@ -615,9 +698,20 @@ export class WaveformStrip {
     return Number.isFinite(sec) ? Math.max(0, Math.min(this.durationSec, sec)) : Number.NaN;
   }
 
-  /** The same, for the overview ribbon, which is always on the even ruler. */
+  /** The same, for the overview ribbon, which is always the WHOLE TAKE. */
   private evenSecAt(x: number): number {
-    return Math.max(0, Math.min(this.durationSec, this.evenXToSec(x)));
+    return Math.max(0, Math.min(this.durationSec, this.wholeTakeXToSec(x)));
+  }
+
+  /** The ribbon's own axis: the whole recording, always, whatever the body is showing. */
+  private wholeTakeSecToX(sec: number): number {
+    return this.durationSec > 0
+      ? this.gutterPx + (sec / this.durationSec) * this.plotWidth
+      : this.gutterPx;
+  }
+
+  private wholeTakeXToSec(x: number): number {
+    return ((x - this.gutterPx) / this.plotWidth) * this.durationSec;
   }
 
   /**
@@ -648,8 +742,8 @@ export class WaveformStrip {
     // The whole take is on screen below: nothing to point at.
     if (lo <= 0.0005 && hi >= this.durationSec - 0.0005) return null;
 
-    let fromX = this.secToEvenX(lo);
-    let toX = this.secToEvenX(hi);
+    let fromX = this.wholeTakeSecToX(lo);
+    let toX = this.wholeTakeSecToX(hi);
     // Widen a hairline bracket around its own middle so both edges survive as edges. It lies
     // by a pixel or two about the range; a bracket you cannot see lies about all of it.
     const min = WaveformStrip.VIEWPORT_MIN_DRAW_PX;
@@ -905,7 +999,7 @@ export class WaveformStrip {
       if (!this.pressMoved && Math.abs(x - this.pressX) < WaveformStrip.DRAG_SLOP_PX) return;
       this.pressMoved = true;
       this.moveBracketTo(
-        this.centreFor(this.evenXToSec(x) - this.grabOffsetSec, this.grabSpanSec),
+        this.centreFor(this.wholeTakeXToSec(x) - this.grabOffsetSec, this.grabSpanSec),
         false
       );
       return;
@@ -961,7 +1055,7 @@ export class WaveformStrip {
       const rect = this.canvas.getBoundingClientRect();
       const x = e.clientX - rect.left;
       this.moveBracketTo(
-        this.centreFor(this.evenXToSec(x) - this.grabOffsetSec, this.grabSpanSec),
+        this.centreFor(this.wholeTakeXToSec(x) - this.grabOffsetSec, this.grabSpanSec),
         true
       );
       return;
@@ -1195,9 +1289,8 @@ export class WaveformStrip {
       const right = Math.min(w, Math.max(fromX, toX));
       if (right < g || left > w) continue;
       const width = Math.max(2, right - left);
-      const colour = region.applied ? this.colors.autoEdit : this.colors.autoAttention;
       ctx.globalAlpha = 0.14;
-      ctx.fillStyle = colour;
+      ctx.fillStyle = this.colors.autoEdit;
       ctx.fillRect(left, top, width, height);
       ctx.globalAlpha = 0.85;
       ctx.fillRect(left, top, width, 2);
@@ -1278,8 +1371,8 @@ export class WaveformStrip {
       const trimStart = this.trim ? this.trim.startOffsetSec : 0;
       const trimEnd = this.trim ? this.trim.endSec : this.durationSec;
       for (let x = g; x < w; x++) {
-        const a = this.evenXToSec(x);
-        const p = this.columnPeak(a, this.evenXToSec(x + 1));
+        const a = this.wholeTakeXToSec(x);
+        const p = this.columnPeak(a, this.wholeTakeXToSec(x + 1));
         if (!p) continue;
         ctx.fillStyle = a < trimStart || a > trimEnd ? this.colors.waveDim : this.colors.wave;
         ctx.fillRect(x, mid + p.lo * scale, 1, Math.max(1, (p.hi - p.lo) * scale));
@@ -1306,9 +1399,9 @@ export class WaveformStrip {
 
     if (this.durationSec > 0) {
       ctx.fillStyle = this.colors.marker;
-      ctx.fillRect(this.secToEvenX(this.barOneSec) - 0.5, 0, 1, ribbonH);
+      ctx.fillRect(this.wholeTakeSecToX(this.barOneSec) - 0.5, 0, 1, ribbonH);
       ctx.fillStyle = this.colors.playhead;
-      ctx.fillRect(this.secToEvenX(this.positionSec) - 0.5, 0, 1, ribbonH);
+      ctx.fillRect(this.wholeTakeSecToX(this.positionSec) - 0.5, 0, 1, ribbonH);
     }
 
     ctx.fillStyle = this.colors.line;
@@ -1403,6 +1496,11 @@ export class WaveformStrip {
     overviewPx: number;
     /** True when the body is drawn on the SHEET's engraved x-axis rather than on even time. */
     sheetLinked: boolean;
+    /** ALIGN: the stretch of RECORDING the BODY is showing. The ribbon is always whole-take. */
+    windowFromSec: number | null;
+    windowToSec: number | null;
+    /** What the middle of the body's plot means, in RECORDING seconds. */
+    midPlotSec: number;
     /** Written second 0 on the recording's clock, as handed in. Compare with the sheet's. */
     scoreOriginSec: number;
     /** The fixed width a click asks about. */
@@ -1435,7 +1533,13 @@ export class WaveformStrip {
     /** True when a listener is wired; false means probing is off. */
     selectable: boolean;
     dragging: DragKind | null;
-    /** Stretches the auto-edit pass marked, and how many of those were real edits. */
+    /**
+     * Stretches the auto-edit pass marked, and how many of those were real edits.
+     *
+     * The same number twice now, and both kept: every mark IS a real edit since the yellow
+     * "noticed but untouched" kind was removed, and `attentionApplied` is the field the
+     * harness asserts drops to zero once the player has reviewed the pass.
+     */
     attentionRegions: number;
     attentionApplied: number;
   } {
@@ -1452,6 +1556,9 @@ export class WaveformStrip {
       handleLanePx: ribbon,
       overviewPx: ribbon,
       sheetLinked: !!m,
+      windowFromSec: this.anchors ? Number((this.anchorSec(0) ?? 0).toFixed(4)) : null,
+      windowToSec: this.anchors ? Number((this.anchorSec(1) ?? 0).toFixed(4)) : null,
+      midPlotSec: Number(this.evenXToSec(this.gutterPx + this.plotWidth / 2).toFixed(4)),
       scoreOriginSec: Number(this.scoreOriginSec.toFixed(3)),
       probeWindowSec: WaveformStrip.PROBE_WINDOW_SEC,
       durationSec: Number(this.durationSec.toFixed(3)),
@@ -1473,7 +1580,7 @@ export class WaveformStrip {
       selectable: !!this.opts.onSelectionChange,
       dragging: this.dragging,
       attentionRegions: this.attention.length,
-      attentionApplied: this.attention.filter((r) => r.applied).length
+      attentionApplied: this.attention.length
     };
   }
 

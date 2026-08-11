@@ -101,7 +101,39 @@ export interface EngineStatus {
   stopsAfterEachJob?: boolean;
   idleSeconds?: number;
   canStop?: boolean;
+  /** A server is up that Riffsheet did NOT start. See `stopExternalEngine`. */
+  externalServer?: boolean;
+  /**
+   * `stopExternalEngine()` would actually try, on this machine, right now.
+   *
+   * THE BUTTON IS DRAWN FROM THIS AND FROM NOTHING ELSE — not from `adopted`, not from
+   * `externalServer`. On Windows the listening process's command line cannot be read, so the
+   * shell cannot prove a server is a MuScriptor before ending it and refuses by design:
+   * `externalServer` is true there while this is false, and a button drawn from the first
+   * could only ever refuse. See BRIDGE.md.
+   */
+  canStopExternal?: boolean;
   memoryMb?: number | null;
+
+  /**
+   * The whole model size table — not only what is on disk.
+   *
+   * `installedModels` above answers "what is here"; this answers "what are the choices, what
+   * would each cost, and which of them can this machine actually run". `fits` is the `auto`
+   * rule's own answer (a size needing more than 40% of physical RAM is dropped), so a chooser
+   * built on it agrees with what `auto` would do rather than second-guessing it.
+   *
+   * Optional: a shell older than the model table does not send it, and the card falls back to
+   * the figures BRIDGE.md documents.
+   */
+  models?: Array<{
+    name: string;
+    /** Loaded, Python and the GPU buffers included: 900 | 1800 | 5000. */
+    approxResidentMb: number;
+    installed: boolean;
+    /** Within the auto rule's 40%-of-physical-RAM ceiling. */
+    fits: boolean;
+  }>;
   /**
    * Engine setup, for the guide-and-detect screen.
    *
@@ -197,6 +229,22 @@ export interface EngineSummary {
   installing: boolean;
   detail: string;
   error: string | null;
+
+  /**
+   * The engine's licence, as a short SPDX-ish string ("MIT", "Apache-2.0", "Non-commercial").
+   *
+   * OPTIONAL, and it is optional on purpose: a shell built before this field existed simply
+   * does not send it, and the card then names the source without claiming a licence it was
+   * never told. Never guessed from the URL — "it is on GitHub" says nothing about the terms,
+   * and the one thing this line exists to be is right.
+   */
+  license?: string;
+
+  // NOTE: there is deliberately no per-model RAM field here. The size table belongs to the
+  // ENGINE'S STATUS, not to its catalogue row — see `EngineStatus.models`, which the shell
+  // sends with `installed` and `fits` alongside each figure. This was designed as
+  // `modelRamMb` here before that landed and moved once the real contract existed, rather
+  // than being kept as a second, weaker copy of the same fact.
 }
 
 /** The answer to `listEngines()` (BRIDGE.md §3.1). */
@@ -204,8 +252,31 @@ export interface EngineListResult {
   configuredEngine: string;
   resolvedEngine: string;
   engineReason: string;
+  /**
+   * What the SHELL would use if the engine that runs in this page bowed out.
+   *
+   * Riffsheet's own engine (`riffsheet`) transcribes here, in the web view, and it can refuse a
+   * take it hears as chordal. When it does, the take is handed on — and this is the id it is
+   * handed to, together with the name to put in the sentence the player reads. It comes from the
+   * shell rather than from an order written out again here, because "which engine is next" is
+   * one decision and two copies of it would drift and then lie to somebody.
+   *
+   * OPTIONAL, like every multi-engine field: a shell that predates the in-page engine does not
+   * send it, and on such a shell `resolvedEngine` is never `riffsheet` so nothing ever needs it.
+   */
+  nativeFallbackEngine?: string;
   engines: EngineSummary[];
 }
+
+/**
+ * The id of the engine that runs in this page rather than in the shell.
+ *
+ * Spelled once. `app.ts` compares `resolvedEngine` against it to decide whether to run the local
+ * pass or call the bridge, and the mock's catalogue uses it for its row — so a rename is one
+ * edit here and one in `shell/Source/engines/EngineCatalog.cpp`, which is the coupling the
+ * shell's own comment describes.
+ */
+export const RIFFSHEET_ENGINE_ID = 'riffsheet';
 
 /**
  * An install in flight.
@@ -781,6 +852,86 @@ export interface NativeBridge {
    * and stopping that would be taking something that is not ours.
    */
   stopEngine?(): Promise<{ stopped: boolean; reason: string }>;
+
+  /**
+   * Stop a listener Riffsheet did NOT start, after the user has been told it is not ours.
+   *
+   * `stopEngine()` refuses an adopted server on principle — Riffsheet borrows a server the
+   * user started themselves and killing it would be taking something that is not ours. That
+   * principle is right as a default and wrong as an absolute: the person being refused is
+   * usually the same person who started it, they are looking at a notice saying 1.5 GB is
+   * being held, and "it is not mine to stop" is not an answer they can act on.
+   *
+   * So this is the escape hatch, and it is deliberately a SEPARATE call rather than a flag on
+   * `stopEngine`: an explicit second gesture, after an explicit notice, is the only thing that
+   * makes killing somebody else's process defensible. Nothing calls it automatically.
+   *
+   * It must still refuse mid-job — a transcription in flight anywhere on this machine is the
+   * one rule that has no override — and it answers with the same `{ stopped, reason }` shape
+   * `stopEngine` does so one piece of UI renders either outcome.
+   *
+   * NOT YET IN THE SHELL. Registered here and implemented in the browser mock so the button
+   * and its harness check are real; `hasNativeFunction('stopExternalEngine')` is the truthful
+   * capability test, and the notice simply carries no button on a shell without it.
+   */
+  stopExternalEngine?(): Promise<{ stopped: boolean; reason: string }>;
+
+  /**
+   * "I already have this engine — it is over there."
+   *
+   * The one-click cards can download an engine, and for somebody who installed the same thing
+   * last year that is several hundred megabytes of pointless traffic and a second copy on
+   * disk. This is the other door: point Riffsheet at the copy that is already here, have it
+   * checked, and use it.
+   *
+   * ONE CALL, TWO JOBS, chosen over two calls because the shell has to do the same work for
+   * both and a second entry point is a second thing to keep in step:
+   *
+   *  - `path === ''` means SNIFF: look in the places this engine is normally installed and
+   *    answer with what was found. `path` on the way back is where it is.
+   *  - a non-empty `path` means VALIDATE THAT: is a working copy of engine `id` at this
+   *    location, and if not, why not.
+   *
+   * `detail` is a sentence for the player either way — "Found a working copy at …" or "That
+   * folder has no `bin/muscriptor` in it" — because the useful half of a failed check is
+   * knowing what was looked for. `ok: true` means the engine is usable from that path and
+   * Riffsheet has recorded it; the card then behaves exactly as it does after an install.
+   *
+   * IN THE SHELL SINCE WAVE 5, and the shape did not have to change to get there — which was
+   * the point of keeping it to two strings in and a boolean plus two strings out. What the
+   * shell does with it is per engine and deliberately a FILE check rather than an execution:
+   * `transkun` is present when its console script is in an environment's `bin`, `bass-v2` when
+   * a checkout has both `infer.py` and a checkpoints folder with weights in it. Running a
+   * stranger's script to find out whether it is installed is a bigger promise than this call
+   * makes, and on a broken venv it hangs. `hasNativeFunction` is still the capability test: an
+   * older shell has no such call and the card simply carries no box.
+   */
+  validateExistingEngineInstall?(
+    id: string,
+    path: string
+  ): Promise<{ ok: boolean; detail: string; path?: string; searched?: string[] }>;
+
+  /**
+   * Beats, and nothing else.
+   *
+   * WHY IT EXISTS. Beat tracking has never belonged to an engine here — it is a bundled model
+   * the shell runs for all of them, as a sub-phase of `transcribe` gated on `preciseBeats`. That
+   * worked while every engine ran in the shell. Riffsheet's own engine runs HERE, so a take
+   * transcribed locally would have notes and no grid, and the only way to reach the tracker was
+   * to start a whole transcription and throw its notes away.
+   *
+   * Same tracker, same numbers, no engine involved. It takes no turn in the engine queue, so it
+   * does not wait behind somebody else's four-minute job.
+   *
+   * Optional: `hasNativeFunction('trackBeats')` is the capability test, and a page on an older
+   * shell keeps its notes and goes without a grid rather than hanging on a call nobody answers.
+   */
+  trackBeats?(source: AudioFileRef | CaptureResult): Promise<{
+    beats: number[];
+    downbeats: number[];
+    bpm: number | null;
+    beatsPerBar: number | null;
+  }>;
 
   /**
    * Ask for different weights.

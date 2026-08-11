@@ -42,6 +42,18 @@ namespace ModelCatalog
         Python and the Metal/CPU runtime included. */
     int estimatedResidentMb (const juce::String& model);
 
+    /** Step 1 of the auto rule below, on its own: would this size fit in a
+        machine with this much PHYSICAL memory, at the 40% ceiling?
+
+        It is a separate function because two callers need the same answer and a
+        second copy of "* 5 <= * 2" is exactly how the UI ends up telling the
+        user something the resolver does not believe. engineStatus() reports it
+        per model so a card can list all three sizes with an honest "this
+        machine cannot carry that one"; chooseAutomatically() uses it to pick.
+        `ramTotalMb <= 0` means "could not tell", and answers true rather than
+        hiding every model behind an unknown. */
+    bool fitsInPhysicalRam (const juce::String& model, int ramTotalMb);
+
     struct Choice
     {
         juce::String model;      // always one of small/medium/large

@@ -185,6 +185,34 @@ public:
     /** Bytes under a directory, following nothing. 0 when it does not exist. */
     static juce::int64 bytesOnDisk (const juce::File& directory);
 
+    //== "I already have this one" =============================================
+    //
+    // The other door beside a download. See NativeBridge::fnValidateExistingEngineInstall
+    // for the contract; these three are the mechanism.
+
+    /** Where the user pointed us at a copy of this engine, or an invalid File.
+        Read on every discovery, so a pointed-at engine survives a restart. */
+    static juce::File recordedLocation (const juce::String& id);
+
+    /** Records a validated copy: <appSupport>/engines/<id>.location, one line of
+        text. A file rather than a key in engine.json because engine.json is the
+        user's CHOICE of engine and this is a fact about the disk; mixing the two
+        would make clearing one clear the other. Pass an invalid File to forget. */
+    static void rememberInstallLocation (const juce::String& id, const juce::File& location);
+
+    /** Is there a working copy of `engine` at `requestedPath` - or, when that is
+        empty, anywhere this engine normally lives?
+
+        Returns the directory to run it from, or an invalid File. `searched` gets
+        every path that was looked at, in order, and `detail` one sentence for a
+        human either way - the useful half of a failed check is knowing what was
+        looked for. Stats files; never executes anything (see fnValidateExisting-
+        EngineInstall for why). Worker threads. */
+    static juce::File findExistingInstall (const EngineManifest& engine,
+                                           const juce::String& requestedPath,
+                                           juce::StringArray& searched,
+                                           juce::String& detail);
+
     //== python ================================================================
 
     struct PythonFind

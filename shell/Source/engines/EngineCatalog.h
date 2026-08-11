@@ -40,12 +40,24 @@ namespace EngineCatalog
 
     //== the resolution constants ==============================================
 
-    /** What `auto` prefers when it is installed. */
+    /** The order `auto` tries engines in, best first. Never empty; every id is a
+        real row (static_asserted); the last one is `fallbackId()`. The reasoning
+        behind the order is on `kAutoOrder` in the .cpp. */
+    std::vector<const char*> autoOrder();
+
+    /** The head of `autoOrder()` - what `auto` prefers when it can be used. */
     const char* autoPreferredId() noexcept;
 
     /** What `auto` falls back to: the bundled engine, which needs no setup and
-        is always present once wave 3 has compiled it in. */
+        is always present once wave 3 has compiled it in. The tail of
+        `autoOrder()`, so the chain can never run out. */
     const char* fallbackId() noexcept;
+
+    /** True for an engine that does NOT execute in this process - it runs in the
+        web view and the shell only carries its row. The shell must never try to
+        drive one: `resolve (nativeOnly)` skips these, and their adapter refuses.
+        See AdapterKind::inPageClient. */
+    bool runsInPage (const EngineManifest& engine) noexcept;
 
     //== wire spellings ========================================================
     // The bridge speaks 'bundled' | 'one-click' | 'guide'; the enum spells the

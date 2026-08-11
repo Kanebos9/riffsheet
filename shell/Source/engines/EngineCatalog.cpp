@@ -61,6 +61,7 @@ namespace
 
     //== instrument strengths, for the cards ===================================
 
+    constexpr const char* kRiffStrengths[]  = { "Bass", "Guitar", "Any single-note line" };
     constexpr const char* kBpStrengths[]    = { "Guitar", "Piano", "Voice", "Any single instrument" };
     constexpr const char* kMuStrengths[]    = { "Bass", "Guitar", "Piano", "Drums", "35 groups" };
     constexpr const char* kBassStrengths[]  = { "Bass" };
@@ -73,11 +74,49 @@ namespace
 
     constexpr EngineManifest kEngines[] =
     {
+      //--------------------------------------------------------------------- riffsheet
+      //
+      // THE ONE RIFFSHEET WROTE, AND THE DEFAULT.
+      //
+      // Zero bytes on disk, zero setup, and it does not run here: it is the app's
+      // own attack detector and pitch tracker fused in the web view. The row
+      // exists so that the picker, `auto` and `selectEngine()` treat it exactly
+      // like every other engine; the adapter behind it (ClientEngineAdapter)
+      // reports "always installed" and refuses to transcribe, because asking the
+      // SHELL to run it is a category error rather than a failure.
+      //
+      // It is `bundled` because that is what bundled means here - it ships in the
+      // release and needs nothing fetched - and `redistributable` because the
+      // bytes are ours. approxDiskBytes is 0 and that is the truth, not a
+      // placeholder: the engine is already inside the web bundle that has to be
+      // there anyway.
+      //
+      // producesConfidence is TRUE and earned: every note carries the share of
+      // its own frames that agreed on the pitch. producesVelocity is FALSE and
+      // must stay false - onset strength is relative to the loudest attack in the
+      // same take and is not a dynamic marking (see onsets.ts).
+      { "riffsheet", "Riffsheet", "Built in",
+        "Built in - good for single-note lines. Instant, needs no setup, and hands the take to "
+        "another engine when it hears chords.",
+        "https://github.com/riffsheet/riffsheet",
+        AdapterKind::inPageClient, InstallKind::bundled, EngineConcurrency::inProcess,
+        kRiffStrengths, 3,
+        /*acceptsInstrumentConstraint*/ false,
+        /*producesBeatGrid*/ false, /*producesConfidence*/ true, /*producesVelocity*/ false,
+        // It listens to the player's own samples in the page. The shell's -12 dBFS and A440
+        // preparation happens to a COPY on this side and never reaches it, so claiming to want
+        // either would be claiming something that cannot happen.
+        /*needsGainNorm*/ false, /*needsTuningNorm*/ false, /*preferredInputRate*/ 0.0,
+        "AGPL-3.0-only", "n/a - no weights", /*redistributable*/ true,
+        {},                       // no download: it is the app
+        "", "", "", "", 0, 0,
+        nullptr, 0 },
+
       //-------------------------------------------------------------------- basic-pitch
       { "basic-pitch", "Basic Pitch", "Built in",
         "Always available. Fast, general purpose, works with no setup at all.",
         "https://github.com/spotify/basic-pitch",
-        AdapterKind::inProcessOnnx, InstallKind::bundled, Concurrency::inProcess,
+        AdapterKind::inProcessOnnx, InstallKind::bundled, EngineConcurrency::inProcess,
         kBpStrengths, 4,
         /*acceptsInstrumentConstraint*/ false,
         /*producesBeatGrid*/ false, /*producesConfidence*/ true, /*producesVelocity*/ false,
@@ -93,7 +132,7 @@ namespace
         "35 instrument groups. Its weights are non-commercial and gated, so Riffsheet "
         "can never install it for you.",
         "https://pypi.org/project/muscriptor/",
-        AdapterKind::httpServerVenv, InstallKind::guide, Concurrency::exclusiveMachineWide,
+        AdapterKind::httpServerVenv, InstallKind::guide, EngineConcurrency::exclusiveMachineWide,
         kMuStrengths, 5,
         /*acceptsInstrumentConstraint*/ true,
         /*producesBeatGrid*/ true, /*producesConfidence*/ false, /*producesVelocity*/ false,
@@ -119,7 +158,7 @@ namespace
         "A bass transcriber that is very good at exactly that, and carries a general "
         "checkpoint for everything else. About 1 GB once its Python environment is built.",
         "https://github.com/anime-song/instrument-agnostic-amt",
-        AdapterKind::sidecarVenv, InstallKind::oneClick, Concurrency::exclusiveMachineWide,
+        AdapterKind::sidecarVenv, InstallKind::oneClick, EngineConcurrency::exclusiveMachineWide,
         kBassStrengths, 1,
         /*acceptsInstrumentConstraint*/ true,
         /*producesBeatGrid*/ false, /*producesConfidence*/ false, /*producesVelocity*/ true,
@@ -148,7 +187,7 @@ namespace
       { "transkun", "Transkun v2", "One-click",
         "Piano only, and very good at it. Everything it needs comes from pip.",
         "https://pypi.org/project/transkun/",
-        AdapterKind::sidecarPipCli, InstallKind::oneClick, Concurrency::exclusiveMachineWide,
+        AdapterKind::sidecarPipCli, InstallKind::oneClick, EngineConcurrency::exclusiveMachineWide,
         kPianoStrengths, 1,
         /*acceptsInstrumentConstraint*/ false,
         /*producesBeatGrid*/ false, /*producesConfidence*/ false, /*producesVelocity*/ true,
@@ -198,10 +237,30 @@ namespace
                    "EngineCatalog: an entry is unpinned, unverified, or would ship "
                    "bytes it has no right to ship. See engine-architecture.md §2.3.");
 
-    // The two ids the resolver names. Spelled once, proved to exist once, so a
-    // rename of a row cannot leave `auto` pointing at nothing.
-    constexpr const char* kAutoPreferredId = "muscriptor";
-    constexpr const char* kFallbackId      = "basic-pitch";
+    /*  THE ORDER `auto` TRIES ENGINES IN, best first.
+
+        Riffsheet's own engine leads because for the material this app is for -
+        one note at a time, which is most of what anybody records into it - it is
+        at least as good as the alternatives and it costs nothing, needs nothing
+        installed, and answers in under a second. It is also the only engine that
+        can say "this is not for me": a take it refuses falls through to the next
+        row here automatically, so leading with it costs a chordal take one extra
+        second and nothing else.
+
+        MuScriptor second, because when it IS installed it is the best thing on
+        the machine and somebody who went through its guided setup meant it.
+
+        Basic Pitch last, and last for the reason it has always been the
+        fallback: it is compiled in, so this list can never run out.
+
+        An explicit choice by the user overrides all of this - see
+        EngineRegistry::resolve(). */
+    constexpr const char* kAutoOrder[] = { "riffsheet", "muscriptor", "basic-pitch" };
+    constexpr int kAutoOrderCount = (int) (sizeof (kAutoOrder) / sizeof (kAutoOrder[0]));
+
+    // The id everything falls back to when nothing else can run: the last row of
+    // the order above, which must be the bundled engine that is always present.
+    constexpr const char* kFallbackId = kAutoOrder[kAutoOrderCount - 1];
 
     constexpr bool containsId (const char* id)
     {
@@ -212,10 +271,28 @@ namespace
         return false;
     }
 
-    static_assert (containsId (kAutoPreferredId),
-                   "EngineCatalog: `auto` prefers an engine that is not in the table.");
-    static_assert (containsId (kFallbackId),
-                   "EngineCatalog: `auto` falls back to an engine that is not in the table.");
+    constexpr bool autoOrderIsSane()
+    {
+        if (kAutoOrderCount < 1)
+            return false;
+
+        for (int i = 0; i < kAutoOrderCount; ++i)
+        {
+            if (! containsId (kAutoOrder[i]))
+                return false;
+
+            // A duplicate would make one engine tried twice and another never.
+            for (int j = i + 1; j < kAutoOrderCount; ++j)
+                if (sameString (kAutoOrder[i], kAutoOrder[j]))
+                    return false;
+        }
+
+        return true;
+    }
+
+    static_assert (autoOrderIsSane(),
+                   "EngineCatalog: `auto`'s order names an engine that is not in the table, "
+                   "or names one twice.");
 }
 
 //==============================================================================
@@ -248,8 +325,18 @@ std::vector<const EngineManifest*> EngineCatalog::offered()
     return result;
 }
 
-const char* EngineCatalog::autoPreferredId() noexcept { return kAutoPreferredId; }
+std::vector<const char*> EngineCatalog::autoOrder()
+{
+    return { kAutoOrder, kAutoOrder + kAutoOrderCount };
+}
+
+const char* EngineCatalog::autoPreferredId() noexcept { return kAutoOrder[0]; }
 const char* EngineCatalog::fallbackId() noexcept      { return kFallbackId; }
+
+bool EngineCatalog::runsInPage (const EngineManifest& engine) noexcept
+{
+    return engine.adapter == AdapterKind::inPageClient;
+}
 
 juce::String EngineCatalog::installName (InstallKind kind)
 {

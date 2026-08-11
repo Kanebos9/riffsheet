@@ -137,13 +137,17 @@ public:
 
     void runTest() override
     {
-        const auto* muScriptorRow = EngineCatalog::find (EngineCatalog::autoPreferredId());
+        // The order `auto` walks, straight from the catalogue, so these tests
+        // follow a change to it rather than encoding a second copy of it.
+        const auto order = EngineCatalog::autoOrder();
+        const auto* inPageRow = EngineCatalog::find (EngineCatalog::autoPreferredId());
+        const auto* muScriptorRow = EngineCatalog::find ("muscriptor");
         const auto* bundledRow = EngineCatalog::find (EngineCatalog::fallbackId());
 
-        if (muScriptorRow == nullptr || bundledRow == nullptr)
+        if (muScriptorRow == nullptr || bundledRow == nullptr || inPageRow == nullptr)
         {
-            beginTest ("the catalog has the two rows the resolver names");
-            expect (false, "EngineCatalog is missing the preferred or fallback engine");
+            beginTest ("the catalog has the rows the resolver names");
+            expect (false, "EngineCatalog is missing an engine the auto order names");
             return;
         }
 
@@ -152,8 +156,99 @@ public:
         // reason. Say so instead of pretending.
         const auto overridden = EngineSettings::environmentOverride().isNotEmpty();
 
-        beginTest ("auto + MuScriptor installed -> MuScriptor");
+        beginTest ("the auto order starts at an in-page engine and ends at the bundled one");
         {
+            // THE SHAPE THE REST OF THIS FILE ASSUMES, asserted rather than
+            // assumed: `auto` prefers Riffsheet's own engine, and the list ends
+            // at an engine that is compiled in, so the chain can never run out.
+            expect (order.size() >= 2, "an auto order with one entry is not an order");
+            expectEquals (juce::String (order.front()), juce::String (EngineCatalog::autoPreferredId()));
+            expectEquals (juce::String (order.back()), juce::String (EngineCatalog::fallbackId()));
+            expect (EngineCatalog::runsInPage (*inPageRow),
+                    "auto now leads with the engine that runs in the page");
+            expect (bundledRow->install == InstallKind::bundled,
+                    "the last resort has to be an engine that is already here");
+        }
+
+        beginTest ("auto on a fresh machine -> Riffsheet's own engine");
+        {
+            // THE DEFAULT, and the whole point of the wave: nothing installed,
+            // nothing downloaded, and the app can still transcribe - because the
+            // engine it reaches for first is the app.
+            ScratchSettings scratch;
+            EngineRegistry registry { scratch.settings };
+            registry.add (std::make_unique<FakeAdapter> (*inPageRow, EngineAdapter::Availability::ready));
+            registry.add (std::make_unique<FakeAdapter> (*muScriptorRow, EngineAdapter::Availability::notInstalled));
+            registry.add (std::make_unique<FakeAdapter> (*bundledRow, EngineAdapter::Availability::ready));
+
+            const auto resolution = registry.resolve();
+
+            if (! overridden)
+            {
+                expectEquals (resolution.configured, juce::String ("auto"));
+                expectEquals (resolution.resolved, juce::String (inPageRow->id));
+                expect (resolution.adapter != nullptr);
+                expect (resolution.reason.isNotEmpty(), "a resolution with no sentence is not a resolution");
+                expect (resolution.reason.containsIgnoreCase (inPageRow->name));
+            }
+        }
+
+        beginTest ("auto prefers Riffsheet even when MuScriptor is installed");
+        {
+            // This is the CHANGE OF MEANING this wave makes, and it is the one
+            // worth stating out loud: MuScriptor being on the machine no longer
+            // wins `auto` by itself. It is second in line, and it gets the take
+            // when Riffsheet's engine refuses it or the user picks it by hand.
+            ScratchSettings scratch;
+            EngineRegistry registry { scratch.settings };
+            registry.add (std::make_unique<FakeAdapter> (*inPageRow, EngineAdapter::Availability::ready));
+            registry.add (std::make_unique<FakeAdapter> (*muScriptorRow, EngineAdapter::Availability::installed));
+            registry.add (std::make_unique<FakeAdapter> (*bundledRow, EngineAdapter::Availability::ready));
+
+            if (! overridden)
+                expectEquals (registry.resolve().resolved, juce::String (inPageRow->id));
+        }
+
+        beginTest ("a native job skips the in-page engine and lands on MuScriptor");
+        {
+            // What fnTranscribe asks. The page runs its own engine itself, so
+            // the honest answer to "which engine would the SHELL use" is the
+            // next row down - and that is also the chain a refused take falls
+            // through to.
+            ScratchSettings scratch;
+            EngineRegistry registry { scratch.settings };
+            registry.add (std::make_unique<FakeAdapter> (*inPageRow, EngineAdapter::Availability::ready));
+            registry.add (std::make_unique<FakeAdapter> (*muScriptorRow, EngineAdapter::Availability::installed));
+            registry.add (std::make_unique<FakeAdapter> (*bundledRow, EngineAdapter::Availability::ready));
+
+            const auto resolution = registry.resolve (true);
+
+            if (! overridden)
+            {
+                expectEquals (resolution.resolved, juce::String (muScriptorRow->id));
+                expect (resolution.adapter != nullptr);
+            }
+        }
+
+        beginTest ("a native job with no MuScriptor lands on the bundled engine");
+        {
+            ScratchSettings scratch;
+            EngineRegistry registry { scratch.settings };
+            registry.add (std::make_unique<FakeAdapter> (*inPageRow, EngineAdapter::Availability::ready));
+            registry.add (std::make_unique<FakeAdapter> (*muScriptorRow, EngineAdapter::Availability::notInstalled));
+            registry.add (std::make_unique<FakeAdapter> (*bundledRow, EngineAdapter::Availability::ready));
+
+            if (! overridden)
+            {
+                expectEquals (registry.resolve (true).resolved, juce::String (bundledRow->id));
+                // ...and the page's own answer is unchanged by asking.
+                expectEquals (registry.resolve().resolved, juce::String (inPageRow->id));
+            }
+        }
+
+        beginTest ("auto without the in-page engine still prefers MuScriptor over the bundled one");
+        {
+            // The old two-engine world, which a build could still be in.
             ScratchSettings scratch;
             EngineRegistry registry { scratch.settings };
             registry.add (std::make_unique<FakeAdapter> (*muScriptorRow, EngineAdapter::Availability::installed));
@@ -163,31 +258,12 @@ public:
 
             if (! overridden)
             {
-                expectEquals (resolution.configured, juce::String ("auto"));
                 expectEquals (resolution.resolved, juce::String (muScriptorRow->id));
-                expect (resolution.adapter != nullptr);
-                expect (resolution.reason.isNotEmpty(), "a resolution with no sentence is not a resolution");
                 expect (resolution.reason.containsIgnoreCase (muScriptorRow->name));
             }
         }
 
-        beginTest ("auto + MuScriptor NOT installed -> the bundled engine");
-        {
-            ScratchSettings scratch;
-            EngineRegistry registry { scratch.settings };
-            registry.add (std::make_unique<FakeAdapter> (*muScriptorRow, EngineAdapter::Availability::notInstalled));
-            registry.add (std::make_unique<FakeAdapter> (*bundledRow, EngineAdapter::Availability::ready));
-
-            const auto resolution = registry.resolve();
-
-            if (! overridden)
-            {
-                expectEquals (resolution.resolved, juce::String (bundledRow->id));
-                expect (resolution.reason.containsIgnoreCase (bundledRow->name));
-            }
-        }
-
-        beginTest ("auto + a MuScriptor that failed to start still means MuScriptor");
+        beginTest ("a MuScriptor that failed to start is still chosen when it is next in line");
         {
             // `broken` is "installed, and its last start failed". Moving the user
             // silently onto a different engine - with different output - hides

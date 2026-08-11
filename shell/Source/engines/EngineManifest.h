@@ -17,8 +17,28 @@
 */
 
 enum class InstallKind  { bundled, oneClick, guide };
-enum class AdapterKind  { inProcessOnnx, httpServerVenv, sidecarVenv, sidecarPipCli };
-enum class Concurrency  { inProcess, exclusiveMachineWide };
+/*  How an engine is driven.
+
+    `inPageClient` is the odd one and it is deliberate: that engine does NOT run
+    in this process at all. Riffsheet's own transcriber is TypeScript in the web
+    view (webcore/src/audio/riffsheetEngine.ts), and the PCM it needs is already
+    on that side of the bridge, so shipping the samples down to C++ and the notes
+    back up would be pure cost. The shell still carries a row and an adapter for
+    it, because the catalogue, the picker, the resolver and `listEngines()` are
+    the one place the user's engine choice lives and a second mechanism for one
+    engine would be a second thing to keep in step. See BRIDGE.md, "The engine
+    that runs in the page". */
+enum class AdapterKind  { inProcessOnnx, httpServerVenv, sidecarVenv, sidecarPipCli, inPageClient };
+
+/** ENGINE-prefixed, and it has to stay that way: this was `Concurrency`, and on
+    Windows that is the name of a GLOBAL NAMESPACE the MSVC runtime opens
+    (`Concurrency`, from ppltasks.h/concrt.h, which JUCE's Windows headers pull
+    in). An `enum class Concurrency` at global scope collides with it, and the
+    CI Windows leg proved it by failing to compile. The enumerator names below
+    are unchanged and so is every wire string - the collision was only ever
+    about the type name. */
+enum class EngineConcurrency  { inProcess, exclusiveMachineWide };
+
 enum class ArchiveKind  { none, singleFile, zip, pipPackage };
 
 /** The sentinel a real sha256 replaces. EngineCatalog.cpp static_asserts that
@@ -48,6 +68,28 @@ struct GuideStep
     const char* detail;
 };
 
+/**
+    THE ONLY WAY A STRING IN THIS TABLE MAY BECOME A juce::String.
+
+    Every literal here is UTF-8 - the source files are, and MSVC is given
+    /utf-8 in CMakeLists.txt so the bytes in the binary are too. juce::String's
+    `const char*` constructor is NOT: it is `CharPointer_ASCII`, one byte per
+    character, so an em dash (E2 80 94) arrives as three Latin-1 characters and
+    the page draws "a" with a hat on it followed by two invisible controls.
+    That is precisely the garbage the install guide was showing, and a Debug
+    build would have caught it - `String(const char*)` jasserts on bytes above
+    0x7F. A Release build simply mangles them.
+
+    So nothing reads a manifest string directly. This wraps it in
+    CharPointer_UTF8, which decodes it properly, and it is a one-liner so that
+    the fix cannot be forgotten at the next call site - a `juce::var` built
+    from a bare `const char*` takes the same broken path.
+*/
+inline juce::String manifestText (const char* utf8)
+{
+    return utf8 != nullptr ? juce::String (juce::CharPointer_UTF8 (utf8)) : juce::String();
+}
+
 struct EngineManifest
 {
     // identity
@@ -60,7 +102,7 @@ struct EngineManifest
     // shape
     AdapterKind adapter;
     InstallKind install;
-    Concurrency concurrency;
+    EngineConcurrency concurrency;
 
     // capability (mirrors EngineAdapter::Capabilities; the adapter may widen
     // `instruments` at runtime, never narrow the flags)

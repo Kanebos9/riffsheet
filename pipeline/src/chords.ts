@@ -81,9 +81,9 @@ export function collectChords(notes: InputNote[], beatPeriodSec: number): ChordE
 
 /**
  * `noOverlap`: a ring-out is truncated at the next attack. Runs in the SECONDS domain, before
- * quantization, so the lengthening pass downstream sees an honest gap rather than an overlap.
+ * quantization, so a detector overlap never reaches the page as invented polyphony.
  * A member whose truncated length would fall below `minSec` keeps `minSec` — the note existed,
- * the detector just overlapped it; the rest killer will decide what to print.
+ * the detector just overlapped it, and it is written at whatever length survives.
  */
 export function clampOverlaps(events: ChordEvent[], minSec = 0.02): ChordEvent[] {
   const out = events.map((e) => ({ ...e, notes: e.notes.map((n) => ({ ...n })) }));

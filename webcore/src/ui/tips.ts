@@ -165,7 +165,6 @@ export const TIPS = {
   position: 'Where you are in the recording, in minutes and seconds.',
   fader:
     'Slide between your actual recording and the app\'s version of what it heard. Sitting in the middle plays both at once — the fastest way to spot a note it got wrong.',
-  metronome: 'A click on every beat while playing, so you can hear if the bars line up with your riff.',
   bpm:
     'The tempo — how many beats per minute. Unless it came from your DAW, the app worked this out from the recording by ear, so it can be wrong; if the rhythm on the sheet looks wrong, fixing this number is the FIRST thing to try.',
   timesig:
@@ -212,6 +211,8 @@ export const TIPS = {
 
   tabOctaveShift:
     'This note is outside what your instrument can reach, so the tab has moved the position by a whole octave to keep it on the fretboard: 8va means the tab is an octave above the note on the staff, 8vb an octave below (15ma and 15mb are two octaves). Play what the tab says. The staff above still shows the note you really played.',
+  stringLetters:
+    'What each tab line is tuned to, with the open string played on that line. The bottom line is your thickest string. Change them with the Tab menu under the sheet — these follow whatever tuning the sheet is written for, and they print.',
 
   // --- editing -------------------------------------------------------------
   // The first seven of these belonged to the per-note popover, and nothing renders them any
@@ -237,8 +238,6 @@ export const TIPS = {
     'The smallest note the app is allowed to write on the sheet. Auto works it out bar by bar and is the only setting that can write straight notes and triplets in the same piece — leave it there unless the page comes out fussier than you played. Choosing a size instead forbids everything finer, so a triplet played against 1/8 loses a note. Free writes exactly what you played, with no tidying. This never changes the piano roll.',
   rollGrid:
     'The columns drawn on the piano roll, and the size of a note you add by hand: with 1/4 selected, double-clicking an empty spot puts a quarter note there, on the nearest quarter-note line. It never re-writes what the app heard — changing it does not move a single note on the sheet. Hold Option while dragging to ignore it.',
-  fillGaps:
-    'Nobody lets go of a note at the exact instant the next one starts, so written down literally an ordinary riff becomes a thicket of tiny rests. This lengthens each note on the page instead — as far as the next note, or to the nearest beat, whichever reads better. It changes the written note lengths, so it also changes what the playback plays and what the tidied-up MIDI export contains. Your recording and the "exactly as you played" MIDI keep your real note lengths whatever this says. Turn it off only if you really did play everything short and clipped.',
   clef:
     'Auto chooses one stable clef for the whole part. Treble and Bass force one clef; Grand stacks treble and bass for music that genuinely needs both ranges.',
   fingering:
@@ -284,6 +283,8 @@ export const TIPS = {
     'something.',
   openAnother:
     'Return to the main menu to open a file, capture the DAW track, create a blank score, or resume current work.',
+  rollZoom:
+    'How tall the piano-roll rows are. The wheel over the keyboard on the left does the same, a trackpad pinch does it anywhere on the roll, and a double-click on the keyboard fits every note in the take on screen at once.',
   rollFit:
     'Zoom the piano roll out until every note in the take fits. Useful once, to see the shape of ' +
     'the whole thing — but it is not how the roll opens any more, because fitting a wide-ranging ' +

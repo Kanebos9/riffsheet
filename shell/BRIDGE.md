@@ -581,6 +581,75 @@ orchestra_hit, trumpet, trombone, tuba, french_horn, brass_section,
 soprano_and_alto_sax, tenor_sax, baritone_sax, oboe, english_horn, bassoon,
 clarinet, flutes, synth_lead, synth_pad, drums`. An unknown name is an error.
 
+### Beats on their own — `trackBeats`
+
+```ts
+trackBeats(options: { token?: string, path?: string }): Promise<{
+  ok: true,
+  beats: number[],
+  downbeats: number[],
+  bpm: number | null,
+  beatsPerBar: number | null,
+}>
+```
+
+The same bundled beat tracker `transcribe({ preciseBeats: true })` runs, reached
+without starting a transcription. It exists for the engine that runs in the page
+(see *The engine that runs in the page*): beat tracking has never belonged to an
+engine here — it is a model this process runs for all of them — so a locally
+transcribed take would otherwise have notes and no grid, and the only way to get
+one was to start a whole job and throw its notes away.
+
+- **No turn in the engine queue and no lock.** Same reasoning as an in-process
+  transcription (§1.3b): the model is small and runs here, and making a beat grid
+  wait behind somebody else's four-minute MuScriptor job would put the fallback
+  path behind the slow path for nothing.
+- **The user's own audio, untouched.** `transcribe` runs the tracker over the
+  *prepared* copy so notes and beats share one timebase; there is no prepared
+  copy here, because the engine that produced the notes heard the original
+  samples in the page. Both halves are already in the recording's timebase and
+  there is nothing to map back.
+- Registration is the capability test, as always: a page on an older shell keeps
+  its notes and goes without a grid rather than hanging.
+
+### "I already have this one" — `validateExistingEngineInstall`
+
+```ts
+validateExistingEngineInstall(id: string, path: string): Promise<{
+  ok: boolean,
+  detail: string,          // a sentence either way
+  path?: string,           // where it is, on ok
+  searched?: string[],     // every place looked at, in order
+}>
+```
+
+The other door beside a one-click install, for somebody who installed the same
+engine last year and does not want several hundred megabytes fetched again.
+
+- `path === ''` **sniffs**: Riffsheet's own layout first, then the places this
+  engine normally lives (and, for a console-script engine, every directory on
+  `PATH`).
+- a non-empty `path` **validates that one place**, and says what was missing when
+  it is not one.
+
+What counts as a working copy is per engine and is deliberately a **file check,
+not an execution**:
+
+| engine | working means |
+|---|---|
+| `transkun` (pip console script) | the `transkun` program in an environment's `bin/` — the venv itself, a folder holding one, or a path straight at the program |
+| `bass-v2` (repo checkout) | `infer.py` **and** a checkpoints folder with weights actually in it, in that folder or one level down (which is how a zip unpacks) |
+
+Nothing is run to find out. Executing a stranger's script to see whether it is
+installed is a bigger promise than this call makes, it is slow, and on a broken
+venv it hangs. An **empty** checkpoints folder is refused — a cloned repo whose
+weights were never fetched is the commonest half-install there is.
+
+A validated location is written to `<appSupport>/engines/<id>.location` and read
+by `SidecarAdapter::installDirectory()` when there is no copy Riffsheet
+installed itself. A bundled engine is refused outright: it ships inside
+Riffsheet, so there is no other copy to point at.
+
 ### The engine: which weights, who is using it
 
 ```ts
@@ -596,6 +665,12 @@ engineStatus(id?: string): Promise<{
   resolvedModel: string,        // what 'auto' currently means
   modelReason: string,          // a plain sentence explaining the choice
   installedModels: string[],    // weights found on disk, e.g. ["medium"]
+  models: Array<{               // ALL THREE sizes, installed or not — see below
+    name: 'small' | 'medium' | 'large',
+    approxResidentMb: number,   // 900 | 1800 | 5000
+    installed: boolean,         // usable weights in the HuggingFace cache
+    fits: boolean,              // ≤ 40% of physical RAM — the auto rule's own answer
+  }>,
   venv: string,                 // discovered/configured environment root
   executable: string,           // expected muscriptor executable
   engineInstalled: boolean,
@@ -614,6 +689,8 @@ engineStatus(id?: string): Promise<{
   stopsAfterEachJob: true,      // the engine dies at the end of every job; see below
   idleSeconds: number,          // since the last job finished anywhere on this machine
   canStop: boolean,             // stopEngine() would actually do something
+  externalServer: boolean,      // a server is up that Riffsheet did NOT start
+  canStopExternal: boolean,     // stopExternalEngine() would actually try
   memoryMb: number | null,      // resident size of the server process; null = unknown
 
   searchedPaths: string[],      // every venv location discovery looked in, in order
@@ -659,6 +736,27 @@ slightly, in the only way that generalises:
   report idle while it worked. `busyOwner` is `"self"` for such a job.
 - `engineConfigPath` still points at `<appSupport>/engine.json`, which is now
   also where the engine choice lives.
+- `models` and the two `*External*` booleans are MuScriptor-shaped like the
+  rest: `[]` and `false` for every other engine, because no other engine has
+  weights to choose between or a server somebody else could have started.
+
+**`models` is the whole size table, not just what is on disk.** `installedModels`
+answers "what do you have"; `models` answers "what are the choices, and what
+would each one cost me" — which is the question somebody deciding whether to
+download `large` is actually asking, and which the card previously could not
+answer at all. `approxResidentMb` is `ModelCatalog::estimatedResidentMb()` — the
+same 0.9 / 1.8 / 5 GB the auto rule uses, Python and the Metal buffers included,
+not the size of the weights file. `fits` is that rule's own step-1 answer
+(`ModelCatalog::fitsInPhysicalRam()`), sent rather than recomputed in TypeScript
+so the card cannot end up disagreeing with the resolver about what this machine
+can carry. On this 8 GB Mac: small `fits: true`, medium `fits: true`, large
+`fits: false`.
+
+**Hiding the install guide when the engine is present**: `engineInstalled` is
+the boolean to test, in `engineStatus`. It is true whenever the engine is on
+this machine — including when its last start *failed*, because a broken install
+is still an install and its own `error` is the sentence worth reading, not the
+setup steps. `listEngines` carries the same thing per card as `installed`.
 
 **`guideSteps` is a list of pairs `{ what, detail }`, not of strings.** The
 setup screen draws `what` in a `<strong>` and `detail` in a `<div class="dim">`,
@@ -693,9 +791,10 @@ listEngines(): Promise<{
   ok: true,
   configuredEngine: string,        // 'auto' | '<id>'
   resolvedEngine: string,          // what 'auto' means right now, always a real id
-  engineReason: string,            // "MuScriptor is installed, so Auto is using it."
+  engineReason: string,            // "Auto is using Riffsheet - it is built in and needs no setup."
+  nativeFallbackEngine: string,    // what the SHELL would run; see "The engine that runs in the page"
   engines: Array<{
-    id: string,                    // 'basic-pitch' | 'muscriptor' | ...
+    id: string,                    // 'riffsheet' | 'basic-pitch' | 'muscriptor' | ...
     name: string,
     tier: string,                  // "Built in" | "Best quality - guided setup" | "One-click"
     summary: string,
@@ -704,6 +803,7 @@ listEngines(): Promise<{
     state: 'ready' | 'installed' | 'not-installed' | 'broken',
     selected: boolean,             // resolvedEngine === id
     instrumentStrengths: string[], // ["Bass"] - for the card's capability line
+    installed: boolean,            // state !== 'not-installed'; hide the guide on true
     acceptsInstrumentConstraint: boolean,
     producesBeatGrid: boolean,
     producesConfidence: boolean,
@@ -751,13 +851,78 @@ choice resolves to. Modelled on `setEngineModel`, including its refusal:
   `resolvedEngine` falls back to something that can actually run, and `reason`
   says why in a sentence.
 
-**What `auto` means: MuScriptor when it is discovered and installed, otherwise
-the bundled engine.** That keeps today's behaviour exactly for a machine that
-already has MuScriptor, and gives a fresh one a working app with no setup. If
-the chosen engine cannot run and nothing else can either, resolution stays on
+**What `auto` means: the first engine in `EngineCatalog::autoOrder()` that is
+present on this machine.** Today that order is:
+
+```
+riffsheet  ->  muscriptor  ->  basic-pitch
+```
+
+- **`riffsheet`** first. It is the app's own transcriber, it runs in the page,
+  it needs nothing installed and it answers in under a second. For a single-note
+  line — which is most of what gets recorded into this app — it is at least as
+  good as the alternatives, and it is the only engine that can say *"this is not
+  for me"*: a take it hears as chordal falls through to the next row here
+  automatically. Leading with it therefore costs a chordal take one extra second
+  and nothing else.
+- **`muscriptor`** second. When it is installed it is the best thing on the
+  machine, and somebody who went through its guided setup meant it.
+- **`basic-pitch`** last, because it is compiled in, so the chain cannot run out.
+
+The order lives in `EngineCatalog.cpp` and is `static_assert`ed to name real
+rows with no duplicates. `EngineRegistry` only walks it.
+
+If the chosen engine cannot run and nothing else can either, resolution stays on
 the chosen engine — falling back to an equally unavailable one would replace an
 honest error ("MuScriptor was not found; here is where I looked") with a vaguer
 one.
+
+#### The engine that runs in the page
+
+`riffsheet` has `AdapterKind::inPageClient`, and it is the one row in the table
+the shell **does not execute**. The transcriber is TypeScript in the web view
+(`webcore/src/audio/riffsheetEngine.ts`); the samples it listens to are already
+on that side of the bridge, so shipping them down to C++ and the notes back up
+would be pure cost. The shell still carries a row and an adapter
+(`ClientEngineAdapter`) because the picker, `auto`, `selectEngine` and the cards
+are the one place the user's engine choice lives, and a second mechanism for one
+engine would be a second thing to keep in step.
+
+Its adapter reports `ready` always — it ships inside the web bundle the app
+cannot start without, so there is no state in which the app is running and this
+engine is not installed — and **refuses `transcribe()`** with a sentence saying
+where it really runs. That refusal is unreachable through the normal path, and
+that is the point of the next paragraph.
+
+**Resolution has two answers, and callers must pick the right one.**
+
+| question | call | used by |
+|---|---|---|
+| which engine is the USER on? | `resolve()` | `listEngines`, the picker, the cards |
+| which engine would THIS PROCESS run? | `resolve(true)` | `transcribe`, `engineStatus()` with no id |
+
+`resolve(true)` skips in-page engines. Two consequences worth stating:
+
+- `transcribe()` with no `engineId` never lands on `riffsheet` — the page runs
+  that one itself and never asks the shell to — so a native transcription
+  resolves past it to MuScriptor or Basic Pitch. `nativeFallbackEngine` in
+  `listEngines()` is that same answer, handed to the page so a refusal can name
+  the engine it is passing the take to instead of re-deriving the order in
+  TypeScript.
+- `engineStatus()` with no id answers for the native engine too. Every field in
+  that payload is about a *listener process* — a port, an adopted server, the
+  weights in memory, whether it can be stopped — and the in-page engine has none
+  of them. Answering for it would have silently retired the "left running,
+  1.5 GB" notice about somebody else's MuScriptor the moment `auto` preferred
+  Riffsheet, which is exactly the notice that exists because a player could not
+  tell what was eating their machine.
+
+**What the page does with all this.** When `resolvedEngine === 'riffsheet'`,
+`App.runTranscription` runs the local pass instead of calling `transcribe`, and
+produces the same `DetectedNoteDTO` shape — with a real `confidence` per note
+(the share of that note's frames that agreed on the pitch), no velocity, and no
+beat grid of its own. On a refusal it shows one sentence ("Sounded like chords
+— handed to X") and calls `transcribe({ engineId: nativeFallbackEngine })`.
 
 `RIFFSHEET_ENGINE` overrides the file for scripted runs, exactly as
 `RIFFSHEET_MUSCRIPTOR_MODEL` overrides the model: a hard override that nothing
@@ -882,6 +1047,8 @@ The two rules the shutdown may never break, and how each is kept:
   `ServerRegistry` — the pid we wrote down when we spawned it — plus the
   process's own command line at the moment of the kill. An adopted server (the
   user's `START-MEDIUM.command` on 8222) is disconnected from, never killed.
+  The single deliberate exception is `stopExternalEngine()` below, which no
+  automatic path ever calls and which only a human can ask for.
 - **Never stop it mid-job, anywhere on this machine.** The end of a job releases
   the machine-wide `EngineLock` **first**, so anybody queued behind it takes the
   engine within ~200 ms; the shutdown then refuses while the lock is held or any
@@ -902,6 +1069,81 @@ finished with it.
 `stopEngine()` still exists for the chip in the header. It is mostly redundant
 now — what is left for it is a server left up because the last job was queued
 behind somebody else's — and it obeys exactly the same two rules.
+
+#### `stopExternalEngine` — the way out of "Left running"
+
+```ts
+stopExternalEngine(): Promise<{
+  ok: true,
+  stopped: boolean,
+  reason: string,               // always a sentence, whichever way it went
+  port: number,                 // where it was; 0 when there was nothing
+  pid: number,                  // what was ended; 0 when nothing was
+  freedMb: number | null,       // what it was holding; null = unmeasurable
+}>
+```
+
+Rule 1 above — *never stop a server Riffsheet did not start* — is the right
+**default** and was a dead end. Somebody who force-quit the DAW that started the
+server, or closed the Terminal window it came from, was being told by the *Left
+running* notice to go and close a window that no longer exists, while 1.5 GB sat
+there. This call is the same action with a human's explicit consent behind it,
+and it is **the only path in the shell that may end a process Riffsheet did not
+spawn**. Nothing calls it automatically.
+
+**It takes no arguments, and it never will.** A `port` parameter would let the
+page aim a kill, and the page is the least trustworthy thing in the system. The
+target is only ever the server the *shell* found on its own reuse ports and is
+already reporting through `engineStatus()`; the pid is re-derived from that port
+inside the shell.
+
+**What it proves before killing anything**, freshly, after taking the
+machine-wide turn so nothing can start using the server between the proof and
+the kill:
+
+1. something is listening on that port and the listening **pid can be read** —
+   no pid, no kill (so this does nothing at all on Windows, by design);
+2. `ServerRegistry` has **no record** of that pid — a record would mean it is
+   ours after all, and ours is `stopEngine()`'s job;
+3. the process's **own command line** says `muscriptor` *and* `serve` — the same
+   two-halves test the orphan reaper uses, so a shell sitting in the muscriptor
+   folder or an editor with the source open is never a candidate;
+4. it is **answering `/health`** as a MuScriptor right now.
+
+Then `SIGTERM`, wait up to 5 s, `SIGKILL` if it is still there. If any of the
+four fails the process is left completely alone and `reason` says which one.
+
+**`stopped` is decided by the port, not only by the pid.** A killed process
+whose parent has not reaped it yet is a zombie: it exists, holds no memory,
+answers nothing and has released its socket. Reporting *"it would not stop, it
+may belong to another user"* about one would be a lie, and that message is what
+a user would act on. So the success test is "the process is gone **or** nothing
+is listening on that port any more" — which is also strictly stronger for the
+case the failure message is really about, since a process we genuinely may not
+signal is still listening afterwards.
+
+**Refusals are `stopped: false`, never `ok: false`.** "It is busy", "that is not
+a MuScriptor", "it turned out to be ours" are *answers*, not faults — the same
+convention `stopEngine()` already follows. It also refuses outright while
+anything on this machine is transcribing or queued to: an external server is
+exactly the kind another Riffsheet window borrowed and is mid-job against, and
+their transcription is not ours to throw away either. That refusal cannot be
+overridden.
+
+**When to offer the button**: `engineStatus().canStopExternal`. Do not derive it
+from `adopted` or from `externalServer` alone — on Windows the listening pid's
+command line cannot be read, so `externalServer` is true while
+`canStopExternal` is false, and a button drawn from the first can only ever
+refuse. `hasNativeFunction('stopExternalEngine')` is the capability test for an
+older shell, exactly as it is for `listEngines`.
+
+The log line, either way:
+
+```
+Riffsheet/MuScriptor: Stopped the transcription server on port 8222 that
+Riffsheet did not start, and gave back 1487 MB. (you asked to stop a server
+Riffsheet did not start)
+```
 
 ```ts
 openEngineSetup(): Promise<{

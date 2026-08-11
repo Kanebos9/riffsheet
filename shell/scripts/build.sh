@@ -175,13 +175,24 @@ sign_and_verify() {
     # and the `sleep 2` below handed the daemon the window it needed to do it
     # again. Stripping here closes the gap to milliseconds.
     #
-    # Nothing is weakened by this. It is the same `xattr -cr` the loop already
-    # ran, at a moment when it can still matter; FinderInfo on the bundle
-    # directory is applied from outside and is not part of what was signed. A
-    # genuine resource fork inside an object file would have been removed by the
-    # first strip and would not come back, so this cannot hide one. The verify
-    # below is still --strict and still the thing that decides.
+    # Nothing is weakened by this. It is the same `xattr` the loop already ran,
+    # at a moment when it can still matter; FinderInfo on the bundle directory
+    # is applied from outside and is not part of what was signed. A genuine
+    # resource fork inside an object file would have been removed by the first
+    # strip and would not come back, so this cannot hide one. The verify below is
+    # still --strict and still the thing that decides.
+    #
+    # -c, NOT -cr, AND THAT IS THE POINT. The recursive form walks several
+    # thousand files in these bundles and takes long enough that the provider
+    # re-stamps the ROOT - which it strips first - before the traversal is even
+    # finished, so `xattr -cr` immediately before a verify could still lose the
+    # race it was added to win. On a night when two builds and an iCloud sync
+    # were running at once this stopped being intermittent and failed all six
+    # attempts, repeatedly. The recursive strip at the top of the loop is what
+    # covers the contents; this one exists solely to clear the bundle root at the
+    # last possible instant, and non-recursively it is a single syscall.
     xattr -cr "$bundle" 2>/dev/null || true
+    xattr -c  "$bundle" 2>/dev/null || true
 
     # `verify && echo` would be exempt from set -e: a rejected bundle would
     # neither abort nor print. Check it explicitly.

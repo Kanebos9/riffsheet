@@ -75,13 +75,26 @@ private:
     must outlive the editor for exactly the reason the server does: closing the
     plugin window may not kill a transcription in flight.
 
-    WHAT `auto` MEANS, and why it is that. MuScriptor when its venv is
-    discovered on this machine, otherwise the bundled engine. That keeps today's
-    behaviour exactly for the user who already has MuScriptor on disk and expects
-    it, while giving a fresh machine a working app with no setup at all. An
-    explicit choice is honoured whenever that engine is on this machine; when it
-    is not, resolution falls back and `reason` says why, in a sentence a person
-    can read - the same shape as configuredModel/resolvedModel/modelReason.
+    WHAT `auto` MEANS, and why it is that. The first engine in
+    EngineCatalog::autoOrder() that is present on this machine - today
+    Riffsheet's own in-page engine, then MuScriptor, then the bundled fallback.
+    The ORDER and the argument for it live in the catalogue, deliberately: this
+    class walks a list it does not own, so "which engine is best" stays one
+    decision in one place. An explicit choice is honoured whenever that engine is
+    on this machine; when it is not, resolution falls back along the same order
+    and `reason` says why, in a sentence a person can read - the same shape as
+    configuredModel/resolvedModel/modelReason.
+
+    THE `nativeOnly` FLAG, and why resolution has two answers. Riffsheet's own
+    engine does not run in this process at all (AdapterKind::inPageClient): the
+    page has the samples and runs it there. So there are two honest answers to
+    "which engine is this?" - the one the USER is on, which is what the picker
+    and every card must show, and the one THIS PROCESS would use if it were
+    asked to transcribe, which is what fnTranscribe needs. `resolve(true)` gives
+    the second by skipping in-page engines. It is also exactly the chain a take
+    falls through to when the in-page engine refuses a chord, which is why the
+    page is told the answer (`nativeFallbackEngine` in listEngines) rather than
+    re-deriving the order for itself.
 
     WHY A NOT-INSTALLED CHOICE STILL RESOLVES TO ITSELF WHEN THERE IS NO
     ALTERNATIVE. Falling back to an engine that is equally unavailable would
@@ -89,7 +102,7 @@ private:
     looked") with a vaguer one. If nothing in the build can transcribe, the user
     is better served by the chosen engine's own failure.
 
-    THE IN-PROCESS MUTEX. Engines whose manifest says Concurrency::inProcess do
+    THE IN-PROCESS MUTEX. Engines whose manifest says EngineConcurrency::inProcess do
     not take the machine-wide EngineLock - see engine-architecture.md §1.3b: the
     lock exists for a 1.5 GB server that answers a second client with HTTP 503,
     and queueing a 30 MB in-process inference behind a four-minute MuScriptor job
@@ -129,8 +142,12 @@ public:
         EngineAdapter* adapter = nullptr;   // null only when no adapter is registered
     };
 
-    /** What `auto` (or the stored choice) means at this instant. */
-    Resolution resolve() const;
+    /** What `auto` (or the stored choice) means at this instant.
+
+        `nativeOnly` skips engines that execute in the web view - pass it from
+        anything that is about to drive an engine IN THIS PROCESS, and leave it
+        false for anything that is reporting the user's choice back to them. */
+    Resolution resolve (bool nativeOnly = false) const;
 
     /** As resolve(), but for one explicit id - the per-transcription override
         (`transcribe({ engineId })`). An id that is unknown, not offered, or has
@@ -200,7 +217,7 @@ public:
 
 private:
     /** The `auto` rule, plus the sentence explaining it. */
-    Resolution chooseAutomatically (const juce::String& configured) const;
+    Resolution chooseAutomatically (const juce::String& configured, bool nativeOnly) const;
     EngineAdapter* findLocked (const juce::String& id) const;
     static juce::String displayName (const EngineAdapter& adapter);
 

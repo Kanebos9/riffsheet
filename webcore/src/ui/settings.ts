@@ -10,10 +10,6 @@ import { t, TIPS, tipsEnabled, setTipsEnabled } from './tips';
 import {
   DEFAULT_SETTINGS,
   type AppSettings,
-  type ClefMode,
-  type FingeringStyle,
-  type NotationGrid,
-  type RollGrid,
   type RuntimeState
 } from '../app/state';
 import { type SynthVoice } from '../audio/synth';
@@ -207,6 +203,29 @@ const ENGINE_MODELS: Array<[EngineModel, string]> = [
   ['large', 'Large — most accurate, slowest, most memory']
 ];
 
+/** Smallest first — the order the RAM line on the card lists them in. */
+const MODEL_ORDER = ['small', 'medium', 'large'] as const;
+
+/**
+ * What each MuScriptor size holds in memory, when the shell has not said.
+ *
+ * BRIDGE.md §3.4's own figures — "roughly 0.9 GB (small), 1.8 GB (medium) or 5 GB (large),
+ * Python and the Metal buffers included" — which is the same table `auto` steps down through
+ * when it drops a size that needs more than 40% of physical RAM. Written here so the card is
+ * still honest against a shell that predates `EngineSummary.modelRamMb`, and superseded the
+ * moment that field arrives, because the shell is the one that knows.
+ */
+const DEFAULT_MODEL_RAM_MB: Record<string, number> = { small: 900, medium: 1800, large: 5000 };
+
+/**
+ * The engine a single-engine shell is talking about, for `modelChooser`'s benefit only.
+ *
+ * A shell too old for `listEngines()` has exactly one engine and it is MuScriptor — that is
+ * what "too old" means here, since the registry is what introduced the others. Enough of an
+ * `EngineSummary` to name it and to get the RAM table; nothing else is read.
+ */
+const SINGLE_ENGINE_STAND_IN = { id: 'muscriptor', name: 'MuScriptor' } as EngineSummary;
+
 /**
  * How often the engine read-out refreshes while the panel is open.
  *
@@ -246,6 +265,22 @@ const RAM_HEADROOM_MB = 250;
 /** Sizes as a person says them: "1.4 GB", not "1434 MB". */
 function formatMb(mb: number): string {
   return mb >= 1024 ? `${(mb / 1024).toFixed(1)} GB` : `${Math.round(mb)} MB`;
+}
+
+/**
+ * A model's memory cost, in the GB the rest of the product quotes it in.
+ *
+ * NOT `formatMb`, on purpose. That one switches to GB at 1024 MB and rounds to one decimal, so
+ * the three MuScriptor sizes come out "900 MB · 1.8 GB · 4.9 GB" — three different units, one
+ * of which disagrees with BRIDGE.md's own "roughly 0.9 GB (small), 1.8 GB (medium) or 5 GB
+ * (large)". A row whose job is to be compared at a glance has to be in one unit, and the unit
+ * has to be the one the documentation and the `auto` thresholds are written in.
+ *
+ * Decimal GB, and a trailing ".0" trimmed, so 5000 reads "5 GB" rather than "5.0 GB".
+ */
+function formatRamGb(mb: number): string {
+  const gb = mb / 1000;
+  return `${gb.toFixed(1).replace(/\.0$/, '')} GB`;
 }
 
 /** The same, from raw bytes — what the engine manifest and the download frames speak in. */
@@ -348,22 +383,7 @@ const FALLBACK_GUIDE_STEPS: readonly GuideStep[] = [
   }
 ];
 
-/**
- * The fret counts real instruments have, for the "Highest fret" picker.
- *
- * A list rather than a free number box because this is a fact about somebody's instrument and
- * there are only so many answers: a short-scale bass stops at 20, a Strat at 21 or 22, a
- * shredder's neck at 24. The stored value is carried in whatever it is, on the same reasoning
- * as the time-signature picker in `ui/app.ts` — a `<select>` that cannot show its own value
- * silently snaps to the first option and reads as if the app had thrown the setting away.
- */
-const FRET_COUNTS: readonly number[] = [12, 15, 17, 19, 20, 21, 22, 24];
-
-function fretOptions(current: number): number[] {
-  const list = [...FRET_COUNTS];
-  if (Number.isFinite(current) && current > 0 && !list.includes(current)) list.push(current);
-  return list.sort((a, b) => a - b);
-}
+// FRET_COUNTS / fretOptions moved to ui/app.ts with the picker they feed.
 
 export interface SettingsPanelOptions {
   settings: Store<AppSettings>;
@@ -373,6 +393,18 @@ export interface SettingsPanelOptions {
   /** Called for changes that only affect the view or playback. */
   onViewChange: () => void;
   onClose: () => void;
+  /**
+   * Choose an engine, and do what choosing one MEANS.
+   *
+   * The panel used to call `selectEngine()` itself, which stored the choice and stopped — and
+   * on a screen already showing a transcription that is a control with no visible effect. The
+   * whole gesture (ask about unsaved edits, cancel whatever is running, store the choice, then
+   * listen again with the new engine) belongs to the app, which is the only thing that knows
+   * about takes and edits, so the panel delegates and renders whatever refusal comes back.
+   *
+   * Resolves to a sentence when the choice was refused, or null when it went through.
+   */
+  onChooseEngine?: (id: string) => Promise<string | null>;
 }
 
 export class SettingsPanel {
@@ -436,6 +468,25 @@ export class SettingsPanel {
   private installingHere = new Set<string>();
   /** What the shell said when it refused an engine change. Cleared by the next attempt. */
   private engineSelectError: string | null = null;
+
+  // --- "I already have this one" (see `existingInstallBody`) --------------------------------
+  /** Cards whose "Use existing installation…" panel is open. */
+  private existingOpen = new Set<string>();
+  /** id -> what the shell said about the path it was last given, and whether it accepted it. */
+  private existingSaid = new Map<string, { ok: boolean; detail: string }>();
+  /** id -> what is in that card's path box, so a re-render does not eat what was typed. */
+  private existingPath = new Map<string, string>();
+  /** Cards with a check in flight. One at a time per card; the buttons say "Checking…". */
+  private existingBusy = new Set<string>();
+
+  /**
+   * Is the guided engine's install guide unfolded?
+   *
+   * Collapsed by DEFAULT, and hidden altogether once the engine is found — see `guideBody`.
+   * One flag for the panel rather than one per card, because there is exactly one guided
+   * engine and there is no reading of "expand them all" that anybody wants.
+   */
+  private guideOpen = false;
   /** Press-anywhere-else-to-close. On the document, so it has to be taken off in `destroy`. */
   private onOutsidePointer: (e: PointerEvent) => void = () => undefined;
 
@@ -778,7 +829,16 @@ export class SettingsPanel {
     // screen it has always had — the guide, on its own, every role where it has always been.
     // An empty picker would imply a choice that shell cannot make.
     if (!list || list.engines.length === 0) {
-      replace(host, this.guideStatusRow(this.engine), ...this.guideBody(this.engine));
+      // The model chooser comes too. On this shell there is one engine and it is the guided
+      // one, so "which engine do these weights belong to?" has an obvious answer — but the
+      // control still has to EXIST, or a single-engine build would lose the only way to
+      // choose a model when the row moved onto the cards.
+      replace(
+        host,
+        this.guideStatusRow(this.engine),
+        ...this.modelChooser(SINGLE_ENGINE_STAND_IN),
+        ...this.guideBody(this.engine)
+      );
       return;
     }
 
@@ -834,16 +894,36 @@ export class SettingsPanel {
     // read; every other card gets the generic role. One row either way, never two.
     rows.push(isGuide ? this.guideStatusRow(st) : this.engineStateRow(engine));
 
+    // THE DETAIL BLOCK. Three lines, each answering a different question somebody comparing
+    // engines actually asks, in the order they ask them: what is it good at, what will it cost
+    // me, and whose is it. It used to be one run-on line — "Good at: Bass · 57 MB to download ·
+    // installs in one click" — which reads as a single fact and hides the two that matter most
+    // on a laptop with 8 GB of RAM and a metered connection.
     rows.push(
       el('div', {
         class: 'status-row dim',
         'data-role': 'engine-card-strengths',
         text: this.capabilityLine(engine)
+      }),
+      el('div', {
+        class: 'status-row dim',
+        'data-role': 'engine-card-cost',
+        text: this.costLine(engine)
       })
     );
+    const provenance = this.sourceLine(engine);
+    if (provenance.length > 0) {
+      rows.push(el('div', { class: 'status-row dim', 'data-role': 'engine-card-source' }, ...provenance));
+    }
+
+    // The weights chooser belongs to the engine that HAS weights, not to the panel. See
+    // `modelChooser` — this is the row that used to sit on its own several groups above,
+    // where it applied to an engine it never named.
+    rows.push(...this.modelChooser(engine));
 
     rows.push(this.engineButtons(engine, chosen, usable));
 
+    if (engine.install === 'one-click') rows.push(...this.existingInstallBody(engine));
     if (isGuide) rows.push(...this.guideBody(st));
     else if (engine.install === 'one-click') rows.push(...this.oneClickBody(engine));
 
@@ -870,25 +950,292 @@ export class SettingsPanel {
     );
   }
 
-  /** "Good at: Bass · 57 MB download · installs in one click". */
+  /** Line 1 of the detail block: "Good at: Bass, Guitar and Piano". */
   private capabilityLine(engine: EngineSummary): string {
+    return engine.instrumentStrengths.length > 0
+      ? `Good at: ${humanList(engine.instrumentStrengths)}`
+      : 'Good at: any single instrument';
+  }
+
+  /**
+   * Line 2: what it costs — disk first, then memory, then how it gets here.
+   *
+   * Both numbers, not one. Disk is what somebody on a small SSD cares about and memory is
+   * what decides whether the machine swaps while it runs; the old single line reported
+   * whichever of the two happened to be interesting for that install kind and left the other
+   * one out entirely.
+   */
+  private costLine(engine: EngineSummary): string {
     const parts: string[] = [];
-    if (engine.instrumentStrengths.length > 0) {
-      parts.push(`Good at: ${humanList(engine.instrumentStrengths)}`);
+    if (engine.approxDiskBytes > 0) {
+      parts.push(
+        engine.install === 'bundled'
+          ? `${formatBytes(engine.approxDiskBytes)} on disk, already here`
+          : engine.state === 'not-installed'
+            ? `${formatBytes(engine.approxDiskBytes)} to download`
+            : `${formatBytes(engine.approxDiskBytes)} on disk`
+      );
     }
-    if (engine.install === 'bundled') {
-      if (engine.approxDiskBytes > 0) parts.push(`${formatBytes(engine.approxDiskBytes)}, already here`);
-      parts.push('no setup needed');
-    } else if (engine.install === 'one-click') {
-      if (engine.approxDiskBytes > 0) parts.push(`${formatBytes(engine.approxDiskBytes)} to download`);
+    if (engine.approxPeakRssMb > 0) parts.push(`about ${formatMb(engine.approxPeakRssMb)} of memory while it runs`);
+    if (engine.install === 'bundled') parts.push('no setup needed');
+    else if (engine.install === 'one-click') {
       parts.push(engine.state === 'not-installed' ? 'installs in one click' : 'installed by Riffsheet');
     } else {
-      if (engine.approxPeakRssMb > 0) parts.push(`about ${formatMb(engine.approxPeakRssMb)} of memory while it runs`);
       // Said on the card itself, not only in the policy line further down, because this is the
       // sentence that explains why the best engine here has no Install button.
       parts.push('guided setup — its licence does not let Riffsheet install it');
     }
     return parts.join(' · ');
+  }
+
+  /**
+   * Line 3: whose work this is, and under what terms.
+   *
+   * A transcription engine is somebody else's research, and the two things a person is owed
+   * before running it are where it came from and what its licence says. The licence is drawn
+   * ONLY when the shell sent one — see `EngineSummary.license`. Guessing it from the URL was
+   * the tempting shortcut and would have been a claim about somebody's legal terms made by
+   * pattern-matching a hostname.
+   */
+  private sourceLine(engine: EngineSummary): HTMLElement[] {
+    if (!engine.sourceUrl && !engine.license) return [];
+    const host = engine.sourceUrl.replace(/^https?:\/\//, '').replace(/\/$/, '');
+    const bits: HTMLElement[] = [];
+    if (host) {
+      bits.push(
+        el('span', { text: 'Source:' }),
+        el('code', { class: 'path', 'data-role': 'engine-card-source-url', text: host })
+      );
+    }
+    if (engine.license) {
+      if (bits.length > 0) bits.push(el('span', { text: '·' }));
+      bits.push(el('span', { 'data-role': 'engine-card-license', text: engine.license }));
+    }
+    return bits;
+  }
+
+  /**
+   * The weights chooser, on the card of the engine whose weights they are.
+   *
+   * IT USED TO BE A STANDALONE SETTINGS ROW, several groups above this one, labelled "Model"
+   * with three sizes in it. Nothing on that row said which engine it applied to, and once
+   * Riffsheet drove four engines the answer — MuScriptor, and only MuScriptor — was
+   * unguessable. Somebody running Basic Pitch could set "large" and watch nothing happen.
+   *
+   * The three RAM figures are the point of moving it. "small / medium / large" are three
+   * adjectives; "0.9 GB · 1.8 GB · 5 GB" is the sentence that lets somebody with 8 GB decide,
+   * and it is exactly what `auto` is deciding with on their behalf.
+   */
+  private modelChooser(engine: EngineSummary): HTMLElement[] {
+    if (!this.bridge.setEngineModel) return [];
+
+    // THE SHELL'S OWN TABLE FIRST. `engineStatus().models` carries a figure, `installed` and
+    // `fits` for every size (BRIDGE.md §3.2), and `fits` is the `auto` rule's own answer —
+    // reading it means the row agrees with what `auto` would actually do instead of
+    // second-guessing it from `ramTotalMb`. The constants below are the documented fallback
+    // for a shell that predates the table; only MuScriptor has sizes at all.
+    const st = this.statusFor(engine);
+    const table =
+      st?.models && st.models.length > 0
+        ? st.models.map((m) => ({ name: m.name, mb: m.approxResidentMb, installed: m.installed, fits: m.fits }))
+        : engine.id === 'muscriptor'
+          ? MODEL_ORDER.map((name) => ({
+              name,
+              mb: DEFAULT_MODEL_RAM_MB[name],
+              installed: (st?.installedModels ?? []).includes(name),
+              fits: true
+            }))
+          : [];
+    if (table.length === 0) return [];
+
+    const s = this.opts.settings.get();
+    const rows: HTMLElement[] = [];
+
+    rows.push(
+      el('div', {
+        class: 'status-row dim',
+        'data-role': 'engine-card-model-ram',
+        // "small 0.9 GB · medium 1.8 GB · large 5 GB", in the order they grow. A size this
+        // machine cannot run is named as such rather than quietly listed beside ones it can:
+        // "large 5 GB (too big for this Mac)" is the sentence that stops somebody choosing it
+        // and wondering why nothing changed.
+        text: table
+          .map((m) => `${m.name} ${formatRamGb(m.mb)}${m.fits === false ? ' (too big for this machine)' : ''}`)
+          .join(' · '),
+        title: t(
+          'What each size holds in memory once it is loaded, Python and the GPU buffers included. ' +
+            'Auto picks the largest one that fits this machine and steps down when free memory is short.'
+        )
+      })
+    );
+
+    rows.push(
+      el(
+        'div',
+        { class: 'settings-row' },
+        el('span', { class: 'label', text: 'Model' }),
+        el(
+          'select',
+          {
+            title: t(TIPS.engineModel),
+            'aria-label': `${engine.name} model size`,
+            'data-role': 'engine-model',
+            'data-setting': 'engineModel',
+            onChange: (e: Event) =>
+              void this.pickEngineModel((e.target as HTMLSelectElement).value as EngineModel, s.engineModel)
+          },
+          ...ENGINE_MODELS.map(([value, label]) =>
+            el('option', { value, text: label, selected: value === s.engineModel })
+          )
+        )
+      )
+    );
+
+    if (this.engineModelError) {
+      rows.push(
+        el(
+          'div',
+          { class: 'status-row', 'data-role': 'engine-model-error' },
+          el('span', { class: 'dot warn' }),
+          this.engineModelError
+        )
+      );
+    }
+
+    return rows;
+  }
+
+  /**
+   * "Use existing installation…" — the other way an engine gets onto this machine.
+   *
+   * A one-click card's Install button is 57 to 400 MB of download. For somebody who already
+   * has the same package in a venv from last year that is pointless traffic and a second copy
+   * on disk, and the app had nothing to say to them: the only door was Install.
+   *
+   * Two affordances, in the order somebody tries them:
+   *
+   *  1. LOOK FOR IT — one press, `validateExistingEngineInstall(id, '')`, and the shell
+   *     reports what it found in the places that engine normally lives.
+   *  2. POINT AT IT — a path box, checked with the same call. Deliberately a path box rather
+   *     than a native folder chooser: this is the same gesture the guided card already uses
+   *     for `engine.json`, and it is the one that works when the folder is somewhere a
+   *     sandboxed file dialog will not go.
+   *
+   * Both routes go through ONE native call, which is the whole design: the shell has to do the
+   * same validation either way, and a second entry point would be a second thing to keep in
+   * step with it. See `NativeBridge.validateExistingEngineInstall`.
+   */
+  private existingInstallBody(engine: EngineSummary): HTMLElement[] {
+    // Gated on the capability, so a shell that cannot answer never shows a door onto nothing.
+    if (!this.bridge.validateExistingEngineInstall) return [];
+    // Nothing to point at once Riffsheet has its own copy — Uninstall is the button for that.
+    if (engine.state === 'ready' || engine.state === 'installed') return [];
+
+    const open = this.existingOpen.has(engine.id);
+    const rows: HTMLElement[] = [
+      el('button', {
+        class: 'chip',
+        'data-role': 'engine-use-existing',
+        'aria-expanded': String(open),
+        text: `${open ? '▾' : '▸'} Use existing installation…`,
+        title: t(
+          'Already have this engine on this machine? Point Riffsheet at it instead of downloading it again.'
+        ),
+        onClick: () => {
+          if (open) this.existingOpen.delete(engine.id);
+          else this.existingOpen.add(engine.id);
+          this.renderEngineSetup();
+        }
+      })
+    ];
+    if (!open) return rows;
+
+    const busy = this.existingBusy.has(engine.id);
+    const said = this.existingSaid.get(engine.id);
+
+    rows.push(
+      el(
+        'div',
+        { class: 'row', 'data-role': 'engine-existing' },
+        el('button', {
+          class: 'chip',
+          'data-role': 'engine-existing-sniff',
+          disabled: busy,
+          text: busy ? 'Looking…' : 'Look for it',
+          onClick: () => void this.checkExistingInstall(engine, '')
+        })
+      ),
+      el(
+        'div',
+        { class: 'settings-row' },
+        el('input', {
+          class: 'custom-tuning',
+          type: 'text',
+          spellcheck: 'false',
+          'data-role': 'engine-existing-path',
+          'aria-label': `Where ${engine.name} is installed`,
+          placeholder: '/path/to/the/engine',
+          value: this.existingPath.get(engine.id) ?? '',
+          // Kept on every keystroke: this panel re-renders on a two-second poll, and a box
+          // that lost what was half-typed would be unusable by construction.
+          onInput: (e: Event) => this.existingPath.set(engine.id, (e.target as HTMLInputElement).value)
+        }),
+        el('button', {
+          class: 'chip',
+          'data-role': 'engine-existing-check',
+          disabled: busy,
+          text: busy ? 'Checking…' : 'Use this folder',
+          onClick: () => void this.checkExistingInstall(engine, this.existingPath.get(engine.id) ?? '')
+        })
+      )
+    );
+
+    if (said) {
+      rows.push(
+        el(
+          'div',
+          { class: 'status-row', 'data-role': 'engine-existing-said' },
+          el('span', { class: `dot ${said.ok ? 'ok' : 'warn'}` }),
+          said.detail
+        )
+      );
+    }
+
+    return rows;
+  }
+
+  /**
+   * Ask the shell about a location. Empty path means "look for it yourself".
+   *
+   * A found sniff fills the box rather than silently adopting the result: the player gets to
+   * see WHERE before anything is used, which is the difference between an answer and a
+   * surprise. The check that follows is the one that commits.
+   */
+  private async checkExistingInstall(engine: EngineSummary, path: string): Promise<void> {
+    if (!this.bridge.validateExistingEngineInstall || this.existingBusy.has(engine.id)) return;
+    this.existingBusy.add(engine.id);
+    this.existingSaid.delete(engine.id);
+    this.renderEngineSetup();
+
+    try {
+      const result = await this.bridge.validateExistingEngineInstall(engine.id, path);
+      this.existingSaid.set(engine.id, {
+        ok: result.ok === true,
+        detail: result.detail || (result.ok ? 'That copy works.' : 'That did not work.')
+      });
+      if (result.path) this.existingPath.set(engine.id, result.path);
+    } catch (err) {
+      this.existingSaid.set(engine.id, {
+        ok: false,
+        detail: err instanceof Error ? err.message : 'Riffsheet could not check that location.'
+      });
+    } finally {
+      this.existingBusy.delete(engine.id);
+      this.renderEngineSetup();
+      // The card's state may have changed on disk; ask rather than assume, exactly as an
+      // install does.
+      void this.askEngine();
+    }
   }
 
   /** The state sentence for anything that is not the guided engine. */
@@ -1087,6 +1434,56 @@ export class SettingsPanel {
     const rows: HTMLElement[] = [];
     const found = st?.engineInstalled === true;
 
+    // --- when it is already here, the guide is noise -----------------------
+    //
+    // GONE, not collapsed. Instructions for installing something that is installed are the
+    // clearest possible signal that the app has not noticed — the card says "found at
+    // ~/muscriptor/venv" and then, underneath, tells you to go and make a virtualenv. The two
+    // buttons stay, because "look again" and "open the folder" are still things somebody with
+    // a working engine wants (they are how you check after moving it, or after uninstalling it
+    // by hand). Everything between them and the status line is setup, and setup is over.
+    if (found) {
+      rows.push(...this.guideButtons(found));
+      return rows;
+    }
+
+    // --- and when it is NOT, it is folded away until asked for -------------
+    //
+    // Five numbered steps, a nine-entry path list and a JSON snippet is a wall, and it was the
+    // first thing under the best engine's name. Most people opening this panel are here to
+    // pick an engine, not to install one by hand; the ones who ARE here for that press one
+    // button. Collapsed by default, and the button says what is behind it.
+    if (!this.guideOpen) {
+      rows.push(
+        el('button', {
+          class: 'chip',
+          'data-role': 'engine-guide-toggle',
+          'aria-expanded': 'false',
+          text: '▸ Show setup steps',
+          title: t('The five things to run in Terminal, and every place Riffsheet already looked.'),
+          onClick: () => {
+            this.guideOpen = true;
+            this.renderEngineSetup();
+          }
+        })
+      );
+      rows.push(...this.guideButtons(found));
+      return rows;
+    }
+
+    rows.push(
+      el('button', {
+        class: 'chip',
+        'data-role': 'engine-guide-toggle',
+        'aria-expanded': 'true',
+        text: '▾ Hide setup steps',
+        onClick: () => {
+          this.guideOpen = false;
+          this.renderEngineSetup();
+        }
+      })
+    );
+
     // The promise this card makes, said out loud. It is about THIS engine and its licence, not
     // about Riffsheet in general — the one-click cards above install themselves in a click,
     // and pretending otherwise here would be the same lie in the other direction.
@@ -1174,7 +1571,20 @@ export class SettingsPanel {
       );
     }
 
-    // --- the buttons -------------------------------------------------------
+    rows.push(...this.guideButtons(found));
+    return rows;
+  }
+
+  /**
+   * Check again / Open the setup folder, and whatever the last check said.
+   *
+   * Its own method because it is drawn in all three of the guided card's states — engine
+   * found, guide folded, guide open — and it is the half that stays useful once setup is
+   * over. "Look again, now" is the answer to "I just moved it" as much as to "I just
+   * installed it".
+   */
+  private guideButtons(found: boolean): HTMLElement[] {
+    const rows: HTMLElement[] = [];
     const buttons: HTMLElement[] = [];
 
     // Hidden rather than disabled when the shell is too old to re-run discovery: a button that
@@ -1237,8 +1647,16 @@ export class SettingsPanel {
 
     let refusal: string | null = null;
     try {
-      const result = await this.bridge.selectEngine?.(id);
-      if (result && !result.ok) refusal = result.error ?? 'The engine could not be changed.';
+      // Through the app when it is listening, because pressing a card means "transcribe with
+      // this one" and only the app can cancel a running job, ask about unsaved edits and start
+      // the new one. `selectEngine` on its own is the fallback for a panel mounted without
+      // that callback, and it is exactly what this used to do.
+      if (this.opts.onChooseEngine) {
+        refusal = await this.opts.onChooseEngine(id);
+      } else {
+        const result = await this.bridge.selectEngine?.(id);
+        if (result && !result.ok) refusal = result.error ?? 'The engine could not be changed.';
+      }
     } catch (err) {
       refusal = err instanceof Error ? err.message : 'The engine could not be asked to change.';
     }
@@ -1385,58 +1803,10 @@ export class SettingsPanel {
     }, 2000);
   }
 
-  /**
-   * Settings → Playback → Sound.
-   *
-   * One list, not two questions. It used to ask for a *source* first and then, only if you
-   * had landed on the basic synth, for a *timbre* — which is a fair description of the code
-   * and a poor description of what a player wants, which is to pick a sound. Worse, the
-   * second half was invisible unless you went looking for it, and the reported complaint
-   * was exactly that nothing could be found. Recordings come first because they are the
-   * ones worth having; `<optgroup>` says which is which without a sentence of explanation.
-   *
-   * The status line under it is not decoration: a recorded set can fail to load, and when
-   * it does the app quietly plays the oscillator instead. Saying so is the difference
-   * between "this sounds wrong" and "oh, those recordings are missing".
-   *
-   * The same picker also lives on the transport bar next to the fader — see `soundPicker()`
-   * — because that is where somebody comparing two sounds is actually looking.
-   */
-  private soundSection(s: AppSettings): DocumentFragment {
-    const status = sampleStatus();
-    const chosen = soundOptionFor(s.playbackVoice);
-
-    const fragment = document.createDocumentFragment();
-    fragment.append(
-      el(
-        'div',
-        { class: 'settings-row', title: t(TIPS.sound) },
-        el('span', { class: 'label', text: 'Sound' }),
-        soundSelect(
-          s.playbackVoice,
-          status,
-          (voice) => this.set('playbackVoice', voice, false),
-          'Playback sound'
-        )
-      )
-    );
-
-    const note = soundNote(s.playbackVoice, status);
-    if (note) {
-      fragment.append(
-        el(
-          'div',
-          { class: 'status-row', 'data-role': 'sound-status' },
-          el('span', { class: `dot ${note.dot}` }),
-          // The credit travels with the sound. Every set is MIT or CC0 (webcore/CREDITS.md) and
-          // saying whose recording you are listening to costs one short line.
-          chosen.source ? `${note.text} ${chosen.source}.` : note.text
-        )
-      );
-    }
-
-    return fragment;
-  }
+  // `soundSection` — the panel copy of the sound picker — stood here. It is gone with the
+  // Playback group: the transport's own `soundPicker()` is beside the Original↔MIDI fader,
+  // which is where somebody comparing two sounds is already looking, and it carries the same
+  // "loading…" / "not in this build" status the panel row did.
 
   private render(): void {
     const s = this.opts.settings.get();
@@ -1468,88 +1838,20 @@ export class SettingsPanel {
         'div',
         { class: 'settings-group' },
         el('h3', { text: 'Notation' }),
-        el(
-          'div',
-          { class: 'settings-row', 'data-setting': 'grid' },
-          el('span', { class: 'label', text: 'Grid' }),
-          chipGroup<NotationGrid>(
-            s.grid,
-            [
-              { value: 'auto', label: 'Auto' },
-              { value: 'quarter', label: '1/4' },
-              { value: 'eighth', label: '1/8' },
-              { value: 'sixteenth', label: '1/16' },
-              { value: 'triplet', label: 'Triplet' },
-              { value: 'free', label: 'Free' }
-            ],
-            (v) => this.set('grid', v, true),
-            TIPS.grid
-          )
-        ),
-        // Said in the panel and not only in a tooltip, because the two grids now sit in
-        // different panes and the one question the split has to answer on sight is "which
-        // one am I touching, and does it change what I recorded?".
-        el('div', {
-          class: 'status-row',
-          text: 'Auto is the only setting that can write straight notes and triplets together. Naming a size forbids everything finer. The piano roll has its own, separate grid.'
-        }),
-        el(
-          'div',
-          { class: 'settings-row', 'data-setting': 'clefMode' },
-          el('span', { class: 'label', text: 'Clef' }),
-          chipGroup<ClefMode>(
-            s.clefMode,
-            [
-              { value: 'auto', label: 'Auto' },
-              { value: 'treble', label: 'Treble' },
-              { value: 'bass', label: 'Bass' },
-              { value: 'grand', label: 'Grand' }
-            ],
-            (v) => this.set('clefMode', v, true),
-            TIPS.clef
-          )
-        ),
-        el('div', {
-          class: 'status-row',
-          text: 'Auto chooses one stable clef for the part. Grand uses stacked treble and bass staves.'
-        }),
-        el(
-          'label',
-          { class: 'switch settings-row', title: t(TIPS.fillGaps) },
-          el('input', {
-            type: 'checkbox',
-            'data-setting': 'fillGaps',
-            checked: s.fillGaps,
-            onChange: (e: Event) => this.set('fillGaps', (e.target as HTMLInputElement).checked, true)
-          }),
-          // It was called "Clean up rests", which is what the RESULT looks like and not what
-          // the switch does: it pushes note off-times forward before any rest object exists,
-          // so what it actually changes is written note lengths — and with them the playback
-          // and the tidied-up MIDI export. Reported from the field as "does not work properly,
-          // it seems to do other things", which was an accurate reading of a wrong label.
-          el('span', { text: 'Reduce rests by extending notes' })
-        ),
-        el('div', {
-          class: 'status-row',
-          text:
-            'Lengthens short notes across small gaps so the page is not full of tiny rests. ' +
-            'The "as played" MIDI is unchanged.'
-        }),
-        el(
-          'div',
-          { class: 'settings-row', 'data-setting': 'fingering' },
-          el('span', { class: 'label', text: 'Fingering' }),
-          chipGroup<FingeringStyle>(
-            s.fingering,
-            [
-              { value: 'low-positions', label: 'Low positions' },
-              { value: 'minimize-movement', label: 'Least movement' }
-            ],
-            (v) => this.set('fingering', v, true),
-            TIPS.fingering
-          )
-        ),
-        // How far up the neck a hand edit may go. It sits with Fingering because it is the
+        // THE DIET. Grid, Clef, Fingering, the piano-roll switch, the roll's grid and the
+        // playback sound all used to be duplicated here, and duplicating a control is not
+        // generosity — it is two places to look and two places for the answer to be stale.
+        // Each of them now has exactly one home, next to the thing it changes: Grid, Clef and
+        // the Tab menu (which carries Fingering) live on the notation toolbar under the sheet;
+        // the piano-roll switch and the roll's grid live on the roll's own chip row; the sound
+        // picker lives on the transport beside the fader. What is left in this panel is what
+        // has nowhere else to be.
+        //
+        // `fillGaps` and `metronome` are not moved, they are DELETED. The pipeline stage
+        // `fillGaps` drove no longer reads it, and the metronome click is gone from
+        // audio/synth.ts — a switch that changes nothing is worse than no switch at all.
+        //
+        // How far up the neck a hand edit may go. It sits at the top because it is the
         // same subject — where on the neck a note is put — and it was the one setting in the
         // file with no control anywhere: `AppSettings.maxFret` has always been read by the
         // sheet's drag handling and by the edit actions, and `TriView.setFretLimit()` was
@@ -1560,27 +1862,8 @@ export class SettingsPanel {
         // shortcut: this number reaches the EDITS, not the pipeline (`BuildSettings` never
         // receives it), so there is nothing to re-quantize and re-writing the sheet would
         // claim an effect it does not have. The status row below says so out loud.
-        el(
-          'div',
-          { class: 'settings-row', 'data-setting': 'maxFret', title: t(TIPS.maxFret) },
-          el('span', { class: 'label', text: 'Highest fret' }),
-          el(
-            'select',
-            {
-              'aria-label': 'Highest fret',
-              'data-role': 'max-fret',
-              onChange: (e: Event) =>
-                this.set('maxFret', Number((e.target as HTMLSelectElement).value), false)
-            },
-            ...fretOptions(s.maxFret).map((fret) =>
-              el('option', { value: String(fret), text: `${fret} frets`, selected: fret === s.maxFret })
-            )
-          )
-        ),
-        el('div', {
-          class: 'status-row',
-          text: 'How far up the neck the app may go when you move a note by hand. A drag that would need a higher fret is refused. It does not re-fret what is already written.'
-        }),
+        // "Highest fret" stood here. It is on the notation toolbar now, beside the Tab menu
+        // whose fret numbers it limits — see ui/app.ts §buildNotationToolbar.
         el(
           'label',
           { class: 'switch settings-row', title: t(TIPS.noteNames) },
@@ -1627,17 +1910,8 @@ export class SettingsPanel {
         'div',
         { class: 'settings-group' },
         el('h3', { text: 'Piano roll' }),
-        el(
-          'label',
-          { class: 'switch settings-row', title: t(TIPS.pianoRoll) },
-          el('input', {
-            type: 'checkbox',
-            'data-setting': 'showPianoRoll',
-            checked: s.showPianoRoll,
-            onChange: (e: Event) => this.set('showPianoRoll', (e.target as HTMLInputElement).checked, false)
-          }),
-          el('span', { text: 'Show the piano roll' })
-        ),
+        // "Show the piano roll" was here as well as on the chip row above the roll. The chip
+        // is the one that stays: it is beside the pane it opens and closes.
         el(
           'label',
           { class: 'switch settings-row', title: t(TIPS.rollAllNoteNames) },
@@ -1681,50 +1955,17 @@ export class SettingsPanel {
           class: 'status-row dim',
           text: 'Off, it still shows you where it heard one — it just does not touch your notes.'
         }),
-        // The roll's OWN grid. `false` for the third argument is the whole point of the
-        // split: unlike the notation grid, changing this rebuilds nothing — the pipeline
-        // never receives it, so there is no sheet to re-write.
-        el(
-          'div',
-          { class: 'settings-row', 'data-setting': 'rollGrid' },
-          el('span', { class: 'label', text: 'Grid' }),
-          chipGroup<RollGrid>(
-            s.rollGrid,
-            [
-              { value: 'quarter', label: '1/4' },
-              { value: 'eighth', label: '1/8' },
-              { value: 'sixteenth', label: '1/16' },
-              { value: 'triplet', label: 'Triplet' },
-              { value: 'free', label: 'Free' }
-            ],
-            (v) => this.set('rollGrid', v, false),
-            TIPS.rollGrid
-          )
-        ),
+        // The roll's OWN grid used to be repeated here too. It lives on the chip row beside
+        // the roll, where the columns it draws are.
         el('div', {
           class: 'status-row',
-          text: 'Columns on the roll, and the length of a note you add by hand. It never changes what was transcribed.'
+          text: 'The roll’s grid and its show/hide switch are on the chip row above the roll itself.'
         })
       ),
 
-      // --- playback ---------------------------------------------------------
-      el(
-        'div',
-        { class: 'settings-group' },
-        el('h3', { text: 'Playback' }),
-        this.soundSection(s),
-        el(
-          'label',
-          { class: 'switch settings-row', title: t(TIPS.metronome) },
-          el('input', {
-            type: 'checkbox',
-            'data-setting': 'metronome',
-            checked: s.metronome,
-            onChange: (e: Event) => this.set('metronome', (e.target as HTMLInputElement).checked, false)
-          }),
-          el('span', { text: 'Metronome click' })
-        )
-      ),
+      // The whole Playback group is gone with its two rows: the sound picker is on the
+      // transport beside the fader, which is where somebody choosing a playback sound is
+      // already looking, and the metronome no longer exists to be switched.
 
       // --- help -------------------------------------------------------------
       el(
@@ -1765,32 +2006,10 @@ export class SettingsPanel {
             : 'Checking…'
         ),
         host?.engineMessage && el('div', { class: 'status-row', text: host.engineMessage }),
-        el(
-          'div',
-          { class: 'settings-row' },
-          el('span', { class: 'label', text: 'Model' }),
-          el(
-            'select',
-            {
-              title: t(TIPS.engineModel),
-              'aria-label': 'Transcription model',
-              'data-role': 'engine-model',
-              'data-setting': 'engineModel',
-              onChange: (e: Event) =>
-                void this.pickEngineModel((e.target as HTMLSelectElement).value as EngineModel, s.engineModel)
-            },
-            ...ENGINE_MODELS.map(([value, label]) =>
-              el('option', { value, text: label, selected: value === s.engineModel })
-            )
-          )
-        ),
-        this.engineModelError &&
-          el(
-            'div',
-            { class: 'status-row', 'data-role': 'engine-model-error' },
-            el('span', { class: 'dot warn' }),
-            this.engineModelError
-          ),
+        // THE MODEL ROW IS NOT HERE ANY MORE. It moved onto the card of the engine whose
+        // weights it selects — see `modelChooser()` in the Engine setup group below. Sitting
+        // here it named no engine, applied to exactly one of the four, and did nothing at all
+        // for anybody running the other three.
         engineReadout,
 
         // --- what happens to the audio before an engine hears it ------------
@@ -1804,8 +2023,14 @@ export class SettingsPanel {
           'label',
           {
             class: 'switch settings-row',
+            // WRITTEN FOR SOMEBODY HOLDING A GUITAR, not for somebody who knows what
+            // "normalisation" is. The old label said "Even out the level before listening",
+            // which describes the operation rather than the problem it solves — a player who
+            // does not already know what it does cannot tell whether they want it. The rule
+            // for both of these rows: name the SITUATION first, then what the app will do
+            // about it. Everything true about the old text is still said, further down.
             title: t(
-              'Brings the recording to a standard loudness before an engine listens to it, because that is the level these models were trained near. Applied before engines that need it; engines that do this for themselves are left alone. Your recording is not changed.'
+              'Quiet recordings are the ones engines mishear most — they were trained on audio at a standard loudness. Riffsheet turns up a copy for the engine to listen to. Applied before engines that need it; engines that do this for themselves are left alone. What you hear and what you see is never touched.'
             )
           },
           el('input', {
@@ -1818,19 +2043,19 @@ export class SettingsPanel {
             onChange: (e: Event) =>
               this.set('normalizeBeforeTranscribe', (e.target as HTMLInputElement).checked, false)
           }),
-          el('span', { text: 'Even out the level before listening' })
+          el('span', { text: 'If your recording is quiet, boost it so the engine hears it better' })
         ),
         el('div', {
           class: 'status-row dim',
           'data-role': 'preprocess-normalize-note',
-          text: 'Off unless you switch it on. Applied before engines that need it. Your own recording is never changed — only the copy the engine hears.'
+          text: 'Off unless you switch it on. Your own recording is never changed — only the copy the engine hears.'
         }),
         el(
           'label',
           {
             class: 'switch settings-row',
             title: t(
-              'If the recording is not at concert pitch, nudges it to A440 before an engine listens, so a guitar tuned a quarter-tone flat does not come back a semitone wrong. Applied before engines that need it, and only when the app is confident about the amount.'
+              'A guitar tuned a little flat comes back with the wrong note names — the engine hears what was played, not what was meant. Riffsheet nudges a copy back to standard pitch first. Only done when it is confident about the amount, because a confident-looking correction from a guess is worse than none.'
             )
           },
           el('input', {
@@ -1841,12 +2066,12 @@ export class SettingsPanel {
             onChange: (e: Event) =>
               this.set('correctTuningBeforeTranscribe', (e.target as HTMLInputElement).checked, false)
           }),
-          el('span', { text: 'Correct the tuning to A440 before listening' })
+          el('span', { text: 'If your instrument was tuned slightly off, fix it so notes land on the right pitches' })
         ),
         el('div', {
           class: 'status-row dim',
           'data-role': 'preprocess-tuning-note',
-          text: 'Off unless you switch it on. Applied before engines that need it, and only when the estimate is confident — a confident-looking correction from an unconfident guess is worse than none.'
+          text: 'Off unless you switch it on. Only done when Riffsheet is sure how far off you were.'
         }),
         // What actually happened to the LAST take, as opposed to the two rows above, which
         // describe what may happen to the next one. "Corrected 14 cents flat to A440" is a

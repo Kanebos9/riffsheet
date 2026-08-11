@@ -1,5 +1,6 @@
 #include "PluginProcessor.h"
 #include "PluginEditor.h"
+#include "engines/ClientEngineAdapter.h"
 #include "engines/EngineCatalog.h"
 #include "engines/MuScriptorAdapter.h"
 #include "engines/sidecar/SidecarAdapter.h"
@@ -13,6 +14,16 @@ RiffsheetAudioProcessor::RiffsheetAudioProcessor()
                           .withInput  ("Input",  juce::AudioChannelSet::stereo(), true)
                           .withOutput ("Output", juce::AudioChannelSet::stereo(), true))
 {
+    // Engine #0, and the one `auto` reaches first: Riffsheet's own transcriber.
+    // It does not run in this process - it is TypeScript in the web view, where
+    // the samples already are - so all the shell holds is a row and an adapter
+    // that reports "always ready" and refuses to be driven. Registered from the
+    // table rather than by name, exactly as the sidecars below are, so a second
+    // in-page engine would need no line here either.
+    for (const auto* row = EngineCatalog::begin(); row != EngineCatalog::end(); ++row)
+        if (EngineCatalog::runsInPage (*row))
+            engines.add (std::make_unique<ClientEngineAdapter> (*row));
+
     // Engine #1: the MuScriptor server behind the common adapter door. It wraps
     // `muScriptor` by reference and owns nothing, so registering it costs one
     // allocation and changes no behaviour.

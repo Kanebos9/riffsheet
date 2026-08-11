@@ -54,7 +54,7 @@ juce::String EngineRegistry::configuredEngine() const
 
 juce::String EngineRegistry::displayName (const EngineAdapter& adapter)
 {
-    return adapter.manifest().name;
+    return manifestText (adapter.manifest().name);
 }
 
 juce::String EngineRegistry::stateName (EngineAdapter::Availability availability)
@@ -71,40 +71,55 @@ juce::String EngineRegistry::stateName (EngineAdapter::Availability availability
 }
 
 //==============================================================================
-EngineRegistry::Resolution EngineRegistry::chooseAutomatically (const juce::String& configured) const
+EngineRegistry::Resolution EngineRegistry::chooseAutomatically (const juce::String& configured,
+                                                               bool nativeOnly) const
 {
     Resolution out;
     out.configured = configured;
 
-    const auto present = [] (EngineAdapter* adapter)
+    const auto usable = [nativeOnly] (EngineAdapter* adapter)
     {
-        return adapter != nullptr && isPresent (adapter->status().availability);
+        if (adapter == nullptr || ! isPresent (adapter->status().availability))
+            return false;
+
+        // A native job cannot be handed to an engine that runs in the web view.
+        // Skipping it here rather than failing later is what makes the shell's
+        // own transcribe path keep working when `auto` heads at an in-page
+        // engine: the page runs that one itself and never asks us to.
+        return ! (nativeOnly && EngineCatalog::runsInPage (adapter->manifest()));
     };
 
-    auto* preferred = findLocked (EngineCatalog::autoPreferredId());
-    auto* fallback  = findLocked (EngineCatalog::fallbackId());
+    // FIRST USABLE IN THE CATALOGUE'S ORDER WINS. The order and the reasoning
+    // behind it are EngineCatalog's, not this function's - it only walks it.
+    const auto order = EngineCatalog::autoOrder();
+    EngineAdapter* firstKnown = nullptr;
 
-    if (present (preferred))
+    for (const auto* id : order)
     {
-        out.adapter = preferred;
-        out.reason = displayName (*preferred) + " is installed, so Auto is using it.";
+        auto* candidate = findLocked (id);
+
+        if (candidate == nullptr)
+            continue;
+
+        if (firstKnown == nullptr && ! (nativeOnly && EngineCatalog::runsInPage (candidate->manifest())))
+            firstKnown = candidate;
+
+        if (! usable (candidate))
+            continue;
+
+        out.adapter = candidate;
+        out.reason = candidate == firstKnown && candidate->manifest().install == InstallKind::bundled
+                       ? "Auto is using " + displayName (*candidate) + " - it is built in and needs no setup."
+                       : displayName (*candidate) + " is installed, so Auto is using it.";
+        break;
     }
-    else if (present (fallback))
+
+    if (out.adapter == nullptr)
     {
-        out.adapter = fallback;
-        out.reason = preferred != nullptr
-                       ? displayName (*preferred) + " is not installed, so Auto is using "
-                         + displayName (*fallback) + ", which needs no setup."
-                       : "Auto is using " + displayName (*fallback) + ", which needs no setup.";
-    }
-    else
-    {
-        // Nothing is on this machine. Prefer the engine the user is most likely
-        // to be setting up, so the failure they read is the one they can act on.
-        auto* chosen = preferred != nullptr ? preferred
-                                            : (fallback != nullptr ? fallback
-                                                                   : (adapters.empty() ? nullptr
-                                                                                       : adapters.front().get()));
+        // Nothing on this machine can run. Prefer the engine the user is most
+        // likely to be setting up, so the failure they read is one they can act on.
+        auto* chosen = firstKnown != nullptr ? firstKnown
+                                             : (adapters.empty() ? nullptr : adapters.front().get());
 
         if (chosen != nullptr)
         {
@@ -126,20 +141,20 @@ EngineRegistry::Resolution EngineRegistry::chooseAutomatically (const juce::Stri
     return out;
 }
 
-EngineRegistry::Resolution EngineRegistry::resolve() const
+EngineRegistry::Resolution EngineRegistry::resolve (bool nativeOnly) const
 {
     const auto configured = configuredEngine();
 
     const std::lock_guard<std::mutex> guard (listLock);
 
     if (configured == EngineSettings::defaultSelection())
-        return chooseAutomatically (configured);
+        return chooseAutomatically (configured, nativeOnly);
 
     const auto* manifest = EngineCatalog::find (configured);
 
     if (manifest == nullptr || ! EngineCatalog::isOffered (*manifest))
     {
-        auto out = chooseAutomatically (configured);
+        auto out = chooseAutomatically (configured, nativeOnly);
         out.reason = "\"" + configured + "\" is not an engine this build knows about, so Riffsheet is "
                      "using " + (out.adapter != nullptr ? displayName (*out.adapter) : juce::String (out.resolved))
                    + " instead.";
@@ -147,8 +162,9 @@ EngineRegistry::Resolution EngineRegistry::resolve() const
     }
 
     auto* chosen = findLocked (configured);
+    const bool chosenRunsHere = ! (nativeOnly && EngineCatalog::runsInPage (*manifest));
 
-    if (chosen != nullptr && isPresent (chosen->status().availability))
+    if (chosen != nullptr && chosenRunsHere && isPresent (chosen->status().availability))
     {
         Resolution out;
         out.configured = configured;
@@ -158,20 +174,24 @@ EngineRegistry::Resolution EngineRegistry::resolve() const
         return out;
     }
 
-    // The chosen engine is not on this machine. Fall back only to one that is -
-    // otherwise the chosen engine's own error is the truthful answer.
-    for (const auto* candidateId : { EngineCatalog::fallbackId(), EngineCatalog::autoPreferredId() })
+    // The chosen engine cannot run here. Fall back only to one that can -
+    // otherwise the chosen engine's own error is the truthful answer. Walked in
+    // `auto`'s order so "the next best thing" means the same thing everywhere.
+    for (const auto* candidateId : EngineCatalog::autoOrder())
     {
         auto* candidate = findLocked (candidateId);
 
         if (candidate == nullptr || candidate == chosen || ! isPresent (candidate->status().availability))
             continue;
 
+        if (nativeOnly && EngineCatalog::runsInPage (candidate->manifest()))
+            continue;
+
         Resolution out;
         out.configured = configured;
         out.resolved = candidate->manifest().id;
         out.adapter = candidate;
-        out.reason = juce::String (manifest->name)
+        out.reason = manifestText (manifest->name)
                    + (chosen == nullptr ? " is not part of this build yet, so Riffsheet is using "
                                         : " is not ready yet, so Riffsheet is using ")
                    + displayName (*candidate) + " instead.";
@@ -183,9 +203,9 @@ EngineRegistry::Resolution EngineRegistry::resolve() const
     out.resolved = configured;
     out.adapter = chosen;
     out.reason = chosen != nullptr
-                   ? juce::String (manifest->name) + " is not ready yet, and nothing else in this build "
+                   ? manifestText (manifest->name) + " is not ready yet, and nothing else in this build "
                      "can transcribe, so Riffsheet will report what it needs."
-                   : juce::String (manifest->name) + " is not part of this build yet, and nothing else "
+                   : manifestText (manifest->name) + " is not part of this build yet, and nothing else "
                      "can transcribe.";
     return out;
 }
@@ -206,7 +226,7 @@ EngineRegistry::Resolution EngineRegistry::resolveExplicit (const juce::String& 
 
     if (! EngineCatalog::isOffered (*manifest))
     {
-        out.reason = juce::String (manifest->name) + " is not offered in this build.";
+        out.reason = manifestText (manifest->name) + " is not offered in this build.";
         return out;
     }
 
@@ -215,7 +235,7 @@ EngineRegistry::Resolution EngineRegistry::resolveExplicit (const juce::String& 
 
     if (out.adapter == nullptr)
     {
-        out.reason = juce::String (manifest->name) + " is not part of this build yet.";
+        out.reason = manifestText (manifest->name) + " is not part of this build yet.";
         return out;
     }
 

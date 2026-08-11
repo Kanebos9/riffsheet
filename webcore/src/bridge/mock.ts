@@ -26,6 +26,7 @@ import type {
   TranscribeProgress,
   TranscribeResult
 } from './types';
+import { RIFFSHEET_ENGINE_ID } from './types';
 
 const MOCK_TRANSCRIBE_RATE = 0.35; // seconds of work per second of audio
 
@@ -38,6 +39,15 @@ const MOCK_TRANSCRIBE_RATE = 0.35; // seconds of work per second of audio
  * object that is then quietly dropped, is to write down what arrived.
  */
 let lastTranscribeOptions: TranscribeOptions | null = null;
+
+/** How many transcriptions this page has asked for. See `__RIFFSHEET_MOCKBRIDGE__`. */
+let transcribeCount = 0;
+/** How many of those were abandoned by `transcribeCancel()` while still running. */
+let cancelCount = 0;
+/** Set by `transcribeCancel()`, read between progress frames by the run in flight. */
+let cancelRequested = false;
+/** Is a transcription in flight right now? Only a running job can be cancelled. */
+let transcribeInFlight = false;
 
 /** What the last `transcribe()` call was asked to do. Null until one has been made. */
 export function lastMockTranscribeOptions(): TranscribeOptions | null {
@@ -120,12 +130,17 @@ const MOCK_MUSCRIPTOR_STEPS: GuideStep[] = [
 /**
  * The engines the picker offers, as the browser mock describes them.
  *
- * These four are the real product decision, written down where the UI can be built and tested
+ * These five are the real product decision, written down where the UI can be built and tested
  * against them without a JUCE host. Every claim below is one somebody measured on this machine
  * rather than one that reads well:
  *
+ *  - **Riffsheet** is the app's own engine and the default. It runs in this page rather than in
+ *    the shell, needs nothing installed, answers in under a second, and is for ONE NOTE AT A
+ *    TIME — on 29 s of real bass it found 81 notes over the same pitch range MuScriptor reports
+ *    (33–46). Handed a chord it refuses and the take goes to whatever is next, which is what
+ *    makes leading with it safe rather than optimistic.
  *  - **Basic Pitch** is bundled and always there. It is good across every instrument and it
- *    needs no setup at all, which is what makes it the honest default on a fresh machine.
+ *    needs no setup at all, which is what makes it the honest last resort.
  *  - **MuScriptor** is the best quality available and the only engine that knows 35 instrument
  *    groups — and it is guide-only FOREVER, because its weights are non-commercial and gated.
  *  - **bass_v2** is a bass specialist that matched MuScriptor note for note (86 of 86) at 3.3
@@ -138,6 +153,33 @@ const MOCK_MUSCRIPTOR_STEPS: GuideStep[] = [
  * been an offer it could not keep. It is absent rather than disabled, deliberately.
  */
 const MOCK_ENGINES: readonly EngineSummary[] = [
+  {
+    id: RIFFSHEET_ENGINE_ID,
+    name: 'Riffsheet',
+    tier: 'Built in',
+    summary:
+      'Built in — good for single-note lines. Instant, needs no setup, and hands the take to another engine when it hears chords.',
+    sourceUrl: 'https://github.com/riffsheet/riffsheet',
+    install: 'bundled',
+    state: 'ready',
+    selected: false,
+    instrumentStrengths: ['Bass', 'Guitar', 'Any single-note line'],
+    acceptsInstrumentConstraint: false,
+    producesBeatGrid: false,
+    // It reports the share of each note's frames that agreed on the pitch — a real measurement,
+    // which is why this is true. Velocity is false and must stay false: onset strength is
+    // relative to the loudest attack in the same take and is not a dynamic marking.
+    producesConfidence: true,
+    producesVelocity: false,
+    // Zero, and that is the truth rather than a placeholder: it is already inside the web
+    // bundle the app cannot start without.
+    approxDiskBytes: 0,
+    approxPeakRssMb: 0,
+    installing: false,
+    detail: 'Built in and ready. It listens in the app itself.',
+    error: null,
+    license: 'AGPL-3.0-only'
+  },
   {
     id: 'basic-pitch',
     name: 'Basic Pitch',
@@ -157,7 +199,8 @@ const MOCK_ENGINES: readonly EngineSummary[] = [
     approxPeakRssMb: 120,
     installing: false,
     detail: 'Built in and ready.',
-    error: null
+    error: null,
+    license: 'Apache-2.0'
   },
   {
     id: 'muscriptor',
@@ -178,7 +221,9 @@ const MOCK_ENGINES: readonly EngineSummary[] = [
     approxPeakRssMb: 1800,
     installing: false,
     detail: '',
-    error: null
+    error: null,
+    // The licence that is the whole reason this card has no Install button.
+    license: 'Non-commercial (weights)'
   },
   {
     id: 'bass-v2',
@@ -199,7 +244,8 @@ const MOCK_ENGINES: readonly EngineSummary[] = [
     approxPeakRssMb: 900,
     installing: false,
     detail: 'Not installed yet.',
-    error: null
+    error: null,
+    license: 'MIT'
   },
   {
     id: 'transkun',
@@ -219,7 +265,8 @@ const MOCK_ENGINES: readonly EngineSummary[] = [
     approxPeakRssMb: 1200,
     installing: false,
     detail: 'Not installed yet.',
-    error: null
+    error: null,
+    license: 'Apache-2.0'
   }
 ];
 
@@ -238,8 +285,32 @@ export function createMockBridge(options: MockOptions = {}): NativeBridge {
   // the harness that reads it, and nothing a player can reach.
   if (new URLSearchParams(location.search).get('verify') === '1') {
     (window as unknown as Record<string, unknown>).__RIFFSHEET_MOCKBRIDGE__ = () => ({
-      lastTranscribeOptions: lastMockTranscribeOptions()
+      lastTranscribeOptions: lastMockTranscribeOptions(),
+      // HOW MANY, not merely whether. "A transcription has happened at some point" is true
+      // for most of a harness run; the only way to assert that pressing a control started a
+      // NEW one is to count them and compare either side of the press.
+      transcribeCount,
+      cancelCount,
+      transcribeInFlight
     });
+
+    /**
+     * Put MuScriptor on this pretend machine, or take it off again.
+     *
+     * The guided card has two shapes and they are opposites: with the engine MISSING it
+     * carries a folded "Show setup steps" guide, and with the engine FOUND it carries no guide
+     * at all — instructions for installing something that is installed being the clearest
+     * possible sign the app has not noticed. Both have to be checked, and the mock's default
+     * (found, because `?noengine` is the flag for the other world and it turns off every
+     * engine at once) can only ever show one of them.
+     *
+     * A test-only switch on a mock, gated behind `?verify=1` exactly as the probe above is.
+     * The shell has no such thing: on a real machine this is the filesystem's answer.
+     */
+    (window as unknown as Record<string, unknown>).__RIFFSHEET_MOCKENGINE__ = (present: boolean) => {
+      muscriptorPresent = present !== false;
+      return { muscriptorPresent };
+    };
   }
 
   /**
@@ -257,6 +328,39 @@ export function createMockBridge(options: MockOptions = {}): NativeBridge {
   // survive between calls or "Select" and "Install" would be theatre. Reset with the page,
   // which is what a browser tab is.
   let configuredEngine = 'auto';
+  /**
+   * Is there a listener up that Riffsheet did NOT start?
+   *
+   * True to begin with, because that is the state the "Left running" notice and the
+   * `stopExternalEngine` button exist for, and a mock that never reaches it would leave both
+   * untested. Goes false once the player uses the escape hatch, so the second press honestly
+   * reports that there is nothing left to stop.
+   */
+  let engineExternalRunning = true;
+  /**
+   * Is MuScriptor on this pretend machine? See `__RIFFSHEET_MOCKENGINE__`.
+   *
+   * True by default, which is the world the rest of the mock has always described — a machine
+   * with the guided engine already set up. `?noengine` still overrides everything.
+   */
+  let muscriptorPresent = true;
+  /** path -> the bytes that came in on it. The mock's stand-in for the shell's PCM store. */
+  const audioBytes = new Map<string, ArrayBuffer>();
+
+  /**
+   * Keep a take's bytes so `loadAudioPath` can hand them back later.
+   *
+   * CALLED WHERE THE SHELL FILLS ITS OWN STORE — when the audio is handed over, not when it is
+   * transcribed. It used to be called only from `transcribe()`, which worked for as long as
+   * every transcription went through this bridge and stopped working the moment one did not:
+   * the engine that runs in the page reads the samples directly, so a locally transcribed take
+   * was never recorded here and "listen again" answered "that recording is not available any
+   * more" about a file that was sitting right there. The real PcmStore has always filled at
+   * ingest; this now does the same, which is both a fix and better fidelity.
+   */
+  const rememberAudio = (src: AudioFileRef | CaptureResult): void => {
+    if (!('pcm' in src) && src.bytes && src.path) audioBytes.set(src.path, src.bytes.slice(0));
+  };
   /** One-click engines the mock has been asked to install this session. */
   const installedOneClick = new Set<string>();
   /** id -> jobId, while an install is running. */
@@ -279,27 +383,41 @@ export function createMockBridge(options: MockOptions = {}): NativeBridge {
   const engineState = (e: EngineSummary): EngineSummary['state'] => {
     if (!engineAvailable) return 'not-installed';
     if (e.install === 'bundled') return 'ready';
-    if (e.id === 'muscriptor') return 'ready';
+    if (e.id === 'muscriptor') return muscriptorPresent ? 'ready' : 'not-installed';
     return installedOneClick.has(e.id) ? 'installed' : 'not-installed';
   };
 
   const engineIsUsable = (e: EngineSummary) => engineState(e) === 'ready' || engineState(e) === 'installed';
 
   /**
+   * The order `auto` walks, best first — the same order the shell's catalogue holds, mirrored
+   * here so the browser path resolves the way the plugin does.
+   *
+   * Riffsheet leads because for one note at a time it is at least as good as the alternatives
+   * and costs nothing; MuScriptor second because when it is installed it is the best thing on
+   * the machine; Basic Pitch last because it is always there, so the chain cannot run out.
+   */
+  const AUTO_ORDER = [RIFFSHEET_ENGINE_ID, 'muscriptor', 'basic-pitch'] as const;
+
+  /**
    * What `auto` means right now — BRIDGE.md §3.4, and nothing cleverer.
    *
-   * MuScriptor when it is discovered and installed, otherwise the built-in. That preserves
-   * today's behaviour exactly for somebody who already has MuScriptor on disk, and gives a
-   * fresh machine a working app with no setup at all. A concrete choice wins over both, but
-   * only while that engine is actually usable — a chosen engine that is not installed yet
-   * falls back and says so rather than failing at transcribe time.
+   * The first engine in `AUTO_ORDER` that is usable. A concrete choice wins over all of it, but
+   * only while that engine is actually usable — a chosen engine that is not installed yet falls
+   * back and says so rather than failing at transcribe time.
+   *
+   * `nativeOnly` is the shell's own question, mirrored: which engine would run OUTSIDE this
+   * page? It is what a take falls through to when Riffsheet's engine refuses a chord.
    */
-  const resolveEngine = (): { id: string; reason: string } => {
+  const resolveEngine = (nativeOnly = false): { id: string; reason: string } => {
     const byId = (id: string) => MOCK_ENGINES.find((e) => e.id === id);
-    if (configuredEngine !== 'auto') {
+    const eligible = (e: EngineSummary | undefined) =>
+      !!e && engineIsUsable(e) && !(nativeOnly && e.id === RIFFSHEET_ENGINE_ID);
+
+    if (!nativeOnly && configuredEngine !== 'auto') {
       const chosen = byId(configuredEngine);
-      if (chosen && engineIsUsable(chosen)) {
-        return { id: chosen.id, reason: `You chose ${chosen.name}, and it is ready.` };
+      if (eligible(chosen)) {
+        return { id: chosen!.id, reason: `You chose ${chosen!.name}, and it is ready.` };
       }
       if (chosen) {
         return {
@@ -308,23 +426,46 @@ export function createMockBridge(options: MockOptions = {}): NativeBridge {
         };
       }
     }
-    const mu = byId('muscriptor');
-    if (mu && engineIsUsable(mu)) {
-      return { id: 'muscriptor', reason: 'MuScriptor is installed, so Auto is using it — it is the best quality here.' };
+
+    for (const id of AUTO_ORDER) {
+      const candidate = byId(id);
+      if (!eligible(candidate)) continue;
+      if (id === RIFFSHEET_ENGINE_ID) {
+        return { id, reason: 'Auto is using Riffsheet — built in, instant, and good for single-note lines.' };
+      }
+      if (id === 'muscriptor') {
+        return { id, reason: 'MuScriptor is installed, so Auto is using it — it is the best quality here.' };
+      }
+      return {
+        id,
+        reason: 'Auto is using the built-in Basic Pitch. It needs no setup and works on everything.'
+      };
     }
+
     return {
       id: 'basic-pitch',
-      reason: 'MuScriptor is not installed, so Auto is using the built-in Basic Pitch. It needs no setup and works on everything.'
+      reason: 'No engine is installed yet, so Auto is using the built-in Basic Pitch.'
     };
   };
 
   const mockEngineStatus = () => ({
     state: engineAvailable ? ('ready' as const) : ('stopped' as const),
     port: engineAvailable ? 8223 : 0,
-    adopted: false,
+    // A server somebody else started, which is what makes `stopEngine` refuse and
+    // `stopExternalEngine` the only way out of it. See both, above.
+    adopted: engineExternalRunning,
     model: 'mock',
     configuredModel: 'auto',
     installedModels: ['small', 'medium'],
+    // The whole size table, as the shell sends it (BRIDGE.md §3.2): a figure, whether the
+    // weights are on disk, and whether the size fits inside the auto rule's 40%-of-RAM
+    // ceiling. This pretend machine has 8 GB, so `large` does not fit — which is the case
+    // worth modelling, since it is the one the card has to say something about.
+    models: [
+      { name: 'small', approxResidentMb: 900, installed: true, fits: true },
+      { name: 'medium', approxResidentMb: 1800, installed: true, fits: true },
+      { name: 'large', approxResidentMb: 5000, installed: false, fits: false }
+    ],
     busy: false,
     busyOwner: null,
     queueLength: 0,
@@ -334,6 +475,10 @@ export function createMockBridge(options: MockOptions = {}): NativeBridge {
     stopsAfterEachJob: true,
     idleSeconds: 0,
     canStop: false,
+    // A server somebody else started is up, and on this platform the shell could prove what it
+    // is and end it — which is what puts "Stop it anyway" on the notice. See BRIDGE.md.
+    externalServer: engineExternalRunning,
+    canStopExternal: engineExternalRunning,
     memoryMb: engineAvailable ? 1300 : null,
     searchedPaths: [
       '$RIFFSHEET_MUSCRIPTOR_VENV (not set in a browser)',
@@ -346,9 +491,16 @@ export function createMockBridge(options: MockOptions = {}): NativeBridge {
       '/opt/muscriptor/venv',
       'muscriptor on PATH (browser mock — no real search was run)'
     ],
-    venv: engineAvailable ? '~/muscriptor/venv' : '<Application Support>/Riffsheet/engine/venv',
-    executable: engineAvailable ? '~/muscriptor/venv/bin/muscriptor' : '',
-    engineInstalled: engineAvailable,
+    // `engineInstalled` is about MUSCRIPTOR — this payload is the guided engine's status — so
+    // it follows the pretend filesystem rather than the machine-wide `engineAvailable` flag.
+    // The two only differ under `__RIFFSHEET_MOCKENGINE__(false)`, which is the whole point of
+    // that switch: a machine where the built-in engine works and the guided one is not here.
+    venv:
+      engineAvailable && muscriptorPresent
+        ? '~/muscriptor/venv'
+        : '<Application Support>/Riffsheet/engine/venv',
+    executable: engineAvailable && muscriptorPresent ? '~/muscriptor/venv/bin/muscriptor' : '',
+    engineInstalled: engineAvailable && muscriptorPresent,
     setupDirectory: '<Application Support>/Riffsheet/engine',
     engineConfigPath: '<Application Support>/Riffsheet/engine.json',
     engineConfigExists: false,
@@ -419,13 +571,16 @@ export function createMockBridge(options: MockOptions = {}): NativeBridge {
       configuredEngine,
       resolvedEngine: resolution.id,
       engineReason: resolution.reason,
+      nativeFallbackEngine: resolveEngine(true).id,
       engines: MOCK_ENGINES.map((e) => ({
         ...e,
         state: engineState(e),
         selected: resolution.id === e.id,
         installing: installing.has(e.id),
         detail:
-          e.install === 'bundled'
+          e.id === RIFFSHEET_ENGINE_ID
+            ? 'Built in and ready. It listens in the app itself.'
+            : e.install === 'bundled'
             ? 'Built in and ready.'
             : engineState(e) === 'ready'
               ? 'Installed and ready.'
@@ -530,10 +685,18 @@ export function createMockBridge(options: MockOptions = {}): NativeBridge {
       return () => {};
     },
 
-    // With no id: whichever engine `auto` resolved to, which is what the shell answers and
-    // what the read-out at the top of the panel is about. With an id: that engine's own card.
+    // With an id: that engine's own card. With NO id: whichever engine this process would
+    // actually run — `resolveEngine(true)`, not `resolveEngine()`.
+    //
+    // The difference matters and it is not a detail. Everything this payload is about is a
+    // LISTENER PROCESS: a port, an adopted server, how much memory it is holding, whether it
+    // can be stopped. Riffsheet's own engine has none of those — it is a function call in this
+    // page — so answering for it would mean the "Left running, 1.5 GB" notice about somebody
+    // else's MuScriptor quietly stopped appearing the moment `auto` preferred Riffsheet, which
+    // is exactly the notice that exists because a player could not tell what was eating their
+    // machine. The user-facing resolution is still reported, in `listEngines()`.
     async engineStatus(id?: string) {
-      return statusForEngine(id ?? resolveEngine().id);
+      return statusForEngine(id ?? resolveEngine(true).id);
     },
 
     // The browser has no discovery to re-run, but the button must still be exercisable here:
@@ -542,11 +705,45 @@ export function createMockBridge(options: MockOptions = {}): NativeBridge {
     // control nobody tests. Same payload as engineStatus(), one tick later.
     async recheckEngine() {
       await new Promise((done) => setTimeout(done, 60));
-      return statusForEngine(resolveEngine().id);
+      // Same engine `engineStatus()` answers for, and for the same reason.
+      return statusForEngine(resolveEngine(true).id);
     },
 
     async setEngineModel(model) {
       return { ok: true, model, restarted: false };
+    },
+
+    /**
+     * The ordinary Stop, refusing for the ordinary reason.
+     *
+     * The mock reports a server it did not start, because that is the interesting case and the
+     * one the UI used to have no answer for: `stopEngine` says no, politely, and the player is
+     * left reading "Left running" with a gigabyte and a half still held. That refusal is what
+     * `stopExternalEngine` below exists to follow, and modelling it here is what makes the
+     * two-step gesture testable in a browser.
+     */
+    async stopEngine() {
+      if (!engineExternalRunning) {
+        return { stopped: false, reason: 'There is no listener running, so there was nothing to stop.' };
+      }
+      return {
+        stopped: false,
+        reason:
+          'That listener was started outside Riffsheet — it is on port 8222 and Riffsheet did not spawn it, ' +
+          'so it is not Riffsheet’s to shut down.'
+      };
+    },
+
+    /** The second, explicit gesture. Only ever reached from the notice the refusal above puts up. */
+    async stopExternalEngine() {
+      if (!engineExternalRunning) {
+        return { stopped: false, reason: 'There is no listener running, so there was nothing to stop.' };
+      }
+      engineExternalRunning = false;
+      return {
+        stopped: true,
+        reason: 'The listener on port 8222 has been closed and its memory given back.'
+      };
     },
 
     // --- the engine picker ------------------------------------------------------------
@@ -678,10 +875,96 @@ export function createMockBridge(options: MockOptions = {}): NativeBridge {
       return { ok: true, freedBytes: wasInstalled ? engine.approxDiskBytes : 0 };
     },
 
+    /**
+     * "Use an existing installation" — the mock's half of a shell call that lands next wave.
+     *
+     * Two behaviours behind one call, exactly as the contract describes: an empty path is a
+     * sniff, a real path is a check of that place. Both are answered from a small pretend
+     * filesystem so the card's three outcomes — found, accepted, rejected — can all be driven
+     * from a browser without inventing a fourth for testing.
+     *
+     * The pretend layout is the one the real installer writes, so a check written against this
+     * is a check written against the shape the shell will report.
+     */
+    async validateExistingEngineInstall(id: string, path: string) {
+      await new Promise((done) => setTimeout(done, 80));
+      const engine = MOCK_ENGINES.find((e) => e.id === id);
+      if (!engine) return { ok: false, detail: `There is no engine called "${id}".` };
+      if (engine.install === 'bundled') {
+        return { ok: false, detail: `${engine.name} is built in — there is nothing to point at.` };
+      }
+
+      // Where this mock pretends copies of each engine live, and the list it says it looked in.
+      const pretendAt = `<Application Support>/Riffsheet/engines/${id}`;
+      const searched = [
+        pretendAt,
+        `~/${id}/venv`,
+        `~/Library/Application Support/${engine.name}`,
+        `/opt/${id}`
+      ];
+
+      if (path === '') {
+        // The sniff. It "finds" something for every non-bundled engine, because the whole
+        // point of the row is the found case; the not-found case is what the path box is for.
+        return {
+          ok: true,
+          detail: `Found what looks like ${engine.name} at ${pretendAt}.`,
+          path: pretendAt,
+          searched
+        };
+      }
+
+      // The check. Anything that does not look like a path to the engine is refused with the
+      // reason, because "no" on its own sends somebody back to guessing.
+      const looksRight = /riffsheet|engines|venv|opt|muscriptor|bass|transkun/i.test(path);
+      if (!looksRight) {
+        return {
+          ok: false,
+          detail: `There is no ${engine.name} in ${path} — no runnable engine was found inside it.`,
+          searched
+        };
+      }
+      installedOneClick.add(id);
+      return { ok: true, detail: `${engine.name} at ${path} ran when asked. Riffsheet will use it.`, path };
+    },
+
     // Same fan-out shape as onCaptureState below: a Set, and an unsubscribe that removes.
     onEngineInstallProgress(handler) {
       installHandlers.add(handler);
       return () => installHandlers.delete(handler);
+    },
+
+    /**
+     * Give back audio the mock has already been handed, by the path it came in on.
+     *
+     * THE MOCK HAD NO SUCH CALL, and that absence had a visible cost: `retranscribe()` reaches
+     * for `loadAudioPath` whenever the take has no live token, so in a browser "listen to this
+     * again" could only ever end in "the original recording is not available any more". Every
+     * gesture built on re-reading a take — Start over, and now choosing an engine — was
+     * therefore untestable outside a DAW, which is exactly where their bugs would be found.
+     *
+     * The shell answers this from its PCM store: audio it decoded once, kept, and can hand
+     * back by path. `audioBytes` is that store, one map deep, filled by whatever has actually
+     * been transcribed in this tab. An unknown path answers null, as a real one does for a
+     * file that has been moved.
+     */
+    async loadAudioPath(path: string): Promise<AudioFileRef | null> {
+      const bytes = audioBytes.get(path);
+      if (!bytes) return null;
+      return { path, name: path.split('/').pop() ?? path, token: `mock:${path}`, bytes: bytes.slice(0) };
+    },
+
+    /**
+     * Abandon a transcription that is running. Nothing to do when none is.
+     *
+     * `{ cancelled: n }` is the shell's shape — how many jobs this actually stopped — and the
+     * honest answer here is 1 or 0. The run in flight notices between its next two progress
+     * frames and throws, which is what the shell's own cancel looks like from the page's side.
+     */
+    async transcribeCancel() {
+      if (!transcribeInFlight) return { cancelled: 0 };
+      cancelRequested = true;
+      return { cancelled: 1 };
     },
 
     async pickAudioFile(): Promise<AudioFileRef | null> {
@@ -708,6 +991,8 @@ export function createMockBridge(options: MockOptions = {}): NativeBridge {
       // Written down before anything else can throw: what a caller asked for is worth knowing
       // even about a run that then fails. See lastMockTranscribeOptions().
       lastTranscribeOptions = options ? { ...options } : null;
+      transcribeCount++;
+      rememberAudio(src);
 
       let pcm: Float32Array;
       let sampleRate: number;
@@ -726,9 +1011,24 @@ export function createMockBridge(options: MockOptions = {}): NativeBridge {
       // Simulate the real engine's cost so the ETA logic gets exercised honestly.
       const workMs = durationSec * MOCK_TRANSCRIBE_RATE * 1000;
       const steps = 20;
-      for (let i = 1; i <= steps; i++) {
-        await new Promise((ok) => setTimeout(ok, workMs / steps));
-        onProgress?.({ progress: i / steps, stage: i < steps ? 'listening' : 'writing notes' });
+      cancelRequested = false;
+      transcribeInFlight = true;
+      try {
+        for (let i = 1; i <= steps; i++) {
+          await new Promise((ok) => setTimeout(ok, workMs / steps));
+          // Between frames, exactly as the shell checks its cancel flag between chunks of
+          // work. Without this the mock had no abandonable state at all, and every gesture
+          // that cancels a running job — Start over, and now choosing an engine — could only
+          // be exercised inside a DAW.
+          if (cancelRequested) {
+            cancelCount++;
+            throw new Error('The transcription was cancelled.');
+          }
+          onProgress?.({ progress: i / steps, stage: i < steps ? 'listening' : 'writing notes' });
+        }
+      } finally {
+        transcribeInFlight = false;
+        cancelRequested = false;
       }
 
       // --- what happens before the "engine" listens ------------------------------------
@@ -879,6 +1179,10 @@ export function createMockBridge(options: MockOptions = {}): NativeBridge {
 
     // --- original playback -----------------------------------------------------------
     async loadOriginal(src: AudioFileRef | CaptureResult) {
+      // The app hands every opened take to the A/B player as it ingests it, which makes this
+      // the browser's equivalent of the shell taking the file into its PCM store. See
+      // `rememberAudio`.
+      rememberAudio(src);
       const ac = audioContext();
       if ('pcm' in src) {
         const buffer = ac.createBuffer(1, src.pcm.length, src.sampleRate);

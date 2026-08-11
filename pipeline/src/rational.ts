@@ -12,7 +12,7 @@
  * "1/64 whole note", "1/128 note", "min rest = 1/8" read literally in the code.
  *
  * No float ever enters a metric decision. `toNumber()` exists only for reporting, ratios
- * against user-facing tolerances (e.g. STACCATO_TOL) and seconds<->beats interpolation, and
+ * against user-facing tolerances and seconds<->beats interpolation, and
  * every call site that uses it is commented.
  */
 

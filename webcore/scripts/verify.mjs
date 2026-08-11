@@ -39,6 +39,24 @@ const READY_TIMEOUT_MS = Math.max(
   1_000,
   Math.min(40_000, Number(process.env.RIFFSHEET_VERIFY_READY_TIMEOUT_MS) || 40_000)
 );
+/**
+ * How far a note's roll x may sit from its sheet x, in viewport pixels, with Align ON.
+ *
+ * Not a taste, and not a number anybody would want to be larger: it is the residual of drawing
+ * a LINEAR time ruler under an engraving that deliberately is not linear in time. alphaTab
+ * gives a rhythmically dense bar more pixels than a sparse one, and the roll must stay linear
+ * or a picture of a performance re-spaces itself whenever the performance is edited — the
+ * failure the old linked mode was deleted for, and the one rule this whole item is built
+ * around. The two therefore agree exactly at the edges of the visible span and drift by the
+ * engraving's own unevenness in between.
+ *
+ * Measured on the demo fixture (worst 308 px on a 1440 px pane) and set just above it, so a
+ * regression that made the coupling looser fails here. The ratio check beside it is what stops
+ * this being a rubber stamp: unaligned, the SAME three notes miss by 2712 px, so the bound has
+ * to be nearly nine times tighter than doing nothing.
+ */
+const ALIGN_TOLERANCE_PX = 320;
+
 const VERIFY_STARTED = Date.now();
 const VERIFY_DEADLINE = VERIFY_STARTED + 5 * 60_000;
 let activePhase = { name: 'startup', deadline: VERIFY_STARTED + 30_000 };
@@ -211,13 +229,35 @@ const PROBE = `(() => {
     firstNames: names.slice(0, 10),
     toasts: [...q('.toast')].map(t => t.textContent),
     exportButtons: [...q('.app-header button')].map(b => b.textContent),
-    settingsGear: [...q('.app-header button')].some(b => b.textContent === '\\u2699'),
+    // The gear is BIGGER AND LABELLED now (#11), so it is no longer a button whose whole text
+    // is the glyph. Found by its role, and checked for both halves: the glyph that makes it
+    // recognisable and the word that makes it findable.
+    exportMenuButton: !!document.querySelector('[data-role="export-menu-button"]'),
+    exportMenuIsMenu: document.querySelector('[data-role="export-menu-button"]')?.getAttribute('aria-haspopup') === 'menu',
+    // It is still the control for the remembered MIDI variant — that is what a drag hands over,
+    // and folding four buttons into one must not have lost it. (Whether an OS drag is possible
+    // at all is a separate claim, checked by the drag-probe block below: a browser has no
+    // beginMidiDrag, so the data-drag attribute is correctly absent here.)
+    exportMenuOwnsMidiMode:
+      document.querySelector('[data-role="export-menu-button"]')?.getAttribute('data-setting') === 'midiExportMode',
+    // The three buttons it replaced, and the stray one from the main menu, are all gone.
+    legacyExportButtons: [
+      'export-midi', 'export-pdf', 'export-musicxml', 'save-riffsheet-as'
+    ].filter((r) => !!document.querySelector('[data-role="' + r + '"]')).length,
+    settingsGear: (() => {
+      const g = document.querySelector('[data-role="settings-gear"]');
+      return !!g && g.textContent.indexOf('\\u2699') >= 0 && /Settings/.test(g.textContent);
+    })(),
     mainMenuButton: [...q('.app-header button')].some(b => b.textContent.trim() === 'Main menu'),
     legacyOpenButtons: [...q('button')].filter(b => /^Open(?:\\.\\.\\.)?$/.test(b.textContent.trim())).length,
     linkedControls: [...q('button, [role="switch"]')].filter(e => e.textContent.trim() === 'Align').length,
     notationToolbar: !!document.querySelector('[data-role="notation-toolbar"]'),
     tabView: document.querySelector('[data-role="tab-view"]')?.value ?? null,
-    tuningSummary: document.querySelector('.tuning-summary')?.textContent ?? null,
+    // The "Tuning low → high:" row is gone. Its job — proving the tuning reached the page —
+    // is done by the open-string letters at the left of every tab staff, which are on the
+    // paper too. Read off the DOM rather than off a probe, so this measures what is DRAWN.
+    stringLetters: [...q('.string-letter')].map((e) => e.textContent.trim()).join(' '),
+    stringLetterCount: q('.string-letter').length,
     // TWO grids, and they must be two controls. Until this split they were one <select>
     // driving both the quantizer and the roll's ruler, so asking for bigger cells to draw
     // into also told the transcriber what it was allowed to write.
@@ -243,6 +283,9 @@ const PROBE = `(() => {
 const LAYOUT = `JSON.stringify(window.__RIFFSHEET_LAYOUT__ ? window.__RIFFSHEET_LAYOUT__() : null)`;
 /** The piano roll's view of itself, plus the transport position for the click test. */
 const ROLL = `JSON.stringify(window.__RIFFSHEET_PIANOROLL__ ? window.__RIFFSHEET_PIANOROLL__() : null)`;
+
+/** The strip, same shape of question — its half of the shared ruler. */
+const WAVE_PROBE = `JSON.stringify(window.__RIFFSHEET_WAVE__ ? window.__RIFFSHEET_WAVE__() : null)`;
 
 /** Sheet cursor vs synth vs piano roll: one origin, or the cursor leads the sound. */
 const TIMEBASE = `JSON.stringify(window.__RIFFSHEET_TIMEBASE__ ? window.__RIFFSHEET_TIMEBASE__() : null)`;
@@ -281,9 +324,15 @@ const clickRoll = (frac) => `(() => {
   c.dispatchEvent(new PointerEvent('pointerdown', {
     clientX: r.left + x, clientY: r.top + y, bubbles: true, cancelable: true
   }));
+  // What that fraction MEANS depends on the ruler the roll is on: the whole take normally,
+  // and the sheet's visible span when Align has given it one (#1). Asking the roll itself
+  // rather than assuming duration*frac keeps this check testing click-to-seek instead
+  // of quietly testing which mode the roll happens to be in.
+  const from = typeof p.roll.windowFromSec === 'number' ? p.roll.windowFromSec : 0;
+  const to = typeof p.roll.windowToSec === 'number' ? p.roll.windowToSec : p.roll.durationSec;
   return JSON.stringify({
     clicked: true, atFrac: ${frac}, x: Math.round(x),
-    wantSec: Number((p.roll.durationSec * ${frac}).toFixed(3))
+    wantSec: Number((from + (to - from) * ${frac}).toFixed(3))
   });
 })()`;
 
@@ -362,6 +411,32 @@ const RESIZE_AFFORDANCE = `(() => {
  * for its own vertical zoom. Sending Ctrl here asserted the pitch zoom while driving the
  * sheet's, so the row size correctly never moved.
  */
+/**
+ * A PLAIN wheel over the pitch gutter — no key held. #9's whole point: zoom is discoverable by
+ * putting the pointer somewhere sensible, not by knowing that Alt exists.
+ */
+const WHEEL_OVER_GUTTER = `(() => {
+  const c = document.querySelector('.pianoroll');
+  if (!c) return JSON.stringify({ sent: false });
+  const r = c.getBoundingClientRect();
+  c.dispatchEvent(new WheelEvent('wheel', {
+    clientX: r.left + 10, clientY: r.top + r.height / 2,
+    deltaY: -240, bubbles: true, cancelable: true
+  }));
+  return JSON.stringify({ sent: true });
+})()`;
+
+/** A double-click on the same gutter. This is what "Fit" and "Reset view" retired into. */
+const DOUBLE_CLICK_GUTTER = `(() => {
+  const c = document.querySelector('.pianoroll');
+  if (!c) return JSON.stringify({ sent: false });
+  const r = c.getBoundingClientRect();
+  c.dispatchEvent(new MouseEvent('dblclick', {
+    clientX: r.left + 10, clientY: r.top + r.height / 2, bubbles: true, cancelable: true
+  }));
+  return JSON.stringify({ sent: true });
+})()`;
+
 const WHEEL_ZOOM_IN = `(() => {
   const c = document.querySelector('.pianoroll');
   if (!c) return JSON.stringify({ sent: false });
@@ -831,6 +906,14 @@ async function main() {
         return { right: Math.round(b.right), bottom: Math.round(b.bottom), w: Math.round(b.width), h: Math.round(b.height) }; };
       const btns = [...document.querySelectorAll('.app-header button')].map(b => Math.round(b.getBoundingClientRect().right));
       return JSON.stringify({
+        // PROPORTIONAL, NOT WRAPPED (#11). Two numbers say whether the shell scaled or
+        // re-flowed: the zoom actually in force, and how many ROWS the header came out as
+        // (distinct top edges among its children — wrapping is what pushes that above one).
+        appZoom: Number(getComputedStyle(document.querySelector('#app')).zoom) || 1,
+        headerRows: new Set(
+          [...document.querySelectorAll('.app-header > *')]
+            .map((e) => Math.round(e.getBoundingClientRect().top / 4))
+        ).size,
         bodyScrollW: document.body.scrollWidth, innerW: window.innerWidth,
         docScrollW: document.documentElement.scrollWidth,
         header: r('.app-header'), transport: r('.transport'), triview: r('.triview'),
@@ -984,7 +1067,18 @@ async function main() {
     await evalJson(clickAtPx('.waveform', sharedX));
     await settle(350);
     const waveSeek = (await evalJson(ROLL))?.positionSec ?? null;
-    result.sharedRuler = { x: sharedX, rollSeek, waveSeek };
+    // The two rulers, read at one instant. See the check that consumes this.
+    const rollNow = await evalJson(ROLL);
+    const waveNow = await evalJson(WAVE_PROBE);
+    result.sharedRuler = {
+      x: sharedX,
+      rollSeek,
+      waveSeek,
+      rollMidSec: rollNow?.roll?.midPlotSec ?? null,
+      waveMidSec: waveNow?.midPlotSec ?? null,
+      rollWindow: rollNow?.roll?.windowFromSec ?? null,
+      waveWindow: waveNow?.windowFromSec ?? null
+    };
 
     // "Reset view" must put the pitch view back after a roll zoom. Horizontal time remains
     // linear throughout and is deliberately independent of engraving zoom.
@@ -992,9 +1086,29 @@ async function main() {
     await evalJson(WHEEL_ZOOM_IN);
     await settle(600);
     result.zoomAfterWheel = (await evalJson(ROLL))?.roll ?? null;
-    await evalJson(clickRole('roll-reset'));
+    // NO MODIFIER. A plain wheel over the GUTTER — the pitch ruler — zooms it; the same wheel
+    // over the notes still scrolls. Nothing to hold down and nothing to have been told.
+    await evalJson(WHEEL_OVER_GUTTER);
+    await settle(600);
+    result.zoomAfterGutterWheel = (await evalJson(ROLL))?.roll ?? null;
+    // ...and a double-click on that same ruler fits, which is what the retired chips did.
+    await evalJson(DOUBLE_CLICK_GUTTER);
     await settle(700);
     result.zoomAfterReset = (await evalJson(ROLL))?.roll ?? null;
+    // The visible control, for anyone without a wheel or a trackpad.
+    result.zoomButtons = await evalJson(`JSON.stringify({
+      inButton: !!document.querySelector('[data-role="roll-zoom-in"]'),
+      outButton: !!document.querySelector('[data-role="roll-zoom-out"]'),
+      retiredFit: !!document.querySelector('[data-role="roll-fit"]'),
+      retiredReset: !!document.querySelector('[data-role="roll-reset"]')
+    })`);
+    const beforeButtonZoom = (await evalJson(ROLL))?.roll?.pxPerSemitone ?? null;
+    await evalJson(clickRole('roll-zoom-in'));
+    await settle(400);
+    result.zoomAfterButton = {
+      before: beforeButtonZoom,
+      after: (await evalJson(ROLL))?.roll?.pxPerSemitone ?? null
+    };
 
     // What the MIDI button would drag. A real OS drag cannot be synthesised from a page, so
     // the wiring is checked by asking what it holds rather than by dropping it anywhere.
@@ -1163,7 +1277,7 @@ async function main() {
     phase('checking the engine setup screen', 40_000);
     result.engineSetupOpen = await evalJson(`(() => {
       const gear = [...document.querySelectorAll('.app-header button')]
-        .find((b) => b.textContent === '\\u2699');
+        .find((b) => b.getAttribute('data-role') === 'settings-gear');
       if (!gear) return JSON.stringify({ clicked: false });
       gear.click();
       return JSON.stringify({ clicked: true });
@@ -1183,7 +1297,10 @@ async function main() {
       const recheck = document.querySelector('[data-role="engine-recheck"]');
       const said = document.querySelector('[data-role="engine-recheck-said"]');
       const policy = document.querySelector('[data-role="engine-setup-policy"]');
+      const guideToggle = document.querySelector('[data-role="engine-guide-toggle"]');
       return JSON.stringify({
+        hasGuideToggle: !!guideToggle,
+        guideToggleText: guideToggle ? (guideToggle.textContent || '').trim() : null,
         panelOpen: !!panel && panel.style.display !== 'none',
         group: !!document.querySelector('[data-role="engine-setup-group"]'),
         status: status ? (status.textContent || '').trim() : null,
@@ -1199,6 +1316,26 @@ async function main() {
       });
     })()`;
 
+    // WITH THE ENGINE FOUND. The mock's machine has MuScriptor on it, and the card must
+    // therefore carry NO guide at all — not a collapsed one, none. Instructions for installing
+    // something that is installed are the clearest possible sign the app has not noticed.
+    result.engineSetupInstalled = await evalJson(ENGINE_SETUP);
+
+    // WITH THE ENGINE MISSING. The other half of the same card, and the state everything below
+    // is about: a folded guide behind one button, and the whole of the old setup screen behind
+    // that. `__RIFFSHEET_MOCKENGINE__` is a mock-only switch (see bridge/mock.ts); on a real
+    // machine this is what the filesystem says.
+    result.engineSetupUninstall = await evalJson(`(() => {
+      if (!window.__RIFFSHEET_MOCKENGINE__) return JSON.stringify({ switched: false });
+      window.__RIFFSHEET_MOCKENGINE__(false);
+      return JSON.stringify({ switched: true });
+    })()`);
+    await settle(2400);
+    result.engineSetupFolded = await evalJson(ENGINE_SETUP);
+
+    // Unfold it, and everything the guide has always promised has to still be there.
+    result.engineGuideClick = await evalJson(clickRole('engine-guide-toggle'));
+    await settle(400);
     result.engineSetup = await evalJson(ENGINE_SETUP);
 
     // The searched list is collapsed until asked for — open it and count what is really there.
@@ -1220,6 +1357,16 @@ async function main() {
     })()`);
     await settle(900);
     result.engineRechecked = await evalJson(ENGINE_SETUP);
+
+    // Put MuScriptor back on the pretend machine. Everything below this line — the cards, the
+    // picker, the layout measurements — is written against the mock's ordinary world, and a
+    // switch left flipped would quietly change what those are testing.
+    result.engineSetupRestore = await evalJson(`(() => {
+      if (!window.__RIFFSHEET_MOCKENGINE__) return JSON.stringify({ switched: false });
+      window.__RIFFSHEET_MOCKENGINE__(true);
+      return JSON.stringify({ switched: true });
+    })()`);
+    await settle(2400);
 
     // --- the engine picker: cards, a real install, and a choice that sticks -----------
     //
@@ -1283,13 +1430,20 @@ async function main() {
 
     const GEAR_CLICK = `(() => {
       const gear = [...document.querySelectorAll('.app-header button')]
-        .find((b) => b.textContent === '\\u2699');
+        .find((b) => b.getAttribute('data-role') === 'settings-gear');
       if (!gear) return JSON.stringify({ clicked: false });
       gear.click();
       return JSON.stringify({ clicked: true });
     })()`;
 
     result.engineCards = await evalJson(ENGINE_CARDS);
+
+    // The engine that runs in this page, on two fixtures it built itself. See
+    // `__RIFFSHEET_LOCALENGINE__` for why both takes are needed and why they carry a hiss floor.
+    result.localEngine = await evalJson(
+      `JSON.stringify(window.__RIFFSHEET_LOCALENGINE__ ? window.__RIFFSHEET_LOCALENGINE__() : null)`,
+      30_000
+    );
 
     // A one-click install, pressed for real. The mock takes about 1.2s over eight frames,
     // which is slow enough that the progress row genuinely has to render rather than flash.
@@ -1530,7 +1684,9 @@ async function main() {
         'dead: written ("auto", always) and read by nothing — tabMode took over the job in settings v5',
       settingsVersion: 'bookkeeping: the number migrate() reads, never a knob',
       useHostGrid:
-        'only exists when a DAW does — driven below, in simulated-plugin mode, where there is a grid to follow'
+        'only exists when a DAW does — driven below, in simulated-plugin mode, where there is a grid to follow',
+      anchorFret:
+        'only exists for one fingering style — the box appears beside the Tab menu when "Around fret N" is chosen, and a number that governs nothing is what this pass removed everywhere else'
     };
 
     /** Every `[data-setting]` on screen right now, counted. */
@@ -1856,6 +2012,21 @@ async function main() {
     );
     await settle(300);
 
+    // --- what a .riffsheet file carries ------------------------------------------------
+    //
+    // Deliberately AFTER the persistence probe and before the menu walk. The probe above
+    // leaves the edit log populated with the cursor wound back by its undos, which is the
+    // one state worth writing a document from: it proves the log and the cursor travel
+    // separately. The menu walk below presses Close and would leave nothing to save.
+    //
+    // Synchronous, unlike its neighbours — it is a pure round trip through the writer and
+    // the reader, with no boot and no bridge call.
+    result.document = await evalJson(
+      `window.__RIFFSHEET_DOCUMENT__ ? JSON.stringify(window.__RIFFSHEET_DOCUMENT__()) : 'null'`,
+      30_000
+    );
+    await settle(200);
+
     // --- the main menu, and a blank score, end to end ----------------------------------
     //
     // LAST of the in-page probes, and deliberately so: the menu walk presses Close, which
@@ -1966,6 +2137,22 @@ async function main() {
       60_000
     );
     await settle(600);
+    // VERTICAL CORRESPONDENCE, on and off. The claim Align makes to the eye — a note's sheet x,
+    // roll x and waveform x are one column — measured on three notes spread across the span.
+    result.alignXOn = await evalJson(
+      `window.__RIFFSHEET_ALIGNX__
+        ? window.__RIFFSHEET_ALIGNX__('on').then(r => JSON.stringify(r), e => JSON.stringify({ error: String(e) }))
+        : Promise.resolve('null')`,
+      60_000
+    );
+    await settle(600);
+    result.alignXOff = await evalJson(
+      `window.__RIFFSHEET_ALIGNX__
+        ? window.__RIFFSHEET_ALIGNX__('off').then(r => JSON.stringify(r), e => JSON.stringify({ error: String(e) }))
+        : Promise.resolve('null')`,
+      60_000
+    );
+    await settle(600);
     // The chip itself, pressed twice, so the control and not only the setting is exercised.
     result.linkBefore = await evalJson(ROLL);
     result.linkClickOn = await evalJson(clickRole('roll-link'));
@@ -1975,26 +2162,48 @@ async function main() {
     await settle(900);
     result.linkOff = await evalJson(ROLL);
 
-    // LISTEN AGAIN. The demo has a recording behind it (`peaks`) but no re-openable handle,
-    // which is precisely the state that used to delete the button: it required `audioRef`, so
-    // a restored session whose file could not be re-opened lost the control entirely. It has
-    // to be on screen, and pressing it has to SAY something rather than do nothing.
+    // START OVER, WHICH USED TO BE "LISTEN AGAIN" IN THE TOOLBAR.
+    //
+    // The header button is RETIRED (#10): a permanent control for a rare gesture, in the row
+    // that has to survive REAPER's 390px docked FX window, doing the thing that is now the
+    // ordinary consequence of choosing an engine. What is left of it lives in the Main menu
+    // beside the other deliberate acts. Both halves are asserted — gone from there, working
+    // from here — because "we moved it" is only true if both are.
     result.retranscribeEntry = await evalJson(`(() => {
-      const b = document.querySelector('[data-role="retranscribe"]');
-      const r = b ? b.getBoundingClientRect() : null;
+      const header = document.querySelector('.app-header');
       return JSON.stringify({
-        present: !!b,
-        text: b ? b.textContent.trim() : null,
-        disabled: b ? b.disabled : null,
-        onScreen: !!r && r.width > 0 && r.right <= window.innerWidth + 1 && r.left >= -1,
+        inToolbar: !!document.querySelector('[data-role="retranscribe"]'),
+        headerText: header ? (header.textContent || '').trim() : '',
         toastsBefore: document.querySelectorAll('.toast').length
       });
     })()`);
-    result.retranscribeClick = await evalJson(clickRole('retranscribe'));
+
+    // In the Main menu, on the row that describes the open take.
+    result.retranscribeMenuOpen = await evalJson(clickRole('main-menu'));
+    await settle(700);
+    result.retranscribeMenu = await evalJson(`(() => {
+      const b = document.querySelector('[data-role="retranscribe-menu"]');
+      const r = b ? b.getBoundingClientRect() : null;
+      const row = document.querySelector('[data-role="main-menu-current"]');
+      return JSON.stringify({
+        present: !!b,
+        inCurrentWorkRow: !!row && !!b && row.contains(b),
+        text: b ? b.textContent.trim() : null,
+        onScreen: !!r && r.width > 0 && r.right <= window.innerWidth + 1 && r.left >= -1
+      });
+    })()`);
+    // Pressing it has to reach the app and produce an answer. The demo's handle is genuinely
+    // gone, so the answer is the explanation — what is asserted is that SOMETHING happened and
+    // that it took us back to the sheet rather than leaving us in the menu.
+    result.retranscribeClick = await evalJson(clickRole('retranscribe-menu'));
     await settle(900);
     result.retranscribeAfter = await evalJson(`(() => {
       const toasts = [...document.querySelectorAll('.toast')].map((t) => t.textContent.trim());
-      return JSON.stringify({ toasts, count: toasts.length });
+      return JSON.stringify({
+        toasts,
+        count: toasts.length,
+        backOnSheet: !!document.querySelector('.app-header')
+      });
     })()`);
     await cdp.send('Runtime.evaluate', {
       expression: `document.querySelectorAll('.toast button').forEach(b => b.click())`,
@@ -2029,6 +2238,416 @@ async function main() {
       dialogGone: !document.querySelector('[data-role="confirm-dialog"]'),
       stillHasWork: !!window.__RIFFSHEET_PIANOROLL__ && !!window.__RIFFSHEET_PIANOROLL__().roll
     }))()`);
+
+    // =====================================================================================
+    // NIGHT WAVE 2 — the controls that were added, moved or deleted this wave.
+    //
+    // Ordered by how destructive they are, gently first: reading the transport pair and the
+    // tempo unit changes nothing, the grid warning changes a setting and puts it back, and
+    // the engine gestures re-transcribe the take, so they go last.
+    // =====================================================================================
+    phase('checking undo/redo buttons, the tempo unit and the grid warning', 120_000);
+
+    // BACK TO THE TRIPLET DEMO, ON A FRESH PAGE.
+    //
+    // Two reasons, and both matter. The phases above left the app on the main menu, in
+    // simulated-plugin mode, holding the two-bar STRAIGHT fixture at the mock DAW's 222 BPM in
+    // 3/6 — none of which is the state these checks are about. And the grid warning has to be
+    // exercised on the fixture that actually breaks: a triplet figure, where a 1/4 notation
+    // grid has nowhere to put the second and third note of each triplet.
+    //
+    // A reload also resets the mock's own memory (what is installed, whether the borrowed
+    // listener is up), which is what the engine checks below need to be able to assume.
+    // `?demo=` returns before `restoreSession()`, so the resume prompt cannot fire here.
+    await cdp.send('Page.navigate', { url: `http://127.0.0.1:${PORT}/index.html?${TARGET_QUERY}` });
+    await waitForReady('triplet demo (second pass)', READY_EXPRESSION, READY_TIMEOUT_MS);
+    await settle(1200);
+
+    /** The pair, and whether they are drawn rather than typed. */
+    const UNDO_PAIR = `(() => {
+      const read = (role) => {
+        const b = document.querySelector('[data-role="' + role + '"]');
+        if (!b) return null;
+        const r = b.getBoundingClientRect();
+        const svg = b.querySelector('svg');
+        return {
+          present: true,
+          disabled: b.disabled,
+          onScreen: r.width > 0 && r.height > 0 && r.right <= window.innerWidth + 1 && r.left >= -1,
+          w: Math.round(r.width),
+          h: Math.round(r.height),
+          // DRAWN, not a text glyph: an <svg> with real paths in it, stroked heavily enough
+          // to read as a button rather than as a hairline.
+          hasSvg: !!svg,
+          paths: svg ? svg.querySelectorAll('path, polyline').length : 0,
+          strokeWidth: svg ? Number(svg.getAttribute('stroke-width') || 0) : 0,
+          text: (b.textContent || '').trim()
+        };
+      };
+      const undo = document.querySelector('[data-role="undo"]');
+      const transport = document.querySelector('.transport');
+      return JSON.stringify({
+        undo: read('undo'),
+        redo: read('redo'),
+        // "Near transport" is a claim about where it is, so it is measured rather than assumed.
+        inTransport: !!transport && !!undo && transport.contains(undo)
+      });
+    })()`;
+
+    result.undoPairAtRest = await evalJson(UNDO_PAIR);
+    // Make one edit through the roll, so both ends of the stack get visited.
+    result.undoPairEdit = await evalJson(dragRollNote(0, -18));
+    await settle(700);
+    result.undoPairAfterEdit = await evalJson(UNDO_PAIR);
+    result.undoPairUndoClick = await evalJson(clickRole('undo'));
+    await settle(700);
+    result.undoPairAfterUndo = await evalJson(UNDO_PAIR);
+    result.undoPairRollAfterUndo = await evalJson(ROLL);
+    result.undoPairRedoClick = await evalJson(clickRole('redo'));
+    await settle(700);
+    result.undoPairAfterRedo = await evalJson(UNDO_PAIR);
+    // And back, so nothing downstream inherits the probe's edit.
+    await evalJson(clickRole('undo'));
+    await settle(600);
+
+    // THE TEMPO UNIT, and the thing it must NOT do.
+    //
+    // The box shows the tempo in the beat the signature is written in, so 4/4 -> 6/8 turns
+    // "120" into "240". That is a relabelling, and the only way to prove it is a relabelling
+    // is to compare what the app would SCHEDULE either side of the switch. The probe dumps
+    // `synthNotesFor()` — the exact list handed to the thing that makes sound — and puts the
+    // signature back.
+    result.tempoUnit = await evalJson(
+      `window.__RIFFSHEET_TEMPOUNIT__
+        ? JSON.stringify(window.__RIFFSHEET_TEMPOUNIT__(6, 8))
+        : 'null'`,
+      60_000
+    );
+    await settle(800);
+
+    // THE COARSE-GRID WARNING, on the fixture that breaks. The demo is a triplet figure and a
+    // 1/4 notation grid has nowhere to put the second and third note of each triplet.
+    result.gridWarnBefore = await evalJson(`(() => {
+      const w = document.querySelector('[data-role="grid-too-coarse"]');
+      return JSON.stringify({ shown: !!w, text: w ? w.textContent.trim() : null });
+    })()`);
+    result.gridWarnSet = await evalJson(setSelect('notation-grid', 'quarter'));
+    await settle(1600);
+    result.gridWarnCoarse = await evalJson(`(() => {
+      const w = document.querySelector('[data-role="grid-too-coarse"]');
+      const grid = document.querySelector('[data-role="notation-grid"]');
+      const r = w ? w.getBoundingClientRect() : null;
+      const gr = grid ? grid.getBoundingClientRect() : null;
+      const self = window.__RIFFSHEET_SELFTEST__ ? window.__RIFFSHEET_SELFTEST__() : null;
+      return JSON.stringify({
+        shown: !!w,
+        text: w ? w.textContent.trim() : null,
+        // "Near the grid control" is measured: same row, within a couple of hundred px of it.
+        nearGrid: !!r && !!gr && Math.abs(r.top - gr.top) < 40 && r.left > gr.left,
+        engravedNotes: self ? self.noteGlyphs : null
+      });
+    })()`);
+    // A grid that fits has nothing to warn about, and the line has to go away again.
+    result.gridWarnFineSet = await evalJson(setSelect('notation-grid', 'triplet'));
+    await settle(1600);
+    result.gridWarnFine = await evalJson(`(() => {
+      const w = document.querySelector('[data-role="grid-too-coarse"]');
+      const self = window.__RIFFSHEET_SELFTEST__ ? window.__RIFFSHEET_SELFTEST__() : null;
+      return JSON.stringify({
+        shown: !!w,
+        engravedNotes: self ? self.noteGlyphs : null
+      });
+    })()`);
+    await evalJson(setSelect('notation-grid', 'auto'));
+    await settle(1400);
+
+    // --- the engine cards, second pass: detail block, RAM row, existing installs ---------
+    phase('checking the engine card detail, model row and existing-install path', 90_000);
+    await evalJson(GEAR_CLICK);
+    await settle(1400);
+
+    const CARD_DETAIL = `(() => {
+      const card = (id) => document.querySelector('[data-role="engine-card"][data-engine-id="' + id + '"]');
+      const text = (root, sel) => {
+        const e = root && root.querySelector(sel);
+        return e ? (e.textContent || '').trim() : null;
+      };
+      const read = (id) => {
+        const c = card(id);
+        if (!c) return null;
+        return {
+          strengths: text(c, '[data-role="engine-card-strengths"]'),
+          cost: text(c, '[data-role="engine-card-cost"]'),
+          source: text(c, '[data-role="engine-card-source"]'),
+          license: text(c, '[data-role="engine-card-license"]'),
+          ram: text(c, '[data-role="engine-card-model-ram"]'),
+          hasModelSelect: !!c.querySelector('[data-role="engine-model"]'),
+          hasUseExisting: !!c.querySelector('[data-role="engine-use-existing"]'),
+          scrollW: c.scrollWidth,
+          clientW: c.clientWidth
+        };
+      };
+      const group = document.querySelector('[data-role="engine-setup-group"]');
+      return JSON.stringify({
+        basic: read('basic-pitch'),
+        mu: read('muscriptor'),
+        bass: read('bass-v2'),
+        transkun: read('transkun'),
+        // The old standalone Model row lived in the "Transcription engine" group, ABOVE the
+        // setup group. If one is still there, the control was copied rather than moved.
+        modelSelectsOnPanel: document.querySelectorAll('[data-role="engine-model"]').length,
+        modelSelectsInSetupGroup: group ? group.querySelectorAll('[data-role="engine-model"]').length : 0
+      });
+    })()`;
+
+    result.cardDetail = await evalJson(CARD_DETAIL);
+
+    // "Use existing installation…" — the sniff, then a path that is refused, then one that is
+    // accepted. All three through the one native call the contract defines.
+    result.existingOpen = await evalJson(clickInCard('transkun', 'engine-use-existing'));
+    await settle(500);
+    result.existingPanel = await evalJson(`(() => {
+      const c = document.querySelector('[data-role="engine-card"][data-engine-id="transkun"]');
+      return JSON.stringify({
+        hasSniff: !!c?.querySelector('[data-role="engine-existing-sniff"]'),
+        hasPath: !!c?.querySelector('[data-role="engine-existing-path"]'),
+        hasCheck: !!c?.querySelector('[data-role="engine-existing-check"]')
+      });
+    })()`);
+    result.existingSniff = await evalJson(clickInCard('transkun', 'engine-existing-sniff'));
+    await settle(900);
+    result.existingAfterSniff = await evalJson(`(() => {
+      const c = document.querySelector('[data-role="engine-card"][data-engine-id="transkun"]');
+      const said = c?.querySelector('[data-role="engine-existing-said"]');
+      const box = c?.querySelector('[data-role="engine-existing-path"]');
+      return JSON.stringify({
+        said: said ? said.textContent.trim() : null,
+        // The sniff FILLS the box rather than adopting silently — you see where before
+        // anything is used.
+        path: box ? box.value : null
+      });
+    })()`);
+
+    // A location with no engine in it. The refusal has to say what was wrong.
+    result.existingBadType = await evalJson(`(() => {
+      const c = document.querySelector('[data-role="engine-card"][data-engine-id="transkun"]');
+      const box = c?.querySelector('[data-role="engine-existing-path"]');
+      if (!box) return JSON.stringify({ typed: false });
+      box.value = '/Users/somebody/Music';
+      box.dispatchEvent(new Event('input', { bubbles: true }));
+      return JSON.stringify({ typed: true });
+    })()`);
+    result.existingBadCheck = await evalJson(clickInCard('transkun', 'engine-existing-check'));
+    await settle(900);
+    result.existingAfterBad = await evalJson(`(() => {
+      const c = document.querySelector('[data-role="engine-card"][data-engine-id="transkun"]');
+      const said = c?.querySelector('[data-role="engine-existing-said"]');
+      const dot = said?.querySelector('.dot');
+      return JSON.stringify({
+        said: said ? said.textContent.trim() : null,
+        warned: !!dot && dot.classList.contains('warn'),
+        state: c?.getAttribute('data-engine-state') ?? null
+      });
+    })()`);
+
+    // ...and a real one, which makes the card behave exactly as it does after an install.
+    result.existingGoodType = await evalJson(`(() => {
+      const c = document.querySelector('[data-role="engine-card"][data-engine-id="transkun"]');
+      const box = c?.querySelector('[data-role="engine-existing-path"]');
+      if (!box) return JSON.stringify({ typed: false });
+      box.value = '/opt/transkun';
+      box.dispatchEvent(new Event('input', { bubbles: true }));
+      return JSON.stringify({ typed: true });
+    })()`);
+    result.existingGoodCheck = await evalJson(clickInCard('transkun', 'engine-existing-check'));
+    await settle(1200);
+    result.existingAfterGood = await evalJson(`(() => {
+      const c = document.querySelector('[data-role="engine-card"][data-engine-id="transkun"]');
+      return JSON.stringify({
+        state: c?.getAttribute('data-engine-state') ?? null,
+        hasUninstall: !!c?.querySelector('[data-role="engine-uninstall"]'),
+        // The offer is withdrawn once there is nothing left to point at.
+        hasUseExisting: !!c?.querySelector('[data-role="engine-use-existing"]')
+      });
+    })()`);
+
+    // The two preprocessing switches, in plain speak (#20).
+    result.preprocessCopy = await evalJson(`(() => {
+      const label = (role) => {
+        const input = document.querySelector('[data-role="' + role + '"]');
+        const span = input?.closest('label')?.querySelector('span');
+        return span ? span.textContent.trim() : null;
+      };
+      const note = (role) => {
+        const n = document.querySelector('[data-role="' + role + '"]');
+        return n ? n.textContent.trim() : null;
+      };
+      return JSON.stringify({
+        level: label('preprocess-normalize'),
+        tuning: label('preprocess-tuning'),
+        levelNote: note('preprocess-normalize-note'),
+        tuningNote: note('preprocess-tuning-note'),
+        receipt: !!document.querySelector('[data-role="preprocess-result-note"]') ||
+          note('preprocess-normalize-note') !== null
+      });
+    })()`);
+
+    await evalJson(GEAR_CLICK);
+    await settle(500);
+
+    // --- the two-step engine stop (#5-web) ----------------------------------------------
+    phase('checking the external-engine stop and the engine-click gesture', 120_000);
+
+    result.engineChipStop = await evalJson(`(() => {
+      const chip = document.querySelector('[data-role="engine-chip"]');
+      if (!chip) return JSON.stringify({ present: false });
+      chip.click();
+      return JSON.stringify({ present: true, hidden: chip.style.display === 'none' });
+    })()`);
+    await settle(900);
+    result.leftRunning = await evalJson(`(() => {
+      const toasts = [...document.querySelectorAll('.toast')];
+      const withButton = toasts.find((t) => t.querySelector('[data-role="stop-external-engine"]'));
+      return JSON.stringify({
+        count: toasts.length,
+        texts: toasts.map((t) => t.textContent.trim()),
+        hasStopAnyway: !!withButton,
+        label: withButton
+          ? withButton.querySelector('[data-role="stop-external-engine"]').textContent.trim()
+          : null
+      });
+    })()`);
+    result.stopAnywayClick = await evalJson(clickRole('stop-external-engine'));
+    await settle(900);
+    result.afterStopAnyway = await evalJson(`(() => {
+      const toasts = [...document.querySelectorAll('.toast')].map((t) => t.textContent.trim());
+      return JSON.stringify({ toasts, count: toasts.length });
+    })()`);
+    await cdp.send('Runtime.evaluate', {
+      expression: `document.querySelectorAll('.toast button[aria-label="Dismiss"]').forEach(b => b.click())`,
+      returnByValue: true
+    });
+    await settle(400);
+
+    // --- clicking an engine transcribes with it (#10) -----------------------------------
+    //
+    // Two claims, and the second is the one that was broken: a press must never be a silent
+    // no-op, and a press that would discard edits must ask first. Driven on the MAIN MENU
+    // picker, whose chips are the same gesture as the cards' "Use this engine".
+    //
+    // A REAL RECORDING FIRST. The demo fixtures are note lists with no audio behind them, so
+    // "re-read this take" cannot happen on one — the app correctly says so instead, which
+    // proves the never-silent half and nothing about the transcribe half. This opens two
+    // seconds of WAV through `openFile()`, the same door a drop uses.
+    result.engineClickOpen = await evalJson(
+      `window.__RIFFSHEET_OPENAUDIO__
+        ? window.__RIFFSHEET_OPENAUDIO__().then(r => JSON.stringify(r), e => JSON.stringify({ error: String(e) }))
+        : Promise.resolve('null')`,
+      60_000
+    );
+    await settle(1200);
+    //
+    // An edit is made ON PURPOSE next. The confirm path only exists when there is something
+    // to discard, and a probe that happened to run against a clean take would pass by
+    // accident and prove nothing about the question it is meant to be asking.
+    result.engineClickEdit = await evalJson(dragRollNote(0, -18));
+    await settle(700);
+    result.engineClickMenu = await evalJson(clickRole('main-menu'));
+    await settle(800);
+    result.engineClickBefore = await evalJson(`(() => JSON.stringify({
+      transcribeCount: window.__RIFFSHEET_MOCKBRIDGE__
+        ? window.__RIFFSHEET_MOCKBRIDGE__().transcribeCount
+        : null,
+      toasts: document.querySelectorAll('.toast').length
+    }))()`);
+    result.engineClickPress = await evalJson(`(() => {
+      const chip = document.querySelector('[data-role="engine-pick"] .chip[data-engine-id="basic-pitch"]');
+      if (!chip) return JSON.stringify({ clicked: false });
+      chip.click();
+      return JSON.stringify({ clicked: true });
+    })()`);
+    await settle(900);
+    // With edits on the take, the press has to put the question up BEFORE anything happens.
+    result.engineClickDialog = await evalJson(`(() => {
+      const d = document.querySelector('[data-role="confirm-dialog"]');
+      return JSON.stringify({
+        present: !!d,
+        message: d ? (d.querySelector('[data-role="confirm-message"]')?.textContent ?? '') : null,
+        okText: d ? (d.querySelector('[data-role="confirm-ok"]')?.textContent ?? '') : null
+      });
+    })()`);
+    result.engineClickConfirm = await evalJson(clickRole('confirm-ok'));
+    await settle(2500);
+    result.engineClickAfter = await evalJson(`(() => {
+      const mock = window.__RIFFSHEET_MOCKBRIDGE__ ? window.__RIFFSHEET_MOCKBRIDGE__() : null;
+      const toasts = [...document.querySelectorAll('.toast')].map((t) => t.textContent.trim());
+      return JSON.stringify({
+        // The bridge itself counts them. "Something was sent at some point in this run" would
+        // have been true before the button was pressed, so the count is what makes this a
+        // claim about THIS press.
+        transcribeCount: mock ? mock.transcribeCount : null,
+        toasts,
+        onSheet: !!document.querySelector('.app-header')
+      });
+    })()`);
+
+    // CLICKING AN ENGINE WHILE A JOB IS RUNNING. The board's case, and the one that cannot be
+    // reached by clicking alone: the gesture has to CANCEL what is in flight and start a new
+    // reading, rather than queueing behind it or — as it used to — returning in silence
+    // because `retranscribe()` saw `progress !== null` and gave up.
+    //
+    // Both halves are counted at the bridge: `cancelCount` only rises when a running job was
+    // actually abandoned between two of its own progress frames, and `transcribeCount` only
+    // rises when a new one was started.
+    result.engineBusyStart = await evalJson(
+      `window.__RIFFSHEET_STARTJOB__
+        ? window.__RIFFSHEET_STARTJOB__().then(r => JSON.stringify(r), e => JSON.stringify({ error: String(e) }))
+        : Promise.resolve('null')`,
+      30_000
+    );
+    result.engineBusyBefore = await evalJson(`(() => {
+      const m = window.__RIFFSHEET_MOCKBRIDGE__ ? window.__RIFFSHEET_MOCKBRIDGE__() : null;
+      return JSON.stringify({
+        inFlight: m ? m.transcribeInFlight : null,
+        cancels: m ? m.cancelCount : null,
+        transcribes: m ? m.transcribeCount : null
+      });
+    })()`);
+    result.engineBusyMenu = await evalJson(clickRole('main-menu'));
+    await settle(400);
+    result.engineBusyPress = await evalJson(`(() => {
+      const chip = document.querySelector('[data-role="engine-pick"] .chip[data-engine-id="basic-pitch"]');
+      if (!chip) return JSON.stringify({ clicked: false });
+      chip.click();
+      return JSON.stringify({ clicked: true });
+    })()`);
+    await settle(500);
+    // The take may or may not carry edits by now, so the question may or may not be asked.
+    // Answering it when it is there is not the claim under test; what happens after it is.
+    result.engineBusyConfirm = await evalJson(clickRole('confirm-ok'));
+    await settle(3000);
+    result.engineBusyAfter = await evalJson(`(() => {
+      const m = window.__RIFFSHEET_MOCKBRIDGE__ ? window.__RIFFSHEET_MOCKBRIDGE__() : null;
+      return JSON.stringify({
+        cancels: m ? m.cancelCount : null,
+        transcribes: m ? m.transcribeCount : null,
+        onSheet: !!document.querySelector('.app-header')
+      });
+    })()`);
+    await cdp.send('Runtime.evaluate', {
+      expression: `document.querySelectorAll('.toast button[aria-label="Dismiss"]').forEach(b => b.click())`,
+      returnByValue: true
+    });
+    await settle(300);
+
+    // --- the resume prompt (#25) ---------------------------------------------------------
+    phase('checking the resume-or-start-fresh prompt', 120_000);
+    result.resumePrompt = await evalJson(
+      `window.__RIFFSHEET_RESUMEPROMPT__
+        ? window.__RIFFSHEET_RESUMEPROMPT__().then(r => JSON.stringify(r), e => JSON.stringify({ error: String(e) }))
+        : Promise.resolve('null')`,
+      110_000
+    );
 
     const layouts = [
       ['wide', result.namesLayout],
@@ -2139,7 +2758,16 @@ async function main() {
 
     const checks = [
       ['main screen rendered', result.screen === 'main'],
-      ['header + export buttons', result.header && result.exportButtons.length >= 3],
+      [
+        // Was ">= 3": MIDI, MusicXML and PDF each had a button, and "Save as Riffsheet" was
+        // adrift in the main menu. They are ONE Export menu now (#11) — four permanent buttons
+        // for something done at the end of a session was a poor trade on a bar that has to
+        // survive 360 px — so the assertion is that the menu button is there and that it still
+        // knows it is a MIDI drag source, which is the one thing folding them could have lost.
+        'header + Export menu',
+        result.header && result.exportMenuButton === true && result.exportMenuIsMenu === true &&
+          result.exportMenuOwnsMidiMode === true && result.legacyExportButtons === 0
+      ],
       ['main menu replaces Open', result.mainMenuButton && result.legacyOpenButtons === 0],
       // Was 'removed Linked control stays removed' (linkedControls === 0). That expectation is
       // gone with the control's removal: the player reported the loss directly — "the link
@@ -2147,7 +2775,20 @@ async function main() {
       // is inverted rather than dropped. Exactly one, and it must work; see the block below.
       ['the Align control is on screen', result.linkedControls === 1],
       ['notation controls live beside the notation', result.notationToolbar],
-      ['TAB fixture is visibly set to bass', result.tabView === 'bass' && /Tuning low/.test(result.tuningSummary ?? '')],
+      [
+        // Was: the ".tuning-summary" row read "Tuning low → high: E1 A1 D2 G2". That row is
+        // gone and the letters are on the staff lines themselves, on every system and in the
+        // PDF — so the assertion moved to what replaced it rather than being dropped. Top line
+        // first, so a standard 4-string bass reads G2 D2 A1 E1 down the staff.
+        'TAB fixture is visibly set to bass',
+        result.tabView === 'bass' && result.stringLetters === 'G2 D2 A1 E1'
+      ],
+      [
+        // ALWAYS, including standard tuning: their absence must not be the thing that means
+        // "standard", because that is only readable by somebody who already knew.
+        'string letters: one per string, named on every tab line',
+        result.stringLetterCount === 4
+      ],
       // --- two grids, and the roll's one never touches the transcription ----------------
       //
       // The user's rule, in their own words: "the grid was supposed to not meddle with how
@@ -2169,6 +2810,19 @@ async function main() {
         // stops that being a silent change again.
         'grids: notation offers Auto and starts there',
         (result.notationGridOptions ?? []).includes('auto') && result.notationGridView === 'auto'
+      ],
+      [
+        // FREE IS NOT OFFERED FOR AN AUDIO TAKE (#21), and this is a measured decision rather
+        // than a taste. After the pipeline's rest-filler removal, 'free' stopped inventing long
+        // overlapping notes — its longest written value now matches 'auto' — but the tie chains
+        // remain and are inherent: 64 played notes engrave as 64 glyphs / 0 ties under 'auto'
+        // and as 192 glyphs / 192 ties under 'free', plus 64 rests nobody played. A symbolic
+        // import is the opposite case (the notes carry their own written ticks and the pipeline
+        // forces 'free' anyway), so the option stays there — which is why this is a check about
+        // the AUDIO fixture specifically.
+        'grids: Free is not offered for an audio take',
+        !(result.notationGridOptions ?? []).includes('free') &&
+          (result.notationGridOptions ?? []).length >= 5
       ],
       [
         // And the roll must NOT offer it: its grid is a stated cell size for drawing into.
@@ -2222,12 +2876,36 @@ async function main() {
       ],
       [
         // The promise this screen makes. If the copy ever turns into "installing…", this fails.
+        // Read off the UNFOLDED guide, which is where the policy line lives.
         'engine setup: says out loud that it installs nothing',
         typeof result.engineSetup?.policy === 'string' && /install/i.test(result.engineSetup.policy)
       ],
       [
+        // #7-web. Instructions for installing something that is installed are the clearest
+        // possible sign the app has not noticed what is on the machine. Not folded — absent.
+        'engine setup: an installed engine shows no setup guide at all',
+        result.engineSetupInstalled?.hasGuideToggle === false &&
+          (result.engineSetupInstalled?.steps ?? []).length === 0 &&
+          result.engineSetupInstalled?.hasToggle === false &&
+          // The status line still says where it was found, and Check again is still there:
+          // "look again, now" outlives setup.
+          /found at/i.test(result.engineSetupInstalled?.status ?? '') &&
+          result.engineSetupInstalled?.hasRecheck === true
+      ],
+      [
+        // ...and when it is NOT installed, the guide is behind one button rather than being
+        // the first thing under the best engine's name. Five numbered steps, a nine-entry path
+        // list and a JSON snippet is a wall for the many, to serve the few who are installing.
+        'engine setup: a missing engine folds its guide behind one button',
+        result.engineSetupUninstall?.switched === true &&
+          result.engineSetupFolded?.hasGuideToggle === true &&
+          /show setup steps/i.test(result.engineSetupFolded?.guideToggleText ?? '') &&
+          (result.engineSetupFolded?.steps ?? []).length === 0
+      ],
+      [
         'engine setup: the guide is steps, not a paragraph',
-        Array.isArray(result.engineSetup?.steps) && result.engineSetup.steps.length >= 4 &&
+        result.engineGuideClick?.clicked === true &&
+          Array.isArray(result.engineSetup?.steps) && result.engineSetup.steps.length >= 4 &&
           result.engineSetup.steps.every((s) => s.length > 20)
       ],
       [
@@ -2321,6 +2999,64 @@ async function main() {
           );
         })()
       ],
+      // --- the engine Riffsheet wrote, and the default it now is ------------------------
+      [
+        // IT PRODUCES NOTES. Six plucks at known pitches go in; notes come out, in order, with
+        // a real confidence on each. Not a count match — the attack detector legitimately
+        // re-fires inside a synthetic decay — but every pitch it reports has to be one that was
+        // actually played, which is the property that matters.
+        'riffsheet engine: a single-note take comes back as notes, with confidence',
+        (() => {
+          const m = result.localEngine?.mono;
+          const played = new Set([45, 43, 41, 40]);
+          return (
+            !!m &&
+            m.ok === true &&
+            m.notes >= 6 &&
+            Array.isArray(m.midis) && m.midis.every((n) => played.has(n)) &&
+            typeof m.minConfidence === 'number' && m.minConfidence > 0 && m.minConfidence <= 1
+          );
+        })()
+      ],
+      [
+        // IT REFUSES A CHORD, which is the whole reason it is allowed to be the default. The
+        // same six plucks with a fifth on each are a phantom-fundamental trap: YIN reads them
+        // as one rock-solid note an octave below the root and does not waver, so "the frames
+        // disagreed" cannot catch it and the harmonic-gap test has to. A pass here that came
+        // back `ok` would be six tidy, confident, entirely fictional notes.
+        'riffsheet engine: a chordal take is refused rather than guessed at',
+        (() => {
+          const c = result.localEngine?.chord;
+          return (
+            !!c &&
+            c.ok === false &&
+            c.kind === 'polyphony' &&
+            typeof c.reason === 'string' && /more than one note/i.test(c.reason) &&
+            c.contested >= 2
+          );
+        })()
+      ],
+      [
+        // FRESH STATE RESOLVES TO IT. Nothing installed, nothing downloaded, and the app can
+        // still transcribe — because the engine `auto` reaches for first is the app. The card
+        // is the one in charge, it needs no Install button, and it costs nothing on disk.
+        'riffsheet engine: auto resolves to it on a fresh machine, and its card says so',
+        (() => {
+          const cards = result.engineCards?.cards ?? [];
+          const riff = cards.find((c) => c.id === 'riffsheet');
+          const reason = result.engineCards?.reason ?? '';
+          return (
+            !!riff &&
+            riff.install === 'bundled' &&
+            riff.state === 'ready' &&
+            riff.inCharge === true &&
+            riff.hasInstall === false &&
+            typeof riff.tier === 'string' && riff.tier.length > 3 &&
+            /single-note/i.test(riff.body) &&
+            /riffsheet/i.test(reason)
+          );
+        })()
+      ],
       [
         // "One-click" on its own is worth nothing. The comparison somebody actually makes is
         // "a bass specialist that installs itself" against "the best one here, by hand", so
@@ -2357,15 +3093,19 @@ async function main() {
         })()
       ],
       [
-        'engine cards: MuScriptor’s card still carries the guide, the searched list and the engine.json path',
+        // The guide moved behind a button and lost nothing: when it IS unfolded, every part of
+        // the old setup screen is still on MuScriptor's card, with the same roles. Read off the
+        // unfolded state above rather than off the cards sweep, because by then the mock's
+        // engine is back and the card correctly has no guide at all.
+        'engine cards: MuScriptor’s unfolded guide still carries the steps, the searched list and the engine.json path',
         (() => {
-          const mu = (result.engineCards?.cards ?? []).find((c) => c.id === 'muscriptor');
+          const g = result.engineSetupOpened;
           return (
-            !!mu &&
-            (mu.steps ?? []).length >= 4 &&
-            (mu.steps ?? []).every((s) => s.length > 20) &&
-            mu.hasSearchedToggle === true &&
-            typeof mu.configPath === 'string' && /engine\.json$/.test(mu.configPath)
+            !!g &&
+            (g.steps ?? []).length >= 4 &&
+            (g.steps ?? []).every((s) => s.length > 20) &&
+            g.hasToggle === true &&
+            typeof g.configPath === 'string' && /engine\.json$/.test(g.configPath)
           );
         })()
       ],
@@ -2387,6 +3127,12 @@ async function main() {
       [
         // The promise the licence makes for us. If this copy ever turns into an offer, the
         // screen would be promising something Riffsheet has no right to do.
+        //
+        // TWO PLACES, because the sentence moved. The policy line lives inside the guide, and
+        // the guide is now hidden once the engine is found — so the card that is always on
+        // screen has to carry the claim itself. It does, in the cost line: "guided setup — its
+        // licence does not let Riffsheet install it". Both are asserted, and so is the absence
+        // of an Install button, which is the part a player can actually act on.
         'engine setup: the screen never claims Riffsheet can install MuScriptor',
         (() => {
           const mu = (result.engineCards?.cards ?? []).find((c) => c.id === 'muscriptor');
@@ -2394,7 +3140,8 @@ async function main() {
           return (
             !!mu &&
             mu.hasInstall === false &&
-            /cannot install/i.test(mu.body) &&
+            /licence does not let Riffsheet install it/i.test(mu.body) &&
+            /cannot install/i.test(result.engineSetup?.policy ?? '') &&
             !/riffsheet\s+(can|will|could)\s+install/i.test(group)
           );
         })()
@@ -2517,6 +3264,44 @@ async function main() {
           result.alignOn.sheetErrorPx !== null && result.alignOn.sheetErrorPx < 80
       ],
       [
+        // THE POINT OF THE WHOLE ITEM. With Align ON the roll and the strip are told the
+        // sheet's own visible span — derived from alphaTab's bounds, not guessed — so all
+        // three panes draw the same seconds across the same pixels.
+        'align: ON, the roll and the strip are given the sheet\'s visible span',
+        typeof result.alignOn?.alignedWindowSec === 'number' && result.alignOn.alignedWindowSec > 0
+      ],
+      [
+        // ...and OFF they are independent again: whole take, no window.
+        'align: OFF, the panes go back to being independent',
+        result.alignOff?.alignedWindowSec === null
+      ],
+      [
+        // VERTICAL CORRESPONDENCE, measured. Three notes, sheet x against roll x, in viewport
+        // pixels. The tolerance is what a LINEAR time ruler can do against alphaTab's own
+        // spacing over one screen of music — the roll must stay linear in time or a picture of
+        // a performance starts re-spacing itself when the performance is edited (§1). It is a
+        // real bound, not a rubber stamp: unaligned, the same three notes are hundreds of
+        // pixels apart, which the off-mode check below states as a fact.
+        'align: ON, a note\'s sheet x and its roll x are the same column',
+        result.alignXOn?.aligned === true &&
+          result.alignXOn?.compared >= 3 &&
+          result.alignXOn?.worstDeltaPx <= ALIGN_TOLERANCE_PX
+      ],
+      [
+        'align: OFF, the two panes are free to disagree',
+        result.alignXOff?.aligned === false &&
+          result.alignXOff?.compared >= 3 &&
+          result.alignXOff?.worstDeltaPx > ALIGN_TOLERANCE_PX
+      ],
+      [
+        // The bound above only means something next to what it is a bound ON. Turning Align on
+        // has to close the gap by a large factor, not by a rounding error.
+        'align: ON closes the gap by at least 4x over OFF',
+        typeof result.alignXOn?.worstDeltaPx === 'number' &&
+          typeof result.alignXOff?.worstDeltaPx === 'number' &&
+          result.alignXOn.worstDeltaPx * 4 <= result.alignXOff.worstDeltaPx
+      ],
+      [
         'align: OFF, the sheet is left exactly where the player put it',
         !!result.alignOff && result.alignOff.followed === false && result.alignOff.sheetMoved === false
       ],
@@ -2548,20 +3333,31 @@ async function main() {
           result.linkOff?.roll?.linkedActive === false
       ],
 
-      // --- Listen again: present, and never a silent no-op -------------------------------
+      // --- start over: out of the toolbar, into the Main menu ---------------------------
       [
-        // It used to require an `audioRef`, so it deleted itself in exactly the state somebody
-        // would reach for it: a restored take whose original could not be re-opened.
-        'listen again: the entry point is on screen for a take with a recording',
-        result.retranscribeEntry?.present === true &&
-          result.retranscribeEntry?.onScreen === true &&
-          /Listen again/.test(result.retranscribeEntry?.text ?? '')
+        // #10. The toolbar button is retired, and "retired" has to mean gone rather than
+        // hidden behind a condition — this reads the whole header, not just the role.
+        'start over: “Listen again” is no longer in the toolbar',
+        result.retranscribeEntry?.inToolbar === false &&
+          !/listen again/i.test(result.retranscribeEntry?.headerText ?? '')
+      ],
+      [
+        // ...and it is where the other deliberate, irreversible acts are: on the row that
+        // describes the open take, next to Save as and Close.
+        'start over: the Main menu carries it, in the current-work row',
+        result.retranscribeMenu?.present === true &&
+          result.retranscribeMenu?.inCurrentWorkRow === true &&
+          result.retranscribeMenu?.onScreen === true &&
+          /re-transcribe/i.test(result.retranscribeMenu?.text ?? '')
       ],
       [
         // The click has to reach the app and produce an answer. Here the handle is genuinely
-        // gone, so the answer is the explanation; what is asserted is that SOMETHING happened.
-        'listen again: clicking it is never silent',
-        result.retranscribeClick?.clicked === true && (result.retranscribeAfter?.count ?? 0) > 0
+        // gone, so the answer is the explanation; what is asserted is that SOMETHING happened,
+        // and that pressing it left the menu rather than stranding somebody there.
+        'start over: pressing it is never silent, and returns to the sheet',
+        result.retranscribeClick?.clicked === true &&
+          (result.retranscribeAfter?.count ?? 0) > 0 &&
+          result.retranscribeAfter?.backOnSheet === true
       ],
 
       // --- yes/no questions are asked in the page ----------------------------------------
@@ -2581,6 +3377,406 @@ async function main() {
           result.confirmAfterCancel?.stillHasWork === true
       ],
 
+      // =================================================================================
+      // NIGHT WAVE 2
+      // =================================================================================
+
+      // --- #14: undo and redo, visible ---------------------------------------------------
+      [
+        // ⌘Z has always worked and has always been invisible, which makes it a feature for
+        // people who already knew about it. Seeing that a mistake is undoable BEFORE making
+        // one is most of what makes an editable sheet feel safe to touch.
+        'undo/redo: a visible pair sits in the transport row',
+        result.undoPairAtRest?.undo?.present === true &&
+          result.undoPairAtRest?.redo?.present === true &&
+          result.undoPairAtRest?.inTransport === true &&
+          result.undoPairAtRest?.undo?.onScreen === true &&
+          result.undoPairAtRest?.redo?.onScreen === true
+      ],
+      [
+        // BOLD DRAWN ARROWS, not "↶". At 16px in the shell's UI font the text glyph is a
+        // hairline, sits off-centre, and is missing outright from some fallback fonts. This
+        // asserts real geometry — an <svg> with paths in it — and a stroke heavy enough to
+        // read as a button rather than as decoration.
+        'undo/redo: the arrows are drawn SVG, not thin text glyphs',
+        (() => {
+          const both = [result.undoPairAtRest?.undo, result.undoPairAtRest?.redo];
+          return both.every(
+            (b) => !!b && b.hasSvg === true && b.paths >= 2 && b.strokeWidth >= 2 && b.text === ''
+          );
+        })()
+      ],
+      [
+        // Wired to the real machinery, not to a stub: an edit lights Undo, pressing it puts
+        // the note back AND lights Redo, and pressing that re-applies it.
+        'undo/redo: the buttons act, and light in step with the stack',
+        result.undoPairAtRest?.undo?.disabled === true &&
+          result.undoPairAfterEdit?.undo?.disabled === false &&
+          result.undoPairUndoClick?.clicked === true &&
+          result.undoPairAfterUndo?.redo?.disabled === false &&
+          result.undoPairRedoClick?.clicked === true &&
+          result.undoPairAfterRedo?.redo?.disabled === true
+      ],
+      [
+        // Greyed at the ends rather than hidden. A control that vanishes takes the answer to
+        // "can I undo this?" away at exactly the moment somebody is asking it.
+        'undo/redo: they grey out at the ends of the stack instead of disappearing',
+        result.undoPairAtRest?.redo?.disabled === true &&
+          result.undoPairAtRest?.redo?.present === true &&
+          result.undoPairAfterRedo?.redo?.present === true
+      ],
+
+      // --- #15: the tempo unit, and the rate it must not change --------------------------
+      [
+        'tempo: the beat unit is drawn next to the BPM box',
+        typeof result.tempoUnit?.before?.unit === 'string' &&
+          /♩|♪|𝅝|𝅘𝅥𝅯|𝅘𝅥/.test(result.tempoUnit.before.unit) &&
+          /\/min$/.test(result.tempoUnit.before.unit)
+      ],
+      [
+        // 4/4 counts quarters, 6/8 counts eighths. The glyph follows the signature, and so
+        // does the NUMBER — printing "120" beside a ♪ would be out by a factor of two, since
+        // `tempoBpm` is quarter-notes per minute everywhere in this app.
+        //
+        // The expectation is computed from each side's OWN signature rather than hard-coded,
+        // so this stays a statement about the rule instead of about one fixture.
+        'tempo: changing the signature re-states the tempo in the new beat',
+        (() => {
+          const shownFor = (side) => {
+            if (!side || typeof side.storedBpm !== 'number') return null;
+            const d = Number((side.timeSig ?? '').split('/')[1]);
+            // Only the denominators the app names a beat for are scaled; anything else keeps
+            // the quarter, so the glyph and the number can never disagree.
+            const perQuarter = [1, 2, 4, 8, 16].includes(d) ? d / 4 : 1;
+            return Math.round(side.storedBpm * perQuarter);
+          };
+          const before = result.tempoUnit?.before;
+          const after = result.tempoUnit?.after;
+          return (
+            !!before && !!after &&
+            after.timeSig === '6/8' &&
+            before.unit !== after.unit &&
+            after.unit === '♪/min' &&
+            before.shownBpm === shownFor(before) &&
+            after.shownBpm === shownFor(after)
+          );
+        })()
+      ],
+      [
+        // THE CHECK THE BOARD ASKED FOR, and the answer is a schedule dump comparison rather
+        // than a stopwatch. `synthNotesFor()` is the exact list handed to the thing that makes
+        // sound, so two identical lists either side of a signature change is playback proving
+        // it did not move. It agrees with the static reading: `audio/transport.ts` contains no
+        // reference to a tempo or a signature at all, and every conversion divides 60 by
+        // `tempoBpm` and multiplies by 960 ticks per QUARTER, unconditionally.
+        // NOTE WHAT IS *NOT* ASSERTED: that `score.tempoBpm` stays put. It does not, and that
+        // is correct — the engraving tempo is a pipeline OUTPUT, re-derived for the new meter
+        // (96 quarters/min in 4/4 becomes 144 in 6/8 on this fixture, which is the same music
+        // barred differently). The claim worth making is about the sound, and the sound is
+        // this list: playback schedules absolute seconds computed from the performance, so it
+        // comes out identical to the microsecond.
+        'tempo: changing the signature does NOT change the playback schedule',
+        result.tempoUnit?.scheduleIdentical === true &&
+          (result.tempoUnit?.before?.schedule ?? []).length > 0 &&
+          result.tempoUnit?.restored === result.tempoUnit?.before?.timeSig
+      ],
+
+      // --- #16: a grid too coarse for the riff says so -----------------------------------
+      [
+        // The demo is a triplet figure. A 1/4 notation grid has nowhere to put the second and
+        // third note of each triplet, and what used to happen is that they silently merged —
+        // the only clue being that the sheet looked emptier than it should.
+        'grid: 1/4 on the triplet fixture says how many notes it would merge',
+        result.gridWarnSet?.set === true &&
+          result.gridWarnCoarse?.shown === true &&
+          /1\/4 would merge \d+ notes/.test(result.gridWarnCoarse?.text ?? '') &&
+          /too coarse for this riff/.test(result.gridWarnCoarse?.text ?? '')
+      ],
+      [
+        // The number is the pipeline's own arithmetic — engine notes minus engraved noteheads —
+        // not a guess, and not a constant. Checked two ways: it is a large fraction of the
+        // riff (a 1/4 grid cannot hold a triplet figure at all), and a grid that CAN hold it
+        // engraves that many more notes.
+        'grid: the count is the real difference between heard and engraved notes',
+        (() => {
+          const m = /would merge (\d+) notes/.exec(result.gridWarnCoarse?.text ?? '');
+          const lost = m ? Number(m[1]) : null;
+          const coarse = result.gridWarnCoarse?.engravedNotes;
+          const fine = result.gridWarnFine?.engravedNotes;
+          if (lost === null || typeof coarse !== 'number' || typeof fine !== 'number') return false;
+          // What the engine heard, reconstructed from the two numbers the page itself reported.
+          const heard = coarse + lost;
+          return (
+            lost >= 2 &&
+            // The rule the code applies: more than a tenth of the riff cannot be written.
+            lost > 0.1 * heard &&
+            // ...and a grid that CAN hold the figure recovers most of them.
+            fine > coarse &&
+            fine - coarse > 0.5 * lost
+          );
+        })()
+      ],
+      [
+        // Beside the control it is about. A warning one control away from its cause is a
+        // warning about nothing.
+        'grid: the line sits next to the grid control, and clears when the grid fits',
+        result.gridWarnCoarse?.nearGrid === true &&
+          result.gridWarnBefore?.shown === false &&
+          result.gridWarnFine?.shown === false
+      ],
+
+      // --- #7-web: what a card actually tells you ----------------------------------------
+      [
+        // Three lines, each answering a different question, in the order somebody comparing
+        // engines asks them. It used to be one run-on line that read as a single fact.
+        'engine cards: every card carries a detail block — strengths, cost, source',
+        (() => {
+          const cards = [
+            result.cardDetail?.basic,
+            result.cardDetail?.mu,
+            result.cardDetail?.bass,
+            result.cardDetail?.transkun
+          ];
+          return (
+            cards.every((c) => !!c) &&
+            cards.every((c) => /good at:/i.test(c.strengths ?? '')) &&
+            // Disk or memory, and how it gets here. Never empty.
+            cards.every((c) => (c.cost ?? '').length > 12) &&
+            cards.every((c) => /source:/i.test(c.source ?? ''))
+          );
+        })()
+      ],
+      [
+        // The licence is drawn only when the shell SENT one — never guessed from the URL,
+        // because "it is on GitHub" says nothing about the terms. The mock sends all four.
+        'engine cards: the source line names a licence',
+        (() => {
+          const cards = [
+            result.cardDetail?.basic,
+            result.cardDetail?.mu,
+            result.cardDetail?.bass,
+            result.cardDetail?.transkun
+          ];
+          return cards.every((c) => !!c && typeof c.license === 'string' && c.license.length > 2);
+        })()
+      ],
+      [
+        // The three RAM numbers, on the card of the engine they belong to. "small / medium /
+        // large" are three adjectives; these are what lets somebody with 8 GB decide, and they
+        // are exactly what `auto` is deciding with on their behalf.
+        'engine cards: MuScriptor shows what each model size costs in memory',
+        /small 0\.9 GB/.test(result.cardDetail?.mu?.ram ?? '') &&
+          /medium 1\.8 GB/.test(result.cardDetail?.mu?.ram ?? '') &&
+          /large 5 GB/.test(result.cardDetail?.mu?.ram ?? '')
+      ],
+      [
+        // The figures come from `engineStatus().models`, which carries `fits` — the auto rule's
+        // own answer about this machine. A size that cannot run here is SAID to be, rather than
+        // listed beside the ones that can and left to be chosen and wondered about. (The mock's
+        // machine has 8 GB, so `large` does not fit, which is the whole reason it models one.)
+        'engine cards: a model size this machine cannot run is named as such',
+        /large 5 GB \(too big for this machine\)/.test(result.cardDetail?.mu?.ram ?? '') &&
+          !/0\.9 GB \(too big/.test(result.cardDetail?.mu?.ram ?? '')
+      ],
+      [
+        // MOVED, not copied. The old row sat in the group above, named no engine, and applied
+        // to exactly one of the four — somebody running Basic Pitch could set "large" and watch
+        // nothing happen. Exactly one model select on the whole panel, and it is on the card.
+        'engine cards: the model chooser lives on MuScriptor’s card and nowhere else',
+        result.cardDetail?.mu?.hasModelSelect === true &&
+          result.cardDetail?.basic?.hasModelSelect === false &&
+          result.cardDetail?.bass?.hasModelSelect === false &&
+          result.cardDetail?.transkun?.hasModelSelect === false &&
+          result.cardDetail?.modelSelectsOnPanel === 1 &&
+          result.cardDetail?.modelSelectsInSetupGroup === 1
+      ],
+      [
+        // Cards are ~300px wide inside a panel that is a fixed column, and a <select> takes
+        // its intrinsic width from its longest option. Nothing in a card may push it sideways.
+        'engine cards: nothing in a card overflows it',
+        (() => {
+          const cards = [
+            result.cardDetail?.basic,
+            result.cardDetail?.mu,
+            result.cardDetail?.bass,
+            result.cardDetail?.transkun
+          ];
+          return cards.every((c) => !!c && c.scrollW <= c.clientW + 1);
+        })()
+      ],
+
+      // --- #13: "I already have this one" ------------------------------------------------
+      [
+        // A one-click card's Install button is 57 to 400 MB of download. For somebody who
+        // already has the package the app had nothing to say: the only door was Install.
+        'existing install: one-click cards offer it, the built-in one does not',
+        result.cardDetail?.bass?.hasUseExisting === true &&
+          result.cardDetail?.transkun?.hasUseExisting === true &&
+          result.cardDetail?.basic?.hasUseExisting === false &&
+          result.cardDetail?.mu?.hasUseExisting === false
+      ],
+      [
+        'existing install: it opens onto a sniff row and a path box',
+        result.existingOpen?.clicked === true &&
+          result.existingPanel?.hasSniff === true &&
+          result.existingPanel?.hasPath === true &&
+          result.existingPanel?.hasCheck === true
+      ],
+      [
+        // The sniff FILLS the box rather than adopting silently: you see where before anything
+        // is used, which is the difference between an answer and a surprise.
+        'existing install: “Look for it” reports a location and fills the box',
+        result.existingSniff?.clicked === true &&
+          /found/i.test(result.existingAfterSniff?.said ?? '') &&
+          (result.existingAfterSniff?.path ?? '').length > 3
+      ],
+      [
+        // A refusal has to say what was wrong. "No" on its own sends somebody back to guessing.
+        'existing install: a folder with no engine in it is refused, with a reason',
+        result.existingBadCheck?.clicked === true &&
+          result.existingAfterBad?.warned === true &&
+          /no runnable engine|there is no/i.test(result.existingAfterBad?.said ?? '') &&
+          result.existingAfterBad?.state === 'not-installed'
+      ],
+      [
+        // ...and a real one makes the card behave exactly as it does after an install: usable,
+        // removable, and no longer offering to be pointed anywhere.
+        'existing install: a working copy is adopted and the card becomes an installed one',
+        result.existingGoodCheck?.clicked === true &&
+          result.existingAfterGood?.state === 'installed' &&
+          result.existingAfterGood?.hasUninstall === true &&
+          result.existingAfterGood?.hasUseExisting === false
+      ],
+
+      // --- #20: the two switches, in plain speak -----------------------------------------
+      [
+        // "Even out the level before listening" describes the operation. Somebody who does not
+        // already know what normalisation is cannot tell whether they want it. Name the
+        // SITUATION first, then what the app will do about it.
+        'preprocessing: the switches name the problem, not the process',
+        /if your recording is quiet/i.test(result.preprocessCopy?.level ?? '') &&
+          /boost it so the engine hears it better/i.test(result.preprocessCopy?.level ?? '') &&
+          /if your instrument was tuned slightly off/i.test(result.preprocessCopy?.tuning ?? '') &&
+          /right pitches/i.test(result.preprocessCopy?.tuning ?? '')
+      ],
+      [
+        // Jargon that the old labels leaked. "A440" and "normalise" are correct and are not
+        // what a person reaching for this switch is thinking in.
+        'preprocessing: no jargon left in either label',
+        !/normali[sz]|a440|concert pitch|level\b/i.test(result.preprocessCopy?.level ?? '') &&
+          !/normali[sz]|a440|concert pitch/i.test(result.preprocessCopy?.tuning ?? '')
+      ],
+      [
+        // The receipt row survives the rewrite. "Corrected 14 cents flat" is a fact about
+        // somebody's own recording and the only place they can be told it.
+        'preprocessing: the receipt rows are still there',
+        (result.preprocessCopy?.levelNote ?? '').length > 20 &&
+          (result.preprocessCopy?.tuningNote ?? '').length > 20 &&
+          result.preprocessCopy?.receipt === true
+      ],
+
+      // --- #5-web: a refusal you can act on ----------------------------------------------
+      [
+        // "It is not Riffsheet's to stop" is a correct principle and, on its own, a dead end:
+        // the person reading it usually started that server themselves, can see it holding
+        // well over a gigabyte, and has just been told the app will not help.
+        'engine stop: “Left running” now carries a Stop it anyway button',
+        result.engineChipStop?.present === true &&
+          result.leftRunning?.hasStopAnyway === true &&
+          /left running/i.test((result.leftRunning?.texts ?? []).join(' ')) &&
+          /stop it anyway/i.test(result.leftRunning?.label ?? '')
+      ],
+      [
+        // And it works — through `stopExternalEngine`, which is a separate native call rather
+        // than a flag on the ordinary Stop, so nothing can reach it without the second press.
+        'engine stop: pressing it stops the borrowed listener',
+        result.stopAnywayClick?.clicked === true &&
+          /listener stopped/i.test((result.afterStopAnyway?.toasts ?? []).join(' '))
+      ],
+
+      // --- #10: choosing an engine transcribes with it -----------------------------------
+      [
+        // The old behaviour was to write the choice into engine.json and stop, which on a
+        // screen already showing a sheet is a control that does nothing visible.
+        'engine click: it asks before discarding edits, naming what will be lost',
+        result.engineClickPress?.clicked === true &&
+          result.engineClickDialog?.present === true &&
+          /listening again/i.test(result.engineClickDialog?.message ?? '') &&
+          /change/i.test(result.engineClickDialog?.message ?? '')
+      ],
+      [
+        // ...and then it actually listens. Counted at the BRIDGE, so this is "a transcription
+        // arrived" rather than "the app believes it sent one".
+        'engine click: confirming starts a fresh transcription with the engine just chosen',
+        result.engineClickConfirm?.clicked === true &&
+          typeof result.engineClickAfter?.transcribeCount === 'number' &&
+          result.engineClickAfter.transcribeCount > (result.engineClickBefore?.transcribeCount ?? 0) &&
+          result.engineClickAfter?.onSheet === true
+      ],
+
+      [
+        // THE BOARD'S CASE. Pressing an engine while one is listening used to be the quietest
+        // failure in the app: `retranscribe()` saw `progress !== null` and returned, so the
+        // press did nothing, said nothing, and left the old engine's reading on screen.
+        'engine click: pressing one while a job is running cancels it and starts a new reading',
+        result.engineBusyStart?.running === true &&
+          result.engineBusyBefore?.inFlight === true &&
+          result.engineBusyPress?.clicked === true &&
+          // Counted at the bridge: a job was abandoned mid-flight...
+          result.engineBusyAfter?.cancels > (result.engineBusyBefore?.cancels ?? 0) &&
+          // ...and a new one was started, not merely queued behind it.
+          result.engineBusyAfter?.transcribes > (result.engineBusyBefore?.transcribes ?? 0) &&
+          result.engineBusyAfter?.onSheet === true
+      ],
+
+      // --- #25: opening work that was left behind ----------------------------------------
+      [
+        // Silent restore is right exactly once — a DAW destroying the editor, where the work
+        // reappearing IS the fix — and wrong every other time. Open the plugin on a new track
+        // and last week's riff is on screen, apparently belonging to a project it has nothing
+        // to do with.
+        'resume: a boot with saved work asks instead of restoring silently',
+        result.resumePrompt?.promptOnFresh?.shown === true &&
+          /unfinished work/i.test(result.resumePrompt?.promptOnFresh?.message ?? '') &&
+          /resume previous work/i.test(result.resumePrompt?.promptOnFresh?.resumeLabel ?? '') &&
+          /start fresh/i.test(result.resumePrompt?.promptOnFresh?.freshLabel ?? '')
+      ],
+      [
+        // Fresh means fresh, in both senses: nothing restored, and nothing left waiting to ask
+        // the same question at the next boot.
+        'resume: Start fresh leaves no take and clears the stored copy',
+        result.resumePrompt?.pressedFresh === true &&
+          result.resumePrompt?.freshHasTake === false &&
+          result.resumePrompt?.blobClearedByFresh === true
+      ],
+      [
+        'resume: Resume previous work brings the take back',
+        result.resumePrompt?.pressedResume === true &&
+          result.resumePrompt?.promptOnResume?.shown === true &&
+          (result.resumePrompt?.savedNotes ?? 0) > 0 &&
+          (result.resumePrompt?.resumedNotes ?? 0) > 0
+      ],
+
+      [
+        // PROPORTIONAL, NOT WRAPPED (#11). Below the threshold the shell SCALES. It used to
+        // answer a narrow window by wrapping its bars into more rows, which spends the height
+        // that was already short on chrome — the opposite of what somebody dragging a window
+        // edge is asking for.
+        'layout: at 360x280 the shell scales down instead of wrapping',
+        typeof result.floor?.appZoom === 'number' && result.floor.appZoom < 1
+      ],
+      [
+        // The measurable half of the same claim: the header is ONE row at 900x600 and, at
+        // REAPER's 360x280 floor, has not multiplied. It is measured rather than asserted as
+        // one row because 360 px cannot hold a filename, five chips, an Export menu and a
+        // labelled gear on one line at any legible scale — what it must not do is answer a
+        // smaller window by spending more of it on chrome, which is exactly what wrapping did.
+        'layout: narrowing the window scales the shell rather than multiplying the chrome',
+        typeof result.narrow?.header?.h === 'number' &&
+          typeof result.floor?.header?.h === 'number' &&
+          result.narrow.headerRows <= 3 &&
+          result.floor.header.h <= result.narrow.header.h * 2
+      ],
       ['900x600: no horizontal overflow', !!result.narrow && result.narrow.docScrollW <= result.narrow.innerW + 1],
       ['900x600: header buttons on screen', !!result.narrow && result.narrow.maxHeaderButtonRight <= 900],
       ['900x600: tri-view still drawn', !!result.narrow && result.narrow.svg > 0 && result.narrow.names > 0],
@@ -2630,7 +3826,26 @@ async function main() {
           result.zoomBefore.pxPerSemitone !== result.zoomAfterWheel.pxPerSemitone
       ],
       [
-        'piano roll: Reset view fits the pitch range again',
+        // ZOOM WITH NO MODIFIER, over the ruler. The row height has to actually change.
+        'zoom: a plain wheel over the pitch ruler zooms it',
+        !!result.zoomAfterWheel && !!result.zoomAfterGutterWheel &&
+          result.zoomAfterGutterWheel.pxPerSemitone !== result.zoomAfterWheel.pxPerSemitone
+      ],
+      [
+        // A VISIBLE control, for a mouse with no wheel and for anybody who never discovers a
+        // gesture. Pressed for real, and the row height has to move.
+        'zoom: the +/- control is on screen and works',
+        result.zoomButtons?.inButton === true && result.zoomButtons?.outButton === true &&
+          typeof result.zoomAfterButton?.before === 'number' &&
+          result.zoomAfterButton?.after !== result.zoomAfterButton?.before
+      ],
+      [
+        // RETIRED. Both chips are gone from the bar; their job is the double-click below.
+        'zoom: the Fit and Reset view chips are retired',
+        result.zoomButtons?.retiredFit === false && result.zoomButtons?.retiredReset === false
+      ],
+      [
+        'zoom: a double-click on the ruler fits the pitch range again',
         !!result.zoomAfterReset && result.zoomAfterReset.fitLocked === true
       ],
 
@@ -2878,9 +4093,24 @@ async function main() {
       [
         // The two strips are one timeline. Same pixel, same second, or a note stops sitting
         // over the sound that made it — which is the whole reason this pane exists.
+        // Was: click the roll at x, then the strip at x, and compare where the transport
+        // landed. That worked while both panes always showed the whole take. It cannot survive
+        // Align, because the first click SEEKS — which takes the sheet with it, which moves the
+        // shared window — so the second click is answering a different question by the time it
+        // is asked. Both rulers are now interrogated at the same instant instead, which is a
+        // stricter statement of the same claim and has no gesture in it to perturb anything.
         'piano roll: the same x on the waveform means the same second',
-        result.sharedRuler?.rollSeek !== null && result.sharedRuler?.waveSeek !== null &&
-          Math.abs(result.sharedRuler.rollSeek - result.sharedRuler.waveSeek) < 0.02
+        typeof result.sharedRuler?.rollMidSec === 'number' &&
+          typeof result.sharedRuler?.waveMidSec === 'number' &&
+          Math.abs(result.sharedRuler.rollMidSec - result.sharedRuler.waveMidSec) < 0.02
+      ],
+      [
+        // ...and with Align on, that shared second is the sheet's, not an accident of both
+        // panes happening to draw the whole take.
+        'align: the roll and the strip are given the SAME window',
+        result.sharedRuler?.rollWindow === null
+          ? result.sharedRuler?.waveWindow === null
+          : Math.abs((result.sharedRuler?.rollWindow ?? 0) - (result.sharedRuler?.waveWindow ?? -1)) < 0.001
       ],
       ['piano roll: chip collapses the pane', !!result.rollOff && !result.rollOff.visible && result.rollOff.paneHeight < 40],
       ['piano roll: chip brings it back', !!result.rollBackOn && result.rollBackOn.visible && (result.rollBackOn.roll?.notes ?? 0) > 0],
@@ -3110,6 +4340,57 @@ async function main() {
         // something (raw PCM, most likely) had leaked into the blob.
         'session: the blob is small enough to live in a project file',
         !!result.persist && result.persist.blobBytes > 500 && result.persist.blobBytes < 2_000_000
+      ],
+
+      // --- .riffsheet documents: the four things Save as has to carry -------------------
+      // A document is the portable form of a session, so it owes the user the same four
+      // things: the take it is OF, the performed notes, the edits, and the settings. Three
+      // were carried and the audio reference was not — the loader replaced it with a MIDI
+      // stub, which silently killed the fader's Original side and Listen again on every
+      // reopen. The session probe above could not catch it: the BLOB carries `audio`, only
+      // the document did not.
+      [
+        'document: a saved take names the recording it came from',
+        !!result.document &&
+          !result.document.error &&
+          result.document.syntheticAudio?.kind === 'file' &&
+          result.document.syntheticAudio?.path === '/takes/probe take.wav' &&
+          result.document.syntheticAudio?.durationSec === 12.5
+      ],
+      [
+        // The two volatile handles name a decode inside the process that wrote the file.
+        // Written into a document they are worse than absent: `reopenOriginal` tries the
+        // dead token first and the path that would have worked second.
+        // Gated on the reference actually being there: "no token in the file" is trivially
+        // true of a file that names no take at all, which is precisely the bug this pair
+        // of checks exists to keep out.
+        'document: the process-local audio handles are not written to disk',
+        !!result.document && result.document.syntheticAudio?.name === 'take.wav' && result.document.tokenInBytes === false
+      ],
+      [
+        'document: the performed notes travel, so a reopen never re-listens',
+        !!result.document && result.document.performedNotes > 0 && result.document.performedNotesMatchLive === true
+      ],
+      [
+        // Both halves: the log AND where the user is in it. They differ here because the
+        // persistence probe wound the cursor back, which is the case a single length
+        // comparison would pass while losing every undo.
+        'document: the edit log and the undo cursor both travel',
+        !!result.document &&
+          result.document.edits === result.document.liveEdits &&
+          result.document.edits > 0 &&
+          result.document.editCursor === result.document.liveEditCursor
+      ],
+      [
+        'document: the settings the sheet was engraved with travel',
+        !!result.document && result.document.settingsMatch === true && result.document.settingsKeys > 10
+      ],
+      [
+        // An additive optional field must NOT move the version. The reader rejects any
+        // version it does not recognise, so a bump would make every document written
+        // before it unopenable — a worse bug than the one being fixed.
+        'document: adding the audio reference did not orphan older documents',
+        !!result.document && result.document.version === 1
       ],
 
       // --- About: support the makers ---------------------------------------------------
@@ -3431,9 +4712,8 @@ async function main() {
       [
         // Keep clears the highlight and leaves the notes alone. The chip goes with the last
         // unreviewed edit — a chip reading "0 auto edits" is chrome about nothing.
-        // The APPLIED marks go; the attention marks stay. A thing the pass NOTICED and did
-        // not act on is not the player's to review, and clearing it on a Keep would throw away
-        // the half of the feature that works with the setting switched off.
+        // There is only one kind of mark now (#24), so "the highlight" is unambiguous: the
+        // applied edit's halo, which reviewing it clears.
         'auto edits: Keep clears the highlight and hides the chip',
         !!result.autoKeep && result.autoKeep.afterReview?.rollMarksApplied === 0 &&
           result.autoKeep.afterReview.waveApplied === 0 &&
@@ -3460,12 +4740,20 @@ async function main() {
         !!result.autoBefore && result.autoBefore.enabled === true
       ],
       [
-        // OFF must still SHOW. "Do not touch my notes" is a different instruction from "do not
-        // tell me", and the useful half of the feature is the app no longer disagreeing with
-        // itself in silence.
-        'auto edits: switched off, it highlights without editing',
+        // #24, AND IT REVERSES WHAT THIS CHECK USED TO ASSERT. It used to demand that the
+        // switched-off pass still HIGHLIGHTED what it had noticed — "do not touch my notes" is
+        // a different instruction from "do not tell me". That argument is true and the result
+        // was not worth it: every take came back speckled with yellow marks on notes that were
+        // correct, which the player could neither act on nor clear, and the cost was paid by
+        // the green marks — the ones that mean "the app changed this" — which the eye learned
+        // to skim past with the rest.
+        //
+        // So off now means off: no edits, no marks on either view, no chip. The pass still
+        // RUNS and still records its refusals (`attention` is asserted to be non-zero, which
+        // is what proves the guardrails fired at all) — it simply has no ink.
+        'auto edits: switched off, nothing is marked at all',
         !!result.autoOff && result.autoOff.applied === 0 && result.autoOff.attention > 0 &&
-          result.autoOff.rollMarks + result.autoOff.waveRegions > 0 &&
+          result.autoOff.rollMarks === 0 && result.autoOff.waveRegions === 0 &&
           result.autoOff.chipShown === false && result.autoOff.notesUnchanged === true
       ],
 
@@ -3532,7 +4820,7 @@ async function main() {
       [
         'custom tuning: the printed tuning follows it',
         !!result.customTuning && result.customTuning.summaryChanged === true &&
-          /Tuning low/.test(result.customTuning.dropped?.summary ?? '')
+          /^[A-G]/.test(result.customTuning.dropped?.summary ?? '')
       ],
       [
         'custom tuning: a five-string tuning gives the tab five strings',

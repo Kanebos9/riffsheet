@@ -89,6 +89,13 @@ int estimatedResidentMb (const juce::String& model)
     return 1800;                          // medium, and the safe assumption
 }
 
+bool fitsInPhysicalRam (const juce::String& model, int ramTotalMb)
+{
+    // estimate <= 40% of physical, written as integers so there is no floating
+    // point in a rule the UI quotes back to the user: e * 5 <= t * 2.
+    return ramTotalMb <= 0 || estimatedResidentMb (model) * 5 <= ramTotalMb * 2;
+}
+
 //==============================================================================
 Choice chooseAutomatically (const juce::StringArray& installed, int ramTotalMb, int ramFreeMb)
 {
@@ -111,7 +118,7 @@ Choice chooseAutomatically (const juce::StringArray& installed, int ramTotalMb, 
     juce::StringArray affordable;
 
     for (const auto& size : candidates)
-        if (ramTotalMb <= 0 || estimatedResidentMb (size) * 5 <= ramTotalMb * 2)
+        if (fitsInPhysicalRam (size, ramTotalMb))
             affordable.add (size);
 
     if (affordable.isEmpty())

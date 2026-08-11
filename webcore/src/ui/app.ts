@@ -40,7 +40,9 @@ import {
   rollEditNoteIds,
   setTransientReserve,
   type RollVerticalView,
+  TIMELINE_GUTTER_PX,
   type PianoRollLiveModel,
+  type TimeAnchor,
   type RollEdit,
   type SheetMap
 } from '../view/pianoroll';
@@ -59,7 +61,9 @@ import { selfTest as pitchSelfTest } from '../audio/pitch';
 import { detectOnsets, type OnsetResult } from '../audio/onsets';
 import { soundingMidi } from '../score/fromPipeline';
 import { midiToName } from '../score/notes';
-import { TUNING_PRESETS, parseTuning, tuningLabel } from '../score/tuning';
+import { TUNING_PRESETS, customTuning, parseTuning, tuningById, tuningLabel } from '../score/tuning';
+import { transcribeRiffsheet } from '../audio/riffsheetEngine';
+import { RIFFSHEET_ENGINE_ID } from '../bridge/types';
 import { SettingsPanel, chipGroup, soundPicker } from './settings';
 import { findTrim, computePeaks } from '../audio/trim';
 import { isMidiFile, parseMidi } from '../import/midiFile';
@@ -77,6 +81,7 @@ import { schedulePad } from '../audio/pad';
 import { dropTunedRiff, straightRiff, tripletRiff } from '../score/fixtures';
 import {
   createStores,
+  FINGERING_STYLES,
   forgetRecent,
   loadRecent,
   mergeStoredSettings,
@@ -95,6 +100,7 @@ import {
   encodeSource,
   hasRestorableTake,
   isRiffsheetFile,
+  portableAudioRef,
   readRiffsheetDocument,
   RIFFSHEET_DOCUMENT_VERSION,
   writeRiffsheetDocument,
@@ -129,6 +135,28 @@ import {
 const PEAK_BUCKETS = 20000;
 /** alphaTab's internal ticks per quarter note (MidiUtils.QuarterTime). */
 const ALPHATAB_QUARTER_TICKS = 960;
+
+/**
+ * The undo and redo arrows, drawn rather than typed.
+ *
+ * `↶`/`↷` were the obvious first answer and they are wrong here: at 16px in the shell's UI
+ * font they come out as a hairline a couple of pixels tall, sit off-centre in the button box,
+ * and are missing outright from some fallback fonts — a control that is sometimes an empty
+ * square. These are two paths at a 2.6px stroke in `currentColor`, so they inherit the chip
+ * colour, the hover colour and the disabled colour with no extra styling, and they are the
+ * same visual weight as the glyphs on the play and stop buttons beside them.
+ *
+ * `stroke-linecap="round"` on both: the arrowhead and the tail meet at the same radius the
+ * chips are rounded to, which is what stops the pair reading as clip art next to them.
+ */
+const UNDO_SVG =
+  '<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" ' +
+  'stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false">' +
+  '<path d="M4 9h11a5 5 0 0 1 0 10h-4"/><polyline points="8 5 4 9 8 13"/></svg>';
+const REDO_SVG =
+  '<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" ' +
+  'stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false">' +
+  '<path d="M20 9H9a5 5 0 0 0 0 10h4"/><polyline points="16 5 20 9 16 13"/></svg>';
 const OPEN_FILE_ACCEPT = [
   'audio/*',
   '.mid,.midi',
@@ -150,11 +178,55 @@ export function mountApp(root: HTMLElement): void {
  * without a DAW. A fresh App reads the persisted blob through the same bridge the real one
  * writes it to, so the round trip under test is the real one. See `__RIFFSHEET_PERSIST__`.
  */
-export async function bootSecondApp(root: HTMLElement): Promise<{ probe: () => unknown }> {
+export async function bootSecondApp(
+  root: HTMLElement,
+  options: { autoResume?: boolean } = {}
+): Promise<{ probe: () => unknown; root: HTMLElement }> {
   const app = new App(root);
-  await app.start({ secondary: true });
-  return { probe: () => app.sessionProbe() };
+  // `autoResume` skips the "Resume previous work / Start fresh" prompt. The persistence probe
+  // passes it because what that one is testing is the blob round trip; the resume probe does
+  // NOT, because the prompt is the thing it is testing.
+  await app.start({ secondary: true, autoResume: options.autoResume === true });
+  return { probe: () => app.sessionProbe(), root };
 }
+
+/**
+ * The fret counts real instruments have, for the "Highest fret" picker.
+ *
+ * A list rather than a free number box because this is a fact about somebody's instrument and
+ * there are only so many answers: a short-scale bass stops at 20, a Strat at 21 or 22, a
+ * shredder's neck at 24. The stored value is carried in whatever it is, on the same reasoning
+ * as the time-signature picker in `ui/app.ts` — a `<select>` that cannot show its own value
+ * silently snaps to the first option and reads as if the app had thrown the setting away.
+ */
+const FRET_COUNTS: readonly number[] = [12, 15, 17, 19, 20, 21, 22, 24];
+
+function fretCountOptions(current: number): number[] {
+  const list = [...FRET_COUNTS];
+  if (Number.isFinite(current) && current > 0 && !list.includes(current)) list.push(current);
+  return list.sort((a, b) => a - b);
+}
+
+/** What each fingering style is called on screen. */
+const FINGERING_LABELS: Record<AppSettings["fingering"], string> = {
+  "low-positions": "Low positions",
+  "minimize-movement": "Least movement",
+  "open-strings": "Open strings first",
+  "around-fret": "Around fret N"
+};
+
+/**
+ * How long the aligned window is held after a rebuild, in ms.
+ *
+ * Long enough to cover the re-engrave and the two or three viewport events it fires, short
+ * enough that the player's next deliberate scroll is never the one that gets swallowed. It is a
+ * quiet period, not a lock: nothing happens when it expires, and the window simply starts
+ * following the sheet again on the next scroll.
+ */
+const ALIGN_HOLD_MS = 1500;
+
+/** How much the sheet may move during a rebuild before it counts as the player scrolling. */
+const ALIGN_HOLD_SLOP_PX = 8;
 
 class App {
   private root: HTMLElement;
@@ -164,6 +236,14 @@ class App {
   private runtime: Store<RuntimeState>;
   private transport: Transport;
   private undoStack = new UndoStack();
+  /** ALIGN: the stretch of recording the roll and the strip are showing. Null = whole take. */
+  private alignedWindow: { fromSec: number; toSec: number } | null = null;
+  /** While `performance.now()` is under this, the window is a memory. See §syncViewports. */
+  private alignHoldUntil = 0;
+  /** The ruler those two numbers came out as. Held with them, and pushed to both panes. */
+  private alignedAnchors: TimeAnchor[] | null = null;
+  /** Where the sheet was when the hold opened, so a real scroll can end it early. */
+  private alignHoldScrollLeft = 0;
 
   private triview: TriView | null = null;
   private waveform: WaveformStrip | null = null;
@@ -237,6 +317,15 @@ class App {
    * chip in it and implying a choice nobody has.
    */
   private engineList: EngineListResult | null = null;
+  /**
+   * The engine one refused take is being handed to, for that take only.
+   *
+   * Set when Riffsheet's own engine bows out (a chord, or nothing it could hear), read once by
+   * `transcribeOptions()`, and cleared in `runTranscription`'s `finally`. It holds the id the
+   * SHELL named rather than one derived here, so the engine the toast promised is the engine
+   * that actually listens.
+   */
+  private fallbackEngineId: string | null = null;
   /** The stretch of the RECORDING the player is asking about, if any. */
   private selection: { fromSec: number; toSec: number } | null = null;
   /** A waveform selection opens the audio-check dock; note highlighting alone does not. */
@@ -263,7 +352,10 @@ class App {
       getSourceMidi: () => this.sourceMidi,
       getBaseName: () => this.baseName(),
       isPlugin: () => this.runtime.get().host?.isPlugin ?? false,
-      toast: (kind, title, message) => this.toast(kind, title, message)
+      toast: (kind, title, message) => this.toast(kind, title, message),
+      // The .riffsheet document joins the other three in the Export menu. Only this file can
+      // serialise it, so it is handed over rather than moved.
+      saveDocument: () => void this.saveRiffsheetDocument()
     });
   }
 
@@ -273,7 +365,7 @@ class App {
    * would otherwise be re-pointed at the clone) and ignores `?demo=`, so it takes the same
    * boot path a reopened plugin editor takes. Only `bootSecondApp` passes it.
    */
-  async start(options?: { secondary?: boolean }): Promise<void> {
+  async start(options?: { secondary?: boolean; autoResume?: boolean }): Promise<void> {
     this.renderOpening();
     if (!options?.secondary) {
       this.installGlobalHandlers();
@@ -326,7 +418,7 @@ class App {
     // Nothing above this point can put a take on screen, so a restore cannot fight with
     // one. It is awaited: the drop zone is already rendered, and a session that arrives
     // after the user has started dropping a file would be worse than a slightly later boot.
-    await this.restoreSession();
+    await this.restoreSession({ auto: options?.autoResume === true });
   }
 
   // =========================================================================
@@ -354,7 +446,7 @@ class App {
   }
 
   /**
-   * Choose an engine from the main menu.
+   * Choose an engine from the main menu, and then USE it.
    *
    * A chip for something that is not installed selects it AND jumps to its card, because
    * "selected, and doing nothing visible" is the worst of the three possible outcomes: the
@@ -362,17 +454,83 @@ class App {
    * that is explained and where the Install button lives.
    */
   private async pickEngine(id: string): Promise<void> {
+    const refusal = await this.chooseEngine(id);
+    if (refusal) this.toast('info', 'Engine', refusal);
+    this.renderOpening();
+  }
+
+  /**
+   * CHOOSING AN ENGINE MEANS TRANSCRIBING WITH IT.
+   *
+   * The old behaviour was to write the choice into `engine.json` and stop. On the main menu,
+   * with nothing open, that is defensible. On a screen already showing a sheet it is a control
+   * that does nothing visible: the take on screen was written by the old engine, stays exactly
+   * as it was, and the only way to find out whether the new one is any better was to hunt down
+   * "Listen again". Every press of a card now ends in one of three things happening, and never
+   * in silence:
+   *
+   *   - a fresh transcription with the engine just chosen;
+   *   - a sentence saying why not (nothing open, no recording behind this take, the shell
+   *     refused the change);
+   *   - the engine's own card, when what it needs is installing rather than running.
+   *
+   * ORDER MATTERS AND IS NOT NEGOTIABLE. Ask about unsaved work first — it is the only step
+   * that can still be cancelled. Then cancel the running job, because `selectEngine` refuses
+   * while anything on this machine is transcribing (BRIDGE.md §3.1) and doing this the other
+   * way round produces a refusal the player caused by pressing the button. Then store the
+   * choice. Then listen.
+   *
+   * Returns a refusal to show, or null when the choice went through.
+   */
+  private async chooseEngine(id: string): Promise<string | null> {
     const engine = this.engineList?.engines.find((e) => e.id === id);
     const needsSetup = !!engine && engine.state !== 'ready' && engine.state !== 'installed';
+    const rt = this.runtime.get();
+    const canListen = !!rt.source?.detected && !!this.audioRef && this.audioRef.kind !== 'midi';
 
+    // 1. The one question that can still be answered "no". Only asked when there is something
+    //    to lose AND we are actually going to re-listen; a choice made from the main menu with
+    //    nothing open discards nothing.
+    if (canListen && !needsSetup) {
+      const edits = this.editCursor + 1 + this.perfIndex;
+      if (edits > 0) {
+        const name = engine?.name ?? 'that engine';
+        const ok = await this.askConfirm(
+          `Listening again with ${name} will replace the notes with a fresh reading, and the ${edits} ` +
+            `change${edits === 1 ? '' : 's'} you have made will go with them. Carry on?`,
+          'Listen again'
+        );
+        if (!ok) return null;
+      }
+    }
+
+    // 2. Get out of the shell's way before asking it to change anything.
+    if (rt.progress !== null) await this.bridge.transcribeCancel?.().catch(() => undefined);
+
+    // 3. Store it.
     this.settings.set({ engineId: id });
     const result = await this.bridge.selectEngine?.(id).catch(() => null);
-    if (result && !result.ok) {
-      this.toast('info', 'Engine', result.error ?? 'The engine could not be changed.');
-    }
     await this.loadEngines();
-    this.renderOpening();
-    if (needsSetup) this.openEngineSetup(id);
+    if (result && !result.ok) return result.error ?? 'The engine could not be changed.';
+
+    // 4. And use it — or say, in one sentence, why this press could not end in a transcription.
+    if (needsSetup) {
+      this.openEngineSetup(id);
+      return null;
+    }
+    if (!rt.source) {
+      return `${engine?.name ?? 'That engine'} will do the listening. Open a recording and it will be used.`;
+    }
+    if (!canListen) {
+      return `${engine?.name ?? 'That engine'} will do the listening from now on. This take has no recording behind it to re-read.`;
+    }
+
+    // Onto the sheet BEFORE it starts. The chip that was just pressed may have been on the
+    // main menu, and a transcription running behind a menu is a wait with nothing to watch —
+    // the progress row, the engine chip and the notes appearing are all on the other screen.
+    if (this.runtime.get().screen !== 'main') this.resumeCurrentWork();
+    await this.retranscribe({ confirmed: true });
+    return null;
   }
 
   /**
@@ -566,7 +724,29 @@ class App {
             el('div', {}, el('strong', { text: rt.source?.name ?? 'Current work' }), el('div', { class: 'dim', text: 'Your current work is still open.' })),
             el('div', { class: 'row' },
               el('button', { class: 'primary', text: 'Resume current work', 'data-role': 'resume-current', onClick: () => this.resumeCurrentWork() }),
-              el('button', { text: 'Save as Riffsheet', 'data-role': 'save-riffsheet-as', onClick: () => void this.saveRiffsheetDocument() }),
+              // "Save as Riffsheet" moved into the Export menu in the header, with the other
+        // three ways a file leaves Riffsheet. It was the only one living somewhere else.
+        null,
+              // START OVER, and it says so. This is what the header's "Listen again" became:
+              // the same call, moved to where the other irreversible choices live and named
+              // for what it costs rather than for what it does. Offered whenever there is a
+              // RECORDING behind the take — `peaks` is what that means; a MIDI import has
+              // none and re-running an engine on it would be theatre.
+              //
+              // It is NOT hidden when the audio handle has gone missing. That was the old
+              // bug: the handle is dropped whenever the original cannot be re-opened, so the
+              // button deleted itself in exactly the situation somebody would reach for it.
+              // It stays, and `retranscribe()` explains — a control that says what is wrong
+              // beats one that disappears.
+              rt.source?.detected &&
+                rt.source.peaks &&
+                this.audioRef?.kind !== 'midi' &&
+                el('button', {
+                  text: '↻ Start over (re-transcribe)',
+                  'data-role': 'retranscribe-menu',
+                  title: t(TIPS.retranscribe),
+                  onClick: () => void this.retranscribeFromMenu()
+                }),
               el('button', { class: 'danger-text', text: 'Close current work', 'data-role': 'close-current', onClick: () => void this.closeCurrentWork() })
             )
           ),
@@ -628,6 +808,20 @@ class App {
     );
   }
 
+  /**
+   * Start over from the Main menu: re-read the recording, then go back to the sheet.
+   *
+   * The menu is not where anybody wants to watch a progress bar, so this returns to the sheet
+   * first and the transcription runs against the view it is changing. `retranscribe()` still
+   * owns the questions — unsaved edits, a missing handle — because they are the same questions
+   * wherever the gesture starts.
+   */
+  private async retranscribeFromMenu(): Promise<void> {
+    if (!this.runtime.get().source) return;
+    this.resumeCurrentWork();
+    await this.retranscribe();
+  }
+
   private resumeCurrentWork(): void {
     if (!this.runtime.get().source) return;
     this.blankSetupOpen = false;
@@ -663,7 +857,22 @@ class App {
    * pressed. Escape and a click on the backdrop both mean cancel, which is the safe answer for
    * every question asked through here.
    */
-  private askConfirm(message: string, confirmText = 'Continue'): Promise<boolean> {
+  private askConfirm(
+    message: string,
+    confirmText = 'Continue',
+    /**
+     * What the OTHER button says, and what it means.
+     *
+     * "Cancel" is right for a question about doing something irreversible, and wrong for a
+     * question with two real answers — "Resume previous work" against "Start fresh" is a fork,
+     * not a warning, and labelling one side Cancel would make the safe-looking button the one
+     * that throws the work away. `dismissIs` says which answer Escape and a click on the
+     * backdrop give, so a fork can default to the conservative side rather than to `false`.
+     */
+    options: { cancelText?: string; dismissIs?: boolean; role?: string } = {}
+  ): Promise<boolean> {
+    const cancelText = options.cancelText ?? 'Cancel';
+    const dismissIs = options.dismissIs ?? false;
     return new Promise<boolean>((resolve) => {
       let done = false;
       const finish = (value: boolean) => {
@@ -676,7 +885,7 @@ class App {
       const onKey = (e: KeyboardEvent) => {
         if (e.key === 'Escape') {
           e.preventDefault();
-          finish(false);
+          finish(dismissIs);
         }
       };
       const overlay = el(
@@ -684,10 +893,14 @@ class App {
         {
           class: 'modal-backdrop',
           'data-role': 'confirm-dialog',
+          // A second name for the same element when the caller wants one it can find
+          // unambiguously — there is only ever one dialog on screen, but "the resume prompt"
+          // and "some confirm" are different claims for a check to make.
+          ...(options.role ? { 'data-dialog': options.role } : {}),
           role: 'dialog',
           'aria-modal': 'true',
           onClick: (e: MouseEvent) => {
-            if (e.target === e.currentTarget) finish(false);
+            if (e.target === e.currentTarget) finish(dismissIs);
           }
         },
         el(
@@ -697,7 +910,7 @@ class App {
           el(
             'div',
             { class: 'confirm-actions' },
-            el('button', { text: 'Cancel', 'data-role': 'confirm-cancel', onClick: () => finish(false) }),
+            el('button', { text: cancelText, 'data-role': 'confirm-cancel', onClick: () => finish(false) }),
             el('button', {
               class: 'primary',
               text: confirmText,
@@ -911,12 +1124,19 @@ class App {
     this.rebuildNotation({ keepEdits: false });
   }
 
-  private async saveRiffsheetDocument(): Promise<void> {
+  /**
+   * The document the Save-as button would write, built but not saved.
+   *
+   * Split out from `saveRiffsheetDocument` so `__RIFFSHEET_DOCUMENT__` can round-trip the
+   * REAL thing. A probe that assembled its own object would keep passing after this one
+   * stopped carrying a field.
+   */
+  private buildRiffsheetDocument(): RiffsheetDocument | null {
     const source = this.runtime.get().source;
-    if (!source) return;
+    if (!source) return null;
     const encoded = encodeSource(source);
-    if (!encoded) return;
-    const document: RiffsheetDocument = {
+    if (!encoded) return null;
+    return {
       app: 'riffsheet-document',
       version: RIFFSHEET_DOCUMENT_VERSION,
       savedAt: Date.now(),
@@ -925,8 +1145,18 @@ class App {
       settings: this.settings.get(),
       edits: this.editLog,
       editCursor: this.editCursor,
-      sourceMidi: this.sourceMidi ? bytesToBase64(this.sourceMidi) : undefined
+      sourceMidi: this.sourceMidi ? bytesToBase64(this.sourceMidi) : undefined,
+      // Which take this is OF. Without it the document reopens as a sheet with no recording
+      // behind it: the fader has nothing on its Original side and Listen again is dead.
+      // `portableAudioRef` drops the token and the sample URL, which name a decode inside the
+      // process that wrote the file and are a lie anywhere else.
+      audio: portableAudioRef(this.audioRef)
     };
+  }
+
+  private async saveRiffsheetDocument(): Promise<void> {
+    const document = this.buildRiffsheetDocument();
+    if (!document) return;
     try {
       const outcome = await this.bridge.exportFile(
         `${this.baseName() || 'Untitled'}.riffsheet`,
@@ -945,19 +1175,32 @@ class App {
     if (!source) throw new Error('That Riffsheet document has no score data.');
     this.settings.set(mergeStoredSettings(document.settings));
     this.setSource({ ...source, name: document.name || name.replace(/\.riffsheet$/i, '') });
-    this.audioRef = { kind: 'midi', name, path: '', durationSec: source.durationSec };
+    // A document made before documents carried a take, or made from a symbolic import, still
+    // gets the old stub: no audio, and everything that depends on audio correctly switched off.
+    this.audioRef = document.audio ?? { kind: 'midi', name, path: '', durationSec: source.durationSec };
     try {
       this.sourceMidi = document.sourceMidi ? base64ToBytes(document.sourceMidi) : null;
     } catch {
       this.sourceMidi = null;
     }
+    // Drop whatever the PREVIOUS take left loaded BEFORE trying to reopen this one. Reversing
+    // these two would leave the last recording audible under the newly opened sheet on every
+    // path where the reopen fails, which is most of them — a moved file, another machine.
     this.setPcm(null, 0);
     await this.bridge.unloadOriginal?.().catch(() => undefined);
     await this.bridge.pcmRetain?.(null).catch(() => undefined);
-    this.transport.setOriginalAvailable(false, source.durationSec);
+
+    // The same recovery the session restore uses: token first, then path. It answers rather
+    // than throws for every way this can fail, so a missing recording still opens the sheet.
+    const original = await this.reopenOriginal(this.audioRef);
+    this.transport.setOriginalAvailable(original.available, source.durationSec);
+
     this.goMain(source.name);
     this.rebuildNotation({ keepEdits: false });
     this.replayEdits(document.edits, document.editCursor);
+    // Only when the document named a take and it could not be found. Silence would leave them
+    // wondering why the Original side of the fader does nothing.
+    if (original.message) this.toast('info', 'Opened without the recording', original.message);
   }
 
   // =========================================================================
@@ -1558,12 +1801,18 @@ class App {
    * Everything the player has done since is discarded, because it was made against notes that
    * are about to be replaced — so this asks first.
    */
-  private async retranscribe(): Promise<void> {
+  private async retranscribe(opts: { confirmed?: boolean } = {}): Promise<void> {
     const rt = this.runtime.get();
     const source = rt.source;
     const audio = this.audioRef;
     if (!source) return;
-    if (rt.progress !== null) return;
+    // A job already running is CANCELLED rather than a reason to do nothing. This used to be a
+    // bare `return`, which is the same silent no-op the engine cards had: press the control
+    // while the previous run is still going and nothing at all happens, including no
+    // explanation. Whoever pressed it wants this reading, not the one in flight.
+    if (rt.progress !== null) {
+      await this.bridge.transcribeCancel?.().catch(() => undefined);
+    }
     // The handle is gone: a restore that could not re-open the original, or a file that has
     // moved since. This used to be a silent `return` behind a button that had already removed
     // itself, so the whole feature simply evaporated. Say so instead.
@@ -1576,8 +1825,11 @@ class App {
       return;
     }
 
+    // `confirmed` is set by `chooseEngine()`, which has already asked this exact question and
+    // named the engine in it. Asking twice for one gesture is how a confirm dialog gets
+    // trained out of being read.
     const edits = this.editCursor + 1 + this.perfIndex;
-    if (edits > 0) {
+    if (edits > 0 && !opts.confirmed) {
       const ok = await this.askConfirm(
         `Listening again will replace the notes with a fresh reading, and the ${edits} ` +
           `change${edits === 1 ? '' : 's'} you have made will go with them. Carry on?`,
@@ -1754,31 +2006,31 @@ class App {
    */
   private expectedMidiAt(audioSec: number): number | null {
     const score = this.runtime.get().score;
-    const index = this.triview?.scoreIndex;
-    const model = this.triview?.model;
-    if (!score || !index || !model) return null;
+    if (!score) return null;
 
-    const writtenSec = audioSec - this.originSec(score);
-    const secPerTick = 60 / (score.tempoBpm || 100) / ALPHATAB_QUARTER_TICKS;
+    // THE PERFORMED LAYER, NOT THE ENGRAVED ONE.
+    //
+    // This used to walk the alphaTab graph and use `beat.absolutePlaybackStart` — the WRITTEN
+    // position, the one the quantizer rounded onto a grid line. The player's click is on the
+    // recording, and the two disagree by exactly as much as the quantizer moved the note: at a
+    // 1/8 grid and 120 BPM that is up to 125 ms, which is more than the ±120 ms window below,
+    // so the feature would name the NEIGHBOURING note — or nothing — precisely on the takes
+    // whose timing is loose enough to be worth asking about.
+    //
+    // `synthNotesFor` is the same list the transport plays and the roll and the strip are drawn
+    // against: engraved pitches, retimed onto the seconds they were actually played, already on
+    // the recording's clock. Asking it means the note this names is the note you can hear under
+    // the pointer, which is the entire promise of the feature.
     let best: { midi: number; gap: number } | null = null;
-
-    for (const track of model.tracks) {
-      for (const staff of track.staves) {
-        for (const bar of staff.bars) {
-          for (const voice of bar.voices) {
-            for (const beat of voice.beats) {
-              if (beat.isEmpty || beat.notes.length === 0) continue;
-              const start = beat.absolutePlaybackStart * secPerTick;
-              const end = start + beat.playbackDuration * secPerTick;
-              // Inside the note wins outright; otherwise take the nearest one, so clicking
-              // just before an attack still tells you what is coming.
-              const gap = writtenSec >= start && writtenSec < end ? 0 : Math.min(Math.abs(writtenSec - start), Math.abs(writtenSec - end));
-              if (gap > 0.12) continue;
-              if (!best || gap < best.gap) best = { midi: soundingMidi(index, beat.notes[0]), gap };
-            }
-          }
-        }
-      }
+    for (const note of this.synthNotesFor(score)) {
+      // Inside the note wins outright; otherwise take the nearest one, so clicking
+      // just before an attack still tells you what is coming.
+      const gap =
+        audioSec >= note.startSec && audioSec < note.endSec
+          ? 0
+          : Math.min(Math.abs(audioSec - note.startSec), Math.abs(audioSec - note.endSec));
+      if (gap > 0.12) continue;
+      if (!best || gap < best.gap) best = { midi: note.midi, gap };
     }
     return best ? best.midi : null;
   }
@@ -1854,6 +2106,44 @@ class App {
       r.stopped ? 'Listener stopped' : 'Left running',
       r.stopped
         ? 'The transcription engine has been shut down and its memory given back. It starts again by itself the next time you transcribe something.'
+        : r.reason,
+      // AND A WAY OUT OF IT. "It is not Riffsheet's to stop" is a correct principle and, on its
+      // own, a dead end: the person reading it is usually the same person who started that
+      // server, they can see it holding well over a gigabyte, and the app has just explained
+      // why it will not help. The refusal stays the default — nothing here happens without a
+      // second, deliberate press — but the second press now exists.
+      //
+      // OFFERED FROM `canStopExternal`, AND FROM NOTHING ELSE. Not from `adopted`, not from
+      // `externalServer` — BRIDGE.md is explicit about why: on Windows the listening process's
+      // command line cannot be read, so the shell cannot prove what it is about to end and
+      // refuses by design. There `externalServer` is true while `canStopExternal` is false, and
+      // a button drawn from the first could only ever refuse. The capability test on the call
+      // itself is the other half, for a shell that predates it.
+      !r.stopped && this.bridge.stopExternalEngine && this.engine?.canStopExternal === true
+        ? { label: 'Stop it anyway', role: 'stop-external-engine', run: () => void this.stopExternalEngine() }
+        : undefined
+    );
+    this.pollEngine();
+  }
+
+  /**
+   * Kill a listener Riffsheet did not start, having said so first.
+   *
+   * The only caller is the button on the "Left running" notice, and that is the whole safety
+   * model: you cannot get here without having pressed Stop, read why it refused, and pressed
+   * again. The shell still refuses mid-job — that rule has no override anywhere — so this can
+   * come back with `stopped: false` and the reason is shown exactly as the first refusal was.
+   */
+  private async stopExternalEngine(): Promise<void> {
+    if (!this.bridge.stopExternalEngine) return;
+    const r = await this.bridge
+      .stopExternalEngine()
+      .catch(() => ({ stopped: false, reason: 'the engine did not answer' }));
+    this.toast(
+      'info',
+      r.stopped ? 'Listener stopped' : 'Still running',
+      r.stopped
+        ? `${r.reason} Riffsheet starts its own the next time you transcribe something.`
         : r.reason
     );
     this.pollEngine();
@@ -1880,10 +2170,16 @@ class App {
       // when the player has actually said which instrument this is. Riffsheet used to pin
       // every take to `electric_bass` because it started life bass-first; the engine is
       // good across the board, and "Whatever it hears" must mean exactly that.
-      instruments: []
-      // `engineId` is deliberately absent: which engine listens is a property of how somebody
+      instruments: [],
+      // `engineId` is normally absent: which engine listens is a property of how somebody
       // works, not of one recording, so the shell resolves the global choice. See
       // TranscribeOptions.engineId.
+      //
+      // THE ONE EXCEPTION is a take the engine that runs in this page has just refused. It is
+      // set for exactly that transcription and cleared afterwards, and it carries the id the
+      // SHELL named (`nativeFallbackEngine`) rather than one guessed here — so the engine the
+      // toast promised is the engine that listens.
+      ...(this.fallbackEngineId ? { engineId: this.fallbackEngineId } : {})
     };
   }
 
@@ -1915,6 +2211,18 @@ class App {
     this.renderMain();
 
     try {
+      // THE ENGINE THAT RUNS HERE. When the resolved engine is Riffsheet's own, the samples
+      // are already on this side of the bridge and there is nothing to send anywhere: the
+      // whole pass is a function call. It either produces notes in the same DTO shape the
+      // bridge would have returned — in which case the rest of this method cannot tell the
+      // difference — or it REFUSES, and the take is handed to the shell's next engine with a
+      // sentence saying so. A refusal is a normal outcome, never an error.
+      const local = await this.runLocalEngine(input, durationSec);
+      if (local) {
+        this.acceptTranscription(local);
+        return;
+      }
+
       const result = await this.bridge.transcribe(
         input,
         (p) => {
@@ -1933,6 +2241,28 @@ class App {
         this.transcribeOptions()
       );
 
+      this.acceptTranscription(result);
+    } catch (e) {
+      this.runtime.set({ progress: null, progressEtaSec: null, progressQueuePosition: 0 });
+      this.toast('danger', 'Transcription failed', (e as Error).message);
+      this.renderMain();
+    } finally {
+      // One take, one fallback. Leaving it set would silently pin every later transcription to
+      // the engine one chordal recording happened to need.
+      this.fallbackEngineId = null;
+    }
+  }
+
+  /**
+   * Take a finished result — from the bridge or from the engine that runs here — and make it
+   * the take on screen.
+   *
+   * Extracted so the two paths cannot drift. Everything below this line used to sit inside the
+   * bridge call, and a second copy of it for the local engine would have been a second place to
+   * forget to clear the undo stack.
+   */
+  private acceptTranscription(result: TranscribeResult): void {
+    {
       this.runtime.set({ progress: null, progressEtaSec: null, progressQueuePosition: 0 });
       this.rememberPreprocess(result);
       const source = this.runtime.get().source;
@@ -1983,11 +2313,124 @@ class App {
       this.clearAutoEdits();
       this.autoPassPending = true;
       this.maybeRunAutoEditPass();
-    } catch (e) {
-      this.runtime.set({ progress: null, progressEtaSec: null, progressQueuePosition: 0 });
-      this.toast('danger', 'Transcription failed', (e as Error).message);
-      this.renderMain();
     }
+  }
+
+  /**
+   * Run Riffsheet's own engine, here, on the samples this page already holds.
+   *
+   * Returns a result in the bridge's own shape, or NULL meaning "not my job" — either because
+   * the resolved engine is somebody else's, or because this one listened and refused. Both
+   * cases send the caller down the ordinary bridge path; a refusal also names the engine that
+   * is about to get the take and says so out loud, because a transcription that quietly came
+   * from a different engine than the card says is the kind of surprise that costs trust.
+   *
+   * WHY THE PCM IS ALREADY HERE: `setPcm` holds the decoded mono samples for the tuner, the
+   * waveform and the attack detector. The engine wants exactly those, so the local path sends
+   * nothing over the bridge and answers in well under a second on a 30-second take.
+   */
+  private async runLocalEngine(
+    input: AudioFileRef | CaptureResult,
+    durationSec: number
+  ): Promise<TranscribeResult | null> {
+    if (this.engineList?.resolvedEngine !== RIFFSHEET_ENGINE_ID) return null;
+
+    const pcm = this.pcm;
+    const rate = this.pcmRate;
+    if (!pcm || !(rate > 0)) {
+      // The samples have not arrived (or this take came in as MIDI). Nothing is wrong; the
+      // shell's engines read the file for themselves, so hand it over without a word.
+      this.fallbackEngineId = this.engineList?.nativeFallbackEngine ?? null;
+      return null;
+    }
+
+    const s = this.settings.get();
+    const pass = transcribeRiffsheet(pcm, rate, {
+      // The plausible-range prior, from what the player said they are holding. Empty when TAB
+      // is off, and that is the point: nobody has told us what instrument this is, and an
+      // invented range would be worse than no range — see the octave guard's own comment.
+      tuningLowToHigh: this.engineTuningMidi(),
+      maxFret: s.maxFret,
+      durationSec: durationSec > 0 ? durationSec : undefined
+    });
+
+    if (!pass.ok) {
+      const nextId = this.engineList?.nativeFallbackEngine ?? '';
+      const nextName = this.engineList?.engines.find((e) => e.id === nextId)?.name ?? 'another engine';
+      this.fallbackEngineId = nextId || null;
+      this.toast(
+        'info',
+        pass.refusal.kind === 'polyphony' ? 'Sounded like chords' : 'Not a single-note line',
+        `${pass.refusal.reason} Handed to ${nextName}.`
+      );
+      return null;
+    }
+
+    // Beats are not this engine's job and never were: the shell's tracker runs for every engine
+    // and is better at it than anything here would be. `trackBeats` is the one call that reaches
+    // it without starting a transcription nobody wants. A shell too old to have it, or a browser
+    // with no shell at all, simply gets notes and no grid — which is what the mock has always
+    // returned anyway.
+    let beats: number[] | undefined;
+    let downbeats: number[] | undefined;
+    let tempoBpm: number | undefined;
+    let beatsPerBar: number | null | undefined;
+    if (this.settings.get().preciseBeats && this.bridge.trackBeats) {
+      try {
+        const grid = await this.bridge.trackBeats(input);
+        if (grid.beats.length > 0) {
+          beats = grid.beats;
+          downbeats = grid.downbeats.length > 0 ? grid.downbeats : undefined;
+          tempoBpm = grid.bpm ?? undefined;
+          beatsPerBar = grid.beatsPerBar;
+        }
+      } catch {
+        /* a missing grid is a worse sheet, not a failed transcription */
+      }
+    }
+
+    return {
+      notes: pass.notes.map((n) => ({
+        startSec: n.startSec,
+        endSec: n.endSec,
+        midi: n.midi,
+        confidence: n.confidence
+      })),
+      ...(beats ? { beats } : {}),
+      ...(downbeats ? { downbeats } : {}),
+      ...(tempoBpm ? { tempoBpm } : {}),
+      ...(beats
+        ? {
+            beatGrid: {
+              bpm: tempoBpm ?? 0,
+              beatsPerBar: beatsPerBar ?? null,
+              firstDownbeat: downbeats?.[0],
+              beats
+            }
+          }
+        : {}),
+      durationSec
+    };
+  }
+
+  /**
+   * The open strings the local engine's octave guard reasons about, or nothing.
+   *
+   * NOTHING when TAB is off, deliberately: with no tab the player has not said what instrument
+   * this is, and applying a bass range to a recording of something else would turn a correct
+   * reading into a confident wrong one. The guard is written to do nothing at all with an empty
+   * list, so "we were not told" and "we were told nothing useful" are the same answer.
+   */
+  private engineTuningMidi(): number[] {
+    const s = this.settings.get();
+    if (s.tabMode === 'off') return [];
+    if (s.tabMode === 'custom') {
+      const custom = customTuning(s.customTuningMidi);
+      return custom.midiLowToHigh.length >= 2 ? custom.midiLowToHigh : [];
+    }
+    const remembered = tuningById(s.tuningId);
+    if (remembered.instrument === s.tabMode) return remembered.midiLowToHigh;
+    return TUNING_PRESETS.find((preset) => preset.instrument === s.tabMode)?.midiLowToHigh ?? [];
   }
 
   private setSource(source: SourceAudio): void {
@@ -2058,12 +2501,25 @@ class App {
   }
 
   /**
-   * Put back whatever the last editor left behind.
+   * Put back whatever the last editor left behind — after asking.
    *
    * Note what does NOT happen here: no transcription. The detected notes came back in the
    * blob, so the sheet is rebuilt by the same cheap path a settings change uses.
+   *
+   * AND IT IS NEVER SILENT ANY MORE. This used to restore without a word, which is right
+   * exactly once — the case it was built for, a DAW destroying the editor when you click
+   * another track, where the work reappearing IS the fix. It is wrong every other time. Open
+   * the plugin on a new track and last week's riff is on screen, apparently belonging to a
+   * project it has nothing to do with; try to start something new and the app has already
+   * decided what you are working on. Worst of all it is unclearable: the way to get rid of it
+   * is to notice it is there and find "Close current work".
+   *
+   * So it asks, with two real answers and no default. "Start fresh" clears the stored copy for
+   * good, because a fresh start that leaves the old work waiting to ambush the next boot is
+   * not one. The Main menu's own "Resume current work" is untouched — that is about work
+   * still open in this window, which is a different question with a different answer.
    */
-  private async restoreSession(): Promise<boolean> {
+  private async restoreSession(opts: { auto?: boolean } = {}): Promise<boolean> {
     if (!this.session.canLoad) return false;
 
     const blob = await this.session.load();
@@ -2076,6 +2532,20 @@ class App {
 
     const source = decodeSource(blob.source);
     if (!source) return false;
+
+    // `auto` is for the persistence probe only — `bootSecondApp()` is testing that a blob
+    // written by one app comes back identically in another, and a dialog in the middle of
+    // that is a different test wearing its clothes. Nothing a player can reach sets it; the
+    // prompt itself is exercised by `__RIFFSHEET_RESUMEPROMPT__`, both ways.
+    if (!opts.auto && !(await this.askResume(source.name, blob.savedAt))) {
+      // Not "leave it and hope". A person who has said Start fresh has said it about this
+      // blob, and a blob that survives is one that asks the same question again tomorrow.
+      await this.session.clear();
+      return false;
+    }
+    // A second check, because the question took time to answer: they may have dropped a file
+    // while the prompt was up. Same rule as above — what they just did wins.
+    if (this.runtime.get().source) return false;
     // v1 session blobs stored these globally. Move them onto the restored take once, then the
     // normal save path writes the per-take shape and they can never leak into another source.
     source.tempoBpm ??= blob.settings.tempoBpm;
@@ -2130,6 +2600,26 @@ class App {
     } finally {
       this.restoring = false;
     }
+  }
+
+  /**
+   * "You were working on X. Pick it up, or start fresh?"
+   *
+   * Named after the file and dated, because "previous work" on its own is not enough to decide
+   * with — the answer changes completely depending on whether it is the riff from five minutes
+   * ago or one from a fortnight back that has nothing to do with today.
+   *
+   * Escape and the backdrop resolve to RESUME (`dismissIs: true`), which is the conservative
+   * side: dismissing a dialog is not consent to delete anything, and resuming is undoable by
+   * closing the work while starting fresh is not undoable at all.
+   */
+  private askResume(name: string, savedAt: number): Promise<boolean> {
+    const when = savedAt > 0 ? ` from ${relativeTime(savedAt)}` : '';
+    return this.askConfirm(
+      `You have unfinished work on “${name}”${when}. Pick up where you left off, or start fresh?`,
+      'Resume previous work',
+      { cancelText: 'Start fresh', dismissIs: true, role: 'resume-prompt' }
+    );
   }
 
   /**
@@ -2229,6 +2719,7 @@ class App {
     }
     this.editCursor = this.editLog.length - 1;
     this.reconcileHistory();
+    this.refreshUndoRedo();
     if (this.editCursor < 0) return;
 
     // One re-render for the lot, not one per edit.
@@ -2385,6 +2876,151 @@ class App {
    * and persistence before restoring what they changed. None belong in the shipping plugin.
    */
   private installTestHooks(): void {
+    /**
+     * THE CLAIM: re-stating the tempo in a different beat must not change how fast it plays.
+     *
+     * The BPM box shows the tempo in the beat the signature is written in, so switching 4/4 to
+     * 6/8 turns "120" into "240". That is a relabelling, and the way to prove it is a
+     * relabelling rather than a speed change is to dump what the app would actually SCHEDULE
+     * on either side of the switch and compare the two lists.
+     *
+     * `synthNotesFor()` is the exact list handed to `transport.setScoreNotes()` — the thing
+     * that makes sound — so this is not a model of playback, it is playback's own input. The
+     * signature is put back before returning, so the probe leaves the take as it found it.
+     */
+    (window as unknown as Record<string, unknown>).__RIFFSHEET_TEMPOUNIT__ = (
+      numerator: number,
+      denominator: number
+    ) => {
+      try {
+        const source = this.runtime.get().source;
+        const score = this.runtime.get().score;
+        if (!source || !score) return { error: 'no score' };
+        const original = score.timeSignature;
+
+        const readOut = () => {
+          const s = this.runtime.get().score;
+          const box = this.root.querySelector<HTMLInputElement>('[data-role="bpm"]');
+          const unit = this.root.querySelector<HTMLElement>('[data-role="bpm-unit"]');
+          return {
+            storedBpm: s ? Number(s.tempoBpm.toFixed(6)) : null,
+            shownBpm: box ? Number(box.value) : null,
+            unit: unit ? (unit.textContent ?? '').trim() : null,
+            timeSig: s ? `${s.timeSignature.numerator}/${s.timeSignature.denominator}` : null,
+            // Rounded to the microsecond: this is a comparison of two schedules, and a float
+            // that differs in its last bit is not a tempo change.
+            schedule: s ? this.synthNotesFor(s).map((n) => Number(n.startSec.toFixed(6))) : []
+          };
+        };
+
+        const before = readOut();
+        this.runtime.set({ source: { ...source, timeSignature: { numerator, denominator } } });
+        this.releaseHostGrid('time signature');
+        this.rebuildNotation();
+        this.renderMain();
+        const after = readOut();
+
+        // Put it back, by the same door.
+        const restored = this.runtime.get().source;
+        if (restored) this.runtime.set({ source: { ...restored, timeSignature: original } });
+        this.rebuildNotation();
+        this.renderMain();
+
+        return {
+          before,
+          after,
+          restored: readOut().timeSig,
+          scheduleIdentical:
+            before.schedule.length === after.schedule.length &&
+            before.schedule.every((v, i) => v === after.schedule[i])
+        };
+      } catch (e) {
+        return { error: String(e) };
+      }
+    };
+
+    /**
+     * Open a real recording, through the real door, so re-reading it can be tested.
+     *
+     * The demo fixtures are note lists with no audio behind them, which makes every gesture
+     * that means "listen to this again" unreachable in a browser — including the one this wave
+     * is about, where choosing an engine re-transcribes with it. This builds a couple of
+     * seconds of WAV and hands it to `openFile()`, the same method a drop or a file dialog
+     * calls, so what follows is the ordinary ingest: decode, transcribe, engrave, and an
+     * `audioRef` the app can re-open by path.
+     *
+     * Nothing here is a shortcut around the code under test. It is a file, and the app opens
+     * it the way it opens files.
+     */
+    (window as unknown as Record<string, unknown>).__RIFFSHEET_OPENAUDIO__ = async () => {
+      try {
+        const rate = 22050;
+        const seconds = 2;
+        const frames = rate * seconds;
+        const pcm = new Int16Array(frames);
+        for (let i = 0; i < frames; i++) {
+          const sec = i / rate;
+          // Four plucks a beat apart at 110 Hz, decaying — enough for the onset pass to find
+          // something and quiet enough that the level switch has real work to do.
+          const pluck = Math.floor(sec / 0.5);
+          const since = sec - pluck * 0.5;
+          const env = Math.exp(-since * 6);
+          pcm[i] = Math.round(0.28 * env * Math.sin(2 * Math.PI * 110 * sec) * 32767);
+        }
+        const header = new ArrayBuffer(44);
+        const view = new DataView(header);
+        const ascii = (at: number, text: string) => {
+          for (let i = 0; i < text.length; i++) view.setUint8(at + i, text.charCodeAt(i));
+        };
+        ascii(0, 'RIFF');
+        view.setUint32(4, 36 + pcm.byteLength, true);
+        ascii(8, 'WAVE');
+        ascii(12, 'fmt ');
+        view.setUint32(16, 16, true);
+        view.setUint16(20, 1, true);
+        view.setUint16(22, 1, true);
+        view.setUint32(24, rate, true);
+        view.setUint32(28, rate * 2, true);
+        view.setUint16(32, 2, true);
+        view.setUint16(34, 16, true);
+        ascii(36, 'data');
+        view.setUint32(40, pcm.byteLength, true);
+
+        const file = new File([header, pcm.buffer], 'harness-take.wav', { type: 'audio/wav' });
+        await this.openFile(file);
+        return {
+          opened: this.runtime.get().source?.name ?? null,
+          notes: this.runtime.get().source?.detected?.notes.length ?? 0,
+          // What makes re-reading possible at all: a path the shell (or the mock) can serve back.
+          hasHandle: !!this.audioRef && this.audioRef.kind !== 'midi',
+          path: this.audioRef?.path ?? null
+        };
+      } catch (e) {
+        return { error: String((e as Error).message ?? e) };
+      }
+    };
+
+    /**
+     * Start a re-transcription and DO NOT wait for it.
+     *
+     * The one state that cannot be reached by clicking, from outside: a job actually in
+     * flight. Every control that claims to cancel one — Start over, and choosing an engine —
+     * is only interesting while something is running, and awaiting the gesture that starts it
+     * means it has already finished by the time the next line runs.
+     *
+     * It presses the same method the Main menu's row presses, with the question already
+     * answered, and returns as soon as the app reports itself busy.
+     */
+    (window as unknown as Record<string, unknown>).__RIFFSHEET_STARTJOB__ = async () => {
+      void this.retranscribe({ confirmed: true });
+      // Up to a second for the bridge call to be made and `progress` to appear. Returning
+      // before that would hand the harness a race rather than a running job.
+      for (let i = 0; i < 40 && this.runtime.get().progress === null; i++) {
+        await new Promise((ok) => setTimeout(ok, 25));
+      }
+      return { running: this.runtime.get().progress !== null };
+    };
+
     // Exercise the export paths, so `npm run verify` covers them too.
     (window as unknown as Record<string, unknown>).__RIFFSHEET_SELFTEST__ = () => {
       try {
@@ -2416,6 +3052,68 @@ class App {
       } catch (e) {
         return { error: String((e as Error).stack ?? e) };
       }
+    };
+    /**
+     * The engine that runs in this page, driven over two synthetic takes.
+     *
+     * The two facts worth protecting from outside, and neither can be seen any other way:
+     * a MONOPHONIC take comes back as notes, and a CHORDAL one comes back as a REFUSAL rather
+     * than as a tidy, confident, wrong single line. The second is the whole reason this engine
+     * is allowed to be the default — a monophonic transcriber that cannot tell it is being
+     * handed a chord produces its worst output in exactly the case it should decline.
+     *
+     * The fixtures are built here rather than shipped as WAVs because they have to be exact:
+     * six plucks at known pitches, and the same six with a fifth on top of each. The hiss floor
+     * is not decoration — `onsets.ts` documents a bare harmonic stack as its worst case (window
+     * leakage becomes the detection function), and a fixture with no floor would be testing a
+     * signal no microphone has ever produced.
+     */
+    (window as unknown as Record<string, unknown>).__RIFFSHEET_LOCALENGINE__ = () => {
+      const rate = 44100;
+      const roots = [45, 43, 41, 45, 43, 40];
+      const amps = [0.4, 0.55, 0.3, 0.16, 0.09, 0.05];
+      const phases = [0, 0.7, 1.9, 2.6, 0.4, 1.3];
+      const take = (withFifth: boolean): Float32Array => {
+        const pcm = new Float32Array(rate * 6);
+        const pluck = (atSec: number, midi: number, gain: number) => {
+          const from = Math.round(atSec * rate);
+          const hz = 440 * Math.pow(2, (midi - 69) / 12);
+          for (let k = 0; k + from < pcm.length; k++) {
+            const t = k / rate;
+            if (t > 0.8) break;
+            const env = Math.exp(-t * 2.6) * (1 - Math.exp(-t * 300)) * Math.min(1, (0.8 - t) * 20);
+            let v = 0;
+            for (let p = 0; p < amps.length; p++) {
+              v += amps[p] * Math.exp(-t * (1.2 + p * 0.9)) * Math.sin(2 * Math.PI * hz * (p + 1) * t + phases[p]);
+            }
+            pcm[from + k] += gain * env * v * 0.5;
+          }
+        };
+        roots.forEach((midi, i) => {
+          pluck(0.3 + i * 0.9, midi, 1);
+          if (withFifth) pluck(0.3 + i * 0.9, midi + 7, 0.9);
+        });
+        // A deterministic hiss floor at about -55 dBFS. See the note above.
+        let seed = 12345;
+        for (let i = 0; i < pcm.length; i++) {
+          seed = (seed * 1103515245 + 12345) & 0x7fffffff;
+          pcm[i] += ((seed / 0x7fffffff) * 2 - 1) * 0.0018;
+        }
+        return pcm;
+      };
+      const describe = (pcm: Float32Array) => {
+        const r = transcribeRiffsheet(pcm, rate, { tuningLowToHigh: [28, 33, 38, 43] });
+        return r.ok
+          ? {
+              ok: true,
+              notes: r.notes.length,
+              midis: r.notes.map((n) => n.midi),
+              minConfidence: Math.min(...r.notes.map((n) => n.confidence)),
+              contested: r.stats.contested
+            }
+          : { ok: false, kind: r.refusal.kind, reason: r.refusal.reason, contested: r.stats.contested };
+      };
+      return { mono: describe(take(false)), chord: describe(take(true)) };
     };
     /**
      * One real transcription call, made the way the app makes it, reported both ways.
@@ -2588,7 +3286,7 @@ class App {
 
       const toastsBefore = this.runtime.get().toasts.length;
       try {
-        this.root.querySelector<HTMLElement>('[data-role="export-midi"]')?.click();
+        this.root.querySelector<HTMLElement>('[data-role="export-menu-button"]')?.click();
         const menu = document.querySelector('[data-role="export-menu"]');
         const items = [...(menu?.querySelectorAll<HTMLElement>('.menu-item') ?? [])];
         const item = items.find((i) => i.textContent?.includes(label));
@@ -3065,6 +3763,68 @@ class App {
      * must move NO other note on the roll by a single pixel. That last one is the player's own
      * acceptance test and the reason the old design is gone rather than defaulted off.
      */
+    /**
+     * VERTICAL CORRESPONDENCE: is a note's sheet x really the same column as its roll x?
+     *
+     * The claim Align makes on screen, measured rather than eyeballed. Three notes spread
+     * across the visible span; for each, the sheet's own `noteContentX` (straight off alphaTab's
+     * bounds, not re-derived) minus the sheet's scroll, against the rectangle the roll actually
+     * painted. Both panes are full-width and stacked, so a viewport x in one is a viewport x in
+     * the other and the two numbers are directly comparable.
+     *
+     * `windowSec` is reported alongside because the tolerance is only meaningful next to it:
+     * the roll is linear in time across the window and alphaTab is not, so the residual is
+     * whatever the engraving's own unevenness comes to over one screen of music.
+     */
+    (window as unknown as Record<string, unknown>).__RIFFSHEET_ALIGNX__ = async (
+      mode: 'on' | 'off' = 'on'
+    ) => {
+      const settle = (ms: number) => new Promise((ok) => setTimeout(ok, ms));
+      const was = this.settings.get().alignViews;
+      try {
+        this.settings.set({ alignViews: mode === 'on' });
+        this.renderMain();
+        await settle(600);
+        this.pianoRoll?.fitVertical();
+        this.syncViewports();
+        await settle(300);
+
+        const view = this.triview?.viewport();
+        const rects = (this.pianoRoll?.paintedRects() ?? []).filter((r) => r.noteId);
+        const rows: Array<{ noteId: string; sheetX: number; rollX: number; deltaPx: number }> = [];
+        // Spread across what is drawn rather than the first three: three neighbours would only
+        // ever prove the two panes agree in one place.
+        const picks = [0, Math.floor(rects.length / 2), rects.length - 1]
+          .filter((i, at, all) => i >= 0 && i < rects.length && all.indexOf(i) === at);
+        for (const i of picks) {
+          const r = rects[i];
+          const cx = this.triview?.noteContentX(r.noteId!);
+          if (cx === null || cx === undefined || !view) continue;
+          const sheetX = cx - view.scrollLeft;
+          rows.push({
+            noteId: r.noteId!,
+            sheetX: Math.round(sheetX),
+            rollX: Math.round(r.x),
+            deltaPx: Math.round(Math.abs(sheetX - r.x))
+          });
+        }
+        const window = this.alignedWindow;
+        return {
+          mode,
+          aligned: !!window,
+          windowSec: window ? Number((window.toSec - window.fromSec).toFixed(3)) : null,
+          compared: rows.length,
+          worstDeltaPx: rows.reduce((m, r) => Math.max(m, r.deltaPx), 0),
+          rows
+        };
+      } catch (e) {
+        return { error: String((e as Error).stack ?? e) };
+      } finally {
+        this.settings.set({ alignViews: was });
+        this.renderMain();
+      }
+    };
+
     (window as unknown as Record<string, unknown>).__RIFFSHEET_ALIGN__ = async (
       mode: 'probe' | 'on' | 'off' = 'probe'
     ) => {
@@ -3140,6 +3900,12 @@ class App {
           otherNotesMovedPx = Math.max(otherNotesMovedPx, Math.abs(a.x - b.x), Math.abs(a.w - b.w));
         }
         const noteAdded = (this.runtime.get().source?.detected?.notes ?? []).length > notesBefore;
+        // Read BEFORE the restore below puts `alignViews` back: the window is what this mode
+        // produced, and asking for it after the setting has been handed back would report the
+        // other mode's answer.
+        const alignedWindowSec = this.alignedWindow
+          ? Number((this.alignedWindow.toSec - this.alignedWindow.fromSec).toFixed(3))
+          : null;
         this.undo();
         await settle(500);
         this.selectNoteIds([]);
@@ -3161,6 +3927,12 @@ class App {
           // reads as a failure on a take that fits in the window.
           sheetScrollable: !!view && view.contentWidth > view.viewportWidth + 8,
           sheetErrorPx,
+          // ALIGN's actual geometry: the stretch of recording the roll and the strip were told
+          // to show. Null in off mode, which is what "independent views" means.
+          alignedWindowSec,
+          // How many beats the shared ruler is pinned to. Two is the fallback (the plain
+          // window); more means it is following the engraving beat by beat.
+          alignAnchors: this.alignedAnchors?.length ?? 0,
           selectionCrossed,
           noteAdded,
           // Rounded to whole pixels: the roll re-derives its own layout, so a sub-pixel
@@ -3356,20 +4128,20 @@ class App {
         this.rebuildNotation({ keepEdits: true });
         this.renderMain();
         await settle(900);
-        const standard = { digits: digits(), summary: (this.root.querySelector('.tuning-summary')?.textContent ?? null), strings: this.runtime.get().score?.stringCount ?? 0 };
+        const standard = { digits: digits(), summary: (this.triview?.stringLetterTexts()[0] ?? []).join(' '), strings: this.runtime.get().score?.stringCount ?? 0 };
 
         this.settings.set({ customTuningMidi: [26, 31, 36, 41] });
         this.rebuildNotation({ keepEdits: true });
         this.renderMain();
         await settle(900);
-        const dropped = { digits: digits(), summary: (this.root.querySelector('.tuning-summary')?.textContent ?? null), strings: this.runtime.get().score?.stringCount ?? 0 };
+        const dropped = { digits: digits(), summary: (this.triview?.stringLetterTexts()[0] ?? []).join(' '), strings: this.runtime.get().score?.stringCount ?? 0 };
 
         // A five-string, so the string COUNT is exercised as well as the pitches.
         this.settings.set({ customTuningMidi: [23, 28, 33, 38, 43] });
         this.rebuildNotation({ keepEdits: true });
         this.renderMain();
         await settle(900);
-        const five = { summary: (this.root.querySelector('.tuning-summary')?.textContent ?? null), strings: this.runtime.get().score?.stringCount ?? 0 };
+        const five = { summary: (this.triview?.stringLetterTexts()[0] ?? []).join(' '), strings: this.runtime.get().score?.stringCount ?? 0 };
 
         this.settings.set({ tabMode: beforeMode, customTuningMidi: beforeTuning });
         this.rebuildNotation({ keepEdits: true });
@@ -3859,6 +4631,106 @@ class App {
       }
     };
     /**
+     * Reopening a file that has saved work must ASK, and both answers must be real.
+     *
+     * Three claims, driven against the real blob and a real second app:
+     *
+     *  1. a boot that finds restorable work puts a prompt on screen and restores NOTHING
+     *     until it is answered;
+     *  2. "Start fresh" leaves the second app with no take AND clears the stored copy, so
+     *     the same question is not waiting at the next boot;
+     *  3. "Resume previous work" brings the take back, with its notes.
+     *
+     * Run twice against two throwaway apps because the two answers are destructive in
+     * opposite directions — fresh deletes the blob, resume needs it — so the blob is written
+     * again between them. The live app is never touched: everything happens in an off-screen
+     * root, and the blob is put back the way it was found on the way out.
+     */
+    (window as unknown as Record<string, unknown>).__RIFFSHEET_RESUMEPROMPT__ = async () => {
+      const settled = (ms: number) => new Promise((ok) => setTimeout(ok, ms));
+      const roots: HTMLElement[] = [];
+      const makeRoot = () => {
+        const node = document.createElement('div');
+        Object.assign(node.style, {
+          position: 'fixed',
+          left: '-20000px',
+          top: '0',
+          width: '1200px',
+          height: '800px'
+        });
+        document.body.appendChild(node);
+        roots.push(node);
+        return node;
+      };
+      /** What the prompt looks like inside one app's own root. */
+      const readPrompt = (root: HTMLElement) => {
+        const dialog = root.querySelector('[data-dialog="resume-prompt"]');
+        return {
+          shown: !!dialog,
+          message: dialog?.querySelector('[data-role="confirm-message"]')?.textContent?.trim() ?? null,
+          resumeLabel: dialog?.querySelector('[data-role="confirm-ok"]')?.textContent?.trim() ?? null,
+          freshLabel: dialog?.querySelector('[data-role="confirm-cancel"]')?.textContent?.trim() ?? null
+        };
+      };
+      const press = (root: HTMLElement, role: string) => {
+        const button = root.querySelector<HTMLButtonElement>(`[data-dialog="resume-prompt"] [data-role="${role}"]`);
+        button?.click();
+        return !!button;
+      };
+
+      const original = await this.session.load();
+      try {
+        if (!this.session.canSave) return { error: 'this host cannot persist state' };
+        // A blob with a real take in it, written by the live app through the real bridge.
+        this.scheduleSave();
+        await this.session.flush();
+        const saved = await this.session.load();
+        if (!saved) return { error: 'nothing was saved to reopen' };
+        const savedNotes = saved.source?.detected?.notes.length ?? 0;
+
+        // --- 1 + 2: the prompt appears, and Start fresh is truly fresh ---------
+        const freshRoot = makeRoot();
+        const freshApp = bootSecondApp(freshRoot);
+        await settled(900);
+        const promptOnFresh = readPrompt(freshRoot);
+        const pressedFresh = press(freshRoot, 'confirm-cancel');
+        await freshApp;
+        await settled(400);
+        const afterFresh = (await bootSecondApp(makeRoot(), { autoResume: true })).probe() as Record<string, unknown>;
+        const blobAfterFresh = await this.session.load();
+
+        // --- 3: and Resume brings it back --------------------------------------
+        await this.bridge.setPersistedState?.(JSON.stringify(saved));
+        const resumeRoot = makeRoot();
+        const resumeApp = bootSecondApp(resumeRoot);
+        await settled(900);
+        const promptOnResume = readPrompt(resumeRoot);
+        const pressedResume = press(resumeRoot, 'confirm-ok');
+        const resumed = (await resumeApp).probe() as Record<string, unknown>;
+        await settled(600);
+
+        return {
+          savedNotes,
+          promptOnFresh,
+          pressedFresh,
+          // Fresh means fresh: no take on the app that answered, and no blob left behind for
+          // the next one to find.
+          freshHasTake: (afterFresh.noteCount as number) > 0,
+          blobClearedByFresh: blobAfterFresh === null,
+          promptOnResume,
+          pressedResume,
+          resumedNotes: (resumed.noteCount as number) ?? 0
+        };
+      } catch (e) {
+        return { error: String((e as Error).stack ?? e) };
+      } finally {
+        // Put the store back exactly as it was found, whatever happened above.
+        await this.bridge.setPersistedState?.(original ? JSON.stringify(original) : '').catch(() => undefined);
+        for (const node of roots) node.remove();
+      }
+    };
+
+    /**
      * Plugin amnesia, reproduced and disproved without a DAW.
      *
      * The reported bug is that switching REAPER tracks destroys the plugin editor and
@@ -3925,7 +4797,7 @@ class App {
         if (!stored) return { error: 'nothing came back out of the store' };
 
         document.body.appendChild(clone);
-        const second = await bootSecondApp(clone);
+        const second = await bootSecondApp(clone, { autoResume: true });
         // alphaTab engraves asynchronously; the model is there at once but let it draw.
         await settled(1200);
         const restored = second.probe() as Record<string, unknown>;
@@ -3990,6 +4862,88 @@ class App {
         midiQuantizedB64: b64(score.midi(true)),
         midiAsPlayedB64: b64(this.sourceMidi ?? score.midi(false))
       };
+    };
+
+    /**
+     * What a `.riffsheet` file actually carries, proved by a real round trip.
+     *
+     * The document is meant to be the portable form of a session: the take it is OF, the
+     * PERFORMED notes, the user's edits, and the settings the sheet was engraved with. Three
+     * of those four were carried and one was not — the audio reference was missing, and the
+     * loader replaced it with a MIDI stub, so a reopened document could never play or
+     * re-listen to its own recording. Nothing caught it because the persistence probe above
+     * tests the session BLOB, which does carry `audio`.
+     *
+     * So this goes through `buildRiffsheetDocument` → `writeRiffsheetDocument` →
+     * `readRiffsheetDocument`, the same three the button and the open path use.
+     *
+     * The second half swaps in a synthetic FILE reference before building, because the demo
+     * fixture has no recording behind it: without it the audio assertions would only ever see
+     * `kind: 'midi'` and would pass while carrying nothing. It also proves the two volatile
+     * handles are dropped — a token names a decode inside the process that wrote the file, and
+     * writing it into a document that can be opened on another machine is a lie.
+     *
+     * Read-only apart from that swap, which is put back before returning.
+     */
+    (window as unknown as Record<string, unknown>).__RIFFSHEET_DOCUMENT__ = () => {
+      const roundTrip = (doc: RiffsheetDocument) => {
+        const bytes = writeRiffsheetDocument(doc);
+        return { back: readRiffsheetDocument(bytes), text: new TextDecoder().decode(bytes) };
+      };
+      try {
+        const live = this.buildRiffsheetDocument();
+        if (!live) return { error: 'no source loaded' };
+        const liveTrip = roundTrip(live);
+
+        const before = this.audioRef;
+        let synthetic: ReturnType<typeof roundTrip> | null = null;
+        let syntheticDoc: RiffsheetDocument | null = null;
+        try {
+          this.audioRef = {
+            kind: 'file',
+            name: 'take.wav',
+            path: '/takes/probe take.wav',
+            token: 'tok-should-not-survive',
+            pcmUrl: 'http://127.0.0.1:1/pcm/should-not-survive',
+            durationSec: 12.5
+          };
+          syntheticDoc = this.buildRiffsheetDocument();
+          if (syntheticDoc) synthetic = roundTrip(syntheticDoc);
+        } finally {
+          this.audioRef = before;
+        }
+
+        const settings = this.settings.get();
+        const restoredSettings = liveTrip.back.settings as Record<string, unknown>;
+        return {
+          // (1) audio reference
+          liveAudioKind: liveTrip.back.audio?.kind ?? null,
+          syntheticAudio: synthetic?.back.audio ?? null,
+          tokenInBytes: synthetic ? synthetic.text.includes('should-not-survive') : true,
+          // (2) performed layer — the detections, not the engraved score
+          performedNotes: liveTrip.back.source.detected?.notes.length ?? 0,
+          performedNotesMatchLive: JSON.stringify(liveTrip.back.source.detected?.notes ?? null)
+            === JSON.stringify(this.runtime.get().source?.detected?.notes ?? null),
+          performedBeats: liveTrip.back.source.detected?.beats?.length ?? 0,
+          // (3) user edits
+          edits: liveTrip.back.edits.length,
+          liveEdits: this.editLog.length,
+          editCursor: liveTrip.back.editCursor,
+          liveEditCursor: this.editCursor,
+          editKinds: liveTrip.back.edits.map((e) => e.kind),
+          // (4) settings
+          settingsKeys: Object.keys(restoredSettings).length,
+          settingsMatch: JSON.stringify(restoredSettings) === JSON.stringify(settings),
+          // The version must NOT move for an additive field: the reader rejects any version it
+          // does not know, so a bump would make every document written before it unopenable.
+          version: liveTrip.back.version,
+          sourceName: liveTrip.back.source.name,
+          peakBuckets: liveTrip.back.source.peaks?.buckets ?? 0,
+          bytes: liveTrip.text.length
+        };
+      } catch (e) {
+        return { error: String((e as Error).stack ?? e) };
+      }
     };
   }
 
@@ -4169,12 +5123,11 @@ class App {
     };
   }
 
-  /** Back to the default sheet view, and fit the roll's pitch window. */
-  private resetSheetView(): void {
-    this.triview?.resetView();
-    this.pianoRoll?.fitVertical();
-    this.syncViewports();
-  }
+  // `resetSheetView()` stood here, behind the "Reset view" chip. Both are gone: the chip
+  // retired with "Fit" (see §viewToolChips), and what it did — put the sheet's zoom back and
+  // fit the roll's pitch window — is now a double-click on the roll's gutter, which fits, and
+  // nothing at all for the sheet, whose zoom has never been movable from the UI.
+
 
   /**
    * Repaint everything whose x-axis depends on the sheet's scroll and zoom.
@@ -4198,6 +5151,7 @@ class App {
     const view = tv.viewport();
     if (!view) {
       this.waveform.setViewportRange(null, null);
+      this.setAlignedWindow(null);
       return;
     }
     // The waveform is the whole-take overview and speaks RECORDING seconds, so the bracket
@@ -4212,6 +5166,94 @@ class App {
       from === null || from === undefined ? null : from + origin,
       to === null || to === undefined ? null : to + origin
     );
+    // The ALIGNED window is measured between the same two x's the roll and the strip put their
+    // PLOT between, not between the viewport's own edges: both panes spend their first
+    // TIMELINE_GUTTER_PX on pitch labels, and the sheet spends exactly the same column on page
+    // padding (view/triview.ts §D). Measuring edge-to-edge would hand the roll a span it draws
+    // 34px narrower than the sheet does, and every note would sit a little left of its notehead.
+    const plotFrom = map?.contentXToWrittenSec(view.scrollLeft + TIMELINE_GUTTER_PX);
+    const plotTo = to;
+    const fromSec = plotFrom === null || plotFrom === undefined ? null : plotFrom + origin;
+    const toSec = plotTo === null || plotTo === undefined ? null : plotTo + origin;
+    // THE WHOLE OF ALIGN'S GEOMETRY, and it is two numbers.
+    //
+    // The sheet's visible span, mapped back through alphaTab's own bounds, handed to the roll
+    // and the strip so all three panes draw the same seconds across the same pixels. What is
+    // NOT handed over is the sheet's x-axis: inside the window each pane stays linear in time,
+    // which is what keeps the picture of a performance honest and what makes adding a note
+    // unable to move any other note. See view/pianoroll.ts §setTimeWindow.
+    // HELD ACROSS A REBUILD, and this is the hard rule rather than an optimisation.
+    //
+    // A roll edit re-runs the pipeline and re-engraves, which moves the sheet's own geometry:
+    // the same scroll position now shows slightly different music, so a window re-derived from
+    // it would be a slightly different window — and every rectangle on the roll would shift
+    // under the hand that had just added one note. That is precisely the reflow the old linked
+    // mode was deleted for, arriving through a different door.
+    //
+    // So the window is a memory, not a live read. It follows the sheet when the PLAYER moves
+    // the sheet, and it is left exactly where it was through a rebuild. applyScoreToViews()
+    // opens the hold; the next scroll after it expires picks the sheet up again.
+    // The hold covers a REBUILD, not a scroll. `restoreScrollAnchor` puts the sheet back within
+    // a pixel or two of where it was, so a few pixels of drift is the rebuild; anything more is
+    // the player moving the page, and that must pick the ruler up again immediately or the roll
+    // would sit at a stale offset for a second and a half.
+    const scrolled = Math.abs(view.scrollLeft - this.alignHoldScrollLeft) > ALIGN_HOLD_SLOP_PX;
+    const holding =
+      this.alignedWindow !== null && performance.now() < this.alignHoldUntil && !scrolled;
+    if (!holding) {
+      this.setAlignedWindow(
+        this.settings.get().alignViews && fromSec !== null && toSec !== null && toSec > fromSec
+          ? { fromSec, toSec }
+          : null
+      );
+    } else if (!this.settings.get().alignViews) {
+      // Switching Align off is the player speaking; it outranks the hold.
+      this.setAlignedWindow(null);
+    } else {
+      // Held — but still PUSHED. `renderMain()` builds a fresh roll and a fresh strip, and a
+      // pane that has just been constructed knows nothing; without this it would draw the whole
+      // take for as long as the hold lasted and then jump. Idempotent on both sides.
+      this.setAlignedWindow(this.alignedWindow);
+    }
+  }
+
+  /** One writer for both panes, so they cannot end up looking at different moments. */
+  private setAlignedWindow(w: { fromSec: number; toSec: number } | null): void {
+    this.alignedWindow = w;
+    const anchors = w ? this.alignAnchors(w) : null;
+    this.alignedAnchors = anchors;
+    this.pianoRoll?.setTimeAnchors(anchors);
+    this.waveform?.setTimeAnchors(anchors);
+  }
+
+  /**
+   * THE SHARED RULER: the sheet's visible span, and nothing finer.
+   *
+   * The anchor list is deliberately the two ends. A finer ruler is possible in principle — one
+   * anchor per beat, taken from alphaTab's bounds — and it was built and measured, because two
+   * ends and a straight line between them cannot follow an engraving that spaces a dense bar
+   * wider than a sparse one. It is not shipped, and the reason is the hard rule rather than the
+   * effort: every additional anchor is another number that comes from the ENGRAVING'S GEOMETRY,
+   * and engraving geometry moves when a note is added. Pinning the roll to it re-space the
+   * picture of a performance around the note the player just drew — the exact failure the old
+   * linked mode was deleted for (view/pianoroll.ts §1), arriving through a different door.
+   *
+   * So the ruler stays made of two TIMES. Inside them the roll is perfectly linear, which is
+   * what a picture of a recording has to be, and adding a note changes no other note's time, so
+   * no other rectangle can move. What alignment buys is real and checked: all three panes show
+   * the same seconds across the same pixels, the same moment is in the same horizontal band, and
+   * a note's roll x sits an order of magnitude closer to its notehead than it does unaligned.
+   *
+   * The shape stays a list so a future ruler that solves the reflow problem has somewhere to
+   * land without changing either pane.
+   *
+   * Held across a rebuild with the window it belongs to; see §syncViewports.
+   */
+  private alignAnchors(w: { fromSec: number; toSec: number }): TimeAnchor[] | null {
+    return [
+      { sec: w.fromSec, frac: 0 },
+      { sec: w.toSec, frac: 1 }
+    ];
   }
 
   /** Centre the sheet (and therefore the roll) on a moment in the RECORDING. */
@@ -4266,6 +5308,13 @@ class App {
   }
 
   private applyScoreToViews(score: RiffScore): void {
+    // See §syncViewports: the aligned window must survive this rebuild unchanged, or adding one
+    // note re-spaces the picture of the performance around it.
+    if (this.alignedWindow) {
+      this.alignHoldUntil = performance.now() + ALIGN_HOLD_MS;
+      this.alignHoldScrollLeft = this.triview?.viewport()?.scrollLeft ?? this.alignHoldScrollLeft;
+    }
+    this.refreshTempoBox();
     this.triview?.load(score);
     // Bar 1 is the roll's time origin — without it a count-in slides the whole roll off
     // the waveform above it. See view/pianoroll.ts.
@@ -4282,9 +5331,7 @@ class App {
       this.synthNotesFor(score),
       score.durationSec
     );
-    this.transport.setBeatTimes(score.beatTimesSec);
     this.transport.setVoice(this.settings.get().playbackVoice);
-    this.transport.setMetronome(this.settings.get().metronome);
     this.syncKeyPicker();
   }
 
@@ -4375,14 +5422,32 @@ class App {
             this.renderMain();
           }
         }),
+      // ZOOM, VISIBLE. A minus and a plus, because a wheel and a pinch are both invisible and
+      // somebody on a mouse with no wheel, or reading this on a tablet, still has to be able to
+      // make the rows bigger. The wheel over the gutter and a trackpad pinch do the same thing
+      // — see view/pianoroll.ts §onWheel — and double-clicking the gutter fits, which is what
+      // the two chips that used to sit here ("Fit", "Reset view") were for.
       rollOn &&
-        el('button', {
-          class: 'chip',
-          text: 'Reset view',
-          'data-role': 'roll-reset',
-          title: t(TIPS.rollReset),
-          onClick: () => this.resetSheetView()
-        }),
+        el(
+          'span',
+          { class: 'zoom-pair', 'data-role': 'roll-zoom' },
+          el('button', {
+            class: 'chip icon',
+            text: '\u2212',
+            'data-role': 'roll-zoom-out',
+            'aria-label': 'Smaller rows',
+            title: t(TIPS.rollZoom),
+            onClick: () => this.pianoRoll?.zoomVerticalOut()
+          }),
+          el('button', {
+            class: 'chip icon',
+            text: '+',
+            'data-role': 'roll-zoom-in',
+            'aria-label': 'Bigger rows',
+            title: t(TIPS.rollZoom),
+            onClick: () => this.pianoRoll?.zoomVerticalIn()
+          })
+        ),
       // How many edits the app made on its own evidence and nobody has looked at yet.
       //
       // It cycles rather than opening a list: there are usually one or two, the player wants to
@@ -4403,17 +5468,10 @@ class App {
           el('span', { 'aria-hidden': 'true', text: '◈ ' }),
           el('span', { 'data-role': 'auto-edits-text', text: '0 auto edits' })
         ),
-      // Show every pitch in the take at once. Deliberately a BUTTON rather than the default
-      // state: fitting by default is what squashed a wide-range take into unreadable slivers,
-      // which is the complaint this whole rewrite answers.
-      rollOn &&
-        el('button', {
-          class: 'chip',
-          text: 'Fit',
-          'data-role': 'roll-fit',
-          title: t(TIPS.rollFit),
-          onClick: () => this.pianoRoll?.fitVertical()
-        }),
+      // "Fit" stood here. Fitting is still exactly as available and still not the default —
+      // fitting by default is what squashed a wide-range take into unreadable slivers — but it
+      // is a DOUBLE-CLICK ON THE GUTTER now rather than a permanent chip. Two chips for a
+      // gesture used once a session is a poor trade on a bar that has to survive 360 px.
       // The ROLL's own ruler. It lives with the roll's other controls and not in the notation
       // toolbar because it is not a notation setting: it moves the vertical lines and sizes a
       // hand-added note, and that is all it is allowed to do.
@@ -4536,13 +5594,12 @@ class App {
     const s = this.settings.get();
     const source = this.runtime.get().source;
     const tabOn = s.tabMode !== 'off';
+    // A SYMBOLIC import: every note knows its own written position in the source file's ticks.
+    // That is exactly the case 'free' is for, and exactly the case the pipeline already forces
+    // it in. An audio take has no such thing. See the grid <select> below.
+    const detected = source?.detected?.notes ?? [];
+    const freeGridUsable = detected.length > 0 && detected.every((n) => !!n.sourceTiming);
     const presets = TUNING_PRESETS.filter((preset) => preset.instrument === s.tabMode);
-    const namedTuning =
-      TUNING_PRESETS.find((preset) => preset.id === s.tuningId && preset.instrument === s.tabMode) ?? presets[0];
-    const activeTuning =
-      s.tabMode === 'custom'
-        ? s.customTuningMidi
-        : (namedTuning?.midiLowToHigh ?? []);
 
     const rebuild = (patch: Partial<AppSettings>) => {
       this.settings.set({ ...patch, instrument: 'auto' });
@@ -4604,10 +5661,52 @@ class App {
           title: t(TIPS.grid),
           onChange: (e: Event) => rebuild({ grid: (e.target as HTMLSelectElement).value as AppSettings['grid'] })
         },
-        ...(['auto', 'quarter', 'eighth', 'sixteenth', 'triplet', 'free'] as const).map((value) =>
-          el('option', { value, text: `Notation: ${GRID_LABELS[value]}`, selected: s.grid === value })
-        )
+        ...(['auto', 'quarter', 'eighth', 'sixteenth', 'triplet', 'free'] as const)
+          // FREE IS FOR IMPORTS, NOT FOR AUDIO — and this is a measurement, not a preference.
+          //
+          // 'free' means "write exactly what was played, snapped to nothing". For a MIDI,
+          // MusicXML or Guitar Pro import that is the RIGHT answer and the pipeline already
+          // forces it: every note carries its source ticks and the page comes out as the file
+          // was written.
+          //
+          // For AUDIO it is a trap. A performance has no exact note values, so every notehead
+          // becomes a chain of tied fragments. Measured on the demo fixtures after the
+          // pipeline's rest-filler removal landed: 64 played notes come out as 64 glyphs and 0
+          // ties under 'auto', and as 192 GLYPHS WITH 192 TIES under 'free' — three noteheads
+          // per note, all tied, plus 64 rests that were not in the performance. Human timing
+          // makes it no better (±35 ms: 179 glyphs, 169 tied). That is not a sheet anybody can
+          // read, and offering it beside five settings that work is offering a trap.
+          //
+          // The rest-filler removal DID fix the other half: 'free' no longer invents long
+          // overlapping notes — its longest written value now matches 'auto' exactly. It is
+          // the tie chains that remain, and they are inherent to writing unquantized audio.
+          //
+          // Still OFFERED when it is already the stored value, because a <select> that cannot
+          // show its own setting silently snaps to the first option and reads as if the app
+          // had thrown the choice away.
+          .filter((value) => value !== 'free' || freeGridUsable || s.grid === 'free')
+          .map((value) =>
+            el('option', { value, text: `Notation: ${GRID_LABELS[value]}`, selected: s.grid === value })
+          )
       ),
+      this.coarseGridWarning(),
+      // THE TAB MENU — one dropdown, three sections.
+      //
+      // Everything about the tablature that is a CHOICE now lives here: which instrument it is
+      // written for, how the fingering is planned, and how far up the neck the app may go.
+      // They were in three places (this select, a chip group buried in Settings, and a second
+      // Settings row) and they are one subject, so a player deciding "how should this tab
+      // read?" had to know to look in two panels.
+      //
+      // A `<select>` with `<optgroup>`s rather than three selects, because that is what "one
+      // menu, three sections" is in a form control, and because the toolbar has to survive a
+      // 360px window. Only the INSTRUMENT section carries plain values, so `select.value` is
+      // still the tab mode and nothing reading it has to learn a new vocabulary; the other two
+      // sections use prefixed values, apply their own setting, and mark the current choice with
+      // a tick because a select can only really select one thing.
+      //
+      // `data-setting` on the groups, not only on the select: each group IS the control for
+      // that key, and the settings census counts controls, not selects.
       el(
         'select',
         {
@@ -4616,7 +5715,16 @@ class App {
           'aria-label': 'Tablature',
           title: t(TIPS.instrument),
           onChange: (e: Event) => {
-            const tabMode = (e.target as HTMLSelectElement).value as AppSettings['tabMode'];
+            const raw = (e.target as HTMLSelectElement).value;
+            if (raw.startsWith('fingering:')) {
+              rebuild({ fingering: raw.slice(10) as AppSettings['fingering'] });
+              return;
+            }
+            if (raw.startsWith('maxFret:')) {
+              rebuild({ maxFret: Number(raw.slice(8)) });
+              return;
+            }
+            const tabMode = raw as AppSettings['tabMode'];
             const current = TUNING_PRESETS.find((preset) => preset.id === s.tuningId);
             const tuningId =
               tabMode === 'bass' || tabMode === 'guitar'
@@ -4627,11 +5735,61 @@ class App {
             rebuild({ tabMode, tuningId });
           }
         },
-        el('option', { value: 'off', text: 'Tab: Off', selected: s.tabMode === 'off' }),
-        el('option', { value: 'bass', text: 'Tab: Bass', selected: s.tabMode === 'bass' }),
-        el('option', { value: 'guitar', text: 'Tab: Guitar', selected: s.tabMode === 'guitar' }),
-        el('option', { value: 'custom', text: 'Tab: Custom', selected: s.tabMode === 'custom' })
+        el(
+          'optgroup',
+          { label: 'Instrument' },
+          el('option', { value: 'off', text: 'Tab: Off', selected: s.tabMode === 'off' }),
+          el('option', { value: 'bass', text: 'Tab: Bass', selected: s.tabMode === 'bass' }),
+          el('option', { value: 'guitar', text: 'Tab: Guitar', selected: s.tabMode === 'guitar' }),
+          el('option', { value: 'custom', text: 'Tab: Custom', selected: s.tabMode === 'custom' })
+        ),
+        tabOn &&
+          el(
+            'optgroup',
+            { label: 'Fingering', 'data-setting': 'fingering', 'data-role': 'tab-fingering' },
+            ...FINGERING_STYLES.map((style) =>
+              el('option', {
+                value: `fingering:${style}`,
+                text: `${s.fingering === style ? '✓ ' : '   '}${FINGERING_LABELS[style]}`
+              })
+            )
+          ),
       ),
+      // FRET COUNT — the third section of the same subject, kept as its own control because it
+      // is a NUMBER and a tick beside "24 frets" in a menu is a worse way to read a number than
+      // a box showing 24. It moved here from the settings panel, where it was two panels away
+      // from the tab it describes.
+      tabOn &&
+        el(
+          'select',
+          {
+            'aria-label': 'Highest fret',
+            'data-role': 'max-fret',
+            'data-setting': 'maxFret',
+            title: t(TIPS.maxFret),
+            onChange: (e: Event) => rebuild({ maxFret: Number((e.target as HTMLSelectElement).value) })
+          },
+          ...fretCountOptions(s.maxFret).map((fret) =>
+            el('option', { value: String(fret), text: `${fret} frets`, selected: fret === s.maxFret })
+          )
+        ),
+      // The anchor for "Around fret N", and only then — every other style ignores it, and a
+      // number box that changes nothing is the kind of control this whole pass is removing.
+      tabOn && s.fingering === 'around-fret' &&
+        el('label', { class: 'string-count', title: t(TIPS.fingering) },
+          el('span', { class: 'dim', text: 'Around fret' }),
+          el('input', {
+            type: 'number',
+            min: '0',
+            max: '24',
+            'data-role': 'anchor-fret',
+            'data-setting': 'anchorFret',
+            'aria-label': 'Anchor fret',
+            value: String(s.anchorFret),
+            onChange: (e: Event) =>
+              rebuild({ anchorFret: Math.max(0, Math.min(24, Math.round(Number((e.target as HTMLInputElement).value)) || 0)) })
+          })
+        ),
       tabOn && s.tabMode !== 'custom' &&
         el(
           'select',
@@ -4698,7 +5856,10 @@ class App {
               rebuild({ capo: Math.max(0, Math.min(12, Math.round(Number((e.target as HTMLInputElement).value)) || 0)) })
           })
         ),
-      tabOn && el('span', { class: 'tuning-summary', text: `Tuning low → high: ${tuningLabel(activeTuning)}` }),
+      // The "Tuning low → high: E1 A1 D2 G2" row stood here. It said the right thing in the
+      // wrong place: on the screen but never on the paper, once for a whole document, and as
+      // prose you had to count against the lines. The letters are on the staff now, on every
+      // system and in the PDF — see view/stringLetters.ts.
       source?.documentBars !== undefined &&
         el('div', { class: 'document-bars' },
           el('button', { text: '− Bar', title: 'Remove the last empty bar', onClick: () => this.changeDocumentBars(-1) }),
@@ -4789,39 +5950,39 @@ class App {
           el('span', { 'data-role': 'engine-text', text: 'Listener' }),
           el('span', { class: 'chip-detail', text: '✕' })
         ),
-      // Offered whenever there is a RECORDING behind what is on screen, which is what `peaks`
-      // means — a MIDI import has none, and re-running the engine on it would be theatre.
+      // "LISTEN AGAIN" IS NOT IN THIS HEADER ANY MORE.
       //
-      // It used to require `this.audioRef` as well, and that is why it went missing: the handle
-      // is dropped whenever the original cannot be re-opened (a restored session whose file has
-      // moved, or one the shell would not re-authorise), so the button silently deleted itself
-      // in exactly the situation somebody would reach for it. It stays put now and
-      // `retranscribe()` says what is wrong, because a control that explains itself beats one
-      // that disappears.
-      rt.source?.detected &&
-        rt.source.peaks &&
-        this.audioRef?.kind !== 'midi' &&
-        el('button', {
-          text: '↻ Listen again',
-          'data-role': 'retranscribe',
-          disabled: rt.progress !== null,
-          title: t(TIPS.retranscribe),
-          onClick: () => void this.retranscribe()
-        }),
+      // It was a permanent button for a rare gesture, sitting in the row somebody reads on
+      // every take, and the thing it did is now the ordinary consequence of choosing an
+      // engine — which is what people were reaching for it to do. What is left of it, "read
+      // this recording again from scratch", is a deliberate start-over and lives in the Main
+      // menu next to the other deliberate acts (Save as, Close), as `retranscribe-menu`.
+      //
+      // The header is where a plugin window pays for chrome first: it is the row that has to
+      // survive REAPER's 390px-wide docked FX window, and every button in it costs the ones
+      // beside it.
       // Fresh elements every render — the header is rebuilt wholesale, so the bar hands
       // back new buttons and re-binds its own popover anchor.
       ...this.exportBar.buttons(),
-      el('button', {
-        class: 'icon',
-        // Named so the panel's outside-click dismissal can exempt it. Without that, pressing
-        // the gear while the panel is open would close it on the way down and reopen it on the
-        // way up, and the button would look broken.
-        'data-role': 'settings-gear',
-        text: '⚙',
-        'aria-label': 'Settings',
-        title: t(TIPS.settings),
-        onClick: () => this.toggleSettings()
-      })
+      // THE GEAR, BIGGER AND NAMED. It was a bare glyph at icon size, indistinguishable at a
+      // glance from the export buttons beside it. A settings panel is the one control in a
+      // header somebody actively hunts for, so it says what it is; the word collapses on the
+      // narrowest layouts (styles.css §.settings-gear) and the glyph stays.
+      el(
+        'button',
+        {
+          class: 'settings-gear',
+          // Named so the panel's outside-click dismissal can exempt it. Without that, pressing
+          // the gear while the panel is open would close it on the way down and reopen it on
+          // the way up, and the button would look broken.
+          'data-role': 'settings-gear',
+          'aria-label': 'Settings',
+          title: t(TIPS.settings),
+          onClick: () => this.toggleSettings()
+        },
+        el('span', { class: 'gear-glyph', 'aria-hidden': 'true', text: '⚙' }),
+        el('span', { class: 'gear-label', text: 'Settings' })
+      )
     );
 
     // No waveform for a MIDI import — there is no audio, and an empty strip is a lie about
@@ -5046,6 +6207,106 @@ class App {
     this.pollEngine();
   }
 
+  /**
+   * Say so when the chosen grid is too coarse to hold this riff.
+   *
+   * THE CASE THIS EXISTS FOR. The demo is a triplet figure. Ask for a 1/4 notation grid and
+   * the quantizer has nowhere to put the second and third note of each triplet: they land on
+   * the same quarter as the first, and what comes out of the pipeline is one note where the
+   * player played three. The sheet was simply wrong, quietly, and the only clue was that it
+   * looked too empty — which is indistinguishable from a bad transcription.
+   *
+   * The count is not a heuristic and not a prediction: it is the engine's own note count
+   * minus what actually got engraved, measured on the score that is on screen right now.
+   * `noteGlyphs` counts noteheads, so a chord of three is three, which is the same unit
+   * `detected.notes` is in. Ties do not double-count — the IR's stats already fold them.
+   *
+   * Nothing is prevented. The player asked for quarter notes and may have meant it (a
+   * simplified lead sheet is a legitimate thing to want); this only refuses to let the app
+   * lose notes without mentioning it. Silent on `auto` and `free`, which are the settings that
+   * mean "work it out" and "do not quantize" — neither can be the wrong choice in this sense.
+   */
+  private coarseGridWarning(): HTMLElement | null {
+    const s = this.settings.get();
+    if (s.grid === 'auto' || s.grid === 'free') return null;
+
+    const detected = this.runtime.get().source?.detected?.notes;
+    const score = this.runtime.get().score;
+    if (!detected || detected.length === 0 || !score) return null;
+
+    const engraved = score.ir.stats.noteGlyphs;
+    const lost = detected.length - engraved;
+
+    // TWO THRESHOLDS, AND THE PROPORTIONAL ONE IS THE IMPORTANT HALF.
+    //
+    // An absolute floor on its own ("two or more notes went missing") fires on grids that are
+    // perfectly reasonable: engraving a real performance always folds a few things — a note
+    // clipped by the trim, two attacks inside one grid cell that genuinely were one note. On
+    // the triplet demo a 1/4 grid loses 44 of 77 notes and a triplet grid loses 7, and only
+    // the first of those is a grid that cannot hold the riff. A warning that appears on both
+    // is a warning that gets ignored on both.
+    //
+    // A tenth is the line: below it the engraving is doing its ordinary job, above it the
+    // grid is the reason the page disagrees with the recording.
+    if (lost < 2 || lost / detected.length <= 0.1) return null;
+
+    return el('span', {
+      class: 'status-row warn-row',
+      'data-role': 'grid-too-coarse',
+      text: `${GRID_LABELS[s.grid]} would merge ${lost} notes — too coarse for this riff`,
+      title: t(
+        `The engine heard ${detected.length} notes and this grid can only write ${engraved} of them, ` +
+          'because the rest fall between its lines. Try a finer grid, or Auto, which picks one that fits.'
+      )
+    });
+  }
+
+  /**
+   * The tempo as the BOX shows it — in the beat the time signature is written in.
+   *
+   * `tempoBpm` is quarter-notes per minute everywhere else in this app, without exception: the
+   * pipeline, `secondsToTick`, `synthNotesFor` and `documentDuration` all divide 60 by it and
+   * multiply by 960 ticks per quarter, and `documentDuration` carries the `4 / denominator`
+   * factor that converts a signature's beats into quarters. So in 6/8 a stored 120 is 120
+   * quarters a minute, which is 240 eighths a minute — and a box that printed "120" beside a
+   * ♪ glyph would be out by a factor of two.
+   *
+   * The conversion is presentation only, in both directions, and the stored value never moves
+   * when the signature does. That is the property worth stating out loud: switching 4/4 to 6/8
+   * changes this number from 120 to 240 and changes NOTHING about how fast the take plays. The
+   * playback clock never reads a tempo at all — `audio/transport.ts` schedules absolute
+   * seconds computed once, and contains no reference to bpm or to a signature.
+   */
+  private displayedBpm(): number {
+    const rt = this.runtime.get();
+    const quarters = rt.score?.tempoBpm ?? rt.source?.tempoBpm ?? 100;
+    return Math.round(quarters * beatUnit(rt.score?.timeSignature ?? rt.source?.timeSignature).perQuarter);
+  }
+
+  /**
+   * Put the live tempo, and its unit, into the boxes that are already on screen.
+   *
+   * THE BOX COULD LIE, and it could do so before any of this wave's work: its value is written
+   * once, when the transport is built, from `score?.tempoBpm ?? source?.tempoBpm ?? 100`. The
+   * demo path builds the transport BEFORE the first engraving exists, so the fallback 100 was
+   * drawn over a take the pipeline had put at 96 and nothing ever corrected it. Harmless-looking
+   * until the unit arrived beside it: "100 ♩/min" next to a sheet engraved at 96 is a specific,
+   * checkable, wrong claim rather than a vague one.
+   *
+   * Called from `applyScoreToViews`, which is the one place every rebuild goes through. In
+   * place rather than by re-rendering, and never while the box has focus — overwriting somebody
+   * mid-keystroke is its own bug.
+   */
+  private refreshTempoBox(): void {
+    const box = this.root.querySelector<HTMLInputElement>('[data-role="bpm"]');
+    if (box && document.activeElement !== box) box.value = String(this.displayedBpm());
+    const unit = this.root.querySelector<HTMLElement>('[data-role="bpm-unit"]');
+    if (unit) {
+      const rt = this.runtime.get();
+      unit.textContent = `${beatUnit(rt.score?.timeSignature ?? rt.source?.timeSignature).glyph}/min`;
+    }
+  }
+
   private buildTransport(): HTMLElement {
     const rt = this.runtime.get();
 
@@ -5061,6 +6322,39 @@ class App {
         onClick: () => void this.transport.toggle()
       }),
       el('button', { text: '⏹', 'aria-label': 'Stop', title: t(TIPS.stop), onClick: () => void this.transport.stop() }),
+
+      // UNDO AND REDO, ON SCREEN. ⌘Z has always worked and has always been invisible, which
+      // makes it a feature for people who already knew about it. The player has to be able to
+      // see that a mistake is undoable BEFORE making one — that is most of what makes an
+      // editable sheet feel safe to touch — so the pair sits in the transport row, next to the
+      // controls a hand is already on.
+      //
+      // Drawn arrows, not "↶". The text glyph renders as a hairline at this size in the
+      // shell's font and reads as decoration; a 2.6px stroke reads as a button. Same box and
+      // same weight as the chips beside them.
+      el(
+        'div',
+        { class: 'row undo-redo' },
+        el('button', {
+          class: 'icon undo-btn',
+          'data-role': 'undo',
+          'aria-label': 'Undo',
+          html: UNDO_SVG,
+          disabled: !this.canUndo(),
+          title: t(this.undoTitle()),
+          onClick: () => this.undo()
+        }),
+        el('button', {
+          class: 'icon undo-btn',
+          'data-role': 'redo',
+          'aria-label': 'Redo',
+          html: REDO_SVG,
+          disabled: !this.canRedo(),
+          title: t(this.redoTitle()),
+          onClick: () => this.redo()
+        })
+      ),
+
       el('button', {
         class: 'chip',
         text: this.transport.loop && this.loopBarNumber !== null ? `Bar ${this.loopBarNumber}` : 'Loop bar',
@@ -5117,19 +6411,37 @@ class App {
           min: '20',
           max: '400',
           style: { width: '62px' },
-          value: String(Math.round(rt.score?.tempoBpm ?? rt.source?.tempoBpm ?? 100)),
+          'data-role': 'bpm',
+          value: String(this.displayedBpm()),
           title: t(TIPS.bpm),
-          'aria-label': 'Tempo in beats per minute',
+          'aria-label': `Tempo in ${beatUnit(rt.score?.timeSignature ?? rt.source?.timeSignature).name}s per minute`,
           onChange: (e: Event) => {
             const v = Number((e.target as HTMLInputElement).value);
             if (v >= 20 && v <= 400) {
               const source = this.runtime.get().source;
-              if (source) this.runtime.set({ source: { ...source, tempoBpm: v } });
+              // Back into quarter-notes per minute, which is the ONLY unit `tempoBpm` is ever
+              // in. See `displayedBpm()` for why the box is not always in that unit.
+              const quarters =
+                v / beatUnit(this.runtime.get().score?.timeSignature ?? source?.timeSignature).perQuarter;
+              if (source) this.runtime.set({ source: { ...source, tempoBpm: quarters } });
               this.releaseHostGrid('tempo');
               this.rebuildNotation();
               this.renderMain();
             }
           }
+        }),
+        // THE UNIT, next to the number. "120" on its own is ambiguous the moment the sheet is
+        // in anything but a /4 meter, and the app was showing quarter-notes-per-minute under a
+        // 6/8 signature with nothing to say so.
+        el('span', {
+          class: 'dim bpm-unit',
+          'data-role': 'bpm-unit',
+          text: `${beatUnit(rt.score?.timeSignature ?? rt.source?.timeSignature).glyph}/min`,
+          title: t(
+            `The beat this tempo counts — ${beatUnit(rt.score?.timeSignature ?? rt.source?.timeSignature).name}s ` +
+              'per minute, which is the beat the time signature below is written in. Changing the ' +
+              'signature re-states the same tempo in the new beat; it never plays back faster or slower.'
+          )
         }),
         el(
           'select',
@@ -5274,7 +6586,6 @@ class App {
     // written for and, until the control existed, had no caller.
     this.triview?.setFretLimit(s.maxFret);
     this.transport.setVoice(s.playbackVoice);
-    this.transport.setMetronome(s.metronome);
     // The roll's ruler is a VIEW setting and belongs on this side of the line, not with the
     // rebuilding ones: it redraws one canvas. The panel and the header chip write the same
     // setting, so whichever the player reaches for, the other follows — which is why the
@@ -5424,6 +6735,7 @@ class App {
       this.scheduleSave();
     }
     this.applyResult(result, keepSelected);
+    this.refreshUndoRedo();
   }
 
   /**
@@ -5521,6 +6833,15 @@ class App {
   /** Snapshots of the whole performance, one per roll edit. Entry 0 is "as transcribed". */
   private perfStack: InputNote[][] = [];
   private perfIndex = 0;
+  /**
+   * What each performance step WAS, parallel to `perfStack`.
+   *
+   * Index 0 is the take as the engine returned it and has no label, so `perfLabels[i]` names
+   * the step that produced `perfStack[i]`. Only the undo/redo tooltips read it — the notation
+   * stack has carried labels all along and the performance stack was the half that could not
+   * say what it would put back.
+   */
+  private perfLabels: Array<string | null> = [null];
   /** The order the two layers were edited in, so one ⌘Z walks back through both. */
   private history: Array<'perf' | 'score'> = [];
   private historyIndex = -1;
@@ -5558,9 +6879,11 @@ class App {
   private resetHistories(): void {
     const notes = this.runtime.get().source?.detected?.notes ?? [];
     this.perfStack = [notes];
+    this.perfLabels = [null];
     this.perfIndex = 0;
     this.history = [];
     this.historyIndex = -1;
+    this.refreshUndoRedo();
   }
 
   /**
@@ -5622,10 +6945,13 @@ class App {
   /**
    * Look at the take with the app's own ears, and act if the setting allows it.
    *
-   * The thinking happens either way. With the setting OFF nothing is edited, but the same
-   * detections are shown as attention highlights — because the useful half of this feature is
-   * that the app stops disagreeing with itself in silence, and "do not touch my notes" is a
-   * different instruction from "do not tell me".
+   * The thinking happens either way, and with the setting OFF the result is now NOTHING on
+   * screen: no edits, no marks, no chip. That is a reversal. The old behaviour drew the
+   * refusals as yellow highlights on the argument that "do not touch my notes" is a different
+   * instruction from "do not tell me" — which is true, and still produced a take speckled
+   * with marks the player could neither act on nor clear. Switching the feature off now
+   * means what it says. The plan is still computed and still recorded on `autoAttention`,
+   * because the probes and the guardrail checks read it; it is simply never painted.
    */
   private runAutoEditPass(): void {
     const source = this.runtime.get().source;
@@ -5695,23 +7021,29 @@ class App {
     }
   }
 
-  /** Push the current marks into the two views that are allowed to show them. */
+  /**
+   * Push the current marks into the two views that are allowed to show them.
+   *
+   * ONLY EDITS THAT WERE ACTUALLY MADE. `this.autoAttention` — everything the pass noticed
+   * and refused — is deliberately NOT drawn any more, on either view. It is still recorded,
+   * still counted by the probes, and still the reason a guardrail can be shown to have
+   * fired; it simply has no ink.
+   *
+   * Why: a yellow highlight is a request for attention that comes with nothing to do about
+   * it. Every take had a scattering of them, on notes that were correct, and the cost was
+   * paid by the green marks — the ones that mean "the app changed this, check it" — which
+   * the eye learned to skim along with the rest. One kind of mark, one meaning, one action.
+   */
   private refreshAutoMarks(): void {
-    const marks: Array<{ noteId: string; applied: boolean }> = [];
+    const marks: Array<{ noteId: string }> = [];
     for (const edit of this.autoEdits) {
       if (edit.reviewed) continue;
-      for (const id of edit.noteIds) marks.push({ noteId: id, applied: true });
-    }
-    for (const mark of this.autoAttention) {
-      if (mark.noteId) marks.push({ noteId: mark.noteId, applied: false });
+      for (const id of edit.noteIds) marks.push({ noteId: id });
     }
     this.pianoRoll?.setAutoMarks(marks);
-    this.waveform?.setAttentionRegions([
-      ...this.autoEdits
-        .filter((e) => !e.reviewed)
-        .map((e) => ({ fromSec: e.fromSec, toSec: e.toSec, applied: true })),
-      ...this.autoAttention.map((m) => ({ fromSec: m.fromSec, toSec: m.toSec, applied: false }))
-    ]);
+    this.waveform?.setAttentionRegions(
+      this.autoEdits.filter((e) => !e.reviewed).map((e) => ({ fromSec: e.fromSec, toSec: e.toSec }))
+    );
     this.updateAutoChip();
   }
 
@@ -5860,19 +7192,22 @@ class App {
     this.scheduleSave();
   }
 
-  private commitPerformance(notes: InputNote[], _label: string): void {
+  private commitPerformance(notes: InputNote[], label: string): void {
     const source = this.runtime.get().source;
     if (!source?.detected) return;
 
     // Drop the redo tail on both stacks — a new edit after an undo replaces the future.
     this.perfStack = this.perfStack.slice(0, this.perfIndex + 1);
+    this.perfLabels = this.perfLabels.slice(0, this.perfIndex + 1);
     this.perfStack.push(notes);
+    this.perfLabels.push(label);
     this.perfIndex = this.perfStack.length - 1;
     this.history = this.history.slice(0, this.historyIndex + 1);
     this.history.push('perf');
     this.historyIndex = this.history.length - 1;
 
     this.setPerformance(notes);
+    this.refreshUndoRedo();
   }
 
   /** Put a performance on screen: new notes in, pipeline re-run, notation edits replayed. */
@@ -5888,6 +7223,58 @@ class App {
     this.scheduleSave();
   }
 
+  /**
+   * Is there anything to walk back? Asked of BOTH layers, not of one.
+   *
+   * `undo()` below prefers the interleaved history and falls through to the notation stack, so
+   * the button has to be lit whenever either of them would do something. Reading only
+   * `undoStack.canUndo` would grey the button out after a roll edit — which is a performance
+   * step, lives on the other stack, and is undoable.
+   */
+  private canUndo(): boolean {
+    return this.historyIndex >= 0 || this.undoStack.canUndo;
+  }
+
+  private canRedo(): boolean {
+    return this.historyIndex < this.history.length - 1 || this.undoStack.canRedo;
+  }
+
+  /** "Undo — move note" beats "Undo", and it costs one lookup. */
+  private undoTitle(): string {
+    if (!this.canUndo()) return 'Nothing to undo yet.';
+    const next = this.historyIndex >= 0 ? this.history[this.historyIndex] : 'score';
+    const label = next === 'perf' ? (this.perfLabels[this.perfIndex] ?? null) : this.undoStack.undoLabel;
+    return label ? `Undo — ${label.toLowerCase()}` : 'Undo the last change (⌘Z).';
+  }
+
+  private redoTitle(): string {
+    if (!this.canRedo()) return 'Nothing to redo.';
+    const next = this.historyIndex < this.history.length - 1 ? this.history[this.historyIndex + 1] : 'score';
+    const label = next === 'perf' ? (this.perfLabels[this.perfIndex + 1] ?? null) : this.undoStack.redoLabel;
+    return label ? `Redo — ${label.toLowerCase()}` : 'Redo the change you just undid (⇧⌘Z).';
+  }
+
+  /**
+   * Light or grey the pair, in place.
+   *
+   * In place rather than by re-rendering the transport: an edit that rebuilt the row would
+   * throw away the fader element mid-drag and take the sound picker's open menu with it.
+   */
+  private refreshUndoRedo(): void {
+    const undo = this.root.querySelector<HTMLButtonElement>('[data-role="undo"]');
+    const redo = this.root.querySelector<HTMLButtonElement>('[data-role="redo"]');
+    if (undo) {
+      undo.disabled = !this.canUndo();
+      const title = this.undoTitle();
+      if (t(title)) undo.title = title;
+    }
+    if (redo) {
+      redo.disabled = !this.canRedo();
+      const title = this.redoTitle();
+      if (t(title)) redo.title = title;
+    }
+  }
+
   private undo(): void {
     // One ⌘Z, two layers. Which one is decided by what was done last, not by which panel has
     // focus — the player is undoing "the last thing I did", not "the last thing I did here".
@@ -5895,6 +7282,7 @@ class App {
       this.historyIndex--;
       this.perfIndex = Math.max(0, this.perfIndex - 1);
         this.setPerformance(this.perfStack[this.perfIndex]);
+      this.refreshUndoRedo();
       return;
     }
 
@@ -5909,6 +7297,7 @@ class App {
       this.scheduleSave();
     }
     this.applyResult(result, null);
+    this.refreshUndoRedo();
   }
 
   private redo(): void {
@@ -5916,6 +7305,7 @@ class App {
       this.historyIndex++;
       this.perfIndex = Math.min(this.perfStack.length - 1, this.perfIndex + 1);
         this.setPerformance(this.perfStack[this.perfIndex]);
+      this.refreshUndoRedo();
       return;
     }
 
@@ -6069,7 +7459,15 @@ class App {
         runtime: this.runtime,
         onRebuild: () => this.rebuildNotation(),
         onViewChange: () => this.onViewSettingsChanged(),
-        onClose: () => this.toggleSettings(false)
+        onClose: () => this.toggleSettings(false),
+        // Pressing "Use this engine" on a card is the same gesture as pressing a chip on the
+        // main menu, and it must have the same consequence — see `chooseEngine()`. The panel
+        // closes on the way, because what happens next is a transcription of the sheet the
+        // panel is covering.
+        onChooseEngine: async (id: string) => {
+          this.toggleSettings(false);
+          return this.chooseEngine(id);
+        }
       });
     }
     return this.settingsPanel;
@@ -6157,6 +7555,10 @@ class App {
   }
 
   private toastLayer(): HTMLElement {
+    const dismiss = (id: number) => {
+      this.runtime.set({ toasts: this.runtime.get().toasts.filter((x) => x.id !== id) });
+      this.refreshToasts();
+    };
     return el(
       'div',
       { class: 'toasts', 'aria-live': 'polite' },
@@ -6164,14 +7566,30 @@ class App {
         el(
           'div',
           { class: `toast ${toast.kind}` },
-          el('div', {}, el('strong', { text: toast.title }), el('div', { text: toast.message })),
+          el(
+            'div',
+            {},
+            el('strong', { text: toast.title }),
+            el('div', { text: toast.message }),
+            // A NOTICE THAT CAN BE ACTED ON. Some of these say something the player would
+            // immediately want to do something about — "the listener is still running and
+            // holding 1.5 GB" being the one this was built for — and until now the only
+            // control on a toast was the one that made it go away.
+            toast.action &&
+              el('button', {
+                class: 'chip toast-action',
+                text: toast.action.label,
+                'data-role': toast.action.role,
+                onClick: () => {
+                  dismiss(toast.id);
+                  toast.action?.run();
+                }
+              })
+          ),
           el('button', {
             text: '✕',
             'aria-label': 'Dismiss',
-            onClick: () => {
-              this.runtime.set({ toasts: this.runtime.get().toasts.filter((x) => x.id !== toast.id) });
-              this.refreshToasts();
-            }
+            onClick: () => dismiss(toast.id)
           })
         )
       )
@@ -6182,9 +7600,14 @@ class App {
     this.root.querySelector('.toasts')?.replaceWith(this.toastLayer());
   }
 
-  private toast(kind: 'info' | 'danger', title: string, message: string): void {
+  private toast(
+    kind: 'info' | 'danger',
+    title: string,
+    message: string,
+    action?: { label: string; role: string; run: () => void }
+  ): void {
     const id = ++this.toastId;
-    this.runtime.set({ toasts: [...this.runtime.get().toasts, { id, kind, title, message }] });
+    this.runtime.set({ toasts: [...this.runtime.get().toasts, { id, kind, title, message, action }] });
     this.refreshToasts();
     // Errors stay until acknowledged; info fades. That split proved right in Basscribe.
     if (kind === 'info') {
@@ -6563,6 +7986,45 @@ function resizeTuning(current: number[], requested: number): number[] {
  * case was 3/6 — and a `<select>` that cannot represent its own value silently snaps to the
  * first option, which reads as the app having thrown the DAW's answer away.
  */
+/**
+ * The note that gets one beat in this signature: its glyph, its name, and how many fit in a
+ * quarter.
+ *
+ * ONE FUNCTION FOR ALL THREE, because they are one fact and splitting them is how a label
+ * ends up disagreeing with the number beside it. That is not hypothetical: a DAW really does
+ * hand us meters like 3/6 (the user's own reproduction case), and a version of this that
+ * scaled by `denominator / 4` unconditionally while only naming a glyph for 1, 2, 4, 8 and 16
+ * would have printed a quarter-note glyph next to a number multiplied by one and a half.
+ *
+ * So the rule is: a denominator this can NAME is one it scales by, and a denominator it
+ * cannot name is left in quarters — which is the unit `tempoBpm` is stored in, so the pair
+ * stays true rather than blank or invented.
+ *
+ * Textbook reading of the denominator otherwise: /4 counts quarters, /8 counts eighths, /2
+ * counts halves. Compound meters are the known simplification — 6/8 is usually FELT in dotted
+ * quarters, and this calls its beat the eighth, which is what the signature literally says and
+ * what a metronome mark in 6/8 is normally written against. Being literal is the right kind of
+ * wrong here: it is the reading somebody can check against the number on screen.
+ */
+function beatUnit(sig: { numerator: number; denominator: number } | undefined): {
+  glyph: string;
+  name: string;
+  perQuarter: number;
+} {
+  switch (sig?.denominator) {
+    case 1:
+      return { glyph: '𝅝', name: 'whole note', perQuarter: 0.25 };
+    case 2:
+      return { glyph: '𝅗𝅥', name: 'half note', perQuarter: 0.5 };
+    case 8:
+      return { glyph: '♪', name: 'eighth note', perQuarter: 2 };
+    case 16:
+      return { glyph: '𝅘𝅥𝅯', name: 'sixteenth note', perQuarter: 4 };
+    default:
+      return { glyph: '♩', name: 'quarter note', perQuarter: 1 };
+  }
+}
+
 function timeSigOptions(current: { numerator: number; denominator: number } | undefined): string[] {
   const presets = ['4/4', '3/4', '6/8', '5/4', '7/8', '12/8'];
   if (!current) return presets;

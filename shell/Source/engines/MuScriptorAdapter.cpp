@@ -2,6 +2,7 @@
 #include "EngineCatalog.h"
 #include "EngineSettings.h"
 #include "ModelCatalog.h"
+#include "SystemProbe.h"     // physicalRamMb(), for the per-model RAM table
 
 namespace
 {
@@ -121,9 +122,28 @@ EngineAdapter::Status MuScriptorAdapter::status() const
     }();
 
     juce::Array<juce::var> installedList;
+    const auto installedNames = ModelCatalog::installedModels();
 
-    for (const auto& name : ModelCatalog::installedModels())
+    for (const auto& name : installedNames)
         installedList.add (name);
+
+    // ALL THREE SIZES AS DATA, not just the ones on disk. The card used to be
+    // able to say "you have medium" and nothing else; a user deciding whether
+    // to download large had no way to find out from Riffsheet what large would
+    // cost them, and the 0.9 / 1.8 / 5 GB figures existed only inside
+    // ModelCatalog's auto rule and inside a paragraph of BRIDGE.md. Sending the
+    // table means the page renders the numbers the resolver actually uses -
+    // including `fits`, which is that rule's own 40%-of-physical answer rather
+    // than a second copy of the arithmetic in TypeScript.
+    const auto ramTotalMb = SystemProbe::physicalRamMb();
+    juce::Array<juce::var> modelTable;
+
+    for (const auto& name : ModelCatalog::allModelNames())
+        modelTable.add (makeObject ({
+            { "name", name },
+            { "approxResidentMb", ModelCatalog::estimatedResidentMb (name) },
+            { "installed", installedNames.contains (name) },
+            { "fits", ModelCatalog::fitsInPhysicalRam (name, ramTotalMb) } }));
 
     // The MuScriptor-only half of engineStatus(), merged over the shared shape
     // by NativeBridge::makeEngineStatusVar(). Every one of these fields exists
@@ -135,6 +155,7 @@ EngineAdapter::Status MuScriptorAdapter::status() const
         { "resolvedModel", server.getResolvedModel() },
         { "modelReason", server.getModelReason() },
         { "installedModels", installedList },
+        { "models", modelTable },
         { "venv", config.venv.getFullPathName() },
         { "executable", executable.getFullPathName() },
         { "setupDirectory", MuScriptorServer::recommendedSetupDirectory().getFullPathName() },
@@ -142,6 +163,16 @@ EngineAdapter::Status MuScriptorAdapter::status() const
         { "engineConfigExists", MuScriptorServer::engineConfigFile().existsAsFile() },
         { "idleSeconds", idle.idleSeconds },
         { "canStop", idle.canStop },
+
+        // "Somebody else's server is on the wire", and "you may ask Riffsheet
+        // to stop it anyway". Two fields rather than one because the first
+        // decides what the card SAYS about who owns the server and the second
+        // decides whether the button is offered at all - on Windows, where the
+        // listening pid's command line cannot be read, the first is true and
+        // the second is false, and collapsing them would offer a button that
+        // can only ever refuse.
+        { "externalServer", idle.external },
+        { "canStopExternal", idle.canStopExternal },
         // Null rather than 0 when the platform will not say - "unknown" and
         // "using no memory" must not look the same.
         { "memoryMb", idle.memoryMb > 0 ? juce::var (idle.memoryMb) : juce::var() } });

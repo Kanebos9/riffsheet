@@ -159,16 +159,30 @@ const GRID_MAP: Record<AppSettings['grid'], BuildSettings['grid']> = {
   free: 'free'
 };
 
+/**
+ * The same translation for fingering: the app's words, Team C's words.
+ *
+ * All four of the pipeline's styles are reachable now. `open-strings` and `around-fret` were
+ * added to its tab planner and had no way in from here, which is a feature that exists in the
+ * build and not in the product.
+ */
+const FINGERING_MAP: Record<AppSettings['fingering'], BuildSettings['fingeringStyle']> = {
+  'low-positions': 'low',
+  'minimize-movement': 'minMovement',
+  'open-strings': 'openStrings',
+  'around-fret': 'aroundFret'
+};
+
 export function toBuildSettings(settings: AppSettings, title?: string): BuildSettings {
   const tuning = selectedNotationTuning(settings);
   const tuningMidi = tuning ? [...tuning.midiLowToHigh] : [];
   const instrument = instrumentKind(settings, tuningMidi);
   return {
     grid: GRID_MAP[settings.grid],
-    fillGaps: settings.fillGaps,
     instrument,
     tuningMidi,
-    fingeringStyle: settings.fingering === 'minimize-movement' ? 'minMovement' : 'low',
+    fingeringStyle: FINGERING_MAP[settings.fingering],
+    ...(settings.fingering === 'around-fret' ? { anchorFret: settings.anchorFret } : {}),
     ...(settings.tempoBpm !== undefined ? { bpmOverride: settings.tempoBpm } : {}),
     ...(settings.timeSignature
       ? { timeSigOverride: [settings.timeSignature.numerator, settings.timeSignature.denominator] as [number, number] }

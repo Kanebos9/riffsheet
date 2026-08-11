@@ -487,7 +487,8 @@ jobs:
           # NOTICE.md names these paths, so shipping the notice without the texts
           # would be a promise the zip does not keep.
           mkdir -p "$OUT/third-party/basic-pitch" "$OUT/third-party/neuralnote" \
-                   "$OUT/third-party/beat-this" "$OUT/third-party/onnxruntime"
+                   "$OUT/third-party/beat-this" "$OUT/third-party/onnxruntime" \
+                   "$OUT/third-party/music21"
           cp third-party/basic-pitch/LICENSE "$OUT/third-party/basic-pitch/LICENSE"
           cp third-party/neuralnote/LICENSE  "$OUT/third-party/neuralnote/LICENSE"
           # beat_this's checkpoint is compiled into these binaries, and MIT
@@ -496,6 +497,14 @@ jobs:
           cp third-party/onnxruntime/LICENSE "$OUT/third-party/onnxruntime/LICENSE"
           cp third-party/onnxruntime/THIRD-PARTY-NOTICES.txt \
              "$OUT/third-party/onnxruntime/THIRD-PARTY-NOTICES.txt"
+
+          # The pipeline ships as GPL-3.0-only, not under the root AGPL LICENSE,
+          # and PIPELINE-ATTRIBUTIONS.md names both of these texts. Staging the
+          # notice without them was the same broken promise as above. The GPL
+          # text is renamed rather than dropped at `LICENSE`, which is already
+          # taken by the AGPL that covers everything else in the zip.
+          cp pipeline/LICENSE "$OUT/PIPELINE-LICENSE"
+          cp third-party/music21/LICENSE "$OUT/third-party/music21/LICENSE"
 
           # THE SIZE BUDGET, enforced rather than hoped for: no product zip over
           # 35 MB, no bundle over 100 MB. Statically linked ONNX Runtime is paid
@@ -638,6 +647,7 @@ jobs:
           New-Item -ItemType Directory -Force "$out\third-party\neuralnote"  | Out-Null
           New-Item -ItemType Directory -Force "$out\third-party\beat-this"   | Out-Null
           New-Item -ItemType Directory -Force "$out\third-party\onnxruntime" | Out-Null
+          New-Item -ItemType Directory -Force "$out\third-party\music21"     | Out-Null
           Copy-Item third-party/basic-pitch/LICENSE "$out\third-party\basic-pitch\LICENSE"
           Copy-Item third-party/neuralnote/LICENSE  "$out\third-party\neuralnote\LICENSE"
           # beat_this's checkpoint is compiled into these binaries, and MIT
@@ -646,6 +656,13 @@ jobs:
           Copy-Item third-party/onnxruntime/LICENSE "$out\third-party\onnxruntime\LICENSE"
           Copy-Item third-party/onnxruntime/THIRD-PARTY-NOTICES.txt `
                     "$out\third-party\onnxruntime\THIRD-PARTY-NOTICES.txt"
+
+          # The pipeline ships as GPL-3.0-only, not under the root AGPL LICENSE,
+          # and PIPELINE-ATTRIBUTIONS.md names both of these texts. The GPL text
+          # is renamed rather than dropped at `LICENSE`, which is already taken
+          # by the AGPL that covers everything else in the zip.
+          Copy-Item pipeline/LICENSE "$out\PIPELINE-LICENSE"
+          Copy-Item third-party/music21/LICENSE "$out\third-party\music21\LICENSE"
 
           # The same size budget the other two legs are held to. STAGE_DIR is
           # handed over with forward slashes: "$PWD\$out" is a Windows path, and

@@ -11,8 +11,10 @@
  *   4. key BEFORE spelling BEFORE accidental display   (detectKey -> spellNoteList -> display)
  *   5. beaming AFTER the time signature and tie-split  (computeBeams, on the finished bars)
  *
- * And the one that owns the user's actual complaint: the rest killer runs BETWEEN quantization
- * and bar construction, so that by the time anything constructs a rest, the gaps are gone.
+ * DURATIONS ARE NOT NEGOTIATED. Station 2b used to lengthen every note over the silence behind
+ * it; that pass is deleted (simplify.ts explains why at length). What reaches bar construction
+ * is the played length, snapped to the grid and clamped so one voice never holds two notes at
+ * once. Silence that was played is printed as a rest, including a short one.
  */
 
 import { DIVISIONS, type IRBar, type IRBeat, type IRKeySignature, type IRNote, type IRVoice, type RiffsheetIR, type BeamState, type DurationType } from './ir.js';
@@ -22,7 +24,7 @@ import { applyGuards } from './guards.js';
 import { buildTimeSkeleton, compoundEvidence, type TimeSkeleton } from './timeSkeleton.js';
 import { clampOverlaps, collectChords, type ChordEvent } from './chords.js';
 import { quantizeOnsets, type QuantNote } from './quantize.js';
-import { minimizeNumberOfRests, snapLeadingOnset, type SimplifyBar, type SimplifyEvent } from './simplify.js';
+import { clampEventOverlaps, snapLeadingOnset, type SimplifyEvent } from './simplify.js';
 import { buildBarMetric, glyphFor, toDurationList, tupletWrittenLen, VOCABULARY, type BarMetric } from './meter.js';
 import { detectKey } from './key.js';
 import { accidentalDisplayForMeasure, spellNoteList, type DisplayNote } from './spelling.js';
@@ -52,7 +54,6 @@ interface PlacedEvent {
   startTick: number;
   offTick: number;
   tupletId?: string;
-  staccato: boolean;
 }
 
 const BEAM_LEVEL: Partial<Record<DurationType, number>> = { eighth: 1, '16th': 2, '32nd': 3 };
@@ -208,57 +209,32 @@ export function buildScore(input: BuildInput, settings: BuildSettings): BuildRes
     const compound = b.timeSig[1] === 8 && b.timeSig[0] > 3 && b.timeSig[0] % 3 === 0;
     return buildBarMetric(b.timeSig[0], b.timeSig[1], compound);
   });
-  const simplifyBars: SimplifyBar[] = skel.bars.map((b, i) => ({
-    startTick: b.startTick,
-    ticks: b.ticks,
-    metric: metrics[i]
-  }));
-
   const chordById = new Map(quantInput.map((q, i) => [q.id, chords[i]]));
   if (qNotes.length && !exactSymbolicTiming) {
-    qNotes[0].startTick = snapLeadingOnset(qNotes[0].startTick, simplifyBars[0].startTick, DIVISIONS);
+    qNotes[0].startTick = snapLeadingOnset(qNotes[0].startTick, skel.bars[0].startTick, DIVISIONS);
   }
 
-  // ---- station 2: the rest killer ------------------------------------------------------------
-  // sounding/IOI per event, measured in SECONDS before quantization — the staccato gate (§5.1).
-  const soundingRatios = new Map<string, number>();
-  quantInput.forEach((qi, i) => {
-    const c = chords[i];
-    const next = chords[i + 1];
-    const ioi = next ? next.onsetSec - c.onsetSec : c.endSec - c.onsetSec;
-    soundingRatios.set(qi.id, ioi > 0 ? (c.endSec - c.onsetSec) / ioi : 1);
-  });
+  // ---- station 2: overlap clamp ---------------------------------------------------------------
+  // Durations reach the page as played. The only adjustment is cutting an off-time back to the
+  // next attack when tick rounding pushed it past one — a voice cannot hold two notes at once.
   const simplifyEvents: SimplifyEvent[] = qNotes.map((n) => ({
     startTick: n.startTick,
     offTick: n.offTick,
-    ...(n.tupletId ? { tupletId: n.tupletId } : {}),
-    ...(soundingRatios.has(n.id) ? { soundingRatio: soundingRatios.get(n.id)! } : {})
+    ...(n.tupletId ? { tupletId: n.tupletId } : {})
   }));
-  const tupletMap = new Map(
-    quant.tuplets.map((t) => [t.id, { startTick: t.startTick, endTick: t.endTick, unitTicks: t.unitTicks }])
-  );
-  const lengthened = minimizeNumberOfRests(simplifyEvents, {
-    divisions: DIVISIONS,
-    bars: simplifyBars,
-    basicQuantTicks: quant.basicQuantTicks,
-    compound: skel.compound,
-    tuplets: tupletMap,
-    fillGaps: s.fillGaps && s.grid !== 'free' && !exactSymbolicTiming,
-    showStaccato: s.showStaccato
-  });
+  const clamped = clampEventOverlaps(simplifyEvents);
 
   // A final ring-out may not extend past the last bar: there is nothing there to tie to, and a
   // dangling <tie type="start"/> is a broken file.
   //
-  // ZIP FIRST, FILTER SECOND. `lengthened[i]` is positional against `qNotes`; filtering before
+  // ZIP FIRST, FILTER SECOND. `clamped[i]` is positional against `qNotes`; filtering before
   // the map silently pairs each surviving note with the wrong result.
   const placed: PlacedEvent[] = qNotes
     .map((n, i) => ({
       chord: chordById.get(n.id)!,
       startTick: n.startTick,
-      offTick: Math.min(lengthened[i].offTick, skel.totalTicks),
-      ...(n.tupletId ? { tupletId: n.tupletId } : {}),
-      staccato: lengthened[i].staccato
+      offTick: Math.min(clamped[i].offTick, skel.totalTicks),
+      ...(n.tupletId ? { tupletId: n.tupletId } : {})
     }))
     .filter((p) => p.startTick < skel.totalTicks && p.offTick > p.startTick);
 
@@ -275,6 +251,7 @@ export function buildScore(input: BuildInput, settings: BuildSettings): BuildRes
     tuningMidi: s.tuningMidi,
     fingeringStyle: s.fingeringStyle,
     capo: s.capo,
+    anchorFret: s.anchorFret,
     ...(s.maxFret !== undefined ? { maxFret: s.maxFret } : {}),
     legatoPairs
   });
@@ -292,8 +269,7 @@ export function buildScore(input: BuildInput, settings: BuildSettings): BuildRes
       );
 
   // ---- bars: rests are constructed here, and only here ---------------------------------------
-  const built = buildBars(placed, skel, metrics, quant.tuplets, s.showStaccato, key.fifths);
-  built.stats.gapsAbsorbed = lengthened.filter((l) => l.absorbedTicks > 0).length;
+  const built = buildBars(placed, skel, metrics, quant.tuplets, key.fifths);
 
   // ---- station 3b: spelling, then accidental display -----------------------------------------
   const orderedSourceNotes: { id: string; midi: number }[] = [];
@@ -410,7 +386,7 @@ export function buildScore(input: BuildInput, settings: BuildSettings): BuildRes
     skel.external ? 'grid: host DAW (external)' : skel.synthesised ? 'grid: synthesised, no beats supplied' : 'grid: detected beats',
     `quantizer: basicQuant ${quant.basicQuantTicks} ticks, jitter ${quant.jitterTicks.toFixed(2)} ticks`,
     key.accepted ? `key: fifths ${key.fifths} (confidence ${key.confidence})` : (key.reason ?? 'key: open'),
-    `rests: ${built.stats.restGlyphs} of ${built.stats.restGlyphs + built.stats.noteGlyphs} glyphs (${(built.stats.restDensity * 100).toFixed(1)}%), ${built.stats.gapsAbsorbed} gaps absorbed`,
+    `rests: ${built.stats.restGlyphs} of ${built.stats.restGlyphs + built.stats.noteGlyphs} glyphs (${(built.stats.restDensity * 100).toFixed(1)}%), durations as played`,
     ...(exactSymbolicTiming
       ? [`timing: exact symbolic ticks preserved${sourceBarsApplied ? ' with source bars/meter' : ''}`]
       : []),
@@ -488,7 +464,7 @@ interface BuiltBars {
   stats: RiffsheetIR['stats'];
 }
 
-function newNote(src: InputNote, tieStart: boolean, tieStop: boolean, staccato: boolean): IRNote {
+function newNote(src: InputNote, tieStart: boolean, tieStop: boolean): IRNote {
   return {
     id: src.id!,
     midi: src.midi,
@@ -497,7 +473,6 @@ function newNote(src: InputNote, tieStart: boolean, tieStop: boolean, staccato: 
     octave: 4,
     tieStart,
     tieStop,
-    ...(staccato ? { staccato: true } : {}),
     ...(src.velocity !== undefined ? { velocity: src.velocity } : {}),
     ...(src.confidence !== undefined ? { confidence: src.confidence } : {}),
     // webcore/IR.md: "please carry the original detected times through" — the as-played MIDI
@@ -530,7 +505,6 @@ function buildBars(
   skel: TimeSkeleton,
   metrics: BarMetric[],
   tuplets: { id: string; startTick: number; endTick: number; unitTicks: number; actual: number; normal: number }[],
-  showStaccato: boolean,
   keyFifths: number
 ): BuiltBars {
   const tupletById = new Map(tuplets.map((t) => [t.id, t]));
@@ -584,9 +558,6 @@ function buildBars(
         const shown = group
           ? typeOf(tupletWrittenLen(metric.beatLen, Math.max(1, Math.round(ticks / group.unitTicks)), group.normal))
           : typeOf(len);
-        const singleGlyph = pieces.length === 1 && !tieStop && !tieStart;
-        const staccato = showStaccato && ev.staccato && lastPiece && singleGlyph;
-        if (staccato) stats.staccatoNotes++;
         if (tieStart || tieStop) stats.tiedGlyphs++;
         stats.noteGlyphs++;
         beats.push({
@@ -606,7 +577,7 @@ function buildBars(
                 }
               }
             : {}),
-          notes: ev.chord.notes.map((src) => newNote(src, tieStart, tieStop, staccato))
+          notes: ev.chord.notes.map((src) => newNote(src, tieStart, tieStop))
         });
         t += ticks;
       });

@@ -425,10 +425,13 @@ void MuScriptorServer::identifyServerOnPort (int port, bool startedByUs)
         recorded = ServerRegistry::findByPid (pid);
 
     const auto previousPid = serverPid.exchange (pid);
-    const auto ours = pid > 0
-                   && SystemProbe::looksLikeMuScriptorServer (commandLine)
-                   && (recorded.has_value() || pid == ownedServerPid.load());
+    const auto looksRight = pid > 0 && SystemProbe::looksLikeMuScriptorServer (commandLine);
+    const auto ours = looksRight && (recorded.has_value() || pid == ownedServerPid.load());
 
+    // Cached separately from `ours`: this half is true of the user's own server
+    // too, and it is what lets getIdleState() offer "stop it anyway" for one
+    // without shelling out on the message thread.
+    serverLooksLikeMuScriptor = looksRight;
     registryOwned = ours;
     serverMemoryMb = pid > 0 ? SystemProbe::processResidentMemoryMb (pid) : -1;
 
@@ -521,6 +524,7 @@ void MuScriptorServer::clearServerFacts()
     serverPid = 0;
     serverMemoryMb = -1;
     registryOwned = false;
+    serverLooksLikeMuScriptor = false;
     ourServerSinceMs = 0.0;
 }
 
@@ -1102,10 +1106,24 @@ MuScriptorServer::IdleState MuScriptorServer::getIdleState() const
 
     if (! result.ours)
     {
+        result.external = true;
+
+        // The ordinary stop still refuses it, and that is still the right
+        // default. What changed is that the refusal is no longer a dead end:
+        // when the two cheap halves of the identity test hold and nothing on
+        // this machine is using it, a human may ask for it anyway.
+        result.canStopExternal = ! result.busy
+                              && serverPid.load() > 0
+                              && serverLooksLikeMuScriptor.load();
+
         result.reason = "The transcription server on port " + juce::String (result.port)
                       + " was started outside Riffsheet, so it belongs to whoever launched it - "
-                        "usually the START-MEDIUM.command window. Riffsheet will not stop it. "
-                        "Close that window yourself if you want the memory back.";
+                        "usually the START-MEDIUM.command window. Riffsheet will not stop it on "
+                        "its own."
+                      + (result.canStopExternal
+                             ? juce::String (" Close that window, or ask Riffsheet to stop it anyway.")
+                             : juce::String (" Close that window yourself if you want the memory "
+                                             "back."));
         return result;
     }
 
@@ -1150,9 +1168,9 @@ MuScriptorServer::StopOutcome MuScriptorServer::stopIfAllowed (const juce::Strin
 {
     StopOutcome outcome;
 
-    // Fresh facts rather than the cache. This is the one call in the shell that
-    // ends a process, so it re-probes instead of trusting a reading that could
-    // be three seconds old.
+    // Fresh facts rather than the cache. This is one of the two calls in the
+    // shell that end a process - stopExternalServer() below is the other - so it
+    // re-probes instead of trusting a reading that could be three seconds old.
     refreshStatus();
 
     const auto idle = getIdleState();
@@ -1196,6 +1214,9 @@ MuScriptorServer::StopOutcome MuScriptorServer::stopIfAllowed (const juce::Strin
     killIdentifiedServer (pid);
 
     outcome.stopped = true;
+    outcome.port = port;
+    outcome.pid = pid;
+    outcome.freedMb = freedMb;
     outcome.reason = freedMb > 0
         ? "Closed the transcription server on port " + juce::String (port) + " and gave back "
           + juce::String (freedMb) + " MB."
@@ -1228,5 +1249,168 @@ MuScriptorServer::StopOutcome MuScriptorServer::stopAfterJob()
         juce::Logger::writeToLog ("Riffsheet/MuScriptor: transcription finished; engine left running - "
                                   + outcome.reason);
 
+    return outcome;
+}
+
+//==============================================================================
+// "Stop it anyway." See the header for the four proofs and why this is the only
+// function in the shell allowed to end a process Riffsheet did not start.
+
+MuScriptorServer::StopOutcome MuScriptorServer::stopExternalServer (const juce::String& trigger)
+{
+    StopOutcome outcome;
+
+    // Fresh facts. Same reason stopIfAllowed() re-probes: a reading three
+    // seconds old is fine for drawing a chip and not fine for ending a process.
+    refreshStatus();
+
+    const auto idle = getIdleState();
+    outcome.port = idle.port;
+
+    if (! idle.running)
+    {
+        outcome.reason = idle.reason;
+        return outcome;
+    }
+
+    if (idle.ours)
+    {
+        // Not this function's business, and saying so beats quietly doing the
+        // other thing: the ordinary path releases our own bookkeeping too.
+        outcome.reason = "Riffsheet started the transcription server on port "
+                       + juce::String (idle.port)
+                       + " itself, so the ordinary Stop is what ends it.";
+        return outcome;
+    }
+
+    if (idle.busy)
+    {
+        // The one refusal a human cannot override. An external server is
+        // precisely the kind another Riffsheet window borrowed and is mid-job
+        // against, and their transcription is not ours to throw away either.
+        const auto holder = EngineLock::getInstance().snapshot().holderLabel;
+
+        outcome.reason = "Something on this machine is transcribing through that server right now"
+                       + (holder.isNotEmpty() ? " (" + holder + ")" : juce::String())
+                       + ", so it has been left alone. Try again when it has finished.";
+        return outcome;
+    }
+
+    // Take the machine-wide turn BEFORE proving anything. Everything below is a
+    // fact about a moment, and holding the engine is what stops that moment
+    // from ending between the proof and the kill.
+    auto& engine = EngineLock::getInstance();
+
+    if (! engine.tryAcquireNow ("Riffsheet - stopping an external transcription server"))
+    {
+        outcome.reason = "Something on this machine started using the transcription server just now, "
+                         "so it has been left alone.";
+        return outcome;
+    }
+
+    // release(false): this is housekeeping, not a job, and must not push the
+    // machine-wide "last transcription finished" stamp forward.
+    struct ReleaseOnExit
+    {
+        ~ReleaseOnExit() { EngineLock::getInstance().release (false); }
+    } releaseGuard;
+
+    const auto port = idle.port;
+
+    //-- proof 1: who is actually listening there, right now -------------------
+    const auto pid = SystemProbe::listeningProcessId (port);
+
+    if (pid <= 0)
+    {
+        outcome.reason = "Riffsheet could not work out which process is listening on port "
+                       + juce::String (port) + ", so it has not touched anything. (On Windows it "
+                                               "cannot, and this button does nothing there by "
+                                               "design.)";
+        return outcome;
+    }
+
+    //-- proof 2: it is not one of ours after all ------------------------------
+    if (ServerRegistry::findByPid (pid).has_value())
+    {
+        outcome.reason = "The server on port " + juce::String (port) + " turns out to be one "
+                         "Riffsheet started after all, so the ordinary Stop is what ends it.";
+        return outcome;
+    }
+
+    //-- proof 3: the process's own command line says what it is ---------------
+    if (! SystemProbe::looksLikeMuScriptorServer (SystemProbe::processCommandLine (pid)))
+    {
+        outcome.reason = "The process listening on port " + juce::String (port) + " does not say "
+                         "it is a MuScriptor server, so Riffsheet has left it completely alone.";
+        return outcome;
+    }
+
+    //-- proof 4: and it is answering as one ----------------------------------
+    if (! probeHealth (port))
+    {
+        outcome.reason = "Nothing is answering on port " + juce::String (port) + " any more, so "
+                         "there was nothing left to stop.";
+        return outcome;
+    }
+
+    //-- all four hold. SIGTERM, wait, SIGKILL ---------------------------------
+    // A longer grace than the reaper's 2 s: that one is for a server already
+    // established to be wedged, this one is for a healthy process somebody else
+    // owns, and a clean exit is worth waiting for.
+    // Read the resident size BEFORE the kill - it is unreadable a moment later -
+    // but only report it if the kill actually worked. `pid` and `freedMb` mean
+    // "what was ended and what that gave back", so a process that is still
+    // running must not be described as having freed anything.
+    const auto residentMb = SystemProbe::processResidentMemoryMb (pid);
+
+    // THE PORT, NOT ONLY THE PID, DECIDES WHETHER THIS WORKED.
+    //
+    // terminateProcess() answers "does a process with this id still exist",
+    // and a process can exist while being unambiguously stopped: a killed child
+    // whose parent has not reaped it yet is a zombie, and `kill(pid, 0)`
+    // succeeds on a zombie for as long as the entry is around. It holds no
+    // memory, answers nothing and has released its socket, so reporting "it
+    // would not stop, it may belong to another user" about one would be a plain
+    // lie - and that message is what a user would act on.
+    //
+    // The port is the honest test, and it is also the strictly stronger one for
+    // the case the message is really about: a process we genuinely may not
+    // signal (EPERM, another user's) is still listening afterwards, so this
+    // still reports the failure it exists to report.
+    const auto ended = SystemProbe::terminateProcess (pid, 5000)
+                    || SystemProbe::listeningProcessId (port) <= 0;
+
+    if (! ended)
+    {
+        outcome.reason = "The server on port " + juce::String (port) + " did not stop, even after "
+                         "being asked and then forced. It may belong to another user.";
+        juce::Logger::writeToLog ("Riffsheet/MuScriptor: " + outcome.reason + " (" + trigger + ")");
+        return outcome;
+    }
+
+    outcome.pid = pid;
+    outcome.freedMb = residentMb;
+
+    // We were only ever borrowing it, so there is no ownership to release -
+    // just this object's cached belief that there is a server on the wire.
+    activePort = 0;
+    adopted = false;
+    state = State::stopped;
+    clearServerFacts();
+
+    {
+        const juce::ScopedLock ml (modelLock);
+        runningModelDescription = {};
+        runningModelSource = "nothing is running yet";
+    }
+
+    outcome.stopped = true;
+    outcome.reason = outcome.freedMb > 0
+        ? "Stopped the transcription server on port " + juce::String (port)
+          + " that Riffsheet did not start, and gave back " + juce::String (outcome.freedMb) + " MB."
+        : "Stopped the transcription server on port " + juce::String (port)
+          + " that Riffsheet did not start.";
+
+    juce::Logger::writeToLog ("Riffsheet/MuScriptor: " + outcome.reason + " (" + trigger + ")");
     return outcome;
 }

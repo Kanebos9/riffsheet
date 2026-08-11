@@ -442,6 +442,12 @@ juce::WebBrowserComponent::Options NativeBridge::configure (juce::WebBrowserComp
         .withNativeFunction ("loadAudioPath",     bind (&NativeBridge::fnLoadAudioPath))
         .withNativeFunction ("authorizeRecentPaths", bind (&NativeBridge::fnAuthorizeRecentPaths))
         .withNativeFunction ("transcribe",        bind (&NativeBridge::fnTranscribe))
+        // The beat tracker on its own, for the engine that runs in the page and
+        // therefore never starts a native transcription to get a grid out of it.
+        // Registration is the capability test here too: an older shell answers
+        // hasNativeFunction('trackBeats') with false and the page keeps its
+        // notes without beats rather than hanging on a call nobody will answer.
+        .withNativeFunction ("trackBeats",        bind (&NativeBridge::fnTrackBeats))
         .withNativeFunction ("exportFile",        bind (&NativeBridge::fnExportFile))
         .withNativeFunction ("exportFiles",       bind (&NativeBridge::fnExportFiles))
         .withNativeFunction ("beginMidiDrag",     bind (&NativeBridge::fnBeginMidiDrag))
@@ -473,9 +479,19 @@ juce::WebBrowserComponent::Options NativeBridge::configure (juce::WebBrowserComp
         .withNativeFunction ("installEngine",     bind (&NativeBridge::fnInstallEngine))
         .withNativeFunction ("cancelInstall",     bind (&NativeBridge::fnCancelInstall))
         .withNativeFunction ("uninstallEngine",   bind (&NativeBridge::fnUninstallEngine))
+        // Same rule again: the "I already have this one" box on a card is drawn
+        // only when this call is registered, so a shell without it shows no box
+        // instead of a box that hangs.
+        .withNativeFunction ("validateExistingEngineInstall",
+                                                  bind (&NativeBridge::fnValidateExistingEngineInstall))
         .withNativeFunction ("openEngineSetup",   bind (&NativeBridge::fnOpenEngineSetup))
         .withNativeFunction ("setEngineModel",    bind (&NativeBridge::fnSetEngineModel))
         .withNativeFunction ("stopEngine",        bind (&NativeBridge::fnStopEngine))
+        // Registration is the capability test, exactly as it is for
+        // listEngines: an older shell answers hasNativeFunction with false, and
+        // the page hides the "stop it anyway" button rather than hanging on a
+        // call that will never be answered.
+        .withNativeFunction ("stopExternalEngine", bind (&NativeBridge::fnStopExternalEngine))
         .withNativeFunction ("transcribeCancel",  bind (&NativeBridge::fnTranscribeCancel))
         .withNativeFunction ("hostTimelineProbe", bind (&NativeBridge::fnHostTimelineProbe));
 }
@@ -902,15 +918,21 @@ void NativeBridge::fnTranscribe (const juce::Array<juce::var>& args, Completion 
 
     // ---- which engine does this job ----------------------------------------
     //
-    // Normally the stored choice, resolved now: `auto` means MuScriptor when it
-    // is installed and the bundled engine otherwise. `engineId` in the options
-    // overrides it for this one transcription - designed for a future "listen
-    // again with Basic Pitch" button, honoured here so that button is later a
-    // button and not a refactor. Nothing in webcore sets it yet.
+    // Normally the stored choice, resolved now, in the order EngineCatalog sets.
+    // `engineId` in the options overrides it for this one transcription - which
+    // is how the page hands a take on after its own engine refuses a chord, and
+    // how a future "listen again with Basic Pitch" button will work.
+    //
+    // `resolve (true)` and not `resolve()`: this is about to drive an engine IN
+    // THIS PROCESS, and `auto` now heads at an engine that runs in the web view.
+    // The page runs that one itself and never asks us to, so the truthful answer
+    // to "which engine would the SHELL use" skips it and lands on the next row
+    // that can actually be driven. Getting this wrong would not misbehave subtly
+    // - every native transcribe would fail with a category error.
     const auto requestedEngine = optionProperty (args, 0, "engineId").toString().trim();
     auto& registry = proc.getEngines();
     const auto resolution = requestedEngine.isNotEmpty() ? registry.resolveExplicit (requestedEngine)
-                                                         : registry.resolve();
+                                                         : registry.resolve (true);
 
     if (resolution.adapter == nullptr)
     {
@@ -922,7 +944,7 @@ void NativeBridge::fnTranscribe (const juce::Array<juce::var>& args, Completion 
     // machine-wide; an in-process engine takes a process-local turn instead. See
     // engine-architecture.md §1.3b for why that is not a shortcut.
     const auto exclusiveMachineWide =
-        resolution.adapter->manifest().concurrency == Concurrency::exclusiveMachineWide;
+        resolution.adapter->manifest().concurrency == EngineConcurrency::exclusiveMachineWide;
 
     const auto jobId = nextJobId++;
 
@@ -2001,6 +2023,214 @@ void NativeBridge::fnEngineStatus (const juce::Array<juce::var>& args, Completio
 
     On the worker pool: it stats a dozen paths and can health-probe two ports.
 */
+/**
+    Beats, and nothing else - for the engine that runs in the page.
+
+    WHY THIS EXISTS AT ALL, because a second entry point into the beat tracker
+    needs a reason. Beat tracking has never been an engine's job here: it is a
+    bundled ONNX model this process runs for EVERY engine, as a sub-phase of
+    `transcribe` gated on `preciseBeats`. That worked while every engine ran in
+    the shell. Riffsheet's own engine does not - it listens in the web view - so
+    the page has notes and no beats, and the only way to reach the tracker was to
+    start a whole transcription it does not want and throw the notes away.
+
+    So: the same tracker, the same wire shape, no engine involved.
+
+        trackBeats({ token } | { path }) -> { ok, beats, downbeats, bpm, beatsPerBar }
+
+    It takes NO turn in the engine queue and holds no lock. That is deliberate
+    and it is safe for the same reason an in-process transcription is (see
+    engine-architecture.md §1.3b): the model is small, it runs here, and making a
+    beat grid wait behind somebody else's four-minute MuScriptor job would be the
+    fallback path queueing behind the slow path for no reason.
+
+    THE AUDIO IS THE USER'S OWN, untouched. `transcribe` runs the tracker over
+    the PREPARED copy so notes and beats share one timebase; here there is no
+    prepared copy, because the engine that produced the notes heard the original
+    samples in the page. Both halves are therefore already in the recording's own
+    timebase and there is nothing to map back.
+*/
+void NativeBridge::fnTrackBeats (const juce::Array<juce::var>& args, Completion completion)
+{
+    const auto token = optionProperty (args, 0, "token").toString();
+    const auto path  = optionProperty (args, 0, "path").toString();
+
+    juce::File audioFile;
+    // Same reason as fnTranscribe: a job in flight is a genuine user of the
+    // take, so it holds the entry until it is finished with it.
+    std::shared_ptr<const PcmStore::Entry> entryHold;
+
+    if (token.isNotEmpty())
+    {
+        entryHold = proc.getPcmStore().get (token);
+
+        if (entryHold == nullptr)
+        {
+            completion (makeError ("unknown pcm token: " + token));
+            return;
+        }
+
+        juce::String error;
+        audioFile = proc.getPcmStore().ensureSourceFile (token, error);
+
+        if (audioFile == juce::File())
+        {
+            completion (makeError (error));
+            return;
+        }
+    }
+    else if (path.isNotEmpty())
+    {
+        audioFile = juce::File (path);
+
+        if (! isAuthorizedAudioPath (audioFile))
+        {
+            completion (makeError ("For safety, beat tracking paths must be Riffsheet takes or "
+                                   "files selected in this window."));
+            return;
+        }
+    }
+
+    if (! audioFile.existsAsFile())
+    {
+        completion (makeError ("trackBeats needs { token } or { path } pointing at a real file"));
+        return;
+    }
+
+    // `entryHold` is captured and never read on purpose: holding the PcmStore
+    // entry for the life of the job is what stops the take - and the temp WAV a
+    // capture renders into - being swept while the tracker is reading it.
+    longWorkers.addJob ([audioFile, entryHold, shutdown = shuttingDown,
+                         reply = std::move (completion)]
+                        {
+                            if (shutdown->load())
+                            {
+                                reply (makeError ("Riffsheet is closing."));
+                                return;
+                            }
+
+                            juce::String error;
+
+                           #if RIFFSHEET_HAS_ONNX
+                            const auto beats = BeatTracker::analyse (audioFile, error);
+                           #else
+                            const juce::var beats;
+                            error = "This build was configured without an inference runtime, "
+                                    "so it cannot track the beat.";
+                           #endif
+
+                            if (beats.isVoid())
+                            {
+                                reply (makeError (error));
+                                return;
+                            }
+
+                            // The tracker's object plus ok:true, so the page reads one
+                            // shape whether the beats came from here or from a
+                            // transcription's `preciseBeats`.
+                            auto out = beats;
+
+                            if (auto* obj = out.getDynamicObject())
+                                obj->setProperty ("ok", true);
+
+                            reply (out);
+                        });
+}
+
+/**
+    "I already have this engine - it is over there."
+
+    The other door beside a one-click install, and the shape webcore has been
+    built against since wave 2 (webcore/src/bridge/types.ts). One call, two jobs:
+
+      - path == ""  -> SNIFF. Look where this engine normally lives and say what
+                       was found. `searched` comes back either way, because the
+                       useful half of a failed check is knowing what was looked
+                       for.
+      - path != ""  -> VALIDATE THAT ONE PLACE, and if it is not a working copy,
+                       say what was missing.
+
+    WHAT "WORKING" MEANS IS PER ENGINE, and it is deliberately a FILE check, not
+    an execution:
+
+      - transkun is a pip console script. A copy is working when the `transkun`
+        executable is there and runnable - in a venv's bin/, or on PATH.
+      - bass-v2 is a repository you point at. A copy is working when `infer.py`
+        and a checkpoints folder with something in it are both present.
+
+    Nothing is run to find out. Executing a stranger's script to see whether it
+    is installed is a bigger promise than this call makes, it is slow, and on a
+    broken venv it hangs. Stat is enough to tell a real install from a folder
+    somebody hoped was one.
+
+    Refuses engines that cannot be installed anywhere else: a bundled engine has
+    no "other copy", and an in-page engine has no copy at all.
+*/
+void NativeBridge::fnValidateExistingEngineInstall (const juce::Array<juce::var>& args,
+                                                    Completion completion)
+{
+    const auto id = argAt (args, 0).toString().trim();
+    const auto requested = argAt (args, 1).toString().trim();
+
+    const auto* manifest = EngineCatalog::find (id);
+
+    if (manifest == nullptr || ! EngineCatalog::isOffered (*manifest))
+    {
+        completion (makeObject ({ { "ok", false },
+                                  { "detail", "\"" + id + "\" is not an engine this build knows about." } }));
+        return;
+    }
+
+    if (manifest->install == InstallKind::bundled)
+    {
+        completion (makeObject ({ { "ok", false },
+                                  { "detail", manifestText (manifest->name)
+                                              + " ships inside Riffsheet, so there is no other copy "
+                                                "to point at." } }));
+        return;
+    }
+
+    workers.addJob ([this, id, requested, manifest, shutdown = shuttingDown,
+                     reply = std::move (completion)]
+                    {
+                        if (shutdown->load())
+                        {
+                            reply (makeError ("Riffsheet is closing."));
+                            return;
+                        }
+
+                        juce::StringArray searched;
+                        juce::String detail;
+                        const auto found = EngineInstaller::findExistingInstall (*manifest, requested,
+                                                                                 searched, detail);
+
+                        juce::Array<juce::var> searchedVar;
+
+                        for (const auto& one : searched)
+                            searchedVar.add (one);
+
+                        if (found == juce::File())
+                        {
+                            reply (makeObject ({ { "ok", false },
+                                                 { "detail", detail },
+                                                 { "searched", searchedVar } }));
+                            return;
+                        }
+
+                        // Recorded exactly as an install records itself, so the card
+                        // behaves from here on as it does after a download.
+                        EngineInstaller::rememberInstallLocation (id, found);
+
+                        if (auto* adapter = proc.getEngines().find (id))
+                            adapter->rediscover();
+
+                        reply (makeObject ({ { "ok", true },
+                                             { "detail", detail },
+                                             { "path", found.getFullPathName() },
+                                             { "searched", searchedVar } }));
+                    });
+}
+
 void NativeBridge::fnRecheckEngine (const juce::Array<juce::var>&, Completion completion)
 {
     workers.addJob ([this, shutdown = shuttingDown, reply = std::move (completion)]
@@ -2030,17 +2260,29 @@ void NativeBridge::fnRecheckEngine (const juce::Array<juce::var>&, Completion co
 juce::var NativeBridge::makeEngineStatusVar (const juce::String& id)
 {
     auto& registry = proc.getEngines();
-    const auto resolution = registry.resolve();
 
-    // With no id this answers for the RESOLVED engine, which is exactly what it
-    // did when MuScriptor was the only engine there was.
+    // WITH NO ID THIS ANSWERS FOR THE ENGINE **THIS PROCESS** WOULD RUN, which
+    // is `resolve (true)` and not `resolve()`. It was the same thing until the
+    // catalogue gained an engine that runs in the web view, and the difference
+    // is not a detail: every field in this payload is about a LISTENER PROCESS -
+    // a port, an adopted server, the weights in memory, whether it can be
+    // stopped. Riffsheet's own engine has none of them, so answering for it
+    // would mean the "left running, 1.5 GB" notice about somebody else's
+    // MuScriptor silently stopped appearing the moment `auto` preferred
+    // Riffsheet - which is precisely the notice that exists because a player
+    // could not tell what was eating their machine. The USER-facing resolution
+    // is unaffected and is still reported below and by listEngines().
+    const auto resolution = registry.resolve();
+    const auto nativeResolution = registry.resolve (true);
+
     const EngineManifest* manifest = nullptr;
     EngineAdapter* adapter = nullptr;
 
     if (id.isEmpty())
     {
-        adapter = resolution.adapter;
-        manifest = adapter != nullptr ? &adapter->manifest() : EngineCatalog::find (resolution.resolved);
+        adapter = nativeResolution.adapter;
+        manifest = adapter != nullptr ? &adapter->manifest()
+                                      : EngineCatalog::find (nativeResolution.resolved);
     }
     else
     {
@@ -2067,7 +2309,7 @@ juce::var NativeBridge::makeEngineStatusVar (const juce::String& id)
         // rather than reporting a state it does not have.
         status.availability = EngineAdapter::Availability::notInstalled;
         status.stateName = "stopped";
-        status.detail = juce::String (manifest->name) + " is not part of this build yet.";
+        status.detail = manifestText (manifest->name) + " is not part of this build yet.";
     }
 
     const auto engine = EngineLock::getInstance().snapshot();
@@ -2094,15 +2336,16 @@ juce::var NativeBridge::makeEngineStatusVar (const juce::String& id)
     for (int i = 0; i < manifest->guideStepCount; ++i)
     {
         const auto& step = manifest->guideSteps[i];
-        guideSteps.add (makeObject ({ { "what", step.what }, { "detail", step.detail } }));
-        guideStepsText.add (juce::String (step.what) + " - " + step.detail);
+        guideSteps.add (makeObject ({ { "what",   manifestText (step.what) },
+                                      { "detail", manifestText (step.detail) } }));
+        guideStepsText.add (manifestText (step.what) + " - " + manifestText (step.detail));
     }
 
     auto payload = makeObject ({
         { "ok", true },
 
         // --- which engine this payload is about (new in the multi-engine wave) -
-        { "id", manifest->id },
+        { "id", manifestText (manifest->id) },
         { "configuredEngine", resolution.configured },
         { "resolvedEngine", resolution.resolved },
         { "engineReason", resolution.reason },
@@ -2125,10 +2368,15 @@ juce::var NativeBridge::makeEngineStatusVar (const juce::String& id)
         { "resolvedModel", "" },
         { "modelReason", "" },
         { "installedModels", juce::Array<juce::var>() },
+        { "models", juce::Array<juce::var>() },
         { "venv", "" },
         { "setupDirectory", "" },
         { "idleSeconds", 0.0 },
         { "canStop", false },
+        // No other engine runs a server anybody else could have started, so
+        // "somebody else's engine is up" is false for them rather than absent.
+        { "externalServer", false },
+        { "canStopExternal", false },
         { "memoryMb", juce::var() },
 
         // "this engine is on this machine", which for MuScriptor is exactly what
@@ -2219,24 +2467,29 @@ juce::var NativeBridge::makeEngineListVar()
         {
             status.availability = EngineAdapter::Availability::notInstalled;
             status.stateName = "stopped";
-            status.detail = juce::String (manifest->name) + " is not part of this build yet.";
+            status.detail = manifestText (manifest->name) + " is not part of this build yet.";
         }
 
         juce::Array<juce::var> strengths;
 
         for (int i = 0; i < manifest->instrumentStrengthCount; ++i)
-            strengths.add (manifest->instrumentStrengths[i]);
+            strengths.add (manifestText (manifest->instrumentStrengths[i]));
 
         engines.add (makeObject ({
-            { "id", manifest->id },
-            { "name", manifest->name },
-            { "tier", manifest->tierLabel },
-            { "summary", manifest->summary },
-            { "sourceUrl", manifest->sourceUrl },
+            { "id", manifestText (manifest->id) },
+            { "name", manifestText (manifest->name) },
+            { "tier", manifestText (manifest->tierLabel) },
+            { "summary", manifestText (manifest->summary) },
+            { "sourceUrl", manifestText (manifest->sourceUrl) },
             { "install", EngineCatalog::installName (manifest->install) },
             { "state", EngineRegistry::stateName (status.availability) },
             { "selected", resolution.resolved == manifest->id },
             { "instrumentStrengths", strengths },
+
+            // A clean boolean beside `state`, so a card can hide an install
+            // guide without re-deriving "installed" from a four-valued string
+            // (and getting `broken` wrong, which is installed-but-failing).
+            { "installed", EngineRegistry::isPresent (status.availability) },
             { "acceptsInstrumentConstraint", manifest->acceptsInstrumentConstraint },
             { "producesBeatGrid", manifest->producesBeatGrid },
             { "producesConfidence", manifest->producesConfidence },
@@ -2248,10 +2501,22 @@ juce::var NativeBridge::makeEngineListVar()
             { "error", status.error.isNotEmpty() ? juce::var (status.error) : juce::var() } }));
     }
 
+    // WHAT THIS PROCESS WOULD USE IF THE PAGE'S OWN ENGINE BOWED OUT.
+    //
+    // Riffsheet's engine runs in the web view and can refuse a take it hears as
+    // chordal. When it does, the page hands the take straight on - and it needs
+    // two things to do that honestly: an id to pass as `engineId`, and a name to
+    // put in the sentence it shows ("Sounded like chords - handed to X"). Both
+    // come from here rather than from a copy of the order in TypeScript, because
+    // two copies of "which engine is next" is exactly the kind of thing that
+    // drifts and then lies to somebody.
+    const auto nativeFallback = registry.resolve (true);
+
     return makeObject ({ { "ok", true },
                          { "configuredEngine", resolution.configured },
                          { "resolvedEngine", resolution.resolved },
                          { "engineReason", resolution.reason },
+                         { "nativeFallbackEngine", nativeFallback.resolved },
                          { "engines", engines } });
 }
 
@@ -2361,7 +2626,7 @@ void NativeBridge::fnInstallEngine (const juce::Array<juce::var>& args, Completi
 
     if (manifest->install != InstallKind::oneClick)
     {
-        completion (makeError (juce::String (manifest->name)
+        completion (makeError (manifestText (manifest->name)
                                + " cannot be installed by Riffsheet. "
                                + (manifest->install == InstallKind::bundled
                                     ? juce::String ("It is already built in.")
@@ -2374,7 +2639,7 @@ void NativeBridge::fnInstallEngine (const juce::Array<juce::var>& args, Completi
 
         if (installingEngines.find (id) != installingEngines.end())
         {
-            completion (makeError (juce::String (manifest->name) + " is already installing."));
+            completion (makeError (manifestText (manifest->name) + " is already installing."));
             return;
         }
     }
@@ -2387,8 +2652,8 @@ void NativeBridge::fnInstallEngine (const juce::Array<juce::var>& args, Completi
         juce::Array<juce::var> steps;
 
         for (int i = 0; i < manifest->guideStepCount; ++i)
-            steps.add (juce::String (manifest->guideSteps[i].what) + " - "
-                       + manifest->guideSteps[i].detail);
+            steps.add (manifestText (manifest->guideSteps[i].what) + " - "
+                       + manifestText (manifest->guideSteps[i].detail));
 
         completion (makeObject ({ { "ok", false }, { "error", planError }, { "guideSteps", steps } }));
         return;
@@ -2465,7 +2730,7 @@ void NativeBridge::fnInstallEngine (const juce::Array<juce::var>& args, Completi
         // underneath somebody else's transcription, so it queues for the
         // machine-wide turn like any other job - and gives it back immediately
         // after, without stamping "a transcription just finished".
-        const auto label = "Riffsheet - installing " + juce::String (manifest->name);
+        const auto label = "Riffsheet - installing " + manifestText (manifest->name);
 
         callbacks.acquireMachineTurn = [label, abandon]
         {
@@ -2568,14 +2833,14 @@ void NativeBridge::fnUninstallEngine (const juce::Array<juce::var>& args, Comple
 
     if (manifest->install != InstallKind::oneClick)
     {
-        completion (makeError (juce::String (manifest->name) + " was not installed by Riffsheet, "
+        completion (makeError (manifestText (manifest->name) + " was not installed by Riffsheet, "
                                                                "so Riffsheet will not remove it."));
         return;
     }
 
     if (isInstalling (id))
     {
-        completion (makeError (juce::String (manifest->name)
+        completion (makeError (manifestText (manifest->name)
                                + " is installing right now. Cancel that first."));
         return;
     }
@@ -2585,7 +2850,7 @@ void NativeBridge::fnUninstallEngine (const juce::Array<juce::var>& args, Comple
 
     if ((engine.busy || registry.isLocalBusy()) && registry.resolve().resolved == id)
     {
-        completion (makeError (juce::String (manifest->name) + " is transcribing right now. Try "
+        completion (makeError (manifestText (manifest->name) + " is transcribing right now. Try "
                                                                "again when it has finished."));
         return;
     }
@@ -2646,6 +2911,71 @@ void NativeBridge::fnStopEngine (const juce::Array<juce::var>&, Completion compl
                         reply (makeObject ({ { "ok", true },
                                              { "stopped", outcome.stopped },
                                              { "reason", outcome.reason } }));
+                    });
+}
+
+/**
+    "Stop it anyway" - the escape hatch from the Left running notice.
+
+    stopEngine() refuses a server Riffsheet did not start, and that refusal is
+    correct as a default and useless as an ending: somebody who force-quit the
+    DAW that started it, or closed the Terminal window it came from, was being
+    told to close a window that is not there any more. This is the same button
+    with the user's explicit consent behind it, and it is the ONLY path in the
+    shell that may end a process Riffsheet did not spawn.
+
+    IT TAKES NO ARGUMENTS, ON PURPOSE. A port parameter would let the page aim a
+    kill, and the page is the least trustworthy thing in the system - a bug or a
+    stray string there would become somebody's ended process. The target is only
+    ever the server the SHELL discovered on its own reuse ports and is already
+    reporting through engineStatus(); MuScriptorServer::stopExternalServer()
+    re-derives the pid from that port and re-proves its identity four ways at
+    the moment of the kill.
+
+    Refusals come back as `stopped: false` with a sentence, never as an error -
+    "it is busy" and "that process is not a MuScriptor" are answers, not faults.
+    `ok:false` is reserved for "this build has no MuScriptor to talk about".
+*/
+void NativeBridge::fnStopExternalEngine (const juce::Array<juce::var>&, Completion completion)
+{
+    // Cheap refusal from the cached photograph, so the button does not spin for
+    // a second to say something that was knowable immediately. The real
+    // decision is re-taken from fresh facts on the worker.
+    const auto idle = proc.getMuScriptor().getIdleState();
+
+    if (! idle.external)
+    {
+        completion (makeObject ({ { "ok", true },
+                                  { "stopped", false },
+                                  { "reason", idle.running
+                                                  ? juce::String ("Riffsheet started the "
+                                                                  "transcription server itself, so "
+                                                                  "the ordinary Stop is what ends "
+                                                                  "it.")
+                                                  : idle.reason },
+                                  { "port", idle.port },
+                                  { "pid", 0 },
+                                  { "freedMb", juce::var() } }));
+        return;
+    }
+
+    workers.addJob ([this, reply = std::move (completion)]
+                    {
+                        const auto outcome = proc.getMuScriptor()
+                                                 .stopExternalServer ("you asked to stop a server "
+                                                                      "Riffsheet did not start");
+
+                        reply (makeObject ({
+                            { "ok", true },
+                            { "stopped", outcome.stopped },
+                            { "reason", outcome.reason },
+                            { "port", outcome.port },
+                            { "pid", outcome.pid },
+                            // Null rather than 0 when the platform will not
+                            // say: "unknown" and "freed nothing" must not look
+                            // the same, the same rule memoryMb already follows.
+                            { "freedMb", outcome.freedMb > 0 ? juce::var (outcome.freedMb)
+                                                             : juce::var() } }));
                     });
 }
 

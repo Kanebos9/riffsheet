@@ -214,7 +214,8 @@ export function quantizeOnsets(
 ): QuantResult {
   const states = statesFor(opts.grid, opts.ticksPerBeat, opts.compound);
   const straight = states.filter((s) => !s.tuplet);
-  // `basicQuant` for the rest killer: the finest STRAIGHT subdivision actually on offer.
+  // `basicQuant`: the finest STRAIGHT subdivision actually on offer, and therefore the step
+  // an off-time is allowed to snap to.
   const finestStraight = Math.min(...straight.map((s) => s.grid));
 
   if (opts.grid === 'free' || !notes.length) {
@@ -402,8 +403,9 @@ export function quantizeOnsets(
 
 /**
  * The off-time's own grid, derived from the onset grid — NOT from a duration ladder.
- * A note shorter than the onset grid may still use a finer step, exactly as `quantForLen`
- * does, but a note longer than the grid never gets a finer one. This is the fix for §4.2.
+ * A note shorter than the onset grid may still use a finer step — otherwise a staccato
+ * sixteenth would round up to the grid and gain sustain it never had — but a note longer than
+ * the grid never gets a finer one. This is the fix for §4.2.
  */
 function durationQuant(rawDur: number, finestStraight: number): number {
   let q = finestStraight;

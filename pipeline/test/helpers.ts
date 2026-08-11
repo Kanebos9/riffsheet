@@ -5,9 +5,11 @@ import type { BuildInput, BuildSettings, InputNote } from '../src/types.js';
 export const BASS4 = [28, 33, 38, 43];
 
 export function settings(over: Partial<BuildSettings> = {}): BuildSettings {
+  // No `fillGaps`: it is deprecated and ignored, so the default settings should not imply the
+  // pipeline still has a mode. The tests that pass it explicitly are asserting that it is
+  // accepted and inert, which is a different claim.
   return {
     grid: 'auto',
-    fillGaps: true,
     instrument: 'bass4',
     tuningMidi: BASS4,
     fingeringStyle: 'low',

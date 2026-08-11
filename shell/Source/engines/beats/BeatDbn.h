@@ -63,27 +63,65 @@ namespace BeatDbn
     constexpr double kTransitionLambda = 100.0;   // higher = stronger preference for a steady tempo
     constexpr int    kObservationLambda = 16;     // 1/16 of a beat period counts as "on the beat"
     constexpr double kThreshold = 0.05;           // trim leading/trailing frames below this
-    /** Candidate bar lengths, one HMM each, highest path probability wins.
+    /** THE CORE candidate bar lengths, one HMM each, highest path probability wins.
 
         {3, 4} is madmom's and beat_this's default pair, and it is the set the
         parity goldens in test/golden were captured with - they record it under
         `dbn.beatsPerBar`, and the whole worth of those files is that they came
         out of the Python reference before any of this C++ existed.
 
-        WIDENING THIS WAS TRIED AND REVERTED. {2,3,4,5,6,7} was measured here so
-        that 6/8, 5/4 and 7/8 could be represented at all, which is a real gap for
-        a riff tool. The 120 BPM click track was unaffected (71 beats, 100% within
-        10 ms, still 4/4), but the held-note fixture went from 5 beats to 3: on
-        sparse evidence the extra candidates let the decoder buy a lower beat
-        count with a longer bar, so the change does not merely allow odd metres,
-        it loses beats on weak material. Fixing that needs the observation model
-        looked at, not another entry in this list.
-
-        Do not "update the goldens" to make a widened set pass. They cannot be
+        Do not "update the goldens" to make a wider set pass. They cannot be
         regenerated from this repository - they need beat_this 1.1.0, madmom
         0.17.dev0 and torch under Python 3.10 - and rewriting them from our own
         output would turn a parity test into a recording of whatever we last did. */
     constexpr int    kBeatsPerBarOptions[] = { 3, 4 };
+
+    /** THE ODD METRES, reachable only by earning it. 6/8, 5/4 and 7/8 are real
+        material for a riff tool and the core pair cannot represent them at all.
+
+        WHY THEY ARE NOT SIMPLY IN THE LIST ABOVE. Putting {2,5,6,7} in
+        kBeatsPerBarOptions was tried and reverted, and the reason is structural,
+        not a tuning accident. `track` picks the winner by raw Viterbi path
+        probability, and those numbers are NOT comparable across bar lengths: a
+        bar of N beats is forced to spend exactly one downbeat label per N beats,
+        and log(downbeat activation) is a large negative number wherever the
+        network heard no downbeat. So on material with no downbeat information -
+        a held bass note, four seconds of one pitch - the likelihood rises
+        monotonically with N for a reason that has nothing to do with metre, and
+        the decoder will buy the longer bar by ALSO re-timing to a slower tempo.
+        Measured: the held-note fixture went from 5 beats to 3. The widening did
+        not merely allow odd metres, it lost beats on weak material.
+
+        THE FIX IS IN WHAT IS COMPARED, not in the list. An odd bar length is
+        adopted only when the downbeat column itself says so, measured
+        independently of the path probability by `downbeatEvidence` in the .cpp:
+        the mean log downbeat activation at the beats a bar of N would call
+        downbeats, minus the mean at the beats it would not. That statistic is
+        scale-free in N - a bar length that lines up with real accents scores
+        high whatever its length, and one that does not scores about zero - which
+        is exactly the comparison the raw likelihood cannot make.
+
+        The core pair is decoded first and unconditionally, by the same code as
+        before. An odd candidate replaces it only if it clears all four gates in
+        `track`, so when nothing qualifies the answer is bit-identical to what
+        this file produced with {3,4} alone. That is what keeps the goldens
+        honest rather than merely green. */
+    constexpr int    kExtendedBeatsPerBarOptions[] = { 2, 5, 6, 7 };
+
+    /** GATE 1: how much downbeat evidence a bar length needs before it is even a
+        candidate, in nats of mean log activation. Pure noise scores about 0; a
+        clean accent pattern scores several. */
+    constexpr double kDownbeatEvidenceMin = 1.5;
+
+    /** GATE 2: and how far it must beat the core winner's own evidence by, so a
+        tie or a rounding difference never moves the metre. */
+    constexpr double kDownbeatEvidenceMargin = 0.75;
+
+    /** GATE 3: the minimum number of complete bars the evidence must be measured
+        over. Without it a 5-beat take "supports" a bar of 5 perfectly, because
+        every residue class has exactly one member and one of them is necessarily
+        the loudest. This is the gate that protects sparse material. */
+    constexpr int    kMinBarsForEvidence = 3;
 
     //== input ================================================================
 

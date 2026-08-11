@@ -250,7 +250,16 @@ const PROBE = `(() => {
     })(),
     mainMenuButton: [...q('.app-header button')].some(b => b.textContent.trim() === 'Main menu'),
     legacyOpenButtons: [...q('button')].filter(b => /^Open(?:\\.\\.\\.)?$/.test(b.textContent.trim())).length,
+    // G11: the Align chip is DELETED and alignment is unconditional. Counted, not merely
+    // absent-checked, because "one" and "two" are both wrong for different reasons and only a
+    // count says which happened.
     linkedControls: [...q('button, [role="switch"]')].filter(e => e.textContent.trim() === 'Align').length,
+    // G13: "Fit" is retired from the roll's horizontal zoom pair as well as from the pane.
+    rollTimeFitButton: !!document.querySelector('[data-role="roll-time-fit"]'),
+    // G7: the axis captions say which axis in words rather than in a 12px arrow glyph.
+    zoomAxisLabels: [...q('.zoom-pair [data-role$="zoom-label"]')].map(e => e.textContent.trim()),
+    // G12: selecting "From recording" does the detecting; the button is gone.
+    tempoRedetectButton: !!document.querySelector('[data-role="tempo-redetect"]'),
     notationToolbar: !!document.querySelector('[data-role="notation-toolbar"]'),
     tabView: document.querySelector('[data-role="tab-view"]')?.value ?? null,
     // The "Tuning low → high:" row is gone. Its job — proving the tuning reached the page —
@@ -543,6 +552,93 @@ const PITCH_SELFTEST = `(() => { try {
  * whole reason a fourth gesture could be added to a 46px strip at all, so starting the drag at
  * the wrong height is exactly what this needs to catch.
  */
+/**
+ * A REAL DRAG ON THE STRIP'S BODY (G8): down at one fraction of the plot, three moves, up.
+ *
+ * Three moves rather than one, because the strip ignores the first pointermove inside
+ * `DRAG_SLOP_PX` — a drag proved by a single move would pass on a build that had lost the slop
+ * guard and fail on one that had it. Delivered on the canvas for the reason `clickWaveform`
+ * gives: a synthetic pointer cannot be captured, so the events have to land where the listeners
+ * are. `fromPx` lets a second call aim at an EDGE of the span the first one made, which is the
+ * adjust gesture.
+ */
+const dragWaveform = (fromFrac, toFrac, fromPx = null) => `(() => {
+  const c = document.querySelector('.waveform');
+  const p = window.__RIFFSHEET_WAVE__ ? window.__RIFFSHEET_WAVE__() : null;
+  if (!c || !p) return JSON.stringify({ dragged: false });
+  const r = c.getBoundingClientRect();
+  const x = (f) => r.left + p.gutterPx + p.plotWidth * f;
+  const y = r.top + p.handleLanePx + (r.height - p.handleLanePx) / 2;
+  const ev = (type, ex, buttons) => new PointerEvent(type, {
+    clientX: ex, clientY: y, bubbles: true, cancelable: true,
+    pointerId: 1, isPrimary: true, button: 0, buttons
+  });
+  const startX = ${fromPx === null ? 'x(' + fromFrac + ')' : 'r.left + ' + fromPx};
+  const endX = x(${toFrac});
+  c.dispatchEvent(ev('pointerdown', startX, 1));
+  for (const t of [0.34, 0.67, 1]) c.dispatchEvent(ev('pointermove', startX + (endX - startX) * t, 1));
+  c.dispatchEvent(ev('pointerup', endX, 0));
+  const after = window.__RIFFSHEET_WAVE__();
+  const cut = document.querySelector('[data-role="cut-out"]');
+  return JSON.stringify({
+    dragged: true,
+    selectArmed: after.selectArmed,
+    selectionFromSec: after.selectionFromSec,
+    selectionToSec: after.selectionToSec,
+    selectionFromX: after.selectionFromX,
+    selectionToX: after.selectionToX,
+    spanSec: after.selectionFromSec === null || after.selectionToSec === null
+      ? null : Number((after.selectionToSec - after.selectionFromSec).toFixed(3)),
+    // THE THING THE PLAYER SEES, and the whole of the reported bug: it used to say 0.1s.
+    cutLabel: cut ? cut.textContent.trim() : null,
+    // The tuner is calibrated on a tenth of a second and must stay shut for a span.
+    tunerOnScreen: !!document.querySelector('.tuner-host:not([hidden])')
+  });
+})()`;
+
+/**
+ * ARE THERE FULL-HEIGHT VERTICAL LINES IN THE BODY OF THE STRIP? (G16a)
+ *
+ * The reported "vertical lines in the waveform" were the viewport bracket's two 1px edge rails,
+ * drawn the whole height of the body. They read as bar lines or as cut seams — neither of which
+ * they are — and they move whenever the sheet is scrolled.
+ *
+ * Read off the PIXELS rather than off a flag, because "we deleted the fillRect" is exactly the
+ * kind of claim that a later refactor restores by accident. A full-height rail has a property
+ * nothing else in this strip has: every pixel down its column is bright, so the column's DIMMEST
+ * pixel is bright. The envelope, the playhead and the dim wash all leave dark pixels somewhere
+ * down any column they touch. So: the minimum luminance down the rail's own column, against the
+ * same measure taken six pixels away, where there is certainly no rail.
+ */
+const BODY_RAILS = `(() => {
+  const c = document.querySelector('.waveform');
+  const p = window.__RIFFSHEET_WAVE__ ? window.__RIFFSHEET_WAVE__() : null;
+  if (!c || !p) return JSON.stringify({ measured: false });
+  if (p.overviewPx !== 0 || !p.hasViewport || p.viewportFromX === null) {
+    return JSON.stringify({ measured: false, reason: 'no bracket on the body' });
+  }
+  const ctx = c.getContext('2d');
+  const scale = c.width / (c.clientWidth || 1);
+  const top = Math.round(p.overviewPx * scale);
+  const h = c.height - top;
+  if (!ctx || h < 8) return JSON.stringify({ measured: false, reason: 'nothing to sample' });
+  const minDown = (cssX) => {
+    const px = Math.round(cssX * scale);
+    if (px < 1 || px >= c.width - 1) return null;
+    const d = ctx.getImageData(px, top, 1, h).data;
+    let min = 255 * 3;
+    for (let i = 0; i < d.length; i += 4) min = Math.min(min, d[i] + d[i + 1] + d[i + 2]);
+    return min;
+  };
+  return JSON.stringify({
+    measured: true,
+    railColumn: minDown(p.viewportFromX),
+    // Six pixels in from the edge, which is inside the bright (undimmed) side of the bracket —
+    // so if anything, this column is favoured over the rail's.
+    neighbourColumn: minDown(p.viewportFromX + 6)
+  });
+})()`;
+
 const clickWaveform = (atFrac) => `(() => {
   const c = document.querySelector('.waveform');
   const p = window.__RIFFSHEET_WAVE__ ? window.__RIFFSHEET_WAVE__() : null;
@@ -923,6 +1019,18 @@ async function main() {
           [...document.querySelectorAll('.app-header > *')]
             .map((e) => { const b = e.getBoundingClientRect(); return Math.round((b.top + b.height / 2) / 4); })
         ).size,
+        /*
+         * THE SAME MEASURE FOR THE TRANSPORT (G4). The tempo source has been a child of this row
+         * since F19, but the row wrapped, so at any plugin width it fell onto a line of its own
+         * — three bands of chrome between the roll and the sheet where the design says two.
+         * Counted off centres for exactly the reasons headerRows is; the transport
+         * centre-aligns its items too, and a 20px readout, a 26px chip and a 30px button on one
+         * line have three different top edges.
+         */
+        transportRows: new Set(
+          [...document.querySelectorAll('.transport > *')]
+            .map((e) => { const b = e.getBoundingClientRect(); return Math.round((b.top + b.height / 2) / 4); })
+        ).size,
         bodyScrollW: document.body.scrollWidth, innerW: window.innerWidth,
         docScrollW: document.documentElement.scrollWidth,
         header: r('.app-header'), transport: r('.transport'), triview: r('.triview'),
@@ -949,8 +1057,10 @@ async function main() {
      * not an instruction anybody can follow when there is no scrollbar to see. Both toolbars
      * wrap now, and this is what keeps them wrapping.
      *
-     * `linkControl` is the one control called out by name, because it has been deleted from
-     * this UI once already.
+     * `linkControl` used to be the one control called out by name, because it had been deleted
+     * from this UI once already. It is deleted for good now (G11) and the probe reports its
+     * ABSENCE at every size instead — the claim has flipped, so the probe reads the same
+     * selector and the checks below assert null rather than an on-screen box.
      */
     const REACH = `(() => {
       const scopes = ['.app-header', '[data-role="notation-toolbar"]', '.view-tools'];
@@ -982,8 +1092,22 @@ async function main() {
       }
       const link = document.querySelector('[data-role="roll-link"]');
       const lr = link ? link.getBoundingClientRect() : null;
+      // The zoom captions are measured at every size for the same reason the chips are: G7's
+      // whole claim is that they are LEGIBLE at a plugin's floor, and a caption that has been
+      // shrunk to nothing or clipped away is not.
+      const axes = [...document.querySelectorAll('.zoom-pair [data-role$="zoom-label"]')].map((e) => {
+        const r = e.getBoundingClientRect();
+        const cs = getComputedStyle(e);
+        return {
+          text: e.textContent.trim(),
+          w: Math.round(r.width),
+          fontPx: Math.round(parseFloat(cs.fontSize) * 10) / 10,
+          onScreen: r.width > 0 && r.left >= -1 && r.right <= window.innerWidth + 1
+        };
+      });
       return JSON.stringify({
         offScreen: bad,
+        zoomAxes: axes,
         linkControl: link ? {
           text: link.textContent.trim(),
           setting: link.getAttribute('data-setting'),
@@ -1149,10 +1273,10 @@ async function main() {
     await evalJson(setSelect('notation-grid', 'quarter'));
     await settle(900);
     result.gridAfterNotationChange = await evalJson(SELFTEST);
-    // BACK TO 'free', WHICH IS THE DEFAULT — not to 'auto', which it was until settings v10.
+    // BACK TO 'auto', WHICH IS THE DEFAULT AGAIN under settings v11 (it was 'free' under v10).
     // `gridBefore` was measured with whatever the app opens on, so restoring to a value that is
     // no longer that one compares two different settings and calls the difference a regression.
-    await evalJson(setSelect('notation-grid', 'free'));
+    await evalJson(setSelect('notation-grid', 'auto'));
     await settle(900);
     result.gridRestored = await evalJson(SELFTEST);
 
@@ -1207,6 +1331,49 @@ async function main() {
       onScreen: !!document.querySelector('.tuner-host:not([hidden])'),
       selection: window.__RIFFSHEET_WAVE__ ? window.__RIFFSHEET_WAVE__().selectionFromSec : null
     })`);
+
+    // --- G8: cutting a span you actually chose -----------------------------------------
+    //
+    // The reported fault: "Cut out 0.1s". The strip's only selection was the tuner's fixed
+    // probe window, so the Cut button could never offer anything else — there was no gesture
+    // anywhere in the app that could name a longer stretch. The mode, the drag, the edge
+    // adjust and the way back are all driven here, and NOTHING IS CUT: the label is what was
+    // broken, and committing would leave every check below reading a shortened take.
+    result.cutArmBefore = await evalJson(`JSON.stringify((() => {
+      const b = document.querySelector('[data-role="cut-arm"]');
+      const w = window.__RIFFSHEET_WAVE__ ? window.__RIFFSHEET_WAVE__() : null;
+      return {
+        present: !!b,
+        pressed: b ? b.getAttribute('aria-pressed') : null,
+        armed: w ? w.selectArmed : null
+      };
+    })())`);
+    // UNARMED FIRST: a drag on the strip must still be a click, and still produce the tuner's
+    // fixed window. The mode is what makes the span safe to add; without this the check below
+    // would pass just as well on a build that had made every drag a span.
+    result.cutDragUnarmed = await evalJson(dragWaveform(0.30, 0.62));
+    await settle(400);
+    await evalJson(PRESS_ESCAPE);
+    await settle(300);
+    result.cutArmClick = await evalJson(clickRole('cut-arm'));
+    await settle(400);
+    result.cutDragArmed = await evalJson(dragWaveform(0.30, 0.62));
+    await settle(500);
+    // AND THE EDGE IS A HANDLE. Take hold of the span's left edge and pull it back to 0.12: the
+    // span must GROW from the edge that was grabbed, with the other end pinned.
+    result.cutDragEdge = await evalJson(
+      dragWaveform(0, 0.12, '(window.__RIFFSHEET_WAVE__().selectionFromX)')
+    );
+    await settle(500);
+    // THE VERTICAL LINES (G16a), measured on the pixels while the bracket is on the body.
+    result.bodyRails = await evalJson(BODY_RAILS);
+    // …and the way out. Disarm, and the strip goes back to answering "what is at this moment".
+    result.cutDisarmClick = await evalJson(clickRole('cut-arm'));
+    await settle(400);
+    result.cutAfterDisarm = await evalJson(clickWaveform(0.38));
+    await settle(500);
+    await evalJson(PRESS_ESCAPE);
+    await settle(400);
 
     // --- editing the piano roll changes the sheet -------------------------------------
     // "users should be able to edit piano roll midis and the changes should reflect on music
@@ -1718,7 +1885,15 @@ async function main() {
       rollEditing:
         'dead: forced true by the v9 migration — the roll is always editable, and renderMain passes setEditable(true) outright',
       preciseBeats:
-        'dead: forced false by the v9 migration — the second listening pass it bought cost minutes a take and returned bar lines that followed the player\'s drift'
+        'dead: forced false by the v9 migration — the second listening pass it bought cost minutes a take and returned bar lines that followed the player\'s drift',
+      // The fourth of the same kind, added in G11. The Align chip is deleted and `migrate()`
+      // forces this true, because the OFF position only ever meant "the sheet refuses to follow
+      // the thing you are pointing at" — a worse version of ON rather than a different choice.
+      // The field survives so an older blob still round-trips; the readers in ui/app.ts pass
+      // the literal. The BEHAVIOUR is checked harder than a switch ever checked it: see the
+      // align block below, which no longer has an off state to weaken its bounds.
+      alignViews:
+        'dead: forced true by the v11 migration — alignment is unconditional and the chip is gone (G11)'
     };
 
     /** Every `[data-setting]` on screen right now, counted. */
@@ -2269,36 +2444,22 @@ async function main() {
       60_000
     );
     await settle(600);
-    result.alignOff = await evalJson(
-      `window.__RIFFSHEET_ALIGN__
-        ? window.__RIFFSHEET_ALIGN__('off').then(r => JSON.stringify(r), e => JSON.stringify({ error: String(e) }))
-        : Promise.resolve('null')`,
-      60_000
-    );
-    await settle(600);
+    // `__RIFFSHEET_ALIGN__('off')` and `__RIFFSHEET_ALIGNX__('off')` stood here. Both modes are
+    // deleted with the setting they flipped (G11) — there is no unaligned state left to drive,
+    // and a probe that pretended to produce one would be measuring a mode the app cannot enter.
     // VERTICAL CORRESPONDENCE, on and off. The claim Align makes to the eye — a note's sheet x,
     // roll x and waveform x are one column — measured on three notes spread across the span.
     result.alignXOn = await evalJson(
       `window.__RIFFSHEET_ALIGNX__
-        ? window.__RIFFSHEET_ALIGNX__('on').then(r => JSON.stringify(r), e => JSON.stringify({ error: String(e) }))
+        ? window.__RIFFSHEET_ALIGNX__().then(r => JSON.stringify(r), e => JSON.stringify({ error: String(e) }))
         : Promise.resolve('null')`,
       60_000
     );
     await settle(600);
-    result.alignXOff = await evalJson(
-      `window.__RIFFSHEET_ALIGNX__
-        ? window.__RIFFSHEET_ALIGNX__('off').then(r => JSON.stringify(r), e => JSON.stringify({ error: String(e) }))
-        : Promise.resolve('null')`,
-      60_000
-    );
-    await settle(600);
-    // The chip itself, pressed twice, so the control and not only the setting is exercised.
-    result.linkBefore = await evalJson(ROLL);
-    result.linkClickOn = await evalJson(clickRole('roll-link'));
-    await settle(900);
-    result.linkOn = await evalJson(ROLL);
-    result.linkClickOff = await evalJson(clickRole('roll-link'));
-    await settle(900);
+    // The chip was pressed twice here, so the control and not only the setting was exercised.
+    // There is no control (G11), so what is left is the claim the presses were really guarding:
+    // NEITHER PANE CAN BE PUT ON THE SHEET'S ENGRAVED X-AXIS. That is a property of the roll and
+    // the strip, not of a chip, and it is read straight off them.
     result.linkOff = await evalJson(ROLL);
 
     // START OVER, WHICH USED TO BE "LISTEN AGAIN" IN THE TOOLBAR.
@@ -2497,9 +2658,9 @@ async function main() {
         engravedNotes: self ? self.noteGlyphs : null
       });
     })()`);
-    // Back to the DEFAULT, which is 'free' since settings v10 — everything after this expects
+    // Back to the DEFAULT, which is 'auto' again since settings v11 — everything after this expects
     // the sheet the app opens with.
-    await evalJson(setSelect('notation-grid', 'free'));
+    await evalJson(setSelect('notation-grid', 'auto'));
     await settle(1400);
 
     // --- the engine cards, second pass: detail block, RAM row, existing installs ---------
@@ -2639,6 +2800,10 @@ async function main() {
     // --- the two-step engine stop (#5-web) ----------------------------------------------
     phase('checking the external-engine stop and the engine-click gesture', 120_000);
 
+    // G17 FIRST, BEFORE THE CHIP IS CLICKED — a stop would change every number in it.
+    result.engineChip = await evalJson(
+      `JSON.stringify(window.__RIFFSHEET_ENGINECHIP__ ? window.__RIFFSHEET_ENGINECHIP__() : null)`
+    );
     result.engineChipStop = await evalJson(`(() => {
       const chip = document.querySelector('[data-role="engine-chip"]');
       if (!chip) return JSON.stringify({ present: false });
@@ -2910,11 +3075,24 @@ async function main() {
           result.exportMenuOwnsMidiMode === true && result.legacyExportButtons === 0
       ],
       ['main menu replaces Open', result.mainMenuButton && result.legacyOpenButtons === 0],
-      // Was 'removed Linked control stays removed' (linkedControls === 0). That expectation is
-      // gone with the control's removal: the player reported the loss directly — "the link
-      // button also disappeared. i cant link midi/musicsheet/tab/soundwave" — so the assertion
-      // is inverted rather than dropped. Exactly one, and it must work; see the block below.
-      ['the Align control is on screen', result.linkedControls === 1],
+      // WAS: 'the Align control is on screen' (linkedControls === 1). Inverted again, and this
+      // is the last time — G11 makes alignment unconditional. The history is worth keeping in
+      // one place: it was 0 when the linked mode was deleted, then 1 when the player reported
+      // the loss ("the link button also disappeared. i cant link midi/musicsheet/tab/
+      // soundwave"), and it is 0 now because what the player wanted back is simply how the app
+      // behaves. The BEHAVIOUR they asked for is checked harder than before — see the align
+      // block below, which no longer has an off state to weaken it.
+      ['the Align control is gone and alignment is unconditional', result.linkedControls === 0],
+      // G13. "Fit" was retired once and came back by mistake on the horizontal zoom pair.
+      ['zoom: no Fit button on the roll’s time axis', result.rollTimeFitButton === false],
+      [
+        // G7. The axes say their names. Two captions, spelled out, in the order the pairs sit
+        // in — the glyphs they replaced were unreadable at the plugin's zoom steps.
+        'zoom: the two axes are labelled in words',
+        JSON.stringify(result.zoomAxisLabels ?? []) === JSON.stringify(['Vertical', 'Horizontal'])
+      ],
+      // G12. Choosing "From recording" re-detects, and every take edit re-detects again.
+      ['tempo source: the Re-detect button is gone', result.tempoRedetectButton === false],
       ['notation controls live beside the notation', result.notationToolbar],
       [
         // Was: the ".tuning-summary" row read "Tuning low → high: E1 A1 D2 G2". That row is
@@ -2946,18 +3124,26 @@ async function main() {
           typeof result.rollGridView === 'string' && result.rollGridView.length > 0
       ],
       [
-        // 'auto' IS STILL OFFERED AND IS NO LONGER THE DEFAULT. This check used to assert that
-        // it was both, and that was the sanctioned reality until settings v10 turned the
-        // default into 'free' (see DEFAULT_SETTINGS.grid and the v10 case in `migrate()`): every
-        // value except 'free' ROUNDS, and 'auto' rounds cleverly rather than not at all. The
-        // half worth keeping is that Auto has not been DELETED — it was once, and it is the
-        // only setting that can write straight notes and triplets in the same piece, so it has
-        // to stay reachable for whoever wants tidying.
-        'grids: notation offers Auto, and starts on Free',
-        (result.notationGridOptions ?? []).includes('auto') && result.notationGridView === 'free'
+        // AUTO IS THE DEFAULT AGAIN (G6, settings v11). This check has been both ways round:
+        // 'auto' until v10, 'free' after it, and back now. The reason for the return is in
+        // DEFAULT_SETTINGS.grid and the v11 case in `migrate()` — 'free' and 'auto' engrave
+        // straight material identically, so v10 bought those takes nothing, while a triplet
+        // performance came out of 'free' with 38 rests and 34 ties on the first page anybody
+        // ever sees. Free is still offered for every take (the check below) and is one press
+        // away; what changed is which of the two somebody meets without asking.
+        'grids: notation offers Auto, and starts on it',
+        (result.notationGridOptions ?? []).includes('auto') && result.notationGridView === 'auto'
       ],
       [
-        // FREE IS OFFERED FOR EVERY TAKE, and is the default from settings v10.
+        // THE ORDER IS FINENESS (G6). Triplet (1/12) is finer than an eighth and coarser than a
+        // sixteenth, and it had been sitting after 1/32 as if it were the finest thing on offer.
+        'grids: the Quantize menu runs coarse to fine, with Triplet in its place',
+        JSON.stringify(result.notationGridOptions ?? []) ===
+          JSON.stringify(['auto', 'quarter', 'eighth', 'triplet', 'sixteenth', 'thirtysecond', 'free'])
+      ],
+      [
+        // FREE IS OFFERED FOR EVERY TAKE. It was the default under v10 and is not under v11
+        // (see above); what this check is about is that it is OFFERED at all.
         //
         // This check asserted the OPPOSITE until #36, on a measurement that has since stopped
         // being true: 'free' used to engrave 64 played notes as 192 glyphs with 192 ties, which
@@ -2968,7 +3154,7 @@ async function main() {
         //
         // `scripts/roll-snap-test.ts` §8 holds the numbers, so a regression in the pipeline's
         // 'free' fails there with an arithmetic reason rather than here with a missing option.
-        'grids: Free is offered, and is the default',
+        'grids: Free is offered for every take',
         (result.notationGridOptions ?? []).includes('free') &&
           (result.notationGridOptions ?? []).length >= 6
       ],
@@ -2976,6 +3162,15 @@ async function main() {
         // And the roll must NOT offer it: its grid is a stated cell size for drawing into.
         'grids: the roll has no Auto to infer',
         (result.rollGridOptions ?? []).length >= 5 && !(result.rollGridOptions ?? []).includes('auto')
+      ],
+      [
+        // G14. The roll's ruler grew 1/32 and an Off that draws bar lines only, and Triplet
+        // moved between 1/8 and 1/16 for the same reason it did in the Quantize menu. The exact
+        // value keys are asserted, not the labels: the shell, the saved document and
+        // `rollSnapUnitSec` all key on these words.
+        'grids: the roll offers 1/32 and Off, in fineness order',
+        JSON.stringify(result.rollGridOptions ?? []) ===
+          JSON.stringify(['quarter', 'eighth', 'triplet', 'sixteenth', 'thirtysecond', 'free', 'off'])
       ],
       [
         'grids: changing the roll grid changes the roll',
@@ -3385,20 +3580,33 @@ async function main() {
         !!result.floor?.reach && result.floor.reach.offScreen.length === 0
       ],
       [
-        'align: the Align control is on screen at 900x600',
-        result.narrow?.reach?.linkControl?.onScreen === true &&
-          result.narrow.reach.linkControl.setting === 'alignViews'
+        // G11, at both ends of the size ladder. `linkControl` reads the same selector it always
+        // did; what changed is which answer is correct. Null at every size, because "deleted"
+        // has to mean gone rather than hidden behind a breakpoint.
+        'align: the Align control is gone at 900x600',
+        !!result.narrow?.reach && result.narrow.reach.linkControl === null
       ],
       [
-        'align: the Align control is on screen at 360x280',
-        result.floor?.reach?.linkControl?.onScreen === true
+        'align: the Align control is gone at 360x280',
+        !!result.floor?.reach && result.floor.reach.linkControl === null
+      ],
+      [
+        // G7. Both axis captions readable at the product's floor: on screen, not clipped, and
+        // not shrunk below 9px, which is where 8 uppercase characters stop being a word.
+        'zoom: both axis captions are legible at 360x280',
+        (result.floor?.reach?.zoomAxes ?? []).length === 2 &&
+          result.floor.reach.zoomAxes.every(
+            (a) => a.onScreen === true && a.w >= 24 && a.fontPx >= 9 && /^(Vertical|Horizontal)$/.test(a.text)
+          )
       ],
       [
         // The player asked for it ON out of the box. Safe to default on only because the
         // setting no longer means "borrow the sheet's geometry" — following a moment cannot
         // move anything, which is what made the old default-on dangerous.
         'align: a fresh boot has it ON',
-        !!result.alignDefault && result.alignDefault.enabled === true
+        !!result.alignDefault && result.alignDefault.enabled === true &&
+          // …and there is no control that could ever have it any other way (G11).
+          result.alignDefault.chipPresent === false
       ],
       [
         // The whole of what it does: point at a moment on the roll or the strip and the SHEET
@@ -3409,7 +3617,22 @@ async function main() {
         'align: ON, pointing at a moment takes the sheet there',
         !!result.alignOn && result.alignOn.followed === true &&
           (result.alignOn.sheetScrollable ? result.alignOn.sheetMoved === true : true) &&
-          result.alignOn.sheetErrorPx !== null && result.alignOn.sheetErrorPx < 80
+          result.alignOn.sheetErrorPx !== null &&
+          // CENTRED WHERE CENTRING IS POSSIBLE, ON SCREEN WHERE IT IS NOT.
+          //
+          // The bound was `sheetErrorPx < 80` alone, and the second clause is not a loosening
+          // of it — it is the case the first clause was silently getting away with. A moment in
+          // the last half-viewport of the engraving CANNOT be put in the middle of the pane:
+          // `setScrollLeft` clamps at the end of the content rather than scrolling past it, so
+          // the residual is however far the target is from the centre of the last screenful,
+          // and that is correct behaviour rather than a miss. The target here sits at 75% of
+          // the take, and the take's engraving got shorter when the Quantize default went back
+          // to 'auto' (G6) — same music, fewer glyph-widths — which is what moved this run over
+          // the line. `clampedAtEnd` and `targetOnScreen` are new fields on the probe reporting
+          // exactly which of the two situations a run is in, so the distinction is measured
+          // rather than assumed.
+          (result.alignOn.sheetErrorPx < 80 ||
+            (result.alignOn.clampedAtEnd === true && result.alignOn.targetOnScreen === true))
       ],
       [
         // THE POINT OF THE WHOLE ITEM. With Align ON the roll and the strip are told the
@@ -3418,11 +3641,11 @@ async function main() {
         'align: ON, the roll and the strip are given the sheet\'s visible span',
         typeof result.alignOn?.alignedWindowSec === 'number' && result.alignOn.alignedWindowSec > 0
       ],
-      [
-        // ...and OFF they are independent again: whole take, no window.
-        'align: OFF, the panes go back to being independent',
-        result.alignOff?.alignedWindowSec === null
-      ],
+      // WAS: 'align: OFF, the panes go back to being independent' (alignOff.alignedWindowSec
+      // === null). There is no OFF (G11), so the claim is retired rather than restated — the
+      // window is always supplied, which the check above already asserts. What the off-state
+      // was really guarding, that the roll's own geometry stays linear and independent of the
+      // engraving, is asserted below and by the add-a-note check, neither of which needed it.
       [
         // VERTICAL CORRESPONDENCE, measured. Three notes, sheet x against roll x, in viewport
         // pixels. The tolerance is what a LINEAR time ruler can do against alphaTab's own
@@ -3435,31 +3658,23 @@ async function main() {
           result.alignXOn?.compared >= 3 &&
           result.alignXOn?.worstDeltaPx <= ALIGN_TOLERANCE_PX
       ],
+      // THREE OFF-STATE CHECKS STOOD HERE and are deleted with the state (G11):
+      //
+      //   'align: OFF, the two panes are free to disagree'      (alignXOff.worstDeltaPx > tol)
+      //   'align: ON closes the gap by at least 4x over OFF'    (a ratio between the two modes)
+      //   'align: OFF, the sheet is left exactly where the player put it'
+      //
+      // All three asserted something about a mode the app can no longer enter, so none of them
+      // can fail for a reason anybody would want to hear about. The first two were how the
+      // absolute tolerance above was shown to be a real bound rather than a rubber stamp; that
+      // argument is preserved as a NUMBER instead of as a second measurement — unaligned, the
+      // same three notes were hundreds of pixels apart, against ALIGN_TOLERANCE_PX above.
       [
-        'align: OFF, the two panes are free to disagree',
-        result.alignXOff?.aligned === false &&
-          result.alignXOff?.compared >= 3 &&
-          result.alignXOff?.worstDeltaPx > ALIGN_TOLERANCE_PX
-      ],
-      [
-        // The bound above only means something next to what it is a bound ON. Turning Align on
-        // has to close the gap by a large factor, not by a rounding error.
-        'align: ON closes the gap by at least 4x over OFF',
-        typeof result.alignXOn?.worstDeltaPx === 'number' &&
-          typeof result.alignXOff?.worstDeltaPx === 'number' &&
-          result.alignXOn.worstDeltaPx * 4 <= result.alignXOff.worstDeltaPx
-      ],
-      [
-        'align: OFF, the sheet is left exactly where the player put it',
-        !!result.alignOff && result.alignOff.followed === false && result.alignOff.sheetMoved === false
-      ],
-      [
-        // Selection has always crossed all four views and still does, either way — the chip
-        // governs scrolling, not highlighting, and a check that let that regress would let the
-        // "I cant link midi/musicsheet/tab/soundwave" report come back.
-        'align: selection crosses the views whether it is on or off',
-        !!result.alignOn && !!result.alignOff &&
-          result.alignOn.selectionCrossed === true && result.alignOff.selectionCrossed === true
+        // Selection has always crossed all four views and still does. It was checked in both
+        // modes because the chip governed scrolling and not highlighting; with one mode left,
+        // the claim is the same and the evidence is half as long.
+        'align: selection crosses the views',
+        !!result.alignOn && result.alignOn.selectionCrossed === true
       ],
       [
         // THE USER'S OWN ACCEPTANCE TEST, and the reason the old design was deleted. Adding a
@@ -3472,13 +3687,13 @@ async function main() {
       [
         // ...and the geometry is gone, not merely switched off: there is no supplier left that
         // could put either pane on the engraved axis.
+        // Read off the panes rather than off a chip that no longer exists (G11): there is no
+        // supplier left that could put either of them on the engraved axis, so there is nothing
+        // to press to find out.
         'align: neither pane can be put on the sheet’s x-axis any more',
-        result.linkClickOn?.clicked === true && result.linkClickOff?.clicked === true &&
-          result.linkBefore?.roll?.linkedActive === false &&
-          result.linkOn?.roll?.linkedActive === false &&
-          result.linkOn?.roll?.hasSheetMap === false &&
-          result.linkOn?.wave?.sheetLinked === false &&
-          result.linkOff?.roll?.linkedActive === false
+        result.linkOff?.roll?.linkedActive === false &&
+          result.linkOff?.roll?.hasSheetMap === false &&
+          result.linkOff?.wave?.sheetLinked === false
       ],
 
       // --- start over: out of the toolbar, into the Main menu ---------------------------
@@ -3823,6 +4038,42 @@ async function main() {
           result.preprocessCopy?.receipt === true
       ],
 
+      // --- G17: the chip may only claim a listener that exists ---------------------------
+      [
+        /*
+         * THE BUG: "Listener · running" on a machine where nobody had ever started an engine
+         * server. `EngineStatus.state` means the SERVER'S LIFECYCLE for MuScriptor and "this
+         * engine is installed" for every other engine, and ui/app.ts read it as the first for
+         * both — so on any machine whose resolved engine was not MuScriptor the chip was up
+         * from boot. `memoryMb` was absent, which is why the text read the literal word
+         * "running" instead of a figure; that string was the tell.
+         *
+         * A check cannot start a Python process, so it cannot assert the chip is RIGHT. What it
+         * asserts is the implication that was broken, in both directions: visible only where
+         * the payload carries evidence of a process, and no evidence means not visible. The
+         * evidence list is the same one `engineProcessAlive()` uses, restated here rather than
+         * imported, so a quiet widening of it on the app's side fails this check.
+         */
+        'listener chip: it appears only where a server process actually exists',
+        !!result.engineChip &&
+          result.engineChip.present === true &&
+          result.engineChip.visible ===
+            (['ready', 'starting'].includes(result.engineChip.state) &&
+              ((result.engineChip.port ?? 0) > 0 ||
+                (result.engineChip.memoryMb ?? 0) > 0 ||
+                result.engineChip.externalServer === true ||
+                result.engineChip.adopted === true))
+      ],
+      [
+        // And when it IS shown it says what it is and what pressing it does, in the accent —
+        // "Listener · 1.5 GB" read as a status badge, and nobody clicks a status badge. The
+        // memory figure is not lost; it moved into the tooltip.
+        'listener chip: shown means named, highlighted, and offering to stop',
+        !result.engineChip?.visible ||
+          (/ running — click to stop$| starting…$/.test(result.engineChip?.text ?? '') &&
+            result.engineChip?.highlighted === true)
+      ],
+
       // --- #5-web: a refusal you can act on ----------------------------------------------
       [
         // "It is not Riffsheet's to stop" is a correct principle and, on its own, a dead end:
@@ -3930,6 +4181,15 @@ async function main() {
           typeof result.floor?.header?.h === 'number' &&
           result.narrow.headerRows === 1 &&
           result.floor.header.h <= result.narrow.header.h * 2
+      ],
+      [
+        // G4. TWO ROWS BETWEEN THE ROLL AND THE SHEET, not three. The transport is one of them
+        // and the notation toolbar is the other; the tempo source belongs to the first and used
+        // to wrap out of it into a band of its own at every plugin width. Asserted at 900x600
+        // and at REAPER's 360x280 floor, because the failure was a width-dependent wrap and a
+        // check at one width would have missed it exactly where it happened.
+        'transport: one row at 900x600 and at the 360x280 floor',
+        result.narrow?.transportRows === 1 && result.floor?.transportRows === 1
       ],
       ['900x600: no horizontal overflow', !!result.narrow && result.narrow.docScrollW <= result.narrow.innerW + 1],
       ['900x600: header buttons on screen', !!result.narrow && result.narrow.maxHeaderButtonRight <= 900],
@@ -4117,6 +4377,87 @@ async function main() {
           result.waveSelect.selectionToSec > result.waveSelect.selectionFromSec
       ],
       ['tuner: it opens on that moment', !!result.waveSelect?.tunerOnScreen && !!result.waveSelect.tuner],
+
+      // --- G8: "Cut out 0.1s" ------------------------------------------------------------
+      [
+        // The mode exists and starts OFF, so the strip a player meets is still the tuner's.
+        'cut: the strip has a Cut mode and it is off until asked for',
+        result.cutArmBefore?.present === true &&
+          result.cutArmBefore?.pressed === 'false' &&
+          result.cutArmBefore?.armed === false
+      ],
+      [
+        // UNARMED, A DRAG IS STILL A CLICK. This is what makes the mode worth having: the
+        // tuner's gesture — point at one moment, get one answer — cannot be made ambiguous by
+        // the cut feature. A span here would mean the mode had been skipped.
+        'cut: unarmed, dragging the strip still gives the fixed probe window',
+        result.cutDragUnarmed?.dragged === true &&
+          typeof result.cutDragUnarmed.spanSec === 'number' &&
+          Math.abs(result.cutDragUnarmed.spanSec - (result.waveSelect?.probeWindowSec ?? 0.1)) < 0.01
+      ],
+      [
+        // ARMED, THE DRAG IS A SPAN — and the button says so. The label is the whole of the
+        // reported bug: it read "Cut out 0.1s" whatever you did, because 0.1s was the only
+        // selection the app could make. A third of this take is seconds, not tenths.
+        'cut: armed, a drag sweeps out a real span and the button offers to cut it',
+        result.cutArmClick?.clicked === true &&
+          result.cutDragArmed?.selectArmed === true &&
+          typeof result.cutDragArmed?.spanSec === 'number' &&
+          result.cutDragArmed.spanSec > 1 &&
+          /^Cut out \d+(\.\d)?s$/.test(result.cutDragArmed.cutLabel ?? '') &&
+          !/Cut out 0\.1s/.test(result.cutDragArmed.cutLabel ?? '')
+      ],
+      [
+        // The tuner is calibrated on one steady pitch. Handing it eight seconds of a riff is
+        // the failure the drag gesture was removed for in v1.2, so the span must not open it.
+        'cut: a span does not open the tuner',
+        result.cutDragArmed?.tunerOnScreen === false
+      ],
+      [
+        // THE EDGES ARE HANDLES. Grab the left one, pull it earlier, and the span grows from
+        // that end with the other pinned — otherwise a selection is something you can only make
+        // once and never correct.
+        'cut: either edge of the span can be dragged to adjust it',
+        result.cutDragEdge?.dragged === true &&
+          typeof result.cutDragEdge.spanSec === 'number' &&
+          typeof result.cutDragArmed?.spanSec === 'number' &&
+          result.cutDragEdge.spanSec > result.cutDragArmed.spanSec + 0.2 &&
+          Math.abs((result.cutDragEdge.selectionToSec ?? 0) - (result.cutDragArmed.selectionToSec ?? -1)) < 0.05
+      ],
+      [
+        // And the way out. A mode that outlives the edit it was armed for is a mode somebody
+        // gets stuck in, so disarming has to put the click-to-probe gesture back exactly.
+        'cut: disarming gives the strip its probe gesture back',
+        result.cutDisarmClick?.clicked === true &&
+          result.cutAfterDisarm?.clicked === true &&
+          typeof result.cutAfterDisarm.selectionToSec === 'number' &&
+          Math.abs(
+            result.cutAfterDisarm.selectionToSec -
+              result.cutAfterDisarm.selectionFromSec -
+              result.cutAfterDisarm.probeWindowSec
+          ) < 0.01
+      ],
+
+      // --- G16a: the vertical lines in the waveform --------------------------------------
+      [
+        /*
+         * The player's "vertical lines in the waveform" were the body bracket's two 1px edge
+         * rails. They look like bar lines or cut seams, they are neither, and they move
+         * whenever the sheet scrolls — while the dim wash on either side already says
+         * everything the bracket has to say.
+         *
+         * Measured on the PIXELS, because "we deleted the fillRect" is the kind of claim a
+         * later refactor undoes by accident. A full-height rail is the only mark in this strip
+         * whose column has no dark pixel anywhere down it, so the test is the column's DIMMEST
+         * pixel against the same measure six pixels away. Equal-ish means no rail; a rail
+         * column would sit hundreds of units brighter.
+         */
+        'waveform: the viewport bracket draws no vertical rails on the body',
+        result.bodyRails?.measured === true &&
+          typeof result.bodyRails.railColumn === 'number' &&
+          typeof result.bodyRails.neighbourColumn === 'number' &&
+          result.bodyRails.railColumn <= result.bodyRails.neighbourColumn + 30
+      ],
       [
         // A fixed window, not whatever the pointer happened to cover. Long enough for the pitch
         // detector to get three agreeing frames, short enough not to straddle two notes.
@@ -4799,9 +5140,14 @@ async function main() {
 
       // --- F17/F18: the brand block ----------------------------------------------------
       [
-        'brand: the top-left block carries the mark, the name, the version and the invitation',
+        // G5: THE MARK IS NOT PART OF THIS BLOCK ANY MORE. `mark === true` stood where the
+        // `false` is, and the flip is the whole change: a chamfered R beside the word RIFFSHEET
+        // is the word twice, and BASAMAK — the block this is modelled on — is a wordmark with
+        // nothing in front of it. The R lives in the app icon, which no check here can see.
+        // Asserted as false rather than dropped, so it cannot quietly come back.
+        'brand: the top-left block carries the name, the version and the invitation, and no mark',
         result.brand?.present === true &&
-          result.brand?.mark === true &&
+          result.brand?.mark === false &&
           result.brand?.wordmark === 'RIFFSHEET' &&
           // `v` + whatever the shell said, not `v` + a digit: the version is FEATURE-DETECTED
           // (`bridge.getAppVersion`), the browser mock answers 'dev', and a real build answers
@@ -5197,6 +5543,13 @@ async function main() {
     phase('reporting checks', 15_000);
     console.log(JSON.stringify(result, null, 2));
     console.log('\n--- checks ---');
+    // Every measurement this run took, on disk, when asked for. Off by default because it is a
+    // 200KB file nobody reads on a green run; indispensable on a red one, where the failing
+    // check names a claim and this names the numbers behind it.
+    if (process.env.RIFFSHEET_DUMP) {
+      await mkdir(join(ROOT, 'spike-results'), { recursive: true });
+      await writeFile(join(ROOT, 'spike-results', 'verify-result.json'), JSON.stringify(result, null, 1));
+    }
     for (const [name, ok] of checks) {
       console.log(`${ok ? 'PASS' : 'FAIL'}  ${name}`);
       if (!ok) code = 1;

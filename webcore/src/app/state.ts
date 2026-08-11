@@ -54,7 +54,21 @@ export type NotationGrid =
   | 'thirtysecond'
   | 'triplet'
   | 'free';
-export type RollGrid = 'quarter' | 'eighth' | 'sixteenth' | 'triplet' | 'free';
+export type RollGrid =
+  | 'quarter'
+  | 'eighth'
+  | 'sixteenth'
+  // 1/32. The roll's finest column, and the size a hand-added note comes out at when it is
+  // chosen. Asked for alongside the Quantize menu's 1/32 (G14): a player editing a fast picked
+  // figure could see it on the sheet and had no ruler fine enough to draw it on.
+  | 'thirtysecond'
+  | 'triplet'
+  | 'free'
+  // BAR LINES ONLY (G14). Not a synonym for 'free': 'free' still draws the beat subdivisions
+  // and only refuses to snap to them, while this draws no subdivision at all. It is the ruler
+  // for reading the shape of a take rather than editing it, and `rollSnapUnitSec` returns 0 for
+  // it exactly as it does for 'free', so Snap to grid cannot move a note under it.
+  | 'off';
 
 /** The stored words each grid accepts. Exported so the UI and `migrate()` cannot drift apart. */
 export const NOTATION_GRIDS: readonly NotationGrid[] = [
@@ -69,7 +83,16 @@ export const NOTATION_GRIDS: readonly NotationGrid[] = [
   'triplet',
   'free'
 ];
-export const ROLL_GRIDS: readonly RollGrid[] = ['quarter', 'eighth', 'sixteenth', 'triplet', 'free'];
+/** Coarsest to finest, then the two that do not round at all. The UI shows this order. */
+export const ROLL_GRIDS: readonly RollGrid[] = [
+  'quarter',
+  'eighth',
+  'triplet',
+  'sixteenth',
+  'thirtysecond',
+  'free',
+  'off'
+];
 
 /**
  * How the tab chooses which string and fret to write a note on.
@@ -115,8 +138,9 @@ export interface AppSettings {
    * OFF by default, which is the only honest default for anything that moves somebody's notes.
    *
    * The raw performance is always kept underneath. Switching this on DERIVES a snapped copy —
-   * every note's START moved to the nearest `rollGrid` line, its length carried over intact —
-   * and switching it off throws that copy away and shows the recording again, to the bit.
+   * every note's START and its END moved to the nearest `rollGrid` line, with a floor of one
+   * whole cell so nothing collapses (G9; see `snapPerformanceToGrid`) — and switching it off
+   * throws that copy away and shows the recording again, to the bit.
    * Nothing is ever rewritten in place, so the round trip is lossless by construction rather
    * than by care.
    *
@@ -173,13 +197,17 @@ export interface AppSettings {
    */
   rollEditing: boolean;
   /**
-   * Keep the four views pointing at the same moment.
+   * DEAD FIELD (G11). Keeping the four views on the same moment is simply what the app does.
    *
-   * ON — the default — clicking or seeking anywhere (the waveform, the piano roll, the
-   * transport) scrolls the sheet to that moment as well, so the page you are reading follows
-   * the sound you are pointing at. Selection already crosses all four views and always has.
+   * Clicking or seeking anywhere — the waveform, the piano roll, the transport — scrolls the
+   * sheet to that moment as well, so the page you are reading follows the sound you are
+   * pointing at. Selection already crosses all four views and always has.
    *
-   * OFF leaves them independent: the sheet stays where you put it and only the playhead moves.
+   * There is no control for it anywhere any more, and there is not meant to be: OFF only ever
+   * meant "the sheet refuses to follow the thing you are pointing at", which is a worse version
+   * of ON rather than a different choice. `migrate()` forces this true and the readers in
+   * ui/app.ts pass the literal, so the field exists to keep an older blob round-tripping and
+   * for nothing else.
    *
    * WHAT THIS IS NOT, because the name used to mean something else and the difference is the
    * whole reason the old one was removed. It does NOT put the roll on the sheet's x-axis.
@@ -276,7 +304,7 @@ export interface AppSettings {
 }
 
 /** Raise this AND add a case in `migrate()` when a default has to change under people. */
-export const SETTINGS_VERSION = 10;
+export const SETTINGS_VERSION = 11;
 
 export const DEFAULT_SETTINGS: AppSettings = {
   // 'auto', NOT 'bass'. This is sent to the model as a HARD CONSTRAINT on what it is allowed to
@@ -298,11 +326,20 @@ export const DEFAULT_SETTINGS: AppSettings = {
   // subdivision the player MEANT, and every one of those decisions is a place the page can
   // disagree with the recording.
   //
-  // 'free' is a truthful pass-through now: 1:1 content, the input never mutated, the simplest
-  // symbol that fits what was played. So the sheet starts as a picture of the performance, and
-  // tidying it is something the player asks for rather than something they have to notice and
-  // switch off. See the v10 case in `migrate()`.
-  grid: 'free',
+  // …AND THAT ARGUMENT WAS WRONG IN ONE PLACE, WHICH IS THE DEFAULT (v11).
+  //
+  // Everything above still holds about what the values MEAN: 'free' is a truthful 1:1
+  // pass-through, and naming a size forbids the quantizer everything finer. What v10 got wrong
+  // is which of them somebody should meet first. Straight material is engraved identically by
+  // 'auto' and 'free', so the change bought those takes nothing; a triplet performance comes
+  // out of 'free' with 38 rests and 34 ties (measured — see the note on the Quantize menu in
+  // ui/app.ts), which is a page fussier than anybody played and the first page most people
+  // ever see, because a performance rather than a machine-exact import is the normal input.
+  //
+  // So 'auto' is the default again: the cleanest reading that is still a reading of what you
+  // played, with 'free' one press away for anyone who wants the literal truth. See the v11
+  // case in `migrate()` for who is moved and who keeps their choice.
+  grid: 'auto',
   // A stated size, because a manually added note has to come out some length and 1/8 is the
   // one that makes a riff. It is only ever consulted for hand edits and for drawing the ruler.
   rollGrid: 'eighth',
@@ -327,9 +364,9 @@ export const DEFAULT_SETTINGS: AppSettings = {
   // row and is always editable, and these two are what an old blob's values are normalised to.
   rollAllNoteNames: true,
   rollEditing: true,
-  // ON, at the player's explicit request. It was safe to default this on only once the
+  // TRUE AND NO LONGER CHOOSABLE (G11). It was safe to make this unconditional only once the
   // setting stopped meaning "borrow the sheet's geometry": following a moment has no effect on
-  // where anything is drawn, so there is no reflow for a default to inflict on anybody.
+  // where anything is drawn, so there is no reflow for it to inflict on anybody.
   alignViews: true,
   // ON. It is the answer to a bug the player can see on their own screen — the waveform draws
   // an attack line inside a note the engine returned whole — and a fix nobody switches on is a
@@ -770,6 +807,30 @@ function migrate(settings: AppSettings, stored: Partial<AppSettings>, floor = 0)
     settings.rollSnapToGrid = DEFAULT_SETTINGS.rollSnapToGrid;
   }
 
+  // v10 -> v11: the quantizer's default goes back to 'auto', and Align stops being a switch.
+  //
+  // WHO IS MOVED, AND WHY IT CANNOT BE FINER THAN THIS. v10 forced every existing profile to
+  // 'free' and stamped them at version 10. A player who has since deliberately chosen 'free'
+  // writes exactly the same pair — grid 'free', settingsVersion 10 — as one who was moved there
+  // and never opened the menu, so the two are NOT distinguishable and no amount of care here
+  // will make them so. Everybody sitting on 'free' therefore lands on 'auto' once, and that is
+  // the documented cost of v10 having been wrong.
+  //
+  // Everybody else keeps what they have, and that is the half that IS distinguishable: 'auto',
+  // '1/4', '1/8', 'Triplet', '1/16' and '1/32' were all unreachable as a v10 default, so a
+  // stored one of those can only be a choice somebody made. The condition is on the VALUE for
+  // that reason and not on the version alone. Whatever is picked after this is written with
+  // settingsVersion 11 and is never re-flipped by this case again.
+  if (from < 11 && settings.grid === 'free') settings.grid = 'auto';
+
+  // The second half: `alignViews` is not a control any more (G11). Its OFF position only ever
+  // meant "the sheet refuses to follow what you are pointing at", which nobody chose on
+  // purpose, so the chip is deleted and the behaviour is unconditional. FORCED rather than
+  // merged for the usual reason — a stored `false` is indistinguishable from a typed one — and
+  // the field survives so an older blob still round-trips. Every reader in ui/app.ts passes the
+  // literal `true`; this is what keeps the STORED copy honest.
+  if (from < 11) settings.alignViews = true;
+
   const sampled = new Set([
     'finger-bass',
     'upright-piano',
@@ -797,9 +858,10 @@ function migrate(settings: AppSettings, stored: Partial<AppSettings>, floor = 0)
   if (typeof settings.engineId !== 'string' || settings.engineId.length === 0) {
     settings.engineId = DEFAULT_SETTINGS.engineId;
   }
-  if (typeof settings.alignViews !== 'boolean') {
-    settings.alignViews = DEFAULT_SETTINGS.alignViews;
-  }
+  // Not "a boolean or the default" any more: TRUE, always. The control is gone (G11) and a
+  // `false` arriving from untrusted JSON would set a dead field to a value nothing reads —
+  // harmless in itself, and misleading to the next person who diffs a settings blob.
+  settings.alignViews = true;
   if (typeof settings.normalizeBeforeTranscribe !== 'boolean') {
     settings.normalizeBeforeTranscribe = DEFAULT_SETTINGS.normalizeBeforeTranscribe;
   }

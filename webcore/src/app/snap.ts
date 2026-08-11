@@ -44,9 +44,14 @@ export function rollSnapUnitSec(grid: AppSettings['rollGrid'], tempoBpm: number)
       return quarter / 2;
     case 'sixteenth':
       return quarter / 4;
+    case 'thirtysecond':
+      return quarter / 8;
     case 'triplet':
       return quarter / 3;
     case 'free':
+    // 'off' draws bar lines and nothing else, so there is no column for a note to stand on.
+    // Same answer as 'free', for a different reason, and both are read as "do not snap".
+    case 'off':
       return 0;
   }
 }
@@ -54,11 +59,24 @@ export function rollSnapUnitSec(grid: AppSettings['rollGrid'], tempoBpm: number)
 /**
  * SNAP TO GRID (#41), as a pure derived layer.
  *
- * Every note's START moves to the nearest grid line and its LENGTH is carried over untouched,
- * which is the whole specification: a snapped take has the rhythm of the grid and the
- * articulation of the performance. Nothing is mutated — notes are rebuilt, exactly as
- * `edit/rollPerformance.ts` rebuilds them, because the undo stacks hold arrays of references
- * and an in-place move would rewrite history as well as the present.
+ * BOTH ENDS (G9). Every note's start moves to the nearest grid line AND so does its end, with
+ * a floor of one whole cell so nothing can be snapped out of existence. That is a change from
+ * the first version of this function, which moved the start and carried the played LENGTH over
+ * untouched — "the rhythm of the grid and the articulation of the performance". It reads well
+ * and it is not what anybody asking for a grid means: a take snapped to 1/8 came out with every
+ * note starting on a line and ending 30–70 ms past one, so the sheet still had to round the
+ * durations and the roll still drew ragged right edges under a switch whose whole promise was
+ * that things would line up. Snapping both ends makes the rectangles the columns, which is the
+ * picture the control has always implied.
+ *
+ * The floor is one cell rather than zero: a note played shorter than half a cell would
+ * otherwise round to the same line at both ends and become a zero-length note, which is not a
+ * note. It is applied AFTER both roundings, so a genuinely short note is widened to one cell
+ * and a long one keeps whatever whole number of cells it rounded to.
+ *
+ * Nothing is mutated — notes are rebuilt, exactly as `edit/rollPerformance.ts` rebuilds them,
+ * because the undo stacks hold arrays of references and an in-place move would rewrite history
+ * as well as the present.
  *
  * MEASURED FROM THE RAW TAKE, ALWAYS. The caller passes the recording's own notes, never the
  * output of a previous snap, so changing the grid re-derives from the performance instead of
@@ -82,28 +100,36 @@ export function snapPerformanceToGrid(
 ): InputNote[] {
   if (!(unitSec > 0) || notes.length === 0) return notes as InputNote[];
   const out = notes.map((n) => {
-    const startSec = originSec + Math.round((n.startSec - originSec) / unitSec) * unitSec;
+    const rawStart = originSec + Math.round((n.startSec - originSec) / unitSec) * unitSec;
+    // Clamped before the length is measured off it, so a note snapped backwards past the top of
+    // the file cannot end up describing a negative span.
+    const startSec = Math.max(0, rawStart);
+    // The END, on the same lines as the start, then floored at one whole cell. `Math.round` on
+    // the end rather than `Math.ceil`: a note played a hair past a line belongs on that line,
+    // exactly as its start does, and ceiling would lengthen every note in the take by up to a
+    // cell for no reason anybody could see.
+    const rawEnd = originSec + Math.round((n.endSec - originSec) / unitSec) * unitSec;
+    const endSec = Math.max(startSec + unitSec, rawEnd);
     const deltaSec = startSec - n.startSec;
-    if (deltaSec === 0) return n;
+    if (deltaSec === 0 && endSec === n.endSec) return n;
     const timing = n.sourceTiming;
     const shifted =
       timing && Number.isFinite(timing.ppq) && timing.ppq > 0
         ? (() => {
             const perSec = ((tempoBpm || 100) / 60) * timing.ppq;
             const startTick = Math.max(0, Math.round(timing.startTick + deltaSec * perSec));
-            return {
-              startTick,
-              endTick: startTick + Math.max(1, timing.endTick - timing.startTick),
-              ppq: timing.ppq
-            };
+            // The written ticks follow the SNAPPED span, not the played one — otherwise a
+            // symbolic import would show grid-aligned rectangles on the roll and engrave the
+            // original ragged durations on the sheet, which is the one outcome this feature may
+            // not produce. One tick is the floor for the same reason one cell is above.
+            const endTick = startTick + Math.max(1, Math.round((endSec - startSec) * perSec));
+            return { startTick, endTick, ppq: timing.ppq };
           })()
         : null;
     return {
       ...n,
-      startSec: Math.max(0, startSec),
-      // The LENGTH is the performance's, not the grid's. Held rather than recomputed from the
-      // ends, so a note that snapped backwards past zero keeps its duration instead of growing.
-      endSec: Math.max(0, startSec) + (n.endSec - n.startSec),
+      startSec,
+      endSec,
       ...(shifted ? { sourceTiming: shifted } : {})
     };
   });

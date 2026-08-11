@@ -839,7 +839,7 @@ const CSS = `
   padding: 2px 9px; font-size: 11px; line-height: 1.4;
   border-color: var(--accent); color: var(--accent); background: var(--bg-raised);
 }
-.tuner-close:hover:not(:disabled) { background: var(--accent); color: #1a1005; border-color: var(--accent); }
+.tuner-close:hover:not(:disabled) { background: var(--accent-hover); color: var(--accent-ink); border-color: var(--accent-hover); }
 .tuner-main { grid-area: main; display: flex; align-items: center; gap: 6px; min-width: 0; }
 .tuner-readout { display: flex; align-items: baseline; gap: 5px; min-width: 4.5ch; }
 .tuner-note {

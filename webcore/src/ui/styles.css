@@ -2,7 +2,7 @@
  * Riffsheet web core styling.
  *
  * The palette is deliberately inherited from Basscribe so the two read as siblings:
- * warm orange on cool near-black, with one warm-white "paper" surface for the engraved
+ * violet on cool near-black, with one warm-white "paper" surface for the engraved
  * score. That contrast is the visual signature — the sheet is a physical page sitting
  * inside a dark tool.
  *
@@ -18,8 +18,20 @@
   --border: #2e3340;
   --text: #e8eaee;
   --text-dim: #9aa0ab;
-  --accent: #e8734a;
-  --accent-soft: #e8734a33;
+  /*
+   * THE ACCENT IS PURPLE (G20). It was Basscribe's warm orange; Riffsheet is its own product
+   * now and the brand block, the active chips, the sliders and the played half of the
+   * waveform all move together. One token, so nothing can be left behind on the old hue.
+   *
+   * `--accent-hover` is the lighter step for hover and focus — never a second meaning, only
+   * the same colour with the light turned up. `--accent-ink` is what goes ON a filled accent
+   * surface: near-black rather than white, because #8b5cf6 against white is 4.2:1 and against
+   * this is 4.8:1, and the filled chips carry 12.5px text.
+   */
+  --accent: #8b5cf6;
+  --accent-hover: #a78bfa;
+  --accent-ink: #150c26;
+  --accent-soft: #8b5cf633;
   --paper: #f8f6f0;
   --ink: #16181d;
   --danger: #e05252;
@@ -49,7 +61,8 @@
    * you drag a selection out of.
    */
   --wave: #7c869b;
-  --wave-played: #e8734a;
+  /* The played half of the envelope. The accent, so the strip agrees with the chips. */
+  --wave-played: #8b5cf6;
   --playhead: #ffffff;
 
   /* Piano roll. The note colour is lighter than --wave on purpose: a roll is read as
@@ -84,9 +97,10 @@ button {
   font-size: 12.5px;
   cursor: pointer;
 }
-button:hover:not(:disabled) { border-color: var(--accent); }
+button:hover:not(:disabled) { border-color: var(--accent-hover); }
 button:disabled { opacity: 0.45; cursor: default; }
-button.primary { background: var(--accent); border-color: var(--accent); color: #1a1005; font-weight: 600; }
+button.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-ink); font-weight: 600; }
+button.primary:hover:not(:disabled) { background: var(--accent-hover); border-color: var(--accent-hover); }
 button.ghost { background: transparent; }
 button.icon { padding: 5px 8px; }
 
@@ -98,7 +112,8 @@ button.icon { padding: 5px 8px; }
   font-size: 12px;
   cursor: pointer;
 }
-.chip.on { background: var(--accent); border-color: var(--accent); color: #1a1005; font-weight: 600; }
+.chip.on { background: var(--accent); border-color: var(--accent); color: var(--accent-ink); font-weight: 600; }
+.chip.on:hover:not(:disabled) { background: var(--accent-hover); border-color: var(--accent-hover); }
 
 input[type="range"] { accent-color: var(--accent); }
 input[type="number"], input[type="text"], select {
@@ -178,8 +193,7 @@ input[type="number"], input[type="text"], select {
 /* The whole block is one target: nothing inside it may take the click, which is BASAMAK's
    `setInterceptsMouseClicks(false, false)` on both of its labels. */
 .brand-block > * { pointer-events: none; }
-.brand-mark { display: flex; align-items: center; color: var(--accent); }
-.brand-mark svg { display: block; }
+/* `.brand-mark` (the R glyph) is deleted, not hidden — see the note in ui/app.ts §G5. */
 .brand-wordmark {
   /* BASAMAK's wordmark is vector art, so its weight and tracking are baked into the outlines.
      Ours is text and has to say the same thing out loud: caps, heavy, and generously tracked,
@@ -230,6 +244,26 @@ input[type="number"], input[type="text"], select {
   white-space: nowrap;
 }
 .app-header .spacer { flex: 0 1 auto; }
+/*
+ * THE LISTENER CHIP (G17). It is on screen only while a listening SERVER is actually up, which
+ * is a minority of the time, and it says a whole sentence — "MuScriptor running — click to
+ * stop" — because "Listener · 1.5 GB" read as a status badge and nobody clicks a badge.
+ *
+ * Two rules follow from being the one thing in this row that is a MESSAGE rather than a
+ * control. It takes the row's small type, so a sentence costs what a chip costs; and it is the
+ * only header child allowed to shrink, so when it appears in a bar that was already full it
+ * gives its own ground rather than pushing the export menu and the gear off the edge. The whole
+ * text stays in the tooltip. `min-width` keeps enough of it to be recognisable as the listener
+ * rather than as an anonymous stub.
+ */
+.app-header .engine-chip {
+  font-size: 11px;
+  flex: 0 1 auto;
+  min-width: 7em;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 
 .banner {
   padding: 7px 12px;
@@ -260,12 +294,24 @@ input[type="number"], input[type="text"], select {
  * (one has a 240px drop zone in it), and centring them independently would leave the Recent
  * heading floating at some arbitrary height with nothing to line up with.
  */
+/*
+ * G1: BALANCED, NOT 1fr-AND-A-SLIVER. The right track was `minmax(0, 300px)` against an
+ * unbounded left one, so on a 1600px window the actions column was ~1200px wide holding a
+ * 640px drop zone — 560px of dead space inside the column, which is the same void the
+ * single-centred-column layout had, moved one level in. Both tracks are fractions now and the
+ * left one is capped by its own contents (the drop zone's `width` below), so the gap between
+ * them grows instead of the emptiness inside them.
+ *
+ * `stretch`, not `start`: the side column has to be as tall as the row for its footer to be
+ * able to sit at the bottom of it. The columns' own contents still start at the top, because
+ * each of them is a `flex-direction: column` box that packs from the top.
+ */
 .dropzone-screen {
   flex: 1;
   min-height: 0;
   display: grid;
-  grid-template-columns: minmax(0, 1fr) minmax(0, 300px);
-  align-items: start;
+  grid-template-columns: minmax(0, 3fr) minmax(0, 2fr);
+  align-items: stretch;
   gap: clamp(14px, 2.5vw, 32px);
   /* The margins were `clamp(12px, 3vw, 32px)` of padding on top of a 640px cap — nearly the
      whole width on a wide window. The cap is gone (the columns share the room) and the padding
@@ -284,8 +330,10 @@ input[type="number"], input[type="text"], select {
   gap: clamp(10px, 2vh, 18px);
   min-width: 0;
 }
-.menu-actions { align-items: center; }
-.menu-side { align-items: stretch; }
+/* Centred inside a track that is now only as wide as it needs to be, so "centred" is a nudge
+   rather than a 500px indent. */
+.menu-actions { align-items: center; justify-self: end; width: 100%; max-width: 640px; }
+.menu-side { align-items: stretch; justify-self: start; width: 100%; max-width: 420px; }
 
 /*
  * BELOW 900px THERE IS ONE COLUMN AGAIN, and Recent goes back under the actions.
@@ -296,7 +344,11 @@ input[type="number"], input[type="text"], select {
  */
 @media (max-width: 900px) {
   .dropzone-screen { grid-template-columns: minmax(0, 1fr); justify-content: safe center; }
+  /* One column means there is no "its own column" left for anything to be anchored to the
+     right of, so the caps and the justification go back to centred (G1). */
+  .menu-actions, .menu-side { justify-self: center; max-width: min(640px, 92vw); }
   .menu-side { align-items: center; }
+  .opening-footer { justify-content: center; }
 }
 
 .dropzone {
@@ -338,10 +390,16 @@ input[type="number"], input[type="text"], select {
   padding: 6px 9px; border-radius: 6px; cursor: pointer; font-size: 12.5px;
   min-width: 0;
 }
-.recent-item > span:first-child { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* The name is middle-truncated in JS (ui/app.ts §middleTruncate) so both ends survive. This is
+   the belt to that braces: a name that still overflows a very narrow column is cut rather than
+   allowed to push the age off the row, and the age is what dates the entry. */
+.recent-item .recent-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
 .recent-item:hover { background: var(--bg-panel); }
 .recent-item .when { margin-left: auto; flex: 0 0 auto; color: var(--text-dim); font-size: 11.5px; }
-.opening-footer { width: 100%; display: flex; justify-content: center; margin-top: auto; }
+/* BOTTOM-RIGHT OF ITS OWN COLUMN (G1). `margin-top: auto` puts it at the bottom of the side
+   column — which is why `.dropzone-screen` stretches its tracks — and `flex-end` puts it at the
+   right of it. It is the least urgent thing on the screen and it now reads that way. */
+.opening-footer { width: 100%; display: flex; justify-content: flex-end; margin-top: auto; }
 .legal-link { color: var(--text-dim); text-decoration: underline; text-underline-offset: 2px; }
 
 .current-work {
@@ -538,6 +596,14 @@ input[type="number"], input[type="text"], select {
   opacity: 0.75;
 }
 .take-chip-dismiss:hover { opacity: 1; }
+/*
+ * THE CUT ARM CHIP (G8). Ordinary until it is armed, and then it is the accent — because while
+ * it is on, the strip above it has a different gesture, and a mode you cannot see is a mode you
+ * get stuck in. `.chip.on` supplies the fill; this only widens the target, since the label
+ * changes length when it lights and a chip that resizes under the cursor is a chip you
+ * double-press by accident.
+ */
+.take-cut-arm { min-width: 9.5em; text-align: center; }
 .take-cut { border-color: var(--danger, #e2725b); color: var(--danger, #e2725b); }
 .take-cut:hover:not(:disabled) { background: var(--danger, #e2725b); color: #06131f; }
 .take-cut-note { font-size: 11px; opacity: 0.7; cursor: help; }
@@ -684,7 +750,7 @@ input[type="number"], input[type="text"], select {
  */
 :root {
   /*
-   * The time-selection blue. It has to be a fifth colour: orange already means played-so-far,
+   * The time-selection blue. It has to be a fifth colour: the accent already means played-so-far,
    * amber means bar 1, white means the playhead and grey means the viewport bracket. Used by
    * the waveform's selection band and by the tuner's sequence chips, which must read as the
    * same thing.
@@ -697,6 +763,23 @@ input[type="number"], input[type="text"], select {
 
 /* ------------------------------------------------------------------ transport */
 
+/*
+ * ONE ROW (G4). It wraps to two only if the browser is given permission, and it is not.
+ *
+ * The tempo source has been a child of this row since F19, but `flex-wrap: wrap` meant that at
+ * any plugin width it fell onto a line of its own — so between the roll and the sheet there
+ * were three bands of chrome (transport, the wrapped tempo strip, the notation toolbar) where
+ * the design says two. Wrapping is also the wrong answer for this window in principle: the
+ * narrower it gets the more of its height goes to rows of controls, which is the opposite of
+ * what somebody dragging the edge in is asking for. §narrow scales the whole shell instead.
+ *
+ * `nowrap` on its own would push the right-hand end past the edge, so everything in here is
+ * allowed to SHRINK: `min-width: 0` on the row and on every child, because a flex item's
+ * default `min-width: auto` refuses to go below its content and is what makes a nowrap row
+ * overflow instead of compressing. The items that can afford it give first — see the fader and
+ * the position readout below — and the two that must stay legible (the transport buttons, the
+ * BPM box) carry `flex-shrink: 0`.
+ */
 .transport {
   display: flex;
   align-items: center;
@@ -705,9 +788,22 @@ input[type="number"], input[type="text"], select {
   background: var(--bg-raised);
   border-bottom: 1px solid var(--border);
   flex: 0 0 auto;
-  flex-wrap: wrap;
+  flex-wrap: nowrap;
+  min-width: 0;
 }
-.transport .position { font-variant-numeric: tabular-nums; min-width: 11ch; white-space: nowrap; }
+.transport > * { min-width: 0; }
+.transport > button,
+.transport .undo-redo,
+.transport [data-role="loop"] { flex: 0 0 auto; }
+/* The clock gives up its slack last and its digits never reflow — `11ch` was a floor, and a
+   floor in a nowrap row is a reason to overflow. It is a maximum now, and tabular digits mean
+   the text does not jitter as it counts. */
+.transport .position {
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  flex: 0 1 auto;
+  overflow: hidden;
+}
 
 /* Undo / redo. Tight against each other and loose from everything else, so they read as one
    control with two ends rather than as two more buttons in the row. */
@@ -732,8 +828,12 @@ input[type="number"], input[type="text"], select {
  * Nothing here is allowed to grow the transport row — the select is the same height as the
  * number box beside it, and the detail is inline text.
  */
-.tempo-source { gap: 6px; }
-.tempo-source-select { max-width: 12em; }
+/* The right-hand end of the transport row, where the BPM box used to live on its own (G4). It
+   shrinks as one control: the select gives up width first, the number box never does. */
+.tempo-source { gap: 6px; flex: 0 1 auto; min-width: 0; }
+.tempo-source-select { max-width: 12em; min-width: 4.5em; flex: 0 1 auto; }
+.tempo-source input[data-role="bpm"] { flex: 0 0 auto; }
+.tempo-source select[data-role="timesig"] { min-width: 4em; flex: 0 1 auto; }
 .tempo-source input[readonly] {
   /* Read-only, not broken. Dimmed enough to say "not yours to type in right now" and still
      legible, because the NUMBER is what most people came to this row to read. */
@@ -741,11 +841,25 @@ input[type="number"], input[type="text"], select {
   cursor: default;
 }
 .tempo-source select:disabled { opacity: 0.75; cursor: default; }
-.tempo-source .tempo-detail { font-size: 11px; font-variant-numeric: tabular-nums; white-space: nowrap; }
+/* The one item in this row that is a SENTENCE, so it is the one allowed to be cut short. It
+   said "bar lines · 222 BPM · 3/6" in `white-space: nowrap` with no give, which in a nowrap
+   transport is a guarantee of horizontal overflow rather than of legibility (measured: 12px
+   past the window edge at 1100px). Its full text stays in the DOM and in the tooltip. */
+.tempo-source .tempo-detail {
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
 
-.fader { display: flex; align-items: center; gap: 8px; min-width: 0; }
+/* The first thing to give. A blend fader is still usable at 60px and the row is not usable at
+   all if this refuses to move. */
+.fader { display: flex; align-items: center; gap: 8px; min-width: 0; flex: 1 1 auto; }
 .fader label { font-size: 11.5px; color: var(--text-dim); }
-.fader input[type="range"] { width: clamp(76px, 12vw, 132px); min-width: 0; }
+.fader input[type="range"] { width: clamp(56px, 12vw, 132px); min-width: 0; flex: 1 1 auto; }
 .fader .end { font-size: 11.5px; }
 .fader .end.active { color: var(--accent); font-weight: 600; }
 
@@ -898,27 +1012,80 @@ button[data-drag="midi"]:hover .drag-grip { opacity: 0.9; }
 .settings-gear .gear-glyph { font-size: 15px; line-height: 1; }
 .settings-gear .gear-label { white-space: nowrap; }
 
-.zoom-pair { display: inline-flex; gap: 2px; align-items: center; }
 /*
- * Shorter than they were (was 3px 7px). The axis captions beside them cost width, the header is
- * not allowed to grow a row, and a −/+ needs no side padding to stay hittable — so the pairs
- * give the captions their own space back rather than taking it from the filename.
+ * THE CAPTION SITS OVER ITS PAIR, NOT BESIDE IT (G7).
+ *
+ * Beside was tried first and measured: "Vertical" and "Horizontal" on the same line as the
+ * buttons cost 108px in a header that had 0px of slack left — the filename was already
+ * compressed to nothing at 900px and the two right-hand controls went off the edge. Stacked,
+ * each group is as wide as the wider of its caption and its two buttons (~45px), so the whole
+ * control is ~90px instead of ~200 and the words cost LESS than the arrow glyphs they replaced.
+ *
+ * AND IT IS STILL NOT TALLER THAN THE ROW, which is the constraint that made "beside" the first
+ * choice. The stack is a 10px caption over a 17px button with 1px between them: 28px, against
+ * the ~30px of the ordinary buttons either side of it. The header centres its children, so the
+ * group sits inside the row's existing height and adds nothing to it.
+ *
+ * A GRID WITH EXPLICIT PLACEMENT, because the DOM is flat — caption, −, +, caption, −, + — and
+ * auto-placement cannot span the first of every three across the two under it. The nth-child
+ * rules are the price of not wrapping each group in a div that exists only for the layout; they
+ * are stated once, here, and the builder in ui/app.ts says which six children it emits.
  */
-.zoom-pair .chip { padding: 3px 6px; font-variant-numeric: tabular-nums; }
+.zoom-pair {
+  display: inline-grid;
+  grid-template-columns: auto auto auto auto;
+  grid-template-rows: auto auto;
+  gap: 1px 2px;
+  align-items: center;
+  justify-items: center;
+}
+.zoom-pair > :nth-child(1) { grid-area: 1 / 1 / 2 / 3; }
+.zoom-pair > :nth-child(2) { grid-area: 2 / 1 / 3 / 2; }
+.zoom-pair > :nth-child(3) { grid-area: 2 / 2 / 3 / 3; }
+/* The gap between the two axes. Bigger than the gap inside one of them, so the four buttons
+   read as two pairs rather than as a row of four — which is the guessing game G7 is ending. */
+.zoom-pair > :nth-child(4) { grid-area: 1 / 3 / 2 / 5; margin-left: 8px; }
+.zoom-pair > :nth-child(5) { grid-area: 2 / 3 / 3 / 4; margin-left: 8px; }
+.zoom-pair > :nth-child(6) { grid-area: 2 / 4 / 3 / 5; }
 /*
- * WHICH AXIS. Sits INSIDE the pair, tight against the first button, so it reads as that pair's
- * caption rather than as a separator between the two. It must not add height: no padding, no
- * border, line-height 1, and a font a shade smaller than the chips it labels.
+ * Shorter than they were (was 3px 7px), and that is what buys the stack its height back: the
+ * caption above needs 11 of the row's 30 pixels, so the buttons under it give up their vertical
+ * padding. A −/+ needs no padding to stay hittable.
  */
-.zoom-pair .zoom-label {
-  font-size: 11px;
+.zoom-pair .chip {
+  padding: 1px 5px;
+  line-height: 1.25;
+  font-variant-numeric: tabular-nums;
+  min-width: 20px;
+}
+/*
+ * WHICH AXIS, IN WORDS (G7).
+ *
+ * It was a bare "↕" and a bare "↔" at 11px. At the zoom ladder's 0.9 and 0.8 steps those are
+ * three or four pixels of stroke — specks, not arrows — and the only way anybody found out
+ * which pair made the rows taller was to press one. So the axis says its own name.
+ *
+ * OVER its pair — see the grid above for why, and for the arithmetic that keeps the row the
+ * height it always was.
+ *
+ * Uppercase and tracked at 9.5px: caps at this size read as a label rather than as text you are
+ * meant to click, and 9.5px of caps is a shade wider than 9.5px of mixed case, which is what
+ * stops the caption being narrower than the two buttons under it and leaving the group ragged.
+ * `line-height: 1` and no padding at all, because the eleven pixels this row can spare are all
+ * of them.
+ */
+.zoom-pair .zoom-axis {
+  font-size: 9.5px;
   line-height: 1;
-  padding: 0 1px 0 3px;
+  padding: 0;
+  text-transform: uppercase;
+  letter-spacing: 0.02em;
   color: var(--text-dim);
+  white-space: nowrap;
   cursor: default;
   user-select: none;
 }
-.zoom-pair .zoom-label:first-child { padding-left: 0; }
+
 
 /*
  * The open-string letters at the left of every tab staff — the legend the old one-line
@@ -1293,7 +1460,8 @@ button[data-drag="midi"]:hover .drag-grip { opacity: 0.9; }
  * one column, and centred text nowhere — this is a control, not a hero.
  */
 .engine-pick {
-  width: min(640px, 92vw);
+  width: 100%;
+  max-width: min(640px, 92vw);
   display: flex;
   flex-direction: column;
   gap: 6px;
@@ -1303,9 +1471,36 @@ button[data-drag="midi"]:hover .drag-grip { opacity: 0.9; }
   font-size: 12px; text-transform: uppercase; letter-spacing: 0.06em;
   color: var(--text-dim); margin: 0;
 }
-/* The chips wrap rather than scroll: at 360px a row of four engine names cannot fit on one
-   line, and a horizontally scrolling row of chips hides the ones nobody knows are there. */
-.engine-pick .chip-group { flex-wrap: wrap; }
+/*
+ * AN ALIGNED GRID, NOT A RAGGED WRAP (G1).
+ *
+ * It was a flex row with `flex-wrap: wrap`, and engine names are wildly different lengths —
+ * "Auto", "MuScriptor", "Basic Pitch · install" — so the wrap put two chips on one line and
+ * one on the next with a hole beside it, at a different place at every window width. Chips of
+ * different widths on ragged lines read as a list somebody spilled.
+ *
+ * `auto-fit` with a `minmax` floor gives every chip the same width and as many columns as fit,
+ * so the group is a block with straight edges at every size and reflows in whole columns. The
+ * floor is 9em because that is a shade wider than the longest engine name plus its "· install"
+ * suffix at 12px; below two columns' worth of room the grid becomes one column, which is the
+ * right answer in a 360px window and is what the wrap was really for.
+ */
+.engine-pick .chip-group {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(9em, 1fr));
+  gap: 5px;
+  align-items: stretch;
+}
+/* The chips are grid items now, so they fill their cell rather than hugging their text — which
+   is the whole point of the change. Centred, because a left-aligned label in a cell wider than
+   itself re-introduces the ragged edge on the inside. */
+.engine-pick .chip-group > .chip {
+  width: 100%;
+  text-align: center;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
 .engine-pick [data-role="engine-pick-more"] { align-self: flex-start; }
 
 /* ------------------------------------------------------------------ progress */
@@ -1376,11 +1571,16 @@ button[data-drag="midi"]:hover .drag-grip { opacity: 0.9; }
  */
 @media (max-width: 1000px) {
   .transport { gap: 9px; padding: 7px 10px; }
+  /* What the chosen tempo source is supplying, said in words. It is a corroboration of the
+     numbers beside it rather than a control, so it is the first thing the one-row transport
+     drops when there is not room for everything (G4). */
+  .transport .tempo-detail { display: none; }
+  .fader .end { display: none; }
   .app-header { padding: 7px 10px; }
   button { padding: 5px 8px; }
   .fader label, .fader .end { font-size: 11px; }
-  /* The brand keeps its mark, its name and its version and loses only the invitation — the
-     version is still a link and the tooltip still says so. Same trade as the gear's word. */
+  /* The brand keeps its name and its version and loses only the invitation — the version is
+     still a link and the tooltip still says so. Same trade as the gear's word. */
   .brand-check { display: none; }
   .brand-block { padding: 2px 4px; gap: 6px; }
 }

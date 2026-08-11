@@ -40,7 +40,7 @@ import {
   tabStaveIndex,
   type StaveKind
 } from './staveKinds';
-import { clampXToEngraving, type EngravedExtent } from './timeAxis';
+import type { EngravedExtent } from './timeAxis';
 import { countRendererCredits, stripRendererCredit } from './watermark';
 import { t, TIPS } from '../ui/tips';
 import type { RiffScore } from '../pipeline';
@@ -383,6 +383,49 @@ export class TriView {
   private renderInFlight = false;
   private queuedRender: (() => void) | null = null;
   /**
+   * THE FACADE FRAME, and this is the THIRD ghosting mechanism — the one the render gate and
+   * `reuseViewport: false` could not touch, because it is not about nesting or about reuse.
+   *
+   * alphaTab's browser facade reclaims stale partial placeholders by counting them. Every
+   * render appends its partials into `.at-surface` at `_totalResultCount`, reusing whatever is
+   * already there, and the sweep at the end of a render is
+   *
+   *     while (childElementCount > _totalResultCount) remove the last child
+   *
+   * The counter is reset to 0 by a listener on `renderer.preRender` — and that listener is
+   * registered inside `BrowserUiFacade.initialRender()`, which `AlphaTabApiBase`'s constructor
+   * schedules through `uiFacade.beginInvoke`, i.e. inside `requestAnimationFrame`. So for the
+   * whole of the first animation frame after `new AlphaTabApi(...)` THE COUNTER NEVER RESETS.
+   *
+   * Any render started in that frame therefore APPENDS rather than reuses, and the sweep
+   * removes nothing because the counter has kept climbing. Two renders in that frame leave two
+   * complete engravings inside one surface, a few pixels apart — every glyph doubled, which is
+   * exactly what the report was a photograph of.
+   *
+   * TWO renders in the first frame is the ordinary case for a GRAND STAFF, which is why only
+   * grand-staff scores showed it: `load()` renders once at the braced-overhang GUESS
+   * (`BRACED_LEFT_OVERHANG_PER_SCALE`) and `tuneLeftInset()` immediately re-renders at the
+   * measured value. A single-staff score reuses the already-tuned module-level
+   * `leftInkOverhangPerScale`, so its first frame costs one render and it never doubled.
+   * Measured, live: `.at-surface > div` went 2 -> 4 with two 477-glyph copies at widths 3557
+   * and 3551 the moment the clef was switched to Grand.
+   *
+   * The fix is to hold every render until the facade has had its frame. One rAF, registered
+   * here — after alphaTab's own, in the same frame, so it is guaranteed to run after it. The
+   * cost is that the very first engraving of a view lands one frame later; the alternative is
+   * that it lands twice.
+   */
+  private facadeReady = false;
+  private facadeFrame = 0;
+  private deferredRender: (() => void) | null = null;
+  /**
+   * Partials this render laid out. Our own copy of the facade's `_totalResultCount`, kept so
+   * `trimSurface()` can repair a miscount rather than trust one. See `trimSurface`.
+   */
+  private partialsThisRender = 0;
+  /** Stale placeholders removed since this view was built. MUST stay 0 — see `trimSurface`. */
+  private ghostsTrimmed = 0;
+  /**
    * True from the moment a render is asked for until one finishes. See `renderPending`.
    *
    * A flag rather than a request/finish counter on purpose: alphaTab renders on its own account
@@ -474,6 +517,27 @@ export class TriView {
     // Partials arrive one at a time even with lazy loading off, and each one adds bounds,
     // so the overlay is rebuilt as they land rather than only at the end.
     this.api.renderer.partialRenderFinished.on(() => this.rebuildOverlays());
+    // OUR OWN placeholder count, for `trimSurface`. Subscribed AFTER the facade's own two
+    // listeners (registered in alphaTab's constructor above), so by the time these run the
+    // placeholder for the partial already exists. The `width/height` test mirrors
+    // `_appendRenderResult`'s: a zero-size partial is laid out but never given a placeholder,
+    // and counting it would make the trim remove one live partial too many.
+    this.api.renderer.preRender.on(() => {
+      this.partialsThisRender = 0;
+    });
+    this.api.renderer.partialLayoutFinished.on((r) => {
+      if (r.width > 0 || r.height > 0) this.partialsThisRender++;
+    });
+    // See §THE FACADE FRAME. Registered after alphaTab's own `beginInvoke` rAF and therefore
+    // guaranteed to run after it, in the same frame.
+    this.facadeFrame = requestAnimationFrame(() => {
+      this.facadeFrame = 0;
+      this.facadeReady = true;
+      (window as any).__RSLOG__ = ((window as any).__RSLOG__ ?? []).concat([{ what: 'facadeFrame', held: !!this.deferredRender }]);
+      const held = this.deferredRender;
+      this.deferredRender = null;
+      if (held) this.startRender(held);
+    });
 
     this.scroller.addEventListener('pointerdown', this.onPointerDown);
     this.scroller.addEventListener('scroll', this.onScroll, { passive: true });
@@ -497,7 +561,15 @@ export class TriView {
    * what the page should look like.
    */
   private startRender(run: () => void): void {
+    (window as any).__RSLOG__ = ((window as any).__RSLOG__ ?? []).concat([{ what: 'startRender', ready: this.facadeReady, inFlight: this.renderInFlight, from: new Error().stack?.split('\n')[2]?.trim() }]);
     this.awaitingRender = true;
+    // Nothing renders before alphaTab's facade has initialised itself. See §THE FACADE FRAME:
+    // a render in that window cannot have its placeholders reclaimed, and two of them leave two
+    // engravings on screen. One deep, same argument as the queue below.
+    if (!this.facadeReady) {
+      this.deferredRender = run;
+      return;
+    }
     if (this.renderInFlight) {
       this.queuedRender = run;
       return;
@@ -695,6 +767,9 @@ export class TriView {
     // a request `tuneLeftInset` is about to raise, not the one that has just been served — so
     // this is cleared here and `startRender` sets it again if there is more to come.
     this.awaitingRender = false;
+    // Before anything measures the host: a stale placeholder is ink, and `measureLeftInk()`
+    // and `scrollWidth` would both take it for part of this engraving.
+    this.trimSurface();
     const info = this.rebuildOverlays();
     this.lastRenderInfo = {
       durationMs: performance.now() - this.renderStartedAt,
@@ -711,6 +786,34 @@ export class TriView {
     // drawing against this ruler has to hear about the finished render even when the three
     // numbers happen to be unchanged.
     this.emitViewport(true);
+  }
+
+  /**
+   * Remove placeholders that belong to a PREVIOUS engraving. Belt to §THE FACADE FRAME's braces.
+   *
+   * The frame guard removes the cause; this removes the ghost whatever the cause, and — more
+   * usefully — it is a NUMBER (`ghostsTrimmed`, published through `layoutProbe`) that a harness
+   * can assert stays zero. A repair with no counter is indistinguishable from a bug that never
+   * happened.
+   *
+   * THE LAST `n` CHILDREN ARE THIS RENDER'S, and that is not a guess. alphaTab fills
+   * placeholders from `_totalResultCount` upward, appending past the end when it runs out. If
+   * the counter was reset (the healthy case) this render owns children 0..n-1 and there are
+   * exactly n of them, so "the last n" is all of them and nothing is removed. If the counter
+   * was stale at some base b, this render's ink went into b..b+n-1 and the surface holds
+   * exactly b+n children — so the last n are again this render's, and the first b are the ghost.
+   */
+  private trimSurface(): void {
+    const surface = this.host.querySelector('.at-surface');
+    const n = this.partialsThisRender;
+    if (!surface || n <= 0) return;
+    let extra = surface.childElementCount - n;
+    if (extra <= 0) return;
+    this.ghostsTrimmed += extra;
+    while (extra > 0 && surface.firstElementChild) {
+      surface.firstElementChild.remove();
+      extra--;
+    }
   }
 
   private rebuildOverlays(): { beatCount: number; hasStaffTabSplit: boolean } {
@@ -775,10 +878,17 @@ export class TriView {
           }
         }
 
-        // Beats are duplicated per stave; the first stave's list is enough for anchoring
-        // because onNotesX is identical across staves (one layout pass — that is the point).
-        const beatSource = barBoundsList[0]?.beats ?? [];
-        for (const beatBounds of beatSource) {
+        // EVERY STAVE'S BEATS, DEDUPED — not `bars[0]`'s.
+        //
+        // The old rule ("beats are duplicated per stave, so the first stave's list is enough")
+        // is true of exactly one shape: ONE alphaTab Staff showing notation and tab, where both
+        // rendered staves carry the same Beat objects. A GRAND STAFF is two Staffs with two
+        // independent voices, so `bars[0]` is the TREBLE stave — and on a bass riff every beat
+        // in it is a rest. The whole note-names row silently vanished the moment the clef was
+        // switched to Grand, which is a row of information disappearing with no message.
+        //
+        // Deduped by Beat IDENTITY, so the notation+tab case still labels each beat once.
+        for (const beatBounds of dedupeBeats(barBoundsList)) {
           beatCount++;
           const beat = beatBounds.beat;
           if (beat.isEmpty || beat.notes.length === 0) continue;
@@ -974,12 +1084,37 @@ export class TriView {
     rendererCredits: number;
     /** How many have been removed since this view was built. Non-zero once anything is drawn. */
     rendererCreditsRemoved: number;
+    /**
+     * THE GHOST, counted. `.at-surface` holds one absolutely-positioned `<div>` per render
+     * partial and one `svg.at-surface-svg` inside each, so a second engraving is arithmetic
+     * rather than an impression: `surfacePartials` must equal `partialsThisRender` and
+     * `surfaceSvgs`, and `ghostsTrimmed` must be 0. See §THE FACADE FRAME and `trimSurface`.
+     */
+    surfacePartials: number;
+    surfaceSvgs: number;
+    partialsThisRender: number;
+    ghostsTrimmed: number;
+    /**
+     * Where the first few notes are engraved, by id, in CONTENT and in SCREEN x.
+     *
+     * The sheet's half of the three-pane alignment claim (G2): the roll's rectangle and the
+     * waveform's hit for the same note id have to sit on this same screen x. Published here
+     * rather than computed by the caller so the number under test is the ENGRAVED one — read
+     * off `BeatBounds.onNotesX`, the notehead's own geometry.
+     */
+    noteXs: Array<{ noteId: string; contentX: number; screenX: number }>;
   } | null {
     const lookup = this.api.renderer.boundsLookup;
     if (!lookup) return null;
 
     const systems = lookup.staffSystems.length;
     const contentLeftInset = Math.round(this.measureLeftInk() ?? 0);
+    const surface = this.host.querySelector('.at-surface');
+    const surfacePartials = surface
+      ? Array.from(surface.children).filter((c) => c.tagName === 'DIV').length
+      : 0;
+    const surfaceSvgs = this.host.querySelectorAll('svg.at-surface-svg').length;
+    const noteXs = this.sampleNoteXs();
 
     let band: { top: number; bottom: number } | null = null;
     let staffBottom = 0;
@@ -1029,7 +1164,12 @@ export class TriView {
         systems,
         contentLeftInset,
         rendererCredits: countRendererCredits(this.host),
-        rendererCreditsRemoved: this.creditsRemoved
+        rendererCreditsRemoved: this.creditsRemoved,
+        surfacePartials,
+        surfaceSvgs,
+        partialsThisRender: this.partialsThisRender,
+        ghostsTrimmed: this.ghostsTrimmed,
+        noteXs
       };
     }
 
@@ -1101,8 +1241,49 @@ export class TriView {
       systems,
       contentLeftInset,
       rendererCredits: countRendererCredits(this.host),
-      rendererCreditsRemoved: this.creditsRemoved
+      rendererCreditsRemoved: this.creditsRemoved,
+      surfacePartials,
+      surfaceSvgs,
+      partialsThisRender: this.partialsThisRender,
+      ghostsTrimmed: this.ghostsTrimmed,
+      noteXs
     };
+  }
+
+  /**
+   * A spread of engraved notes, by id, in content and screen x. See `layoutProbe().noteXs`.
+   *
+   * Walked in engraving order and thinned to at most `limit`, spread across the whole score
+   * rather than taken from the front: three neighbours would only ever prove the panes agree in
+   * one place, which is precisely how a coupling that is right at the left edge and wrong
+   * everywhere else survives a check.
+   */
+  private sampleNoteXs(limit = 12): Array<{ noteId: string; contentX: number; screenX: number }> {
+    const lookup = this.api.renderer.boundsLookup;
+    if (!lookup || !this.index) return [];
+    const stackLeft = this.stack.getBoundingClientRect().left;
+    const all: Array<{ noteId: string; contentX: number; screenX: number }> = [];
+    const seen = new Set<string>();
+    for (const system of lookup.staffSystems) {
+      for (const masterBar of system.bars) {
+        for (const beatBounds of dedupeBeats(masterBar.bars ?? [])) {
+          for (const note of beatBounds.beat.notes) {
+            const id = this.index.noteToInfo.get(note)?.id;
+            if (!id || seen.has(id)) continue;
+            seen.add(id);
+            all.push({
+              noteId: id,
+              contentX: Number(beatBounds.onNotesX.toFixed(2)),
+              screenX: Number((stackLeft + beatBounds.onNotesX).toFixed(2))
+            });
+          }
+        }
+      }
+    }
+    if (all.length <= limit) return all;
+    const out: Array<{ noteId: string; contentX: number; screenX: number }> = [];
+    for (let i = 0; i < limit; i++) out.push(all[Math.round((i * (all.length - 1)) / (limit - 1))]);
+    return out;
   }
 
   // -------------------------------------------------------------------------
@@ -1181,7 +1362,22 @@ export class TriView {
     const axis = this.ensureAxis();
     if (!axis) return null;
     if (exact) return axisTickAt(axis, x);
-    return axisTickAt(axis, clampXToEngraving(x, this.engravedExtent()));
+    // THE RIGHT END ONLY. Past the last engraved bar there is genuinely no more music, so the
+    // last engraved moment is what that edge is showing — see `clampXToEngraving`, which is the
+    // pure statement of the same rule and is what everything else in the app uses.
+    //
+    // The LEFT end is deliberately not clamped here (G2). Left of the first beat is the clef,
+    // key and meter prefix: real page width at the very start of the take, and the roll and the
+    // strip are quite right to go on drawing the lead-in that stands under it. Clamping it
+    // pinned the derived window's start to the FIRST ATTACK while the sheet was still showing
+    // the whole prefix, so at scroll 0 the roll drew the first note hard against its gutter and
+    // the sheet drew it up to `firstX - ALIGN_GUTTER_PX` further right — measured at 114-177 px,
+    // the single worst disagreement on the page. `axisTickAt` extrapolates there on the axis's
+    // OWN average slope, which is the one number that makes the prefix worth about what the roll
+    // thinks it is worth.
+    const extent = this.engravedExtent();
+    const held = extent && Number.isFinite(extent.lastX) ? Math.min(extent.lastX, x) : x;
+    return axisTickAt(axis, held);
   }
 
   /**
@@ -1220,9 +1416,12 @@ export class TriView {
     for (const masterBar of system.bars) {
       const right = masterBar.realBounds.x + masterBar.realBounds.w;
       if (right > rightEdge) rightEdge = right;
-      // The first stave is enough: onNotesX is identical across staves because the staff
-      // and the tab come out of one layout pass. Same reason the names row reads bars[0].
-      for (const beatBounds of masterBar.bars?.[0]?.beats ?? []) {
+      // Every stave, deduped — see `dedupeBeats`. On a grand staff `bars[0]` is the treble
+      // stave, so on a bass riff the axis was built from whole-bar RESTS: two or three points
+      // per bar instead of one per attack, and every x between them an interpolation across a
+      // whole bar. That is the coarsest possible ruler for the pane that has to agree with the
+      // roll to the pixel.
+      for (const beatBounds of dedupeBeats(masterBar.bars ?? [])) {
         const beat = beatBounds.beat;
         points.push({ tick: beat.absolutePlaybackStart, x: beatBounds.onNotesX });
         if (!lastBeat || beat.absolutePlaybackStart >= lastBeat.absolutePlaybackStart) {
@@ -2395,8 +2594,11 @@ export class TriView {
   destroy(): void {
     if (this.viewportFrame) cancelAnimationFrame(this.viewportFrame);
     if (this.cursorFrame) cancelAnimationFrame(this.cursorFrame);
+    if (this.facadeFrame) cancelAnimationFrame(this.facadeFrame);
     this.viewportFrame = 0;
     this.cursorFrame = 0;
+    this.facadeFrame = 0;
+    this.deferredRender = null;
     this.detachDragListeners();
     this.drag = null;
     this.scroller.removeEventListener('pointerdown', this.onPointerDown);
@@ -2405,6 +2607,31 @@ export class TriView {
     this.scroller.removeEventListener('pointerleave', this.onHoverLeave);
     this.api.destroy();
   }
+}
+
+/**
+ * Every distinct beat of one master bar, across all its rendered staves, in render order.
+ *
+ * `BoundsLookup` reports one `BarBounds` per rendered STAVE. When one alphaTab `Staff` shows
+ * notation and tablature the two staves carry the SAME `Beat` objects, so a naive concatenation
+ * would visit each beat twice; when the score is a grand staff they are different Staffs with
+ * different beats, so reading only the first stave misses everything the other one plays.
+ * Identity dedupe is the one rule that is right for both, and for grand-staff-plus-tab, where
+ * both things are true at once.
+ */
+function dedupeBeats(
+  bars: ReadonlyArray<alphaTab.rendering.BarBounds>
+): alphaTab.rendering.BeatBounds[] {
+  const seen = new Set<alphaTab.model.Beat>();
+  const out: alphaTab.rendering.BeatBounds[] = [];
+  for (const bar of bars) {
+    for (const bb of bar.beats ?? []) {
+      if (seen.has(bb.beat)) continue;
+      seen.add(bb.beat);
+      out.push(bb);
+    }
+  }
+  return out;
 }
 
 // ---------------------------------------------------------------------------
@@ -2444,10 +2671,36 @@ function axisXAt(axis: TickAxis, tick: number): number {
   const { ticks, xs } = axis;
   const n = ticks.length;
   if (n === 1) return xs[0];
-  if (tick <= ticks[0]) return lerp(ticks[0], xs[0], ticks[1], xs[1], tick);
+  if (tick <= ticks[0]) {
+    const slope = outerTicksPerPx(axis);
+    return slope > 0
+      ? xs[0] + (tick - ticks[0]) / slope
+      : lerp(ticks[0], xs[0], ticks[1], xs[1], tick);
+  }
   if (tick >= ticks[n - 1]) return lerp(ticks[n - 2], xs[n - 2], ticks[n - 1], xs[n - 1], tick);
   const i = bracket(ticks, tick);
   return lerp(ticks[i], xs[i], ticks[i + 1], xs[i + 1], tick);
+}
+
+/**
+ * Ticks per pixel across the WHOLE engraving — the slope used before the first beat.
+ *
+ * The nearest PAIR is the right slope inside the engraving and the wrong one outside it at the
+ * start. What sits left of the first beat is the clef, key signature and meter: a fixed lump of
+ * page that stands for no time at all, and typically wider than the first two beats put
+ * together. Extrapolating across it on the local slope of a fast opening figure said that lump
+ * was worth about a second, which threw every other note out by up to 159 px (measured); the
+ * take's own average says it is worth roughly what a pane-width of roll says it is worth, which
+ * is exactly what the panes have to agree on.
+ *
+ * 0 when there is nothing to measure, which is the caller's signal to fall back.
+ */
+function outerTicksPerPx(axis: TickAxis): number {
+  const n = axis.ticks.length;
+  if (n < 2) return 0;
+  const dx = axis.xs[n - 1] - axis.xs[0];
+  const dt = axis.ticks[n - 1] - axis.ticks[0];
+  return dx > 0 && dt > 0 ? dt / dx : 0;
 }
 
 /** x -> tick, the exact mirror of `axisXAt` so the two round-trip. */
@@ -2455,7 +2708,12 @@ function axisTickAt(axis: TickAxis, x: number): number {
   const { ticks, xs } = axis;
   const n = xs.length;
   if (n === 1) return ticks[0];
-  if (x <= xs[0]) return lerp(xs[0], ticks[0], xs[1], ticks[1], x);
+  if (x <= xs[0]) {
+    // The axis's own average, not the first pair's — see `outerTicksPerPx`. Kept the exact
+    // mirror of `axisXAt`'s branch so the two still round-trip.
+    const slope = outerTicksPerPx(axis);
+    return slope > 0 ? ticks[0] + (x - xs[0]) * slope : lerp(xs[0], ticks[0], xs[1], ticks[1], x);
+  }
   if (x >= xs[n - 1]) return lerp(xs[n - 2], ticks[n - 2], xs[n - 1], ticks[n - 1], x);
   const i = bracket(xs, x);
   return lerp(xs[i], ticks[i], xs[i + 1], ticks[i + 1], x);
@@ -2520,7 +2778,9 @@ function readOverlayColors(): { accent: string; danger: string; paper: string } 
     return v.length > 0 ? v : fallback;
   };
   return {
-    accent: pick('--accent', '#e8734a'),
+    // The purple family (G20): #8b5cf6 is the app's accent, and it is the fallback here so a
+    // renamed token cannot bring the old orange back through the back door.
+    accent: pick('--accent', '#8b5cf6'),
     danger: pick('--danger', '#e05252'),
     paper: pick('--paper', '#f8f6f0')
   };

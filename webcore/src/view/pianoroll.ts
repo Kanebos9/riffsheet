@@ -144,10 +144,11 @@
  *
  *    THE GESTURES, and who they had to be taken from:
  *
- *      wheel                    scroll PITCH        (was: scroll time — see below)
- *      Shift + wheel            scroll TIME         (new home for the old plain wheel)
- *      Alt/Option + wheel       vertical ZOOM, about the pointer
- *      Ctrl/Cmd + wheel         the SHEET's zoom, unchanged — a trackpad pinch arrives here
+ *      two fingers up/down      PITCH ZOOM, about the pointer, heavily damped (G15)
+ *      two fingers left/right   TIME ZOOM, about the pointer, heavily damped (G15)
+ *      Shift + wheel            pan TIME — the mouse's way to the second axis
+ *      Alt/Option + wheel       pitch zoom, about the pointer (kept; it was shipped)
+ *      Ctrl/Cmd + wheel         pitch zoom — a trackpad PINCH arrives here
  *      middle-button drag       pan BOTH axes
  *      Space + drag             pan BOTH axes       (needs one line in app.ts — see below)
  *      left drag on background  pan TIME, unchanged
@@ -159,6 +160,12 @@
  *    timeline: `onPointerDown` has always refused every button but the left one, so no
  *    middle-button gesture ever reached this file. What he had was a wheel, or a middle-button
  *    autoscroll the BROWSER was synthesising wheel events for.
+ *
+ *    BOTH WHEEL AXES ARE ZOOMS NOW (G15). A trackpad has two axes and a DAW spends them on the
+ *    two zooms; panning is the drag and the two scrollbars, which is also where a DAW puts it.
+ *    Every wheel zoom goes through `wheelZoomFactor`, which is exponential in the delta and
+ *    clamped to 6% per event — a trackpad delivers dozens of events per flick and a per-notch
+ *    factor multiplied out into the jump this was reported for.
  *
  *    FIT IS A COMMAND, NOT A DEFAULT. `fitVertical()` shows the whole take at once — it is what
  *    the old geometry did on every frame — but it is now something the player asks for, and it
@@ -369,8 +376,22 @@ export function windowFromAnchors(anchors: ReadonlyArray<TimeAnchor> | null | un
   return toSec > fromSec ? { fromSec, toSec } : null;
 }
 
-/** The visible DAW-style edit grid. It controls drawing and every time edit. */
-export type PianoRollEditGrid = 'quarter' | 'eighth' | 'sixteenth' | 'triplet' | 'free';
+/**
+ * The visible DAW-style edit grid. It controls drawing and every time edit.
+ *
+ * 'off' is a DRAWING answer, not a snapping one: BAR LINES ONLY, nothing between them. A roll
+ * whose every beat and half-beat is ruled is unreadable at riff density, and the player asking
+ * for the ruler to get out of the way still wants to know where bar 5 starts. It snaps like
+ * 'free' — there is no unit it could round to.
+ */
+export type PianoRollEditGrid =
+  | 'off'
+  | 'quarter'
+  | 'eighth'
+  | 'sixteenth'
+  | 'thirtysecond'
+  | 'triplet'
+  | 'free';
 
 /**
  * The sheet's own engraving, injected rather than imported.
@@ -666,6 +687,52 @@ const FIT_FLOOR_PX_PER_SEMITONE = 0.5;
 /** One notch of Alt+wheel, and one press of the zoom buttons. Multiplicative, so it undoes. */
 const VZOOM_IN_FACTOR = 1.15;
 const VZOOM_OUT_FACTOR = 1 / 1.15;
+
+/**
+ * TRACKPAD ZOOM, DAMPED (G15). How much zoom one pixel of two-finger travel is worth.
+ *
+ * The discrete factors above are one NOTCH of a mouse wheel — one deliberate act, one visible
+ * step. A trackpad is not that: a single lazy two-finger flick delivers dozens of wheel events,
+ * and answering each of them with a 15% or 25% step multiplies out to an enormous jump. The
+ * reported symptom was exactly that, "it goes drastic".
+ *
+ * So the factor is exponential in the delta — `exp(-delta * k)`, which composes correctly
+ * (two events of 10px are worth exactly one of 20) and is its own inverse in the other
+ * direction, so a flick one way and back lands where it started.
+ */
+const WHEEL_ZOOM_PER_PX = 0.0015;
+/**
+ * The most a SINGLE wheel event may zoom, in either direction.
+ *
+ * The anti-jump clamp, and the reason it is a clamp rather than a smaller gain: some platforms
+ * (and every plain mouse) send one enormous delta — 100, 120, or a whole 'page' in
+ * `deltaMode` 1 — where a trackpad sends twenty small ones. A gain low enough to make those
+ * bearable would make a trackpad feel dead. 6% is a step you can see and cannot be thrown by.
+ */
+const WHEEL_ZOOM_MAX_STEP = 1.06;
+
+/**
+ * How long a zoom made HERE owns the span, in ms. See `PianoRoll.holdSpan`.
+ *
+ * Long enough to cover the whole round trip — this roll reports the window, the app re-engraves
+ * the sheet at a matching `display.scale`, the sheet's render publishes a new viewport, and the
+ * app derives a window from it and hands it back — including the trailing commit that follows a
+ * wheel by `VIEW_COMMIT_MS`. Short enough that the next deliberate scroll is a scroll.
+ */
+const OWN_ZOOM_ECHO_MS = 700;
+
+/**
+ * One wheel event's worth of zoom. Negative delta (up, or left) zooms IN, matching every notch
+ * gesture in the app; the result is a multiplier for `zoomTimeAt` / `zoomVerticalAt`.
+ *
+ * `deltaMode` is honoured because a Windows mouse reports LINES (mode 1) and some browsers
+ * report PAGES (mode 2): taking those numbers as pixels would make one notch worth nothing.
+ */
+export function wheelZoomFactor(delta: number, deltaMode = 0): number {
+  const px = delta * (deltaMode === 1 ? 16 : deltaMode === 2 ? 400 : 1);
+  const raw = Math.exp(-px * WHEEL_ZOOM_PER_PX);
+  return Math.min(WHEEL_ZOOM_MAX_STEP, Math.max(1 / WHEEL_ZOOM_MAX_STEP, raw));
+}
 /** The whole keyboard, in the pitch coordinate the scroll is expressed in. */
 const MIDI_TOP = 128;
 
@@ -1074,6 +1141,11 @@ export class PianoRoll {
   /** A window that arrived from ALIGN mid-gesture, waiting for the pointer to come up. Boxed so
    *  that a deferred `null` (Align switched off during a drag) differs from "nothing arrived". */
   private deferredWindow: { value: TimeWindow | null } | null = null;
+  /**
+   * Until when a span change arriving from Align is the echo of this roll's own zoom. See
+   * `holdSpan`.
+   */
+  private ownZoomUntilMs = 0;
   /** Trailing "the gesture has stopped" timer for `onTimeWindowChange`. */
   private timeCommitTimer: number | null = null;
   /** The note the pointer is over, for the sheet to ring. Null when it is over nothing. */
@@ -1113,13 +1185,31 @@ export class PianoRoll {
     row: '#191c22',
     line: '#2e3340',
     note: '#6b7695',
-    /** The "sounding right now" accent. Same token the waveform's played region uses. */
-    played: '#e8734a',
+    /**
+     * The "sounding right now" accent. Same token the waveform's played region uses.
+     *
+     * PURPLE, not the old orange (G20). Every canvas-drawn accent in the app is one family now
+     * — the app's accent is #8b5cf6 and its lighter partner #a78bfa — so a highlight on the
+     * roll, a ring on the sheet and a played region on the strip read as one system rather than
+     * as three unrelated colours. These are FALLBACKS: the live values come from the CSS tokens
+     * in `readColors()`, which is where the palette actually lives.
+     */
+    played: '#a78bfa',
     playhead: '#ffffff',
     label: '#9aa0ab',
     /** The outline every rect gets. Light, so it reads on the fill AND on the dark rows. */
     noteEdge: '#cfd6e4',
-    accent: '#e8734a',
+    accent: '#8b5cf6',
+    /**
+     * BAR LINES (G20). The accent, at full strength and 2px wide — clearly heavier than a beat.
+     *
+     * Its own token rather than a reuse of `label`, because "which one is the downbeat" is the
+     * single question the ruler exists to answer and a grey line one shade stronger than its
+     * neighbours does not answer it at a glance. Beats stay in the text colour and subdivisions
+     * in the border colour, so the three weights are now three DIFFERENT things rather than
+     * three alphas of one.
+     */
+    bar: '#8b5cf6',
     text: '#e8eaee',
     ink: '#16181d',
     keyWhite: '#bcc3cf',
@@ -1199,6 +1289,7 @@ export class PianoRoll {
       label: pick('--text-dim', this.colors.label),
       noteEdge: pick('--roll-note-edge', this.colors.noteEdge),
       accent: pick('--accent', this.colors.accent),
+      bar: pick('--accent', this.colors.bar),
       text: pick('--text', this.colors.text),
       ink: pick('--ink', this.colors.ink),
       keyWhite: pick('--roll-key-white', this.colors.keyWhite),
@@ -1364,7 +1455,37 @@ export class PianoRoll {
    * gesture is remembered and applied when the gesture ends. Re-sync on commit, never live.
    */
   setTimeAnchors(anchors: ReadonlyArray<TimeAnchor> | null): void {
-    this.applyWindowRequest(windowFromAnchors(anchors), 'align');
+    this.applyWindowRequest(this.holdSpan(windowFromAnchors(anchors)), 'align');
+  }
+
+  /**
+   * A WINDOW ARRIVING FROM ALIGN IS A PAN, NOT A ZOOM (G16).
+   *
+   * The bug, root-caused rather than described: the horizontal scrollbar writes ONE number,
+   * `TriView.setScrollLeft`. `syncViewports` then re-derives the aligned window by asking the
+   * ENGRAVING which second sits at each end of the sheet's viewport — and the engraving is not
+   * proportional to time, so the same pane width covers a different NUMBER OF SECONDS in a dense
+   * bar than in a sparse one. The span therefore changed on every scroll, and a changing span is
+   * a zoom: dragging the scrollbar visibly re-scaled the roll. Measured at ~20% across this
+   * fixture, and worse at the ends, where `clampXToEngraving` pins one edge while the other goes
+   * on moving — at scroll 0 the first 177 px of travel are pure zoom-out.
+   *
+   * So the span is HELD and only the position is taken. The exception is the one case where a
+   * new span is the point: a zoom the player made HERE (a wheel, a pinch, a zoom button), whose
+   * echo comes back through this same method after the sheet has been re-engraved to match.
+   * `ownZoomUntilMs` is that window, and it is a clock rather than a flag because the echo
+   * arrives partly synchronously (inside `reportTimeWindow`) and partly on the sheet's trailing
+   * render.
+   *
+   * The FIRST window is applied whole: with no span of its own yet the roll has nothing to hold.
+   */
+  private holdSpan(next: TimeWindow | null): TimeWindow | null {
+    const current = this.timeWindow;
+    if (!next || !current) return next;
+    if (now() < this.ownZoomUntilMs) return next;
+    const span = current.toSec - current.fromSec;
+    if (!(span > 0)) return next;
+    return { fromSec: next.fromSec, toSec: next.fromSec + span };
   }
 
   /**
@@ -1417,6 +1538,10 @@ export class PianoRoll {
    * waited for them to let go would simply look broken.
    */
   private applyWindowRequest(next: TimeWindow | null, source: 'align' | 'user'): void {
+    // A span the player asked for HERE is theirs until the echo has come back round. See
+    // `holdSpan` — without this, the coupled zoom's own return trip would be mistaken for a
+    // scroll and the zoom would be undone the instant it was made.
+    if (source === 'user') this.ownZoomUntilMs = now() + OWN_ZOOM_ECHO_MS;
     if (source === 'align' && this.gesture) {
       this.deferredWindow = { value: next };
       return;
@@ -2055,16 +2180,19 @@ export class PianoRoll {
       case 'quarter': return quarter;
       case 'eighth': return quarter / 2;
       case 'sixteenth': return quarter / 4;
+      case 'thirtysecond': return quarter / 8;
       case 'triplet': return quarter / 3;
       // Free placement still needs a sensible default length for a newly added
-      // note and for keyboard nudges. Alt/Option remains fully unsnapped.
+      // note and for keyboard nudges. Alt/Option remains fully unsnapped. 'off' is the same
+      // bargain seen from the ruler's side: no lines to snap to, so no snapping.
+      case 'off':
       case 'free': return quarter / 4;
     }
   }
 
   /** Alt/Option bypasses the grid entirely — see the editing contract. */
   private snap(sec: number, free: boolean): number {
-    if (free || this.editGrid === 'free') return sec;
+    if (free || this.editGrid === 'free' || this.editGrid === 'off') return sec;
     const unit = this.snapSec;
     return unit > 0 ? Math.round(sec / unit) * unit : sec;
   }
@@ -3221,17 +3349,18 @@ export class PianoRoll {
    * THE WHEEL, AND NO KEY TO HOLD DOWN.
    *
    *   over the GUTTER      zoom the pitch axis, about the pointer
-   *   over the NOTES       scroll the pitch axis
-   *   pinch (ctrl-wheel)   zoom, wherever the pointer is
-   *   Alt + wheel          zoom, wherever the pointer is — kept, because it was shipped
-   *   Shift + wheel        time (a request to the sheet)
+   *   over the RULER       zoom the time axis, about the pointer
+   *   over the NOTES       the axis you MOVE is the axis you zoom (G15)
+   *   pinch (ctrl-wheel)   pitch zoom, wherever the pointer is
+   *   Alt + wheel          the same — kept, because it was shipped
+   *   Shift + wheel        pan time
    *
    * WHERE THE POINTER IS, NOT WHICH KEY IS DOWN. Zoom used to need Alt, which is a thing you
    * have to be told and then remember, and the complaint was exactly that: nothing on screen
    * says a modifier exists. The gutter is a RULER — it is the pitch axis drawn as a keyboard —
    * and a wheel over a ruler meaning "zoom that axis" is a convention the player already has
-   * from every DAW, discoverable by trying it once. Over the notes the wheel still scrolls,
-   * which is what a wheel over content means everywhere else.
+   * from every DAW, discoverable by trying it once. Over the NOTES both axes zoom now, damped
+   * hard, so a trackpad reaches either zoom without a modifier and cannot jump (G15).
    *
    * A trackpad pinch arrives as a wheel event with `ctrlKey` set, whether or not anybody is
    * holding ctrl. It is handled as zoom rather than forwarded to the sheet: the roll is under
@@ -3251,48 +3380,36 @@ export class PianoRoll {
      * is why the ruler is drawn at all. No modifier, because the whole point of the convention is
      * that there is nothing to know.
      */
+    const zoom = (delta: number) => wheelZoomFactor(delta, e.deltaMode);
+
     if (this.overTimeRuler(e)) {
       const d = e.deltaY || e.deltaX;
       if (d === 0) return;
       e.preventDefault();
-      this.zoomTimeAt(d < 0 ? TIME_ZOOM_IN_FACTOR : TIME_ZOOM_OUT_FACTOR, this.canvasPoint(e).x);
+      this.zoomTimeAt(zoom(d), this.canvasPoint(e).x);
       return;
     }
 
     // A pinch, or a wheel over the pitch ruler. Both are "zoom this axis" and neither asks the
-    // player to know anything.
+    // player to know anything. A pinch arrives as a wheel with `ctrlKey` set whether or not
+    // anybody is holding ctrl, and it arrives in a stream — hence the damped factor.
     const overGutter = this.gutterPx > 0 && this.localPoint(e).x < this.gutterPx;
-    if (e.ctrlKey || e.metaKey || (overGutter && !e.shiftKey)) {
+    if (e.ctrlKey || e.metaKey || e.altKey || (overGutter && !e.shiftKey)) {
       const d = e.deltaY || e.deltaX;
       if (d === 0) return;
       e.preventDefault();
-      this.zoomVerticalAt(d < 0 ? VZOOM_IN_FACTOR : VZOOM_OUT_FACTOR, this.localPoint(e).y);
-      return;
-    }
-
-    if (e.altKey) {
-      const d = e.deltaY || e.deltaX;
-      if (d === 0) return;
-      e.preventDefault();
-      this.zoomVerticalAt(d < 0 ? VZOOM_IN_FACTOR : VZOOM_OUT_FACTOR, this.localPoint(e).y);
+      this.zoomVerticalAt(zoom(d), this.localPoint(e).y);
       return;
     }
 
     /*
-     * A sideways trackpad swipe still scrolls time without Shift.
+     * SHIFT still PANS TIME, and it is the only thing left that pans from the wheel.
      *
-     * Shift is the CONTRACT — hold it and you get time, on any device. But a two-finger
-     * sideways swipe on a Mac trackpad arrives as a large deltaX with no modifier at all, and
-     * answering that with a vertical scroll would be reading a horizontal gesture backwards.
-     * So: Shift, or a wheel that is genuinely mostly sideways.
-     *
-     * It PANS THE ROLL'S OWN WINDOW now. It used to ask the integrator to scroll the sheet
-     * through `onScrollRequest`, which was never wired and could not fire anyway (`map()` has
-     * returned null since the engraved axis was deleted), so a sideways swipe over the roll did
-     * nothing at all. The roll owns its time axis now, so it can simply move. With Align on the
-     * sheet follows, through `onTimeWindowChange`, which is the same route a zoom takes.
+     * It used to be "Shift, or a wheel that is genuinely mostly sideways", and the sideways half
+     * has moved to the zoom below (G15). Shift is kept because it is the contract on a mouse,
+     * where there is no second axis to move.
      */
-    if (e.shiftKey || Math.abs(e.deltaX) > Math.abs(e.deltaY)) {
+    if (e.shiftKey) {
       // Shift+wheel arrives as deltaX on some platforms and deltaY on others, so take whichever
       // is bigger rather than guessing the platform.
       const delta = Math.abs(e.deltaX) > Math.abs(e.deltaY) ? e.deltaX : e.deltaY;
@@ -3303,9 +3420,27 @@ export class PianoRoll {
       return;
     }
 
-    if (e.deltaY === 0) return;
+    /*
+     * THE AXIS YOU MOVE IS THE AXIS YOU ZOOM (G15).
+     *
+     *   two fingers up/down     -> the PITCH axis zooms, about the pointer
+     *   two fingers left/right  -> the TIME axis zooms, about the pointer
+     *
+     * No modifier, because a trackpad already has two axes and asking somebody to hold a key to
+     * reach the second one wastes the hardware. It replaces "a plain wheel scrolls pitch": with
+     * both zooms on the wheel, panning is the drag (space, or any drag once zoomed in) and the
+     * two scrollbars, which is where a DAW puts it anyway.
+     *
+     * DEGRADES GRACEFULLY. A device with only `deltaY` — a plain mouse, and a Windows precision
+     * touchpad in its scroll-emulation mode — never satisfies the `deltaX` test, so it gets the
+     * pitch zoom and keeps Shift for time. Nothing needs to detect the hardware.
+     */
+    const dx = e.deltaX;
+    const dy = e.deltaY;
+    if (dx === 0 && dy === 0) return;
     e.preventDefault();
-    this.scrollVerticalBy(e.deltaY);
+    if (Math.abs(dx) > Math.abs(dy)) this.zoomTimeAt(zoom(dx), this.canvasPoint(e).x);
+    else this.zoomVerticalAt(zoom(dy), this.localPoint(e).y);
   };
 
   /**
@@ -3758,11 +3893,25 @@ export class PianoRoll {
    * from there lands one ruler-height too high, which since the time axis grew a ruler (#29)
    * meant every synthetic click aimed at a rectangle missed it.
    */
-  paintedRects(): Array<{ noteId: string | null; midi: number; x: number; y: number; w: number; h: number }> {
+  paintedRects(): Array<{
+    noteId: string | null;
+    midi: number;
+    /**
+     * The onset in WRITTEN seconds — `x`'s own input, so a caller can put the same moment on a
+     * third axis (the waveform strip's) instead of guessing it back out of the pixel. Add
+     * `probe().originSec` for the RECORDING clock. See §4.13 on the two clocks.
+     */
+    startSec: number;
+    x: number;
+    y: number;
+    w: number;
+    h: number;
+  }> {
     const rulerH = this.rulerH;
     return this.rects.map((r) => ({
       noteId: r.note.noteId,
       midi: r.midi,
+      startSec: Number(r.startSec.toFixed(4)),
       x: Number(r.x.toFixed(2)),
       y: Number((r.y + rulerH).toFixed(2)),
       w: Number(r.w.toFixed(2)),
@@ -3900,8 +4049,9 @@ export class PianoRoll {
       // is the one question the ruler exists to answer at a glance.
       const bar = mark.level === 'bar';
       const beat = mark.level === 'beat';
-      ctx.globalAlpha = bar ? 0.9 : beat ? 0.55 : 0.28;
-      ctx.fillStyle = bar || beat ? this.colors.label : this.colors.line;
+      // G20: a bar line is the ACCENT, at full strength and 2px. See `colors.bar`.
+      ctx.globalAlpha = bar ? 1 : beat ? 0.55 : 0.28;
+      ctx.fillStyle = bar ? this.colors.bar : beat ? this.colors.label : this.colors.line;
       ctx.fillRect(Math.round(x), 0, bar ? 2 : 1, ph);
     }
     ctx.restore();
@@ -4001,8 +4151,8 @@ export class PianoRoll {
       // Same weights as the plot's own lines below, so a bar tick in the band and the bar line
       // under it read as one mark rather than two of different strengths. See the grid in
       // `drawPlot` for why the label token and not the border one.
-      ctx.globalAlpha = mark.level === 'bar' ? 0.9 : 0.55;
-      ctx.fillStyle = this.colors.label;
+      ctx.globalAlpha = mark.level === 'bar' ? 1 : 0.55;
+      ctx.fillStyle = mark.level === 'bar' ? this.colors.bar : this.colors.label;
       const tickH = mark.level === 'bar' ? rh - 1 : 4;
       ctx.fillRect(Math.round(x), rh - 1 - tickH, mark.level === 'bar' ? 2 : 1, tickH);
       if (!mark.label) continue;

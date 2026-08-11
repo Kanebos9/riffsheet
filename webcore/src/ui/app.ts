@@ -203,42 +203,15 @@ const REDO_SVG =
   '<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" ' +
   'stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false">' +
   '<path d="M20 9H9a5 5 0 0 0 0 10h4"/><polyline points="16 5 20 9 16 13"/></svg>';
-/**
- * THE R MARK — F17/F18, modelled on the brand block in the owner's other app, BASAMAK.
+/*
+ * THE R MARK IS NOT IN THIS FILE ANY MORE (G5).
  *
- * What was copied from it, deliberately and by measurement (Source/ui/PluginEditor.cpp):
- *
- *  - the mark is a VECTOR PATH, not a font glyph and not an image, so it is the same shape at
- *    every scale the header's zoom ladder puts it through;
- *  - it has NO container: no background plate, no border, no border-radius. BASAMAK's B is
- *    simply the first glyph of its wordmark sitting on the window fill, and a badge around
- *    ours would read as a different family of app;
- *  - the geometry is the same idiom — flat-sided, cap-height only, and CHAMFERED rather than
- *    curved, which is what BASAMAK's `L604 600` corner cuts are. 100 units of chamfer on a
- *    700-unit cap height, matched here;
- *  - the stem weight is BASAMAK's: its B runs x=65 to x=198, i.e. 133 of 700. Ours is 140.
- *
- * WHAT IS DELIBERATELY NOT COPIED: the colour. BASAMAK's wordmark is one flat off-white
- * (#F3F3F5) with its gold reserved for the version line; Riffsheet's accent is the orange in
- * `--accent`, and the mark takes it (`currentColor`, set on `.brand-mark`) while the wordmark
- * beside it stays in the off-white `--text` that is this app's equivalent of theirs.
- *
- * Three elements rather than one path with holes: the stem, the bowl and the leg overlap, and
- * a single path would have to cancel those overlaps under `evenodd` instead of unioning them.
- * Separate siblings union by construction, which is a thing that cannot be got subtly wrong.
+ * `RIFFSHEET_MARK_SVG` — the chamfered vector R, modelled on BASAMAK's B — stood here and was
+ * drawn to the left of the wordmark in the header. It is deleted rather than hidden: a mark
+ * beside the word RIFFSHEET says the same thing twice, and BASAMAK's own header is a wordmark
+ * with nothing in front of it. The R survives where a mark is the only thing there is room
+ * for — the app icon, which is built by the shell and not by this file.
  */
-const RIFFSHEET_MARK_SVG =
-  '<svg viewBox="0 0 640 700" width="17" height="18" fill="currentColor" ' +
-  'aria-hidden="true" focusable="false">' +
-  // The stem.
-  '<rect x="0" y="0" width="140" height="700"/>' +
-  // The bowl, as a ring: outer contour then counter, `evenodd` cutting the second out of the
-  // first. Both corners on the right are chamfered at 100 units, as BASAMAK's are.
-  '<path fill-rule="evenodd" d="M140 0H480L580 100V240L480 340H140Z' +
-  'M240 100H445L480 135V205L445 240H240Z"/>' +
-  // The leg. A slanted bar of the same weight as the stem, springing from under the bowl.
-  '<path d="M300 340H470L620 700H455Z"/>' +
-  '</svg>';
 
 /**
  * Where "check updates" goes, and it is the RELEASES INDEX rather than `/latest`.
@@ -467,6 +440,17 @@ class App {
   private selection: { fromSec: number; toSec: number } | null = null;
   /** A waveform selection opens the audio-check dock; note highlighting alone does not. */
   private tunerSelection: { fromSec: number; toSec: number } | null = null;
+  /**
+   * CUT MODE (G8) — armed by the chip under the strip, and the span it has swept out.
+   *
+   * A separate field from `tunerSelection` on purpose. They are two different questions asked
+   * with the same gesture: "what pitch is at this moment" wants a tenth of a second and opens
+   * the tuner, "cut this out" wants seconds and must not. Sharing one field is what produced
+   * the reported bug from the other direction — `Cut out 0.1s`, because the only selection the
+   * strip could make was the tuner's.
+   */
+  private cutArmed = false;
+  private cutSelection: { fromSec: number; toSec: number } | null = null;
   /** Main-menu subview. Visiting it never mutates the current work. */
   private blankSetupOpen = false;
 
@@ -563,11 +547,15 @@ class App {
    * MODELLED ON BASAMAK, the owner's other app, measured off its editor rather than guessed
    * (Source/ui/PluginEditor.cpp §paintContent, §setupComponents, §layoutContent):
    *
+   * G5: THE R GLYPH IS NOT IN THE HEADER. It was a mark beside the word, and a mark plus the
+   * same word spelled out is the word twice — BASAMAK's own header is a WORDMARK and nothing
+   * else. The R survives where a mark is the only thing there is room for: the app icon, which
+   * is not built here. What is left is exactly BASAMAK's three parts — word, version, caption.
+   *
    *   BASAMAK                                    here
    *   ------------------------------------------ --------------------------------------------
-   *   wordmark as vector art, left-aligned,       the R is vector art (`RIFFSHEET_MARK_SVG`);
-   *   x=8 in a 40px toolbar, 150x22               the wordmark is text, because we cannot copy
-   *                                               somebody's letterforms — caps, 700, tracked
+   *   wordmark as vector art, left-aligned,       the wordmark is text, because we cannot copy
+   *   x=8 in a 40px toolbar, 150x22               somebody's letterforms — caps, 800, tracked
    *   version + caption stacked to its RIGHT,     same stack, same order, same side
    *   both centred on one axis, 1px apart
    *   version 11.5px bold, brand gold             version 10px bold, `--accent`
@@ -581,9 +569,9 @@ class App {
    *
    * THE HARD CONSTRAINT, stated by the owner: THE TOP BAR MUST NOT GET TALLER. The tallest
    * thing in this header is an ordinary button — 12.5px text at line-height 1.45 inside 5px of
-   * padding and a border, about 30px. This block is built to come in under that: 18px of mark
-   * against a 19.5px two-line stack (10 + 1 + 8.5, all at line-height 1), inside 2px of
-   * padding. `.brand-block` in styles.css states the same rule as a `max-height` so that a
+   * padding and a border, about 30px. This block is built to come in under that: a 13px
+   * wordmark against a 19.5px two-line stack (10 + 1 + 8.5, all at line-height 1), inside 2px
+   * of padding. `.brand-block` in styles.css states the same rule as a `max-height` so that a
    * later edit to any of those numbers fails visibly rather than silently pushing the sheet
    * down by a row.
    */
@@ -598,7 +586,6 @@ class App {
         title: t(TIPS.brand),
         onClick: () => this.openReleasesPage()
       },
-      el('span', { class: 'brand-mark', 'aria-hidden': 'true', html: RIFFSHEET_MARK_SVG }),
       el('span', { class: 'brand-wordmark', text: 'RIFFSHEET' }),
       el(
         'span',
@@ -892,8 +879,14 @@ class App {
     const options = [
       {
         value: 'auto',
-        label: resolvedName ? `Auto — ${resolvedName}` : 'Auto',
-        title: list.engineReason
+        // JUST "Auto" (G1). The label used to carry what Auto had resolved to — "Auto —
+        // MuScriptor" — which made one chip two or three times the width of every other chip
+        // in the group, and a grid of equal cells cannot be built out of one cell that is
+        // three cells wide. The resolution has not been hidden: it is in this chip's tooltip
+        // and, in full, in the sentence printed under the whole group, which is where somebody
+        // asking "what is it actually using?" was already looking.
+        label: 'Auto',
+        title: resolvedName ? `${list.engineReason} Currently: ${resolvedName}.` : list.engineReason
       },
       ...list.engines.map((e) => {
         const installable = e.state !== 'ready' && e.state !== 'installed';
@@ -1157,7 +1150,13 @@ class App {
                       // along. Nobody wired the two together.
                       onClick: () => void this.openRecentFromMenu(r)
                     },
-                    el('span', { text: r.name }),
+                    // MIDDLE-TRUNCATED, NOT END-TRUNCATED (G1). CSS `text-overflow: ellipsis`
+                    // cuts the tail, and the tail of a filename is the half that identifies it
+                    // — "Bass take 3 — bridge idea (fina…" and "Bass take 3 — bridge idea
+                    // (fina…" are the same string for two different files. Keeping both ends
+                    // keeps the name and the take number, which is what anybody is scanning
+                    // this list for. The whole name is in the tooltip.
+                    el('span', { class: 'recent-name', text: middleTruncate(r.name, 34), title: r.name }),
                     el('span', { class: 'when', text: relativeTime(r.at) })
                   )
                 )
@@ -2747,9 +2746,12 @@ class App {
     void this.bridge
       .engineStatus()
       .then((status) => {
-        const wasUp = this.engine?.state === 'ready' || this.engine?.state === 'starting';
-        const isUp = status?.state === 'ready' || status?.state === 'starting';
+        const wasUp = this.engineProcessAlive();
         this.engine = status;
+        // Both reads go through `engineProcessAlive()` (G17), so the poll and the chip cannot
+        // disagree about what "up" means — which is how a chip for a process that does not
+        // exist stayed on screen and kept re-arming its own timer.
+        const isUp = this.engineProcessAlive();
         if (wasUp !== isUp || (isUp && this.runtime.get().screen === 'main')) this.refreshEngineChip();
         // Only keep asking while it is actually running.
         if (isUp) this.engineTimer = window.setTimeout(() => this.pollEngine(), 10000);
@@ -2757,6 +2759,57 @@ class App {
       .catch(() => {
         this.engine = null;
       });
+  }
+
+  /**
+   * IS THERE ACTUALLY A LISTENER PROCESS? (G17)
+   *
+   * THE BUG: the chip read "Listener · running" on machines where nobody had ever started an
+   * engine server. It was not a stale value and not a leaked process — it was this file reading
+   * `EngineStatus.state` as if it meant one thing when the shell uses it to mean two.
+   *
+   * For MuScriptor, `state` IS the server's lifecycle: 'stopped' at rest, 'starting' while the
+   * Python process boots, 'ready' while it holds a port and about a gigabyte of weights. For
+   * every OTHER engine — the built-in Riffsheet engine, Basic Pitch, and the per-job CLI
+   * engines — there is no server at all, and the shell reports `state: 'ready'` to mean "this
+   * engine is installed and usable". `src/bridge/mock.ts` §statusForEngine models both
+   * faithfully, which is where the difference is easiest to see: the MuScriptor branch answers
+   * `port: 8223` when it is up, the other branch answers `port: 0` always.
+   *
+   * So on any machine whose resolved engine is not MuScriptor, `state === 'ready'` was true
+   * from boot and the chip appeared immediately. `memoryMb` was absent, which is why the text
+   * came out as the literal word "running" rather than as a figure — that string was the tell,
+   * and a genuinely running listener has always read "Listener · 1.5 GB".
+   *
+   * THE FIX: `state` is necessary and no longer sufficient. There has to be evidence of a
+   * PROCESS as well — a listening port, a memory figure, or the shell saying outright that a
+   * server it did not start is up. All three are absent for an engine that is merely installed,
+   * and at least one is present for every server that really exists, including one still
+   * booting once it has claimed its port.
+   *
+   * WHAT IS NOT IN THIS FILE'S POWER. A shell that reports a port for a non-server engine, or
+   * that leaves `state: 'ready'` behind after its process dies, would still be believed here —
+   * the app cannot see processes, only this payload. If the chip is ever seen again after this,
+   * the next thing to read is what the shell's own `engineStatus` returns for the resolved
+   * engine, in that order: `state`, then `port`, then `memoryMb`, then `externalServer`.
+   */
+  private engineProcessAlive(): boolean {
+    const e = this.engine;
+    if (!e || (e.state !== 'ready' && e.state !== 'starting')) return false;
+    return (
+      (typeof e.port === 'number' && e.port > 0) ||
+      (typeof e.memoryMb === 'number' && e.memoryMb > 0) ||
+      e.externalServer === true ||
+      e.adopted === true
+    );
+  }
+
+  /** The engine doing the listening, by the name the player chose it under. */
+  private listenerName(): string {
+    const list = this.engineList;
+    const chosen = this.settings.get().engineId;
+    const id = chosen && chosen !== 'auto' ? chosen : (list?.resolvedEngine ?? '');
+    return list?.engines.find((e) => e.id === id)?.name ?? 'The listener';
   }
 
   /** Cheap in-place update — the header must not be rebuilt every ten seconds. */
@@ -2781,13 +2834,30 @@ class App {
       return;
     }
     const e = this.engine;
-    const up = e && (e.state === 'ready' || e.state === 'starting');
+    const up = this.engineProcessAlive();
     chip.style.display = up ? '' : 'none';
     if (!up || !e) return;
-    const mb = typeof e.memoryMb === 'number' && e.memoryMb > 0 ? `${(e.memoryMb / 1024).toFixed(1)} GB` : 'running';
+    const name = this.listenerName();
+    // IT SAYS WHAT IT IS AND WHAT PRESSING IT DOES. "Listener · 1.5 GB" named neither: it read
+    // as a status badge, and a status badge is not something anybody clicks. The figure has not
+    // been thrown away — it is in the tooltip, with the rest of the explanation.
     chip.querySelector('[data-role="engine-text"]')!.textContent =
-      e.state === 'starting' ? 'Listener starting…' : `Listener · ${mb}`;
-    chip.classList.toggle('on', e.busy === true);
+      e.state === 'starting' ? `${name} starting…` : `${name} running — click to stop`;
+    const mb =
+      typeof e.memoryMb === 'number' && e.memoryMb > 0
+        ? ` It is holding ${(e.memoryMb / 1024).toFixed(1)} GB right now.`
+        : '';
+    // `data-riff-tip` is where ui/tips.ts hoists a `title` the first time a control is hovered,
+    // and the hoisted copy wins from then on — so a bare `chip.title = …` here would be
+    // overwritten by whatever text this chip was carrying when the mouse first touched it.
+    const tip = t(`${TIPS.engineChip}${mb}`);
+    chip.removeAttribute('data-riff-tip');
+    if (tip === undefined) chip.removeAttribute('title');
+    else chip.title = tip;
+    // HIGHLIGHTED WHENEVER IT IS ON SCREEN, not only while a job is running. It is here to be
+    // noticed — the whole reason it exists is that a gigabyte was being held and nothing on
+    // screen said so — and a chip in the same grey as the buttons beside it is not noticed.
+    chip.classList.add('on');
   }
 
   private async stopEngine(): Promise<void> {
@@ -3130,6 +3200,10 @@ class App {
   private setSource(source: SourceAudio): void {
     this.selection = null;
     this.tunerSelection = null;
+    // A new take is a new question for the cut gesture too (G8): a span swept out of the last
+    // recording names seconds this one does not have.
+    this.cutArmed = false;
+    this.cutSelection = null;
     this.tuner?.destroy();
     this.tuner = null;
     // A new take is a new question (F16): whoever waved the offer away did so about the LAST
@@ -3605,6 +3679,38 @@ class App {
      *
      * Everything is put back before returning, so the probe leaves the take as it found it.
      */
+    /**
+     * THE LISTENER CHIP, next to the evidence it is supposed to be drawn from (G17).
+     *
+     * The reported fault was a chip reading "Listener · running" on a machine where no engine
+     * server had ever been started. The cause is written up in full on `engineProcessAlive()`:
+     * `EngineStatus.state` is a server lifecycle for MuScriptor and an "is it installed?" for
+     * every other engine, and this file was reading it as the first for both.
+     *
+     * A check cannot start a Python process, so it cannot assert "the chip is right". What it
+     * CAN assert is the implication that was broken: the chip is on screen ONLY where the
+     * payload carries evidence of a process. Both sides are reported raw so a failure names
+     * which of them disagreed rather than merely saying the chip was wrong.
+     */
+    (window as unknown as Record<string, unknown>).__RIFFSHEET_ENGINECHIP__ = () => {
+      const chip = this.root.querySelector<HTMLElement>('[data-role="engine-chip"]');
+      const e = this.engine;
+      return {
+        present: !!chip,
+        visible: !!chip && chip.style.display !== 'none',
+        highlighted: !!chip?.classList.contains('on'),
+        text: chip?.querySelector('[data-role="engine-text"]')?.textContent ?? null,
+        state: e?.state ?? null,
+        // The three pieces of process evidence, itemised. A payload with none of them and a
+        // visible chip is exactly the bug.
+        port: e?.port ?? null,
+        memoryMb: e?.memoryMb ?? null,
+        externalServer: e?.externalServer ?? null,
+        adopted: e?.adopted ?? null,
+        alive: this.engineProcessAlive()
+      };
+    };
+
     (window as unknown as Record<string, unknown>).__RIFFSHEET_SNAPFEED__ = () => {
       try {
         const source = this.runtime.get().source;
@@ -4356,13 +4462,27 @@ class App {
         const openedEffective = this.settings.get().grid;
         const openedStored = readStored().grid ?? null;
 
-        // 3. They change something else while it is open.
-        this.settings.set({ alignViews: !this.settings.get().alignViews });
+        // 3. They change something else while it is open. Anything that is neither the grid
+        //    nor one of the document's own keys does; `alignViews` used to stand here and is a
+        //    dead field now (G11), so a live one takes its place.
+        this.settings.set({ showPianoRoll: !this.settings.get().showPianoRoll });
         const afterUnrelatedEdit = readStored().grid ?? null;
 
         // 4. …and then set the grid themselves, which is the one thing that MAY write it.
         this.settings.set({ grid: 'sixteenth' });
         const afterOwnEdit = readStored().grid ?? null;
+
+        // 5. THE NEWEST MIGRATION, ASKED THE SAME QUESTION. v11 turns a stored 'free' into
+        //    'auto' once per profile (see `migrate()`), so a document carrying 'free' from an
+        //    ancient build is exactly the shape that would re-fire it — and a re-fire here
+        //    would show somebody else's document engraved with a grid it does not contain.
+        //    Separate from step 2 because the two cases key on different values and one
+        //    document cannot carry both.
+        this.applyDocumentSettingsToStore({
+          settingsVersion: 1,
+          grid: 'free'
+        } as Partial<AppSettings>);
+        const freeDocEffective = this.settings.get().grid;
 
         return {
           /** What the player chose. */
@@ -4377,6 +4497,12 @@ class App {
           afterOwnEdit,
           /** Proof the v10 case did not re-fire off the document's version number. */
           migrationRefired: openedEffective === 'free' && before.grid !== 'free',
+          /**
+           * The same claim for v11: a document whose grid IS 'free' keeps it. 'auto' here
+           * would be the v11 case having fired off the document's own version number, which is
+           * the whole failure `applyDocumentSettings` pins the floor to prevent.
+           */
+          freeDocEffective,
           /** The floor that makes that true, as it stands on disk. */
           migrationFloor: Number(localStorage.getItem('riffsheet.settingsMigratedTo') ?? 0)
         };
@@ -4738,13 +4864,15 @@ class App {
      * the roll is linear in time across the window and alphaTab is not, so the residual is
      * whatever the engraving's own unevenness comes to over one screen of music.
      */
-    (window as unknown as Record<string, unknown>).__RIFFSHEET_ALIGNX__ = async (
-      mode: 'on' | 'off' = 'on'
-    ) => {
+    (window as unknown as Record<string, unknown>).__RIFFSHEET_ALIGNX__ = async () => {
       const settle = (ms: number) => new Promise((ok) => setTimeout(ok, ms));
-      const was = this.settings.get().alignViews;
+      // NO MODE ANY MORE (G11). It used to take 'on' | 'off' and flip `alignViews` around the
+      // measurement, which was the only way to state the bound as a RATIO — aligned against
+      // unaligned. There is no unaligned state to compare against now, so the claim is stated
+      // as the absolute it always really was: three notes, sheet x against roll x, under
+      // ALIGN_TOLERANCE_PX. The comparison the ratio used to make is preserved in that
+      // constant's own comment in scripts/verify.mjs.
       try {
-        this.settings.set({ alignViews: mode === 'on' });
         this.renderMain();
         await settle(600);
         this.pianoRoll?.fitVertical();
@@ -4780,7 +4908,6 @@ class App {
         const applied = this.pianoRoll?.getTimeWindow() ?? null;
         const r3 = (n: number) => Number(n.toFixed(3));
         return {
-          mode,
           aligned: !!window,
           windowSec: window ? Number((window.toSec - window.fromSec).toFixed(3)) : null,
           appliedWindow: applied ? { fromSec: r3(applied.fromSec), toSec: r3(applied.toSec) } : null,
@@ -4795,22 +4922,21 @@ class App {
       } catch (e) {
         return { error: String((e as Error).stack ?? e) };
       } finally {
-        this.settings.set({ alignViews: was });
         this.renderMain();
       }
     };
 
     (window as unknown as Record<string, unknown>).__RIFFSHEET_ALIGN__ = async (
-      mode: 'probe' | 'on' | 'off' = 'probe'
+      mode: 'probe' | 'on' = 'probe'
     ) => {
       const settle = (ms: number) => new Promise((ok) => setTimeout(ok, ms));
-      const enabled = this.settings.get().alignViews;
       if (mode === 'probe') {
-        return { enabled, chipOn: !!this.root.querySelector('[data-role="roll-link"].on') };
+        // `enabled` is a literal, not a read, and that IS the claim being made: there is no
+        // stored value left that could answer it differently. `chipPresent` is the other half
+        // — the control is gone from the DOM rather than merely stuck on.
+        return { enabled: true, chipPresent: !!this.root.querySelector('[data-role="roll-link"]') };
       }
       try {
-        const want = mode === 'on';
-        this.settings.set({ alignViews: want });
         this.renderMain();
         await settle(500);
 
@@ -4829,8 +4955,34 @@ class App {
         const before = this.triview?.viewport()?.scrollLeft ?? 0;
         const targetSec = notes[Math.min(notes.length - 1, Math.floor(notes.length * 0.75))].startSec;
         const followed = this.followSeek(targetSec);
-        await settle(400);
-        const after = this.triview?.viewport()?.scrollLeft ?? 0;
+        /*
+         * WAIT FOR THE ENGRAVING TO STOP MOVING, not for a fixed number of milliseconds.
+         *
+         * A scroll wakes `syncViewports`, which hands the roll a new time window, which can
+         * come back as a coupled sheet SCALE — and a re-engrave restores the scroll to a
+         * musical anchor rather than to the pixel it was on, so the sheet settles a little away
+         * from where it was put. Measuring at a fixed 400ms therefore compared a scroll taken
+         * mid-flight against a `wantedX` read off the engraving it was flying towards, and the
+         * error it reported was however far through that the clock happened to be: 179px on one
+         * run, 98 on the next, on identical code.
+         *
+         * Two consecutive identical readings of both the scroll and the content width mean the
+         * cascade has finished. Capped, so a genuinely oscillating layout reports its badness
+         * instead of hanging the harness.
+         */
+        let after = this.triview?.viewport()?.scrollLeft ?? 0;
+        let contentW = this.triview?.viewport()?.contentWidth ?? 0;
+        let settleTries = 0;
+        for (; settleTries < 12; settleTries++) {
+          await settle(150);
+          const v = this.triview?.viewport();
+          const nextScroll = v?.scrollLeft ?? 0;
+          const nextWidth = v?.contentWidth ?? 0;
+          if (Math.abs(nextScroll - after) < 0.5 && Math.abs(nextWidth - contentW) < 0.5) break;
+          after = nextScroll;
+          contentW = nextWidth;
+        }
+        after = this.triview?.viewport()?.scrollLeft ?? after;
 
         // How close it landed, measured against the sheet's own map rather than against a
         // number this file computed — the point is that the two agree.
@@ -4839,6 +4991,16 @@ class App {
         const wantedX = map?.writtenSecToContentX(targetSec - this.originSec(score)) ?? null;
         const sheetErrorPx =
           wantedX === null || !view ? null : Math.round(Math.abs(after + view.viewportWidth / 2 - wantedX));
+        // WHAT THE ERROR IS AN ERROR AGAINST. Centring is a request, not a promise: a moment in
+        // the last half-viewport of the engraving cannot be put in the middle of the pane, and
+        // `setScrollLeft` clamps rather than scrolling past the end. Without these three numbers
+        // `sheetErrorPx` conflates "it went to the wrong place" with "it went as far as there
+        // is", and only the first of those is a bug. `targetOnScreen` is the claim that survives
+        // the clamp: wherever it landed, the moment being pointed at is visible.
+        const maxScrollLeft = view ? Math.max(0, view.contentWidth - view.viewportWidth) : null;
+        const clampedAtEnd = maxScrollLeft !== null && after >= maxScrollLeft - 1;
+        const targetOnScreen =
+          wantedX === null || !view ? null : wantedX >= after - 1 && wantedX <= after + view.viewportWidth + 1;
 
         // Selection still crosses every view, either way.
         const ids = notes.slice(1, 3).map((n) => n.id!).filter(Boolean);
@@ -4875,33 +5037,36 @@ class App {
           otherNotesMovedPx = Math.max(otherNotesMovedPx, Math.abs(a.x - b.x), Math.abs(a.w - b.w));
         }
         const noteAdded = (this.runtime.get().source?.detected?.notes ?? []).length > notesBefore;
-        // Read BEFORE the restore below puts `alignViews` back: the window is what this mode
-        // produced, and asking for it after the setting has been handed back would report the
-        // other mode's answer.
+        // Read BEFORE the undo below re-engraves: the window is what this measurement produced,
+        // and a rebuild re-derives it from a sheet that has just changed under it.
         const alignedWindowSec = this.alignedWindow
           ? Number((this.alignedWindow.toSec - this.alignedWindow.fromSec).toFixed(3))
           : null;
         this.undo();
         await settle(500);
         this.selectNoteIds([]);
-        this.settings.set({ alignViews: enabled });
         this.renderMain();
         await settle(300);
 
         return {
           mode,
-          enabled: want,
+          enabled: true,
           // Was the seek ROUTED to the sheet at all? The decisive fact, and the only one that
           // survives a sheet whose whole content already fits on screen — which is the normal
           // case for a short take and would otherwise make "it scrolled" untestable.
           followed,
           scrollBefore: Math.round(before),
           scrollAfter: Math.round(after),
+          /** How many 150ms ticks the layout took to stop moving. 0 means it never did move. */
+          settleTries,
           sheetMoved: Math.abs(after - before) > 4,
           // True when there was anywhere to scroll TO. Without it, "the sheet did not move"
           // reads as a failure on a take that fits in the window.
           sheetScrollable: !!view && view.contentWidth > view.viewportWidth + 8,
           sheetErrorPx,
+          maxScrollLeft,
+          clampedAtEnd,
+          targetOnScreen,
           // ALIGN's actual geometry: the stretch of recording the roll and the strip were told
           // to show. Null in off mode, which is what "independent views" means.
           alignedWindowSec,
@@ -6460,14 +6625,10 @@ class App {
     const holding =
       this.alignedWindow !== null && performance.now() < this.alignHoldUntil && !scrolled;
     if (!holding) {
+      // Unconditional (G11): the only question left is whether the sheet has a span to give.
       this.setAlignedWindow(
-        this.settings.get().alignViews && fromSec !== null && toSec !== null && toSec > fromSec
-          ? { fromSec, toSec }
-          : null
+        fromSec !== null && toSec !== null && toSec > fromSec ? { fromSec, toSec } : null
       );
-    } else if (!this.settings.get().alignViews) {
-      // Switching Align off is the player speaking; it outranks the hold.
-      this.setAlignedWindow(null);
     } else {
       // Held — but still PUSHED. `renderMain()` builds a fresh roll and a fresh strip, and a
       // pane that has just been constructed knows nothing; without this it would draw the whole
@@ -6537,7 +6698,7 @@ class App {
    * the roll re-spaced its neighbours as a result. This cannot: it is a scroll position.
    */
   private followSeek(audioSec: number): boolean {
-    if (!this.settings.get().alignViews) return false;
+    // Always. There is no longer a setting that could refuse — see AppSettings.alignViews.
     this.scrollSheetToAudioSec(audioSec);
     return true;
   }
@@ -6711,33 +6872,25 @@ class App {
           this.renderMain();
         }
       }),
-      // ALIGN THE FOUR VIEWS on the same moment. Reported as "the link button disappeared. i
-      // cant link midi/musicsheet/tab/soundwave".
+      // ALIGN IS NOT A CHIP ANY MORE (G11). IT IS ALWAYS ON.
       //
-      // It came back once as the OLD design — the roll borrowing the sheet's x-geometry — and
-      // that design is now deleted rather than defaulted off. alphaTab gives rhythmically
-      // dense bars more pixels, so a roll drawn on that axis re-spaced its own notes whenever
-      // one was added: the player's picture of their performance moved because they edited a
-      // different part of it. No switch makes that acceptable.
+      // The control had exactly one honest state. Aligned, the four views point at the same
+      // moment and a note's roll x sits under its notehead; unaligned, the sheet simply
+      // refuses to follow the thing you are pointing at, which nobody was choosing on purpose.
+      // A switch whose OFF position is only ever a worse version of ON is a question the app
+      // should not be asking, so it is answered here once and for good.
       //
-      // What is left is what the player actually asked for: point at a moment anywhere, and
-      // every view goes to it. Nothing moves that was not already going to move — the roll's
-      // geometry is a linear time ruler, always, and this cannot touch it.
-      rollOn &&
-        el('button', {
-          class: `chip${s.alignViews ? ' on' : ''}`,
-          text: 'Align',
-          'data-role': 'roll-link',
-          'data-setting': 'alignViews',
-          'aria-pressed': String(s.alignViews),
-          title: t(TIPS.alignViews),
-          onClick: () => {
-            const on = !this.settings.get().alignViews;
-            this.settings.set({ alignViews: on });
-            this.syncViewports();
-            this.renderMain();
-          }
-        }),
+      // What is NOT reinstated with it is the old design this chip once meant — the roll
+      // borrowing the sheet's engraved x-axis. alphaTab gives rhythmically dense bars more
+      // pixels, so a roll drawn on that axis re-spaced its own notes whenever one was added:
+      // the player's picture of their performance moved because they edited a different part
+      // of it. That is deleted, not defaulted. The roll's geometry is a linear time ruler,
+      // always, and alignment is a scroll position and a pair of time anchors — nothing that
+      // can move a rectangle the player did not touch.
+      //
+      // `alignViews` survives in `AppSettings` as a dead field so an older blob still
+      // round-trips; `migrate()` forces it true, and every reader in this file passes the
+      // literal rather than the field.
       // ZOOM, VISIBLE. A minus and a plus, because a wheel and a pinch are both invisible and
       // somebody on a mouse with no wheel, or reading this on a tablet, still has to be able to
       // make the rows bigger. The wheel over the gutter and a trackpad pinch do the same thing
@@ -6747,21 +6900,28 @@ class App {
         el(
           'span',
           { class: 'zoom-pair', 'data-role': 'roll-zoom' },
-          // WHICH AXIS (F4). Four unlabelled minus/plus buttons in a row is a guessing game: nothing
-          // said that the first pair made the rows taller and the second made the take wider,
-          // and people found out by pressing one.
+          // WHICH AXIS, IN WORDS (G7). It was a bare "\u2195" and a bare "\u2194": two arrows at
+          // 12px, four unlabelled minus/plus buttons between them, and the only way to find out
+          // which pair made the rows taller was to press one. At plugin sizes — where the whole
+          // shell is already scaled to 0.9 or 0.8 — those glyphs are three or four pixels of
+          // stroke and read as specks rather than as arrows.
           //
-          // A glyph rather than the words "Pitch" and "Time", and that is the constraint doing
-          // the choosing: this bar has to survive a 390px docked FX window, the words cost
-          // ~60px between them, and the header is forbidden from growing a second row. The
-          // glyph carries the axis, the tooltip carries the word, and the buttons themselves
-          // already carry the accessible names ("Bigger rows", "Show more time").
+          // So the axis says its own name, OVER its two buttons rather than beside them. Beside
+          // was tried first and measured: two words on the buttons' own line cost 108px in a
+          // header with no slack left, and the export menu and the gear went off the right edge
+          // at 900px. Stacked, each group is as wide as the wider of its caption and its pair,
+          // so the whole control is NARROWER than the two arrow glyphs plus four buttons it
+          // replaced — and it is not taller, because the caption is 10px over a 17px button
+          // inside a row whose ordinary buttons are 30.
+          //
+          // THE SIX CHILDREN BELOW ARE PLACED BY POSITION. `.zoom-pair` in styles.css §zoom is a
+          // grid with explicit `nth-child` placement — caption, −, +, caption, −, + — so adding
+          // or reordering one here without changing that block will put it in the wrong cell.
           el('span', {
-            class: 'zoom-label',
+            class: 'zoom-axis',
             'data-role': 'roll-zoom-label',
-            'aria-hidden': 'true',
-            text: '\u2195',
-            title: t(`Pitch \u2014 ${TIPS.rollZoom}`)
+            text: 'Vertical',
+            title: t(`Vertical \u2014 ${TIPS.rollZoom}`)
           }),
           el('button', {
             class: 'chip icon',
@@ -6783,20 +6943,15 @@ class App {
           // the recording WIDER, which is the zoom anybody actually means when they say they
           // cannot see where a note starts. Same reasoning as the vertical pair for being
           // visible at all: the wheel over the ruler does it, and a wheel is invisible.
-          //
-          // "Fit" is a button here rather than a double-click, unlike the vertical axis: the
-          // time window is the one Align keeps in step with the sheet, so getting back to the
-          // whole take is a thing players reach for repeatedly rather than once a session.
           el('span', {
-            class: 'zoom-label',
+            class: 'zoom-axis',
             'data-role': 'roll-time-zoom-label',
-            'aria-hidden': 'true',
-            text: '↔',
-            title: t(`Time — ${TIPS.rollTimeZoom}`)
+            text: 'Horizontal',
+            title: t(`Horizontal \u2014 ${TIPS.rollTimeZoom}`)
           }),
           el('button', {
             class: 'chip icon',
-            text: '−',
+            text: '\u2212',
             'data-role': 'roll-time-zoom-out',
             'aria-label': 'Show more time',
             title: t(TIPS.rollTimeZoom),
@@ -6809,15 +6964,11 @@ class App {
             'aria-label': 'Show less time',
             title: t(TIPS.rollTimeZoom),
             onClick: () => this.pianoRoll?.zoomTimeIn()
-          }),
-          el('button', {
-            class: 'chip icon',
-            text: 'Fit',
-            'data-role': 'roll-time-fit',
-            'aria-label': 'Fit the whole take',
-            title: t(TIPS.rollTimeFit),
-            onClick: () => this.pianoRoll?.fitTime()
           })
+          // "FIT" IS NOT HERE (G13). It was retired once — fitting is a double-click on the
+          // roll's gutter and has been for a while — and came back by mistake as a third button
+          // on the horizontal pair, which is exactly the chrome this bar has to survive REAPER's
+          // 390px docked FX window without. The gesture is unchanged; the button is gone.
         ),
       // How many edits the app made on its own evidence and nobody has looked at yet.
       //
@@ -6873,7 +7024,7 @@ class App {
               if (this.settings.get().rollSnapToGrid) this.rebuildNotation({ keepEdits: true });
             }
           },
-          ...(['quarter', 'eighth', 'sixteenth', 'triplet', 'free'] as const).map((value) =>
+          ...(['quarter', 'eighth', 'triplet', 'sixteenth', 'thirtysecond', 'free', 'off'] as const).map((value) =>
             el('option', { value, text: `Grid: ${ROLL_GRID_LABELS[value]}`, selected: s.rollGrid === value })
           )
         ),
@@ -6996,6 +7147,40 @@ class App {
       this.renderMain();
     };
 
+    /**
+     * THE STEPPER FIX (G10). The same change, WITHOUT rebuilding the toolbar under the hand
+     * that is making it.
+     *
+     * THE BUG, reported as "the fret and capo steppers die after one or two clicks". Every
+     * number box in this toolbar was wired `onChange -> rebuild()`, and `rebuild()` ends in
+     * `renderMain()`, which is a wholesale `replace()` of the entire screen — header, waveform,
+     * roll, transport, toolbar and sheet. A native spinner click fires `change` immediately, so
+     * the input the player is clicking is DESTROYED between the first click and the second, and
+     * it fails in two different ways at once:
+     *
+     *   - by keyboard, it is over after one press: focus lives on an element that no longer
+     *     exists, so the second Up arrow goes nowhere at all;
+     *   - by mouse, it is over after one or two, because the replacement box is not in the same
+     *     place. The toolbar's own width changes as its neighbours change — `coarseGridWarning`
+     *     appears and disappears, the Key option's "Auto — G major" text re-measures after the
+     *     re-engrave — so the spinner arrow slides out from under a cursor that has not moved.
+     *     Whichever happens first, the player's reading is that the control stopped working.
+     *
+     * NOTHING ON THIS BAR NEEDS A RE-RENDER FOR THESE VALUES. Capo and the anchor fret change
+     * the ENGRAVING and no other control's text, and `rebuildNotation()` already redraws the
+     * sheet, the roll and the tab. So the settings write and the re-engrave happen exactly as
+     * before and the DOM the hand is on is left alone. The one dependent control — the custom
+     * tuning box, whose text follows the string count — is written in place by its own handler.
+     *
+     * The clamped value is written back to the box because there is no re-render to do it: a
+     * player who types 40 into a 0–12 field must see the 12 that was actually applied.
+     */
+    const stepNumber = (input: HTMLInputElement, value: number, patch: Partial<AppSettings>) => {
+      input.value = String(value);
+      this.settings.set({ ...patch, instrument: 'auto' });
+      this.rebuildNotation({ keepEdits: true });
+    };
+
     return el(
       'div',
       { class: 'notation-toolbar', 'data-role': 'notation-toolbar' },
@@ -7056,30 +7241,31 @@ class App {
           title: t(TIPS.grid),
           onChange: (e: Event) => rebuild({ grid: (e.target as HTMLSelectElement).value as AppSettings['grid'] })
         },
-        ...(['auto', 'quarter', 'eighth', 'sixteenth', 'thirtysecond', 'triplet', 'free'] as const)
-          // FREE IS OFFERED FOR EVERYTHING NOW, and it is the default (settings v10).
+        ...(['auto', 'quarter', 'eighth', 'triplet', 'sixteenth', 'thirtysecond', 'free'] as const)
+          // THE ORDER IS FINENESS, AND THE DEFAULT IS 'auto' AGAIN (G6, settings v11).
           //
-          // It used to be hidden from audio takes, and the reasoning was a measurement rather
-          // than a taste: 'free' meant "write exactly what was played, snapped to nothing", and
-          // for a performance — which has no exact note values — that produced a chain of tied
-          // fragments per note. The number recorded here was 64 played notes coming out as 192
-          // GLYPHS WITH 192 TIES, three noteheads each, plus 64 rests nobody played. Offering
-          // that beside five settings that work was offering a trap, and hiding it was right.
+          // Order first: Auto, 1/4, 1/8, Triplet (1/12), 1/16, 1/32, Free. Triplet moved up
+          // between 1/8 and 1/16 because that is where it belongs by the only measure the list
+          // has — an eighth-note triplet cell is a twelfth of a 4/4 bar, finer than an eighth
+          // and coarser than a sixteenth — and it had been sitting after 1/32 as if it were the
+          // finest thing on offer.
           //
-          // THAT MEASUREMENT IS NO LONGER TRUE. The pipeline's 'free' is a 1:1 pass-through now:
-          // it never mutates its input and writes the simplest symbol that fits. Re-measured on
-          // the same fixtures (`scripts/roll-snap-test.ts` §8 keeps this honest):
+          // FREE IS STILL OFFERED FOR EVERYTHING, and that half of settings v10 stands. It used
+          // to be hidden from audio takes because the pipeline's 'free' engraved 64 played notes
+          // as 192 glyphs with 192 ties — a trap rather than a setting. The pipeline's 'free' is
+          // a 1:1 pass-through now (it never mutates its input and writes the simplest symbol
+          // that fits), re-measured on the same fixtures by `scripts/roll-snap-test.ts` §8:
           //
           //     straight riff — auto: 64 played -> 64 glyphs, 0 rests, 0 ties
           //                     free: 64 played -> 64 glyphs, 0 rests, 0 ties   (identical)
           //     triplet riff  — auto: 77 played -> 70 glyphs, 0 rests, 2 ties
           //                     free: 77 played -> 78 glyphs, 38 rests, 34 ties
           //
-          // Straight material is now indistinguishable from 'auto'. Triplet material is busier
-          // under 'free' — the rests are the real gaps between notes and the ties are held notes
-          // crossing a beat — but that is a page that is fussier than you played, which is what
-          // the tip tells you to reach for 'auto' about. It is not a trap any more, and a
-          // setting that is the DEFAULT cannot be one the player is unable to return to.
+          // What v10 got wrong was making it the DEFAULT. Straight material is indistinguishable
+          // either way, but triplet material comes out of 'free' with 38 rests and 34 ties on a
+          // page nobody asked to be that fussy, and the first thing most people ever see is a
+          // performance rather than a machine-exact import. 'auto' is the readable default and
+          // 'free' is the honest override, one press away and explained in the tip.
           .map((value) =>
             el('option', { value, text: `Quantize: ${GRID_LABELS[value]}`, selected: s.grid === value })
           )
@@ -7181,8 +7367,11 @@ class App {
             'data-setting': 'anchorFret',
             'aria-label': 'Anchor fret',
             value: String(s.anchorFret),
-            onChange: (e: Event) =>
-              rebuild({ anchorFret: Math.max(0, Math.min(24, Math.round(Number((e.target as HTMLInputElement).value)) || 0)) })
+            onChange: (e: Event) => {
+              const box = e.target as HTMLInputElement;
+              const anchorFret = Math.max(0, Math.min(24, Math.round(Number(box.value)) || 0));
+              stepNumber(box, anchorFret, { anchorFret });
+            }
           })
         ),
       tabOn && s.tabMode !== 'custom' &&
@@ -7227,7 +7416,15 @@ class App {
             max: '12',
             'data-role': 'string-count',
             value: String(s.customTuningMidi.length),
-            onChange: (e: Event) => rebuild({ customTuningMidi: resizeTuning(s.customTuningMidi, Number((e.target as HTMLInputElement).value)) })
+            onChange: (e: Event) => {
+              const box = e.target as HTMLInputElement;
+              const customTuningMidi = resizeTuning(this.settings.get().customTuningMidi, Number(box.value));
+              stepNumber(box, customTuningMidi.length, { customTuningMidi });
+              // The one control on this bar whose text follows this number. Written in place
+              // rather than by re-rendering, for the reason in `stepNumber` above.
+              const tuningBox = this.root.querySelector<HTMLInputElement>('[data-role="custom-tuning"]');
+              if (tuningBox) tuningBox.value = tuningLabel(customTuningMidi);
+            }
           })
         ),
       // The capo, next to the tuning because it is the other half of the same fact: what the
@@ -7247,19 +7444,26 @@ class App {
             'data-setting': 'capo',
             'aria-label': 'Capo fret',
             value: String(s.capo),
-            onChange: (e: Event) =>
-              rebuild({ capo: Math.max(0, Math.min(12, Math.round(Number((e.target as HTMLInputElement).value)) || 0)) })
+            onChange: (e: Event) => {
+              const box = e.target as HTMLInputElement;
+              const capo = Math.max(0, Math.min(12, Math.round(Number(box.value)) || 0));
+              stepNumber(box, capo, { capo });
+            }
           })
         ),
       // The "Tuning low → high: E1 A1 D2 G2" row stood here. It said the right thing in the
       // wrong place: on the screen but never on the paper, once for a whole document, and as
       // prose you had to count against the lines. The letters are on the staff now, on every
       // system and in the PDF — see view/stringLetters.ts.
+      // The bar count on a blank score. Same disease as the number boxes above and the same
+      // cure (G10): each press used to re-render the screen, so the two buttons moved out from
+      // under the cursor as the "12 bars" label between them changed width. The label is written
+      // in place by `changeDocumentBars` now and the buttons stay exactly where they are.
       source?.documentBars !== undefined &&
         el('div', { class: 'document-bars' },
-          el('button', { text: '− Bar', title: 'Remove the last empty bar', onClick: () => this.changeDocumentBars(-1) }),
-          el('span', { text: `${source.documentBars} bars` }),
-          el('button', { text: '+ Bar', title: 'Add one bar', onClick: () => this.changeDocumentBars(1) })
+          el('button', { text: '− Bar', 'data-role': 'bar-minus', title: 'Remove the last empty bar', onClick: () => this.changeDocumentBars(-1) }),
+          el('span', { 'data-role': 'bar-count', text: `${source.documentBars} bars` }),
+          el('button', { text: '+ Bar', 'data-role': 'bar-plus', title: 'Add one bar', onClick: () => this.changeDocumentBars(1) })
         )
     );
   }
@@ -7300,7 +7504,9 @@ class App {
     this.runtime.set({ source: { ...source, documentBars: bars, durationSec } });
     if (this.audioRef) this.audioRef = { ...this.audioRef, durationSec };
     this.rebuildNotation({ keepEdits: true });
-    this.renderMain();
+    // In place, not a re-render — see the note on the buttons in `buildNotationToolbar` (G10).
+    const label = this.root.querySelector<HTMLElement>('[data-role="bar-count"]');
+    if (label) label.textContent = `${bars} bars`;
   }
 
   private renderMain(nameOverride?: string): void {
@@ -7338,15 +7544,15 @@ class App {
           {
             class: 'chip engine-chip',
             'data-role': 'engine-chip',
-            style: {
-              display:
-                this.engine && (this.engine.state === 'ready' || this.engine.state === 'starting') ? '' : 'none'
-            },
+            // Same test as `refreshEngineChip`, which is the point: the chip is built hidden on
+            // every render and only `engineProcessAlive()` may ever un-hide it (G17).
+            style: { display: this.engineProcessAlive() ? '' : 'none' },
             title: t(TIPS.engineChip),
             onClick: () => void this.stopEngine()
           },
-          el('span', { 'data-role': 'engine-text', text: 'Listener' }),
-          el('span', { class: 'chip-detail', text: '✕' })
+          // The "✕" that stood beside this went with the text change: the chip says "click to
+          // stop" in words now, and a glyph repeating it is width this row cannot spare.
+          el('span', { 'data-role': 'engine-text', text: 'Listener' })
         ),
       // "LISTEN AGAIN" IS NOT IN THIS HEADER ANY MORE.
       //
@@ -7428,6 +7634,28 @@ class App {
       hidden: !this.tunerSelection
     });
 
+    /**
+     * THE SAFETY NET FOR EVERY OTHER CONTROL ON THIS SCREEN (G10).
+     *
+     * The number boxes that were reported broken are fixed at the source — they no longer ask
+     * for a re-render at all (see `stepNumber` in `buildNotationToolbar`). This is the second
+     * line of defence, for every control that legitimately DOES cause one: a re-render replaces
+     * the element the keyboard is on, and a field that loses focus mid-edit is the same failure
+     * wearing different clothes. The role and the caret are noted before the swap and put back
+     * on whatever now answers to that role.
+     *
+     * Roles only. An element with no `data-role` cannot be identified across a rebuild, and
+     * guessing by position or by tag name would land the caret in a different control — worse
+     * than not restoring it.
+     */
+    const focused = document.activeElement as HTMLElement | null;
+    const focusRole =
+      focused && this.root.contains(focused) ? focused.getAttribute('data-role') : null;
+    const caret =
+      focusRole && focused instanceof HTMLInputElement && focused.type !== 'range'
+        ? { start: focused.selectionStart, end: focused.selectionEnd }
+        : null;
+
     replace(
       this.root,
       header,
@@ -7441,6 +7669,23 @@ class App {
       sheet,
       this.toastLayer()
     );
+
+    if (focusRole) {
+      const again = this.root.querySelector<HTMLElement>(`[data-role="${focusRole}"]`);
+      if (again && again !== document.activeElement) {
+        again.focus();
+        if (caret && again instanceof HTMLInputElement) {
+          // `setSelectionRange` throws on input types that have no text selection (number is
+          // one of them in some engines), and a caret is a nicety — never a reason to abort a
+          // render that has already happened.
+          try {
+            again.setSelectionRange(caret.start, caret.end);
+          } catch {
+            /* the control has no selectable text; the focus is the part that mattered */
+          }
+        }
+      }
+    }
 
     this.waveform?.destroy();
     this.waveform = null;
@@ -7465,14 +7710,26 @@ class App {
         onSelectionChange: (sel, commit) => {
           if (!sel) {
             this.closeTuner();
+            this.cutSelection = null;
             this.selection = null;
             this.waveform?.setSelection(null, null);
             this.selectNoteIds([], false);
+            this.refreshTakeEdits();
             return;
           }
           this.selection = { fromSec: sel.fromSec, toSec: sel.toSec };
           const ids = this.pianoRoll?.noteIdsInAudioRange(sel.fromSec, sel.toSec) ?? [];
           this.selectNoteIds(ids, false);
+          // IN CUT MODE THE TUNER STAYS SHUT (G8). It is calibrated on a tenth of a second —
+          // one steady pitch, one answer — and handing it eight seconds of a riff would make it
+          // group runs and hedge, which is the exact behaviour the drag gesture was removed for
+          // in v1.2. The span is a span; the notes under it still light up, which is the part
+          // that tells you what you are about to remove.
+          if (this.cutArmed) {
+            this.cutSelection = { fromSec: sel.fromSec, toSec: sel.toSec };
+            this.refreshTakeEdits();
+            return;
+          }
           if (!commit) return;
           this.openTuner(sel.fromSec, sel.toSec);
         }
@@ -7487,6 +7744,10 @@ class App {
       // diagnostic overlay would be a lot of arithmetic in service of a picture that is only
       // ever an explanation of what the engine heard. Better nothing than a curve drawn half a
       // second away from the sound it is describing.
+      // The strip is CONSTRUCTED FRESH on every render, so a mode it was left in is the app's
+      // to restate — otherwise arming Cut and then touching anything that re-renders would put
+      // the gesture back to click-to-probe under a chip still saying it was armed (G8).
+      this.waveform.setSelectArmed(this.cutArmed);
       this.waveform.setOnsets(this.cuts().length ? null : this.onsetResult);
       this.waveform.setBarOne(shown.barOneSec);
       // Written second 0 on the recording's clock. The strip's peaks speak recording seconds and
@@ -7581,7 +7842,7 @@ class App {
         // absolute guess instead of tracking the notch the player just turned.
         onTimeWindowChange: (win, commit) => {
           this.waveform?.setTimeAnchors(timeWindowAnchors(win));
-          if (!this.settings.get().alignViews || !commit) return;
+          if (!commit) return;
           const tv = this.triview;
           if (!tv) return;
           const prev = this.alignedWindow;
@@ -7999,20 +8260,32 @@ class App {
         'aria-readonly': String(!manual),
         title: t(manual ? TIPS.bpm : TIPS.tempoSource),
         'aria-label': `Tempo in ${unit.name}s per minute`,
+        // NO `renderMain()` HERE, AND THAT IS THE STEPPER FIX (G10) — see `stepNumber` in
+        // `buildNotationToolbar` for the whole diagnosis. A spinner click fires `change`, and a
+        // handler that replaces the screen destroys the box being clicked: focus dies on the
+        // first press and the arrow slides out from under the cursor on the second.
+        //
+        // Nothing in this row needs rebuilding for a tempo. `rebuildNotation()` re-engraves,
+        // and `refreshTempoBox()` — which it reaches through `applyScoreToViews` — writes the
+        // number and its beat-unit glyph back in place, skipping the box while it has focus so
+        // it cannot fight the player's own typing. The out-of-range case restores the applied
+        // value itself, because there is no re-render left to do it.
         onChange: (e: Event) => {
+          const box = e.target as HTMLInputElement;
           if (!manual) return;
-          const v = Number((e.target as HTMLInputElement).value);
-          if (v >= 20 && v <= 400) {
-            const source = this.runtime.get().source;
-            // Back into quarter-notes per minute, which is the ONLY unit `tempoBpm` is ever
-            // in. See `displayedBpm()` for why the box is not always in that unit.
-            const quarters =
-              v / beatUnit(this.runtime.get().score?.timeSignature ?? source?.timeSignature).perQuarter;
-            if (source) this.runtime.set({ source: { ...source, tempoBpm: quarters } });
-            this.releaseHostGrid('tempo');
-            this.rebuildNotation();
-            this.renderMain();
+          const v = Number(box.value);
+          if (!(v >= 20 && v <= 400)) {
+            box.value = String(this.displayedBpm());
+            return;
           }
+          const source = this.runtime.get().source;
+          // Back into quarter-notes per minute, which is the ONLY unit `tempoBpm` is ever
+          // in. See `displayedBpm()` for why the box is not always in that unit.
+          const quarters =
+            v / beatUnit(this.runtime.get().score?.timeSignature ?? source?.timeSignature).perQuarter;
+          if (source) this.runtime.set({ source: { ...source, tempoBpm: quarters } });
+          this.releaseHostGrid('tempo');
+          this.rebuildNotation();
         }
       }),
       // THE UNIT, next to the number. "120" on its own is ambiguous the moment the sheet is
@@ -8065,19 +8338,24 @@ class App {
         grid &&
         el('span', { class: 'dim tempo-detail', 'data-role': 'tempo-detail', text: describeHostGrid(grid) }),
       mode === 'recording' &&
-        el('span', { class: 'dim tempo-detail', 'data-role': 'tempo-detail', text: 'heard in your playing' }),
-      // RE-DETECT, and only where it means anything. It throws away the per-take tempo and
-      // meter and rebuilds from the detection, which is what "measure it again" is once the
-      // beats are already on disk — it never re-runs the listening engine (that is Start over,
-      // in the Main menu, and it costs minutes rather than milliseconds).
-      mode === 'recording' &&
-        el('button', {
-          class: 'chip',
-          'data-role': 'tempo-redetect',
-          text: 'Re-detect',
-          title: t(TIPS.tempoRedetect),
-          onClick: () => this.setTempoSource('recording')
-        })
+        el('span', { class: 'dim tempo-detail', 'data-role': 'tempo-detail', text: 'heard in your playing' })
+      // "RE-DETECT" IS DELETED (G12), and nothing has been lost with it.
+      //
+      // It was a chip that called `setTempoSource('recording')` — the same call selecting "From
+      // recording" already makes. What that call does is drop the per-take tempo and meter and
+      // rebuild, so the pipeline measures the beats again; it never re-ran the listening engine
+      // (that is "Start over" in the Main menu, and it costs minutes rather than milliseconds).
+      //
+      // In this mode there are no per-take overrides BY DEFINITION — `tempoSourceMode()` reads
+      // 'recording' exactly when `source.tempoBpm` is undefined — so the button's only remaining
+      // effect was to force a rebuild that every take edit already forces. Trimming silence,
+      // cutting a span and editing a note all funnel through `setPerformance()`, which calls
+      // `rebuildNotation()`; dragging the bar-1 marker goes through `onBarOneChange()`, which
+      // calls the debounced one. Each of those re-derives the tempo and the meter from the
+      // EDITED take, and the memo that could have served a stale answer (`snapBasis`) keys on
+      // the notes array by identity plus `barOneSec` and `durationSec`, all three of which those
+      // edits replace. So detection follows the take on its own, which is what the button was
+      // being pressed to ask for.
     );
   }
 
@@ -8976,9 +9254,34 @@ class App {
       );
     }
 
-    // A span dragged on the strip is already the tuner's window; it is also the thing "Cut out"
-    // acts on, so the button appears with the selection rather than needing a mode.
-    const picked = this.tunerSelection;
+    /*
+     * CUT (G8). The chip that ARMS the gesture, and then the button that performs it.
+     *
+     * "The button appears with the selection rather than needing a mode" is what stood here,
+     * and it was true of a strip that could only make one kind of selection: the tuner's 0.1s
+     * probe window. So the button appeared on every click of the waveform offering to remove a
+     * tenth of a second, and there was no gesture anywhere in the app that could ask for more.
+     * That is the reported fault, and a mode is the honest fix — the strip's press has to mean
+     * either "what is at this moment" or "from here to there", and nothing about a press says
+     * which.
+     *
+     * Two clicks to a cut and no more: arm, drag, cut. Arming is free and reversible, and the
+     * chip stays lit so the changed meaning of the strip is visible rather than remembered.
+     */
+    if (this.runtime.get().source?.peaks) {
+      children.push(
+        el('button', {
+          class: `chip take-cut-arm${this.cutArmed ? ' on' : ''}`,
+          'data-role': 'cut-arm',
+          'aria-pressed': String(this.cutArmed),
+          text: this.cutArmed ? '✂ Drag on the recording' : '✂ Cut',
+          title: t(TIPS.cutArm),
+          onClick: () => this.setCutArmed(!this.cutArmed)
+        })
+      );
+    }
+
+    const picked = this.cutArmed ? this.cutSelection : this.tunerSelection;
     if (picked && picked.toSec - picked.fromSec >= MIN_CUT_SEC) {
       children.push(
         el('button', {
@@ -9027,13 +9330,40 @@ class App {
    */
   private cutOutSelection(): void {
     const source = this.runtime.get().source;
-    const picked = this.tunerSelection;
+    // The armed span if there is one, otherwise the tuner's window — which is still a legal
+    // thing to cut, it is simply never more than `PROBE_WINDOW_SEC` long (G8).
+    const picked = this.cutArmed ? this.cutSelection : this.tunerSelection;
     if (!source || !picked) return;
     const next = addCut(this.cuts(), picked, source.durationSec);
     if (next.length === this.cuts().length && cutTotalSec(next) <= cutTotalSec(this.cuts())) return;
     this.closeTuner();
     this.selectNoteIds([]);
+    // Disarmed on the way out, so the strip goes back to answering "what is at this moment" —
+    // a mode that outlives the edit it was armed for is a mode somebody gets stuck in. The span
+    // is cleared with it: the seconds it named have just stopped existing.
+    this.setCutArmed(false);
     this.commitTakeCuts(next, 'Cut out');
+  }
+
+  /**
+   * Arm or disarm the strip's span gesture (G8).
+   *
+   * One writer, because three things have to move together: the strip's own gesture, the
+   * remembered span, and the chip that says which mode you are in. Disarming clears the span
+   * rather than leaving it — an unarmed strip cannot show you where it is or let you adjust it,
+   * so a "Cut out 8.2s" button over a span nobody can see is an offer you cannot check.
+   */
+  private setCutArmed(on: boolean): void {
+    if (this.cutArmed === on) return;
+    this.cutArmed = on;
+    if (!on) {
+      this.cutSelection = null;
+      this.selection = null;
+      this.waveform?.setSelection(null, null);
+      this.selectNoteIds([], false);
+    }
+    this.waveform?.setSelectArmed(on);
+    this.refreshTakeEdits();
   }
 
   /**
@@ -10036,13 +10366,25 @@ const GRID_LABELS: Record<AppSettings['grid'], string> = {
   free: 'Free'
 };
 
-/** The roll's ruler has no 'auto': a cell has to be a stated size to draw a note into. */
+/**
+ * The roll's ruler has no 'auto': a cell has to be a stated size to draw a note into.
+ *
+ * 'Triplet (1/12)' carries its fineness in the label for the same reason the Quantize menu's
+ * does — the one thing somebody comparing it against 1/8 and 1/16 needs to know is where it
+ * sits between them, and the order of the list says the same thing twice.
+ *
+ * 'Off' is not 'free' spelled differently. 'Free' draws the beat subdivisions and refuses to
+ * snap to them; 'Off' draws NO subdivision lines at all and leaves the bar lines, which is
+ * what somebody reading the shape of a take rather than editing it is asking for.
+ */
 const ROLL_GRID_LABELS: Record<AppSettings['rollGrid'], string> = {
   quarter: '1/4',
   eighth: '1/8',
+  triplet: 'Triplet (1/12)',
   sixteenth: '1/16',
-  triplet: 'Triplet',
-  free: 'Free'
+  thirtysecond: '1/32',
+  free: 'Free',
+  off: 'Off'
 };
 
 /**
@@ -10189,6 +10531,31 @@ function hashString(text: string): string {
   let h = 5381;
   for (let i = 0; i < text.length; i++) h = ((h << 5) + h + text.charCodeAt(i)) | 0;
   return (h >>> 0).toString(16);
+}
+
+/**
+ * Keep both ends of a name and lose the middle (G1).
+ *
+ * A filename identifies itself at BOTH ends — "Bass take 3 — bridge idea (final).wav" is a
+ * subject at the front and a version plus an extension at the back — and CSS's own truncation
+ * only ever cuts the tail, which is the end that says which of five near-identical takes this
+ * is. Two files whose names agree for the first thirty characters became the same row.
+ *
+ * The split is deliberately uneven: two thirds to the front, one third to the back. The front
+ * carries the subject and the back only needs to reach past the extension to the version, so an
+ * even split would spend characters on the half that needs fewer of them.
+ *
+ * Counted in UTF-16 code units, like everything else in this file. A name made of astral
+ * characters could in principle be cut through a surrogate pair; the cost is one replacement
+ * glyph in a label whose full text is in the tooltip either way, and the alternative is an
+ * Intl.Segmenter walk on every keystroke of a list that redraws on every menu open.
+ */
+function middleTruncate(name: string, max: number): string {
+  if (name.length <= max) return name;
+  // The ellipsis is one of the `max` characters, so the two halves share what is left.
+  const keep = max - 1;
+  const head = Math.ceil((keep * 2) / 3);
+  return `${name.slice(0, head)}…${name.slice(name.length - (keep - head))}`;
 }
 
 function relativeTime(at: number): string {

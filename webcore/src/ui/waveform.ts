@@ -6,11 +6,11 @@
  * audio to interrogate.
  *
  * ===========================================================================================
- * 1. WHY THERE IS NO DRAG-OUT-A-RANGE GESTURE ANY MORE
+ * 1. WHY A CLICK IS A MOMENT, AND WHEN A DRAG IS A SPAN
  * ===========================================================================================
  * Up to v1.2 the way into the tuner was to drag a stretch of recording out of this strip. That
- * is gone, on the owner's decision, and the reasoning is worth keeping because it will look
- * like a lost feature otherwise:
+ * is gone as the DEFAULT gesture, on the owner's decision, and the reasoning is worth keeping
+ * because it will look like a lost feature otherwise:
  *
  *   A dragged region can contain many notes, and "what pitch is in these four seconds" has no
  *   good answer — the tuner had to group runs, pick a headline and hedge. "What is at THIS
@@ -21,21 +21,37 @@
  * waveform still does that, because you are pointing at the RECORDING and not at a notehead.
  * That is the whole feature; the drag was only ever the delivery mechanism.
  *
- * So a click now emits one committed selection of a FIXED width, `PROBE_WINDOW_SEC`, centred
- * on the moment you clicked. `onSelectionChange(sel, commit)` is unchanged as an outward
- * contract, so the integrator's wiring and the tuner keep working untouched: the strip simply
- * never emits anything but that one width.
+ * So a click emits one committed selection of a FIXED width, `PROBE_WINDOW_SEC`, centred on
+ * the moment you clicked. `onSelectionChange(sel, commit)` is unchanged as an outward
+ * contract, so the integrator's wiring and the tuner keep working untouched.
  *
- * WHY 0.2 SECONDS, measured against `audio/pitch.ts` rather than guessed:
+ * THE WIDTH IS 0.1 SECONDS. This paragraph said 0.2 for a while after the constant was
+ * lowered, which is worth naming rather than quietly correcting: 0.2 was derived, 0.1 was
+ * chosen, and the derivation is what makes the number arguable at all. Against `audio/pitch.ts`:
  *   - the detector's analysis frame is two periods of the lowest note it will look for
  *     (27.5 Hz), i.e. ~73 ms. Under that there is no frame at all.
  *   - `detectPitchTrack`'s default hop is 50 ms, and `ui/tuner.ts` requires `MIN_RUN_FRAMES`
  *     = 2 frames to agree before it will call something a note rather than a transient.
- *   - 0.2 s gives floor((0.200 - 0.073) / 0.05) + 1 = 3 frames. One more than the minimum, so
- *     a steady note survives the run filter with a frame to spare.
- *   - and 0.2 s is shorter than an eighth note at 120 BPM (0.25 s), so it does not straddle
- *     two notes at any tempo a bass player is likely to be at.
- * It is ONE constant. Tuning this feature means changing that number and nothing else.
+ *   - 0.2 s gives floor((0.200 - 0.073) / 0.05) + 1 = 3 frames, one more than the minimum.
+ *   - 0.1 s gives 1 frame by that arithmetic, and it is what ships. The HIGHLIGHT is what this
+ *     constant sizes; the tuner may inspect a wider hidden window around it, and the reason for
+ *     the change was that a 0.2 s band drawn on the strip implies you selected a fifth of a
+ *     second when you were pointing at one transient.
+ * It is ONE constant. Tuning the highlight means changing that number and nothing else.
+ *
+ * ===========================================================================================
+ * 1b. AND THE DRAG IS BACK, BEHIND A MODE (G8)
+ * ===========================================================================================
+ * The argument above is an argument about the TUNER. Cutting a stretch out of a take is a
+ * different question with a perfectly good answer, and with only the probe window to work from
+ * the "Cut out" button under this strip could offer to remove one tenth of one second and
+ * nothing else. That was the whole of the reported fault.
+ *
+ * `setSelectArmed(true)` — driven by the Cut chip under the strip, never by this file — puts a
+ * press-and-drag back on the body: sweep out a span, grab either edge to adjust it, and the
+ * same `onSelectionChange(sel, commit)` carries it. Unarmed, nothing about this file's
+ * behaviour has changed by a pixel, which is the point of the mode: the tuner's gesture cannot
+ * be made ambiguous by a feature it has nothing to do with.
  *
  * ===========================================================================================
  * 2. ONE AXIS: LINEAR RECORDING TIME, FOR EVERYBODY
@@ -224,10 +240,19 @@ export interface WaveformOptions {
 /**
  * Which gesture has the pointer. Null means none is in flight.
  *
- * Two, where there were five. `select`, `select-from` and `select-to` went with the drag —
- * a click needs no gesture state, only `pressing` below.
+ * `select` is back (G8), and it is back BEHIND A MODE rather than as the strip's default
+ * gesture. The reasoning that removed it in v1.2 stands for the TUNER — "what pitch is in
+ * these four seconds" has no good answer, "what is at this moment" has exactly one — but
+ * cutting a stretch out of a take is a different question, and there was no way to ask it: the
+ * only selection the strip could produce was the 0.1s probe window, so "Cut out" offered to
+ * remove a tenth of a second and nothing else. That is the reported bug.
+ *
+ * One gesture, two meanings, told apart by `selectArmed` and never by guessing: unarmed, a
+ * press is a click and paints the probe window exactly as before; armed, a press-and-drag
+ * sweeps out a span. `select-from`/`select-to` are NOT back — an edge grab is this same kind
+ * with the opposite edge pinned as the anchor, which is one state instead of three.
  */
-type DragKind = 'marker' | 'viewport';
+type DragKind = 'marker' | 'viewport' | 'select';
 
 export class WaveformStrip {
   private canvas: HTMLCanvasElement;
@@ -256,6 +281,20 @@ export class WaveformStrip {
   private selectionFromSec: number | null = null;
   private selectionToSec: number | null = null;
   private dragging: DragKind | null = null;
+  /**
+   * Is the strip in span-selecting mode? (G8)
+   *
+   * False by default and false for every caller that never asks, so the strip a player meets
+   * is the click-to-probe strip the tuner is built on. The app arms it from the Cut chip under
+   * the strip; see `setSelectArmed`.
+   */
+  private selectArmed = false;
+  /**
+   * The end of a span drag that is NOT moving: the second the drag started from, or — when an
+   * edge handle was grabbed — the OPPOSITE edge of the existing span. One field, because a
+   * drag has exactly one fixed end however it began.
+   */
+  private dragAnchorSec = 0;
   /** A body press waiting for its release, which is what commits the probe window. */
   private pressing = false;
   /** Where the pointer went down, so a press that never moved can still be a plain click. */
@@ -279,7 +318,7 @@ export class WaveformStrip {
     line: '#2e3340',
     wave: '#3a4150',
     waveDim: '#282d38',
-    played: '#e8734a',
+    played: '#8b5cf6',
     playhead: '#ffffff',
     marker: '#e8b34a',
     viewport: '#9aa0ab',
@@ -323,6 +362,14 @@ export class WaveformStrip {
   // should not imply that a fifth of a second was selected when the user clicked
   // a precise transient.
   private static PROBE_WINDOW_SEC = 0.1;
+  /**
+   * How close to a span's edge counts as taking hold of it (G8).
+   *
+   * Deliberately smaller than `MARKER_HIT_PX`: the bar-1 flag is a thin line somebody has to
+   * find, while a span's edges bound a filled band that is itself a target, so a generous slop
+   * here would steal presses meant for "start a new span in the middle of this one".
+   */
+  private static SELECT_EDGE_HIT_PX = 5;
   /**
    * The whole-take overview ribbon along the top, present ONLY while the body is engraved.
    *
@@ -891,6 +938,40 @@ export class WaveformStrip {
       return;
     }
 
+    // ARMED: sweep out a span (G8). Nothing below this branch runs, which is what keeps the
+    // probe window and the span from ever being emitted by the same press.
+    if (this.selectArmed) {
+      // AN EDGE FIRST, because the alternative — starting a fresh span from a point one pixel
+      // inside the old one — is what makes a selection feel un-adjustable. The anchor becomes
+      // the OPPOSITE edge, so dragging the left handle past the right one simply turns the span
+      // around rather than collapsing it.
+      const box = this.selectionBox(m);
+      if (box) {
+        const slop = WaveformStrip.SELECT_EDGE_HIT_PX;
+        if (Math.abs(x - box.fromX) <= slop) {
+          this.dragAnchorSec = box.toSec;
+          this.dragging = 'select';
+          this.capture(e.pointerId);
+          return;
+        }
+        if (Math.abs(x - box.toX) <= slop) {
+          this.dragAnchorSec = box.fromSec;
+          this.dragging = 'select';
+          this.capture(e.pointerId);
+          return;
+        }
+      }
+      this.dragAnchorSec = sec;
+      this.dragging = 'select';
+      // The seek still happens, because knowing where you have grabbed is worth as much here
+      // as anywhere. What does NOT happen is the probe window: in this mode a press is the
+      // start of a span, and painting a 0.1s band under it would be the app answering a
+      // question nobody asked.
+      this.opts.onSeek(sec);
+      this.capture(e.pointerId);
+      return;
+    }
+
     // See section 6: this does not wait for release.
     this.pressing = true;
     this.opts.onSeek(sec);
@@ -958,6 +1039,44 @@ export class WaveformStrip {
    * silently changing the width the whole feature is calibrated on is how a constant stops
    * meaning anything.
    */
+  /**
+   * Turn span-selecting on or off (G8).
+   *
+   * Public because the control that arms it is not in this file: it lives under the strip with
+   * the other take edits, where "Cut out 3.4s" appears, because arming a destructive gesture
+   * belongs beside the destructive button and not on the canvas it changes the meaning of.
+   *
+   * Disarming does NOT clear the span. The normal sequence is arm, drag, press "Cut out", and
+   * the app disarms on the way into the cut — throwing the span away at that moment would
+   * discard the thing being cut.
+   */
+  setSelectArmed(on: boolean): void {
+    if (this.selectArmed === on) return;
+    this.selectArmed = on;
+    this.canvas.style.cursor = on ? 'crosshair' : 'default';
+    this.draw();
+  }
+
+  /** True while a span drag is the strip's gesture. Reported by `probe()` for the checks. */
+  isSelectArmed(): boolean {
+    return this.selectArmed;
+  }
+
+  /**
+   * The span under the pointer, as a selection, clamped to the take and ordered.
+   *
+   * Shared by the move handler and the edge grab so a span dragged left-to-right and one
+   * dragged right-to-left cannot come out as different shapes.
+   */
+  private emitSpan(sec: number, commit: boolean): void {
+    const lo = Math.max(0, Math.min(this.dragAnchorSec, sec));
+    const hi = Math.min(this.durationSec, Math.max(this.dragAnchorSec, sec));
+    this.selectionFromSec = lo;
+    this.selectionToSec = hi;
+    this.opts.onSelectionChange?.({ fromSec: lo, toSec: hi }, commit);
+    this.draw();
+  }
+
   private setProbeWindow(sec: number, commit: boolean): void {
     // No recording, no question to ask. Emitting a zero-width window here would open the tuner
     // on nothing and have it report "too short", which is a worse answer than silence.
@@ -995,6 +1114,17 @@ export class WaveformStrip {
       return;
     }
 
+    if (this.dragging === 'select') {
+      if (!this.pressMoved && Math.abs(x - this.pressX) < WaveformStrip.DRAG_SLOP_PX) return;
+      const sec = this.secAt(x);
+      if (!Number.isFinite(sec)) return;
+      this.pressMoved = true;
+      // Live, uncommitted: the band follows the finger and the notes under it light up, and
+      // nothing expensive runs until the release.
+      this.emitSpan(sec, false);
+      return;
+    }
+
     if (this.dragging === 'viewport') {
       if (!this.pressMoved && Math.abs(x - this.pressX) < WaveformStrip.DRAG_SLOP_PX) return;
       this.pressMoved = true;
@@ -1018,6 +1148,19 @@ export class WaveformStrip {
       return this.opts.onViewportScrub ? 'grab' : 'default';
     }
     if (this.overMarker(x, m)) return 'ew-resize';
+    if (this.selectArmed) {
+      // The two edges of an existing span are handles, and the cursor is the only thing that
+      // says so — the band has no drawn grips (see `drawSelection`).
+      const box = this.selectionBox(m);
+      if (
+        box &&
+        (Math.abs(x - box.fromX) <= WaveformStrip.SELECT_EDGE_HIT_PX ||
+          Math.abs(x - box.toX) <= WaveformStrip.SELECT_EDGE_HIT_PX)
+      ) {
+        return 'ew-resize';
+      }
+      return 'crosshair';
+    }
     // Crosshair rather than pointer, because the body's gesture is "aim at a moment and ask
     // what is in it", and the answer is only as precise as the aim.
     return this.opts.onSelectionChange ? 'crosshair' : 'pointer';
@@ -1046,6 +1189,30 @@ export class WaveformStrip {
       }
       // Commit: this is what re-runs the notation build (never the transcription).
       this.opts.onBarOneChange(this.barOneSec, true);
+      return;
+    }
+
+    if (was === 'select') {
+      this.canvas.style.cursor = 'crosshair';
+      if (!this.pressMoved) {
+        // Armed, pressed, released without moving. That is "start again here", so the old span
+        // goes: leaving it would make the next press look like it had done nothing, and
+        // falling back to the 0.1s probe window would put the app straight back into the bug
+        // this mode exists to fix — a Cut button offering to remove a tenth of a second.
+        if (this.selectionFromSec !== null || this.selectionToSec !== null) {
+          this.selectionFromSec = null;
+          this.selectionToSec = null;
+          this.opts.onSelectionChange?.(null, true);
+          this.draw();
+        }
+        return;
+      }
+      const rect = this.canvas.getBoundingClientRect();
+      const sec = this.secAt(e.clientX - rect.left);
+      // The release lands where the finger is, not where the press was: the last live frame
+      // may be a whole pointer-move behind, and a span that shrinks on release feels like a
+      // dropped edit.
+      this.emitSpan(Number.isFinite(sec) ? sec : this.selectionToSec ?? this.dragAnchorSec, true);
       return;
     }
 
@@ -1149,7 +1316,7 @@ export class WaveformStrip {
       ctx.closePath();
       ctx.fill();
       if (flagH >= 8) {
-        ctx.fillStyle = '#1a1005';
+        ctx.fillStyle = '#150c26';
         ctx.font = '700 7px ui-monospace, Menlo, monospace';
         ctx.fillText('1', mx + 2.5, top + flagH - 3.5);
       }
@@ -1420,6 +1587,15 @@ export class WaveformStrip {
    * There is no rail to grab any more: with the drag-out-a-range gesture gone there is no
    * fourth gesture to disambiguate, and a click outside the bracket already means "bring the
    * sheet here" — one action instead of a small target to find and slide.
+   *
+   * AND NO EDGES EITHER (G16a). Two full-height 1px rails were drawn at `fromX` and `toX`, and
+   * they are the "vertical lines in the waveform" the player reported: they look exactly like
+   * bar lines or like cut seams, they move whenever the sheet is scrolled, and they mean
+   * something no other line in this strip means. The dim wash on either side says the same
+   * thing without competing with the envelope — it is the one mark here that cannot be
+   * mistaken for a musical one, because it is an absence of brightness rather than a stroke.
+   * The overview ribbon keeps its own bracket, rails and all: up there the rails ARE the
+   * control you grab.
    */
   private drawBodyBracket(
     ctx: CanvasRenderingContext2D,
@@ -1436,13 +1612,6 @@ export class WaveformStrip {
     ctx.fillStyle = this.colors.bg;
     if (b.fromX > g) ctx.fillRect(g, top, b.fromX - g, h - top);
     if (b.toX < w) ctx.fillRect(b.toX, top, w - b.toX, h - top);
-    ctx.restore();
-
-    ctx.save();
-    ctx.globalAlpha = 0.75;
-    ctx.fillStyle = this.colors.viewport;
-    ctx.fillRect(b.fromX, top, 1, h - top);
-    ctx.fillRect(b.toX - 1, top, 1, h - top);
     ctx.restore();
   }
 
@@ -1532,6 +1701,8 @@ export class WaveformStrip {
     selectionToX: number | null;
     /** True when a listener is wired; false means probing is off. */
     selectable: boolean;
+    /** True while the body's press means "sweep out a span" rather than "probe this moment". */
+    selectArmed: boolean;
     dragging: DragKind | null;
     /**
      * Stretches the auto-edit pass marked, and how many of those were real edits.
@@ -1561,6 +1732,7 @@ export class WaveformStrip {
       midPlotSec: Number(this.evenXToSec(this.gutterPx + this.plotWidth / 2).toFixed(4)),
       scoreOriginSec: Number(this.scoreOriginSec.toFixed(3)),
       probeWindowSec: WaveformStrip.PROBE_WINDOW_SEC,
+      selectArmed: this.selectArmed,
       durationSec: Number(this.durationSec.toFixed(3)),
       barOneSec: Number(this.barOneSec.toFixed(3)),
       positionSec: Number(this.positionSec.toFixed(3)),

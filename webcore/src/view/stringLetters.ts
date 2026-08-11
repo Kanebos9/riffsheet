@@ -89,10 +89,23 @@ export function stringLettersFromBounds(
 
     // `visualBounds` spans the outermost tab lines, so N strings give N-1 gaps between them.
     const step = tab.h / (strings - 1);
-    // `columnX` is the caller's column — the right end of the clef/key/meter prefix, so the
-    // letters land in the same x-column the time signature is printed in (F8). Without one the
-    // old behaviour stands: right-aligned in the reserved page padding, just left of the staff.
-    const rightX = columnX !== null && Number.isFinite(columnX) ? columnX : tab.x - gapPx;
+    // WHERE THE COLUMN IS, and it is now the MIDDLE of the two places it has been (G18).
+    //
+    // `columnX` is the caller's column: the right end of the clef/key/meter prefix, i.e. a hair
+    // left of the first notehead. That was the fix for the letters being marooned out in the
+    // page padding, and it overshot — hard against the first beat they read as a label ON the
+    // music rather than as the staff's legend, and at a tight zoom they crowd the meter.
+    //
+    // The staff's own left edge (`tab.x - gapPx`) is the other end of that argument and it is
+    // where they used to be. Neither is right; the midpoint is: clear of the clef and meter,
+    // clear of the first note, in the band of white a tab book leaves for exactly this.
+    // Deliberately arithmetic on the two measured x's rather than a new constant, so it cannot
+    // drift out of range at a zoom nobody tried.
+    const staffEdgeX = tab.x - gapPx;
+    const rightX =
+      columnX !== null && Number.isFinite(columnX)
+        ? (staffEdgeX + columnX) / 2
+        : staffEdgeX;
     for (let line = 0; line < strings; line++) {
       const stringIndex = strings - 1 - line; // top line is the thinnest string
       out.push({

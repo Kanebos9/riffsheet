@@ -9,7 +9,7 @@
  *  2. #41 — Snap to grid is REVERSIBLE. Switching it off restores the recording exactly, and
  *     re-deriving at a different size measures from the recording rather than from the last
  *     snap, so a round trip through three grid sizes lands back on the original numbers.
- *  3. Settings v10 — 'free' becomes the default once, for everybody, and never again.
+ *  3. Settings v11 — the Quantize default goes back to 'auto', once, and never again.
  *
  * Everything under test is a pure function or a pure migration, which is why this runs in node
  * with no DOM. The one part it cannot reach is the wiring inside `ui/app.ts`; that is what
@@ -42,12 +42,15 @@ const fingerprint = (notes: ReadonlyArray<InputNote>): string =>
 assert(rollSnapUnitSec('quarter', 120) === 0.5, 'quarter at 120bpm is half a second');
 assert(rollSnapUnitSec('eighth', 120) === 0.25, 'eighth at 120bpm is a quarter second');
 assert(rollSnapUnitSec('sixteenth', 120) === 0.125, 'sixteenth at 120bpm is an eighth second');
+assert(rollSnapUnitSec('thirtysecond', 120) === 0.0625, '1/32 at 120bpm is a sixteenth of a second');
 assert(Math.abs(rollSnapUnitSec('triplet', 120) - 1 / 6) < 1e-12, 'triplet at 120bpm is a sixth of a second');
-// 'free' is the one that must return 0, because 0 is what every caller reads as "do not snap".
+// The two that must return 0, because 0 is what every caller reads as "do not snap". 'free'
+// draws the subdivisions and refuses to snap to them; 'off' draws no subdivision at all (G14).
 assert(rollSnapUnitSec('free', 120) === 0, "'free' must report no unit at all");
+assert(rollSnapUnitSec('off', 120) === 0, "'off' must report no unit at all");
 
 // ---------------------------------------------------------------------------
-// 2. Snap moves starts, keeps lengths, and never touches its input
+// 2. Snap moves BOTH ENDS onto the grid, and never touches its input
 // ---------------------------------------------------------------------------
 
 // Deliberately human timing: every note is a few milliseconds off the grid, one of them late
@@ -77,11 +80,31 @@ for (const note of snapped) {
   const offGrid = Math.abs((note.startSec - originSec) / 0.25 - Math.round((note.startSec - originSec) / 0.25));
   assert(offGrid < 1e-9, `snapped note ${note.id} must start on a grid line`);
 }
+// BOTH ENDS (G9). The first version of this function moved the start and carried the played
+// length over, which left every note ending a few tens of milliseconds past a line — grid-true
+// starts and ragged right edges, under a switch whose whole promise is that things line up. The
+// end is on a line now, and a note can never come out shorter than one cell.
 for (const before of raw) {
   const after = snapped.find((n) => n.id === before.id)!;
-  const lenBefore = before.endSec - before.startSec;
-  const lenAfter = after.endSec - after.startSec;
-  assert(Math.abs(lenBefore - lenAfter) < 1e-9, `note ${before.id} must keep its length through a snap`);
+  const offGrid = Math.abs((after.endSec - originSec) / 0.25 - Math.round((after.endSec - originSec) / 0.25));
+  assert(offGrid < 1e-9, `snapped note ${before.id} must END on a grid line`);
+  assert(
+    after.endSec - after.startSec >= 0.25 - 1e-9,
+    `snapped note ${before.id} must be at least one whole cell long`
+  );
+}
+// The floor, exercised rather than merely asserted about. n1 was played 1.15 -> 1.37: both ends
+// round to the same 1.25 line, so without the floor it would come out as a note of no length at
+// all. It is widened to one cell instead.
+{
+  const n1 = snapped.find((n) => n.id === 'n1')!;
+  assert(Math.abs(n1.startSec - 1.25) < 1e-9 && Math.abs(n1.endSec - 1.5) < 1e-9, 'n1 is floored to one cell');
+}
+// And a note whose two ends round to DIFFERENT lines keeps the number of cells it rounded to,
+// rather than being flattened to the minimum: n2 was played 1.49 -> 2.1 and comes out 1.5 -> 2.0.
+{
+  const n2 = snapped.find((n) => n.id === 'n2')!;
+  assert(Math.abs(n2.startSec - 1.5) < 1e-9 && Math.abs(n2.endSec - 2.0) < 1e-9, 'n2 keeps its two cells');
 }
 // The grid lines are measured from the ORIGIN, not from the top of the file: with a 1s count-in
 // and a 0.25s unit, 1.02 belongs on 1.00 and not on 1.25.
@@ -181,39 +204,64 @@ assert(fingerprint(raw) === rawBefore, 'building at four grids must leave the pe
 // 7. Settings v10
 // ---------------------------------------------------------------------------
 
-assert(SETTINGS_VERSION === 10, 'this test is written against settings v10');
-assert(DEFAULT_SETTINGS.grid === 'free', "a new user's Quantize default is Free");
+assert(SETTINGS_VERSION === 11, 'this test is written against settings v11');
+assert(DEFAULT_SETTINGS.grid === 'auto', "a new user's Quantize default is Auto again");
 assert(DEFAULT_SETTINGS.rollSnapToGrid === false, 'Snap to grid is off until asked for');
+assert(DEFAULT_SETTINGS.alignViews === true, 'alignment is on and is not a choice');
 
-// The v8 -> v9 -> v10 chain, in one hop, which is how a real blob arrives.
+// The v8 -> … -> v11 chain, in one hop, which is how a real blob arrives. v10 moves this blob's
+// 'auto' to 'free' and v11 moves it straight back, which is exactly right: it was the DEFAULT
+// both times and the player never touched the menu.
 const fromV8 = mergeStoredSettings({
   settingsVersion: 8,
   grid: 'auto',
   rollAllNoteNames: false,
   rollEditing: false,
-  preciseBeats: true
+  preciseBeats: true,
+  alignViews: false
 } as Partial<AppSettings>);
-assert(fromV8.grid === 'free', 'a v8 blob is moved to Free');
+assert(fromV8.grid === 'auto', 'a v8 blob lands on Auto after the v10/v11 pair');
 assert(fromV8.rollAllNoteNames === true && fromV8.rollEditing === true, 'v9 still forces the two roll switches');
 assert(fromV8.preciseBeats === false, 'v9 still forces the drifting-tempo pass off');
 assert(fromV8.rollSnapToGrid === false, 'a migrated blob does not arrive with notes already snapped');
-assert(fromV8.settingsVersion === 10, 'the migrated blob is stamped v10');
+assert(fromV8.alignViews === true, 'v11 forces alignment on — the chip is gone (G11)');
+assert(fromV8.settingsVersion === 11, 'the migrated blob is stamped v11');
 
-// A v9 blob that had explicitly chosen 'sixteenth' is STILL moved, because v10 is a change of
-// default and the only thing that can carry somebody across one is the version number.
+// A v9 blob that had explicitly chosen 'sixteenth' is still carried across v10 — which forced
+// everything to 'free' — and v11 then reads that 'free' as v10's doing rather than as a choice,
+// because by then it is indistinguishable from one. The deliberate 'sixteenth' does not survive
+// v10; that is v10's cost, recorded here rather than glossed over.
 const fromV9 = mergeStoredSettings({ settingsVersion: 9, grid: 'sixteenth' } as Partial<AppSettings>);
-assert(fromV9.grid === 'free', 'the one-time v10 flip applies to every pre-v10 blob');
+assert(fromV9.grid === 'auto', 'a pre-v10 blob ends on Auto');
 
-// …and once they are on v10, their choice is theirs. This is the half that would make the
-// feature obnoxious if it were wrong: a migration that re-fires would overwrite the menu every
-// time the app started.
-const chosen = mergeStoredSettings({ settingsVersion: 10, grid: 'auto', rollSnapToGrid: true } as Partial<AppSettings>);
-assert(chosen.grid === 'auto', "after v10 the player's own Quantize choice is never re-flipped");
-assert(chosen.rollSnapToGrid === true, 'after v10 a chosen snap setting survives');
+// THE HALF THAT MATTERS MOST. A v10 profile sitting on any value except 'free' chose it — no
+// v10 default could have produced it — so v11 leaves it exactly alone.
+for (const kept of ['auto', 'quarter', 'eighth', 'sixteenth', 'thirtysecond', 'triplet'] as const) {
+  const blob = mergeStoredSettings({ settingsVersion: 10, grid: kept } as Partial<AppSettings>);
+  assert(blob.grid === kept, `v11 must not touch a deliberate '${kept}'`);
+}
+
+// …and the one that is NOT distinguishable. A v10 'free' may be the migration's or the
+// player's; the two are written identically, so everybody on it lands on Auto once.
+const wasFree = mergeStoredSettings({ settingsVersion: 10, grid: 'free' } as Partial<AppSettings>);
+assert(wasFree.grid === 'auto', "v11 moves every v10 'free' to Auto exactly once");
+
+// …and once they are on v11, their choice is theirs, INCLUDING 'free'. This is the half that
+// would make the feature obnoxious if it were wrong: a migration that re-fires would overwrite
+// the menu every time the app started.
+const chosen = mergeStoredSettings({ settingsVersion: 11, grid: 'free', rollSnapToGrid: true } as Partial<AppSettings>);
+assert(chosen.grid === 'free', "after v11 the player's own Quantize choice is never re-flipped");
+assert(chosen.rollSnapToGrid === true, 'after v11 a chosen snap setting survives');
 
 // Stored JSON is untrusted: a garbage snap value must normalise rather than reach the feed.
-const junk = mergeStoredSettings({ settingsVersion: 10, rollSnapToGrid: 'yes' } as unknown as Partial<AppSettings>);
+const junk = mergeStoredSettings({ settingsVersion: 11, rollSnapToGrid: 'yes' } as unknown as Partial<AppSettings>);
 assert(junk.rollSnapToGrid === false, 'a non-boolean snap setting falls back to off');
+// And a garbage roll grid falls back rather than reaching the ruler — the vocabulary grew by two
+// words in G14, so the guard has to know both of them.
+const goodGrid = mergeStoredSettings({ settingsVersion: 11, rollGrid: 'off' } as Partial<AppSettings>);
+assert(goodGrid.rollGrid === 'off', "'off' is a real roll grid now");
+const badGrid = mergeStoredSettings({ settingsVersion: 11, rollGrid: 'auto' } as unknown as Partial<AppSettings>);
+assert(badGrid.rollGrid === DEFAULT_SETTINGS.rollGrid, "'auto' is still meaningless as a roll grid");
 
 // ---------------------------------------------------------------------------
 // 8. 'free' is fit to be the default
@@ -221,8 +269,9 @@ assert(junk.rollSnapToGrid === false, 'a non-boolean snap setting falls back to 
 //
 // The Quantize menu hid Free from audio takes for a long time, on a measurement that was true
 // when it was taken: 64 played notes engraved as 192 glyphs with 192 ties — three tied noteheads
-// per note — plus 64 rests nobody played. v10 makes Free the DEFAULT, so that measurement has to
-// be re-taken rather than assumed stale, and it has to keep being re-taken. These are the
+// per note — plus 64 rests nobody played. Free is offered for every take since v10 (it is no
+// longer the default — see §7 — but it is one press away), so that measurement has to be
+// re-taken rather than assumed stale, and it has to keep being re-taken. These are the
 // numbers the comment in `ui/app.ts` §notation toolbar quotes.
 
 const measure = (notes: ReadonlyArray<InputNote>, beatList: number[], grid: BuildSettings['grid']) => {

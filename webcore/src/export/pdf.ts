@@ -25,6 +25,7 @@ import { stringLettersFromBounds, tuningLowToHighFromScore, type StringLetter } 
 import { stripRendererCredit, stripRendererCreditFromMarkup } from '../view/watermark';
 import { buildAlphaTabScore } from '../score/fromPipeline';
 import { A4_HEIGHT_PT, A4_WIDTH_PT, PX_PER_PT, canvasesToPdf, mmToPx } from './pdfWriter';
+import { cleanTakeTitle } from './takeTitle';
 import type { RiffScore } from '../pipeline';
 
 let cachedFontCss: string | null = null;
@@ -165,6 +166,8 @@ function inlineTextStyles(svg: SVGSVGElement): void {
  * bridge-side "save as PDF" can take the HTML without touching the DOM twice.
  */
 export async function buildPrintDocument(score: RiffScore, options: PrintOptions = {}): Promise<string> {
+  // The name of the piece, not the name of the file it is filed under. See `cleanTakeTitle`.
+  const title = options.title ? cleanTakeTitle(options.title) : options.title;
   return withPrintRender(score, async (elements) => {
     // The DOM strip in `withPrintRender` has already run, so this normally changes nothing and
     // returns the same string. It is here because THIS is the document that leaves the app —
@@ -175,7 +178,7 @@ export async function buildPrintDocument(score: RiffScore, options: PrintOptions
     const fontCss = await bravuraFontFace();
 
     return `<!doctype html>
-<html><head><meta charset="utf-8"><title>${escapeHtml(options.title ?? 'Riffsheet')}</title>
+<html><head><meta charset="utf-8"><title>${escapeHtml(title ?? 'Riffsheet')}</title>
 <style>
 ${fontCss}
 @page { size: A4 portrait; margin: 14mm; }
@@ -187,7 +190,7 @@ svg { max-width: 100%; height: auto; page-break-inside: avoid; }
 footer { margin-top: 8mm; font-size: 8pt; color:#888; }
 </style></head>
 <body>
-${options.title ? `<h1>${escapeHtml(options.title)}</h1>` : ''}
+${title ? `<h1>${escapeHtml(title)}</h1>` : ''}
 ${options.subtitle ? `<h2>${escapeHtml(options.subtitle)}</h2>` : ''}
 ${svgs}
 <footer>Made with Riffsheet</footer>
@@ -241,10 +244,39 @@ export async function printScore(score: RiffScore, options: PrintOptions = {}): 
 /**
  * How big an open-string letter is on paper, in points.
  *
- * 6 pt: legible next to a fret digit and quiet enough not to compete with one. It is a legend,
- * read once per system.
+ * 4.5 pt, down from 6 (G18). At 6 they came out as big as the fret digits they are a legend
+ * FOR, which inverts the hierarchy of the page: the legend shouted and the music did not. It is
+ * read once per system, at reading distance, and small is what a tab book prints it at.
+ *
+ * It is a CEILING rather than the size: the real size is capped against the tab's own line
+ * spacing as well — see `stringLetterSize`.
  */
-const STRING_LETTER_PT = 6;
+const STRING_LETTER_PT = 4.5;
+
+/**
+ * The size an open-string letter is actually drawn at, in page pixels.
+ *
+ * THE LINE SPACING IS THE REAL CONSTRAINT, and ignoring it is why the letters touched. They are
+ * stacked one per tab line, and the tab lines on a printed page are a few points apart — closer
+ * on a shrunk system, closer still on a six-string staff. A size chosen only in points is
+ * therefore sometimes larger than the gap it has to sit in, and four letters become one grey
+ * smudge with no space between them.
+ *
+ * So the point size is a ceiling and the measured gap is the other: 68% of the smallest gap
+ * between two adjacent letters leaves a clear line of white between every pair at any staff
+ * size, on any page, without anything having to know how many strings there are.
+ *
+ * `ys` are the letters' baselines in PAGE pixels, in any order. A single letter (or none) has no
+ * gap to measure and simply takes the point size.
+ */
+function stringLetterSize(ys: ReadonlyArray<number>, shrink: number): number {
+  const sorted = [...ys].sort((a, b) => a - b);
+  let minGap = Number.POSITIVE_INFINITY;
+  for (let i = 1; i < sorted.length; i++) minGap = Math.min(minGap, sorted[i] - sorted[i - 1]);
+  const fromPoints = STRING_LETTER_PT * PX_PER_PT * shrink;
+  const fromSpacing = Number.isFinite(minGap) ? minGap * 0.68 : Number.POSITIVE_INFINITY;
+  return Math.max(3.5, Math.min(fromPoints, fromSpacing));
+}
 
 const PAGE_MARGIN_MM = 14;
 /** Breathing room between systems, as a fraction of an inch. */
@@ -259,6 +291,9 @@ const SYSTEM_GAP_MM = 4;
  */
 export async function renderScorePdf(score: RiffScore, options: PrintOptions = {}): Promise<Uint8Array> {
   const fontCss = await bravuraFontFace();
+  // The piece's name, not the file's. Applied once, here, so the heading on the page and the
+  // title in the PDF's own metadata cannot disagree. See `cleanTakeTitle`.
+  const title = options.title ? cleanTakeTitle(options.title) : options.title;
 
   const pageW = Math.round(A4_WIDTH_PT * PX_PER_PT);
   const pageH = Math.round(A4_HEIGHT_PT * PX_PER_PT);
@@ -313,9 +348,9 @@ export async function renderScorePdf(score: RiffScore, options: PrintOptions = {
   let page = newPage();
 
   // Heading, page 1 only — same sizes as the print stylesheet's h1/h2.
-  if (options.title) {
+  if (title) {
     page.font = `600 ${Math.round(18 * PX_PER_PT)}px -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif`;
-    page.fillText(options.title, margin, cursorY, contentW);
+    page.fillText(title, margin, cursorY, contentW);
     cursorY += Math.round(24 * PX_PER_PT);
   }
   if (options.subtitle) {
@@ -346,12 +381,19 @@ export async function renderScorePdf(score: RiffScore, options: PrintOptions = {
     // scale the picture was drawn at, whatever shrinking the page break just imposed.
     if (system.letters.length > 0) {
       const shrink = (h / image.height) * system.scale;
-      const size = Math.max(4, STRING_LETTER_PT * PX_PER_PT * shrink);
+      const size = stringLetterSize(system.letters.map((l) => l.y * shrink), shrink);
       page.save();
       page.font = `600 ${size}px ui-monospace, SFMono-Regular, Menlo, monospace`;
-      page.fillStyle = '#444444';
+      // FULL BLACK (G18). It was #444, which on a laser print of an already-small glyph comes
+      // out as a grey suggestion of a letter. Everything else engraved on this page is black
+      // ink; a legend printed lighter than the thing it explains reads as a watermark.
+      page.fillStyle = '#000000';
       page.textAlign = 'right';
       page.textBaseline = 'middle';
+      // A hair of tracking, where the browser will give it: at this size a monospace pair can
+      // still look joined. Assigned through a cast because `letterSpacing` is not in every
+      // TypeScript DOM lib yet, and simply ignored where it is not supported.
+      (page as CanvasRenderingContext2D & { letterSpacing?: string }).letterSpacing = '0.3px';
       for (const letter of system.letters) {
         page.fillText(letter.text, margin + letter.x * shrink, cursorY + letter.y * shrink);
       }
@@ -369,7 +411,7 @@ export async function renderScorePdf(score: RiffScore, options: PrintOptions = {
     last.fillText('Made with Riffsheet', margin, pageH - margin - footerSize);
   }
 
-  return canvasesToPdf(pages, { title: options.title });
+  return canvasesToPdf(pages, { title });
 }
 
 /**

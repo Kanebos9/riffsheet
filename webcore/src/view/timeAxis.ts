@@ -316,17 +316,27 @@ export const SUBS_PER_BEAT = 4;
  * 'free' snaps to nothing, so there is no unit it could draw; it falls back to the default
  * quarter-division rather than drawing no subdivisions at all, because the ruler is still
  * useful when the notes are not on it.
+ *
+ * 'off' RETURNS 0, and 0 is a value with a meaning here rather than an absence: "the beat is
+ * not a unit I draw at all". `gridDetail` reads it as BAR LINES ONLY. Every other answer is at
+ * least 1 (the beat itself), so 0 cannot collide with a real subdivision count.
  */
 export function subdivisionsPerBeat(
-  grid: 'quarter' | 'eighth' | 'sixteenth' | 'triplet' | 'free'
+  grid: 'off' | 'quarter' | 'eighth' | 'sixteenth' | 'thirtysecond' | 'triplet' | 'free'
 ): number {
   switch (grid) {
+    case 'off':
+      return 0;
     case 'quarter':
       return 1;
     case 'eighth':
       return 2;
     case 'sixteenth':
       return 4;
+    // Eight per beat: a 32nd note is an eighth of a quarter, and a quarter is the beat on every
+    // meter this app writes.
+    case 'thirtysecond':
+      return 8;
     case 'triplet':
       return 3;
     case 'free':
@@ -350,8 +360,14 @@ export function gridDetail(
   secondsPerPixel: number,
   subsPerBeat: number = SUBS_PER_BEAT
 ): GridDetail {
-  const parts = Number.isFinite(subsPerBeat) ? Math.max(1, Math.round(subsPerBeat)) : SUBS_PER_BEAT;
   const beatPx = secondsPerPixel > 0 ? medianBeatSec / secondsPerPixel : Number.POSITIVE_INFINITY;
+  // GRID 'off': bar lines and nothing else. Checked before the clamp below, which would
+  // otherwise round 0 up to 1 and draw the beats anyway. Bar lines stay because the bar number
+  // is the one landmark the ruler is for; see `subdivisionsPerBeat`.
+  if (Number.isFinite(subsPerBeat) && Math.round(subsPerBeat) === 0) {
+    return { bars: true, beats: false, subs: false, labelEvery: labelStep(beatPx), subsPerBeat: 0 };
+  }
+  const parts = Number.isFinite(subsPerBeat) ? Math.max(1, Math.round(subsPerBeat)) : SUBS_PER_BEAT;
   const bars = true;
   const beats = beatPx >= MIN_LINE_GAP_PX;
   const subs = parts > 1 && beatPx / parts >= MIN_LINE_GAP_PX;
@@ -516,6 +532,21 @@ export interface EngravedExtent {
  *
  * Clamping is the honest answer rather than a fudge: past the last engraved bar there is no more
  * music, so the last engraved moment IS what that edge is showing.
+ *
+ * BOTH ENDS, and the left one was re-measured rather than assumed (G2).
+ *
+ * Left of the first engraved beat is the CLEF, KEY AND METER PREFIX: real page width standing
+ * for no time at all. Dropping the left clamp so that column extrapolates was tried, live, on
+ * the grand-staff demo — it fixes the first note (177 px -> 83 px) and makes every note after it
+ * worse (1 px -> 159 px), because the extrapolation runs off the slope of the FIRST TWO BEATS,
+ * which at the start of a fast figure is far steeper than the take's average. Pinning the window
+ * to the first engraved beat is the better of the two, and it is measured that way round rather
+ * than argued.
+ *
+ * The residual it leaves — the first note sitting up to `firstX - ALIGN_GUTTER_PX` right of its
+ * own rectangle at scroll 0 — is a FRACTION question, not a clamping one: the roll is told the
+ * first anchor is at frac 0 (its gutter) when the sheet has it at `firstX`. See
+ * `windowFromSheet` and the anchor list in ui/app.ts.
  */
 export function clampXToEngraving(x: number, extent: EngravedExtent | null | undefined): number {
   if (!extent) return x;

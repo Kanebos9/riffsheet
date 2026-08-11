@@ -178,14 +178,22 @@ export const TIPS = {
     'the app wrote them down while you were playing, and for a file you dropped in it borrows the ' +
     'tempo but counts the bars from the bar-1 marker instead — the line beside the numbers says ' +
     'which of the two you are getting. Manual lets you type both yourself. From recording uses ' +
-    'what the app worked out by ear, which is a guess and can come out wrong. The tempo and ' +
+    'what the app worked out by ear, which is a guess and can come out wrong; it measures again ' +
+    'by itself whenever the take changes, so trimming, cutting or moving bar 1 refreshes it. ' +
+    'The tempo and ' +
     'signature boxes are only yours to type in on Manual; on the other two they show you what is ' +
     'being applied. This used to be a "Use DAW grid" chip in the top bar and a separate BPM box ' +
     'down here, which could disagree with each other.',
+  /**
+   * The old Re-detect button's tip. The button is gone (G12) — choosing "From recording" does
+   * the detecting, and every take edit re-does it — but removing an exported key removes it for
+   * every caller, so it stays with text that is still true of what replaced it.
+   */
   tempoRedetect:
-    'Work the tempo and the time signature out from your playing again, and rebuild the sheet with ' +
-    'them. Worth pressing after you have moved the bar-1 marker. It does not listen to your audio ' +
-    'from scratch — that is "Start over" in the Main menu.',
+    'The tempo and the time signature are worked out from your playing, and they are worked out ' +
+    'again by themselves whenever the take changes — after a trim, a cut, an edit, or a move of ' +
+    'the bar-1 marker. None of that listens to your audio from scratch; that is "Start over" in ' +
+    'the Main menu.',
   timesig:
     'How many beats are in each bar. Most rock and pop is 4/4. If your bars look chopped in the wrong places, try another one.',
 
@@ -204,6 +212,12 @@ export const TIPS = {
     'Where bar 1 begins. The app put it where the recording stops being silent; drag it if the count-in should start somewhere else. Moving it re-draws the sheet — it does not listen to your audio again.',
   trimSilence:
     'Takes the quiet run-up (and the quiet ending) off the take, so the music starts where the music starts. Your recording is not touched — nothing is deleted from it — and one undo puts the silence back exactly as it was.',
+  cutArm:
+    'Turn the recording strip into a span picker, so you can choose exactly the stretch to ' +
+    'remove. With this on, drag across the recording to sweep out a span and drag either end to ' +
+    'adjust it; the notes inside light up so you can see what would go. Turn it off and clicking ' +
+    'the strip goes back to asking what pitch is at that moment. Nothing is removed until you ' +
+    'press "Cut out".',
   cutOut:
     'Removes the part you have selected and closes the gap, as if you had never played it. The sheet, the piano roll and every file you export all get shorter to match. Your recording is not touched: undo puts it back, and you can do this as many times as you like.',
   cutSummary:
@@ -217,8 +231,16 @@ export const TIPS = {
     'The notes the app heard, drawn as blocks: high notes near the top, time running left to right. Bar, beat and column lines come from the Grid chip beside this one, which is only ever used for drawing and editing here — never for re-writing the sheet. Double-click empty space to add a note; double-click a note to delete it.',
   pianoRollResize:
     'Drag this edge down to make the piano roll taller, up to make it shorter. Double-click to put it back to normal. It stays where you leave it.',
+  /**
+   * The Align chip's tip. The chip is deleted (G11) — alignment is simply what the app does —
+   * and the key stays because removing an exported one removes it for every caller.
+   */
   alignViews:
-    'Keeps all four views pointing at the same moment. Click anywhere on the waveform or the piano roll and the sheet scrolls to that spot, so the page you are reading follows the sound you are pointing at. Picking a note always lights it up everywhere, whether this is on or off. It never changes the piano roll’s spacing — the roll is a plain steady ruler, left to right, and adding a note there never shifts the notes around it.',
+    'All four views point at the same moment. Click anywhere on the waveform or the piano roll ' +
+    'and the sheet scrolls to that spot, so the page you are reading follows the sound you are ' +
+    'pointing at. Picking a note lights it up everywhere. It never changes the piano roll’s ' +
+    'spacing — the roll is a plain steady ruler, left to right, and adding a note there never ' +
+    'shifts the notes around it.',
   // Kept because removing an exported key breaks whoever imports it. Its control is now
   // `alignViews`, which means something else: see the note on the Align chip in `ui/app.ts`.
   rollLink:
@@ -270,19 +292,34 @@ export const TIPS = {
    * every caller and this one is read by the notation toolbar under a name nothing else uses.
    */
   grid:
-    'How much the sheet rounds what you played. This never changes the piano roll — only how the sheet rounds it. Free is where it starts, and it writes exactly what you played with no tidying at all. Auto works it out bar by bar and is the only setting that can write straight notes and triplets in the same piece, so it is the one to reach for when Free comes out cluttered. Naming a size instead forbids everything finer, so a triplet played against 1/8 loses a note; 1/32 is there for fast picked figures that 1/16 rounds into each other, and Triplet (1/12) for music that swings in threes.',
+    'How much the sheet rounds what you played. Auto is where it starts: it works out bar by bar ' +
+    'what you meant and writes the cleanest page that is still a reading of your playing — it is ' +
+    'the only setting that can put straight notes and triplets in the same piece. Free writes ' +
+    'exactly what you played, as faithfully as paper allows, with no tidying at all — reach for ' +
+    'it when Auto has smoothed over something you meant. Neither of them ever changes the piano ' +
+    'roll: the roll is your recording and this is only how the sheet writes it down. Naming a ' +
+    'size instead forbids everything finer, so a triplet played against 1/8 loses a note; 1/32 is ' +
+    'there for fast picked figures that 1/16 rounds into each other, and Triplet (1/12) for music ' +
+    'that swings in threes.',
   /**
    * The roll's own ruler, and it keeps the plain name "Grid" on screen. The menu that used to
    * be called Notation is "Quantize" now, so the two no longer read as the same word twice.
    */
   rollGrid:
-    'The columns drawn on the piano roll, and the size of a note you add by hand: with 1/4 selected, double-clicking an empty spot puts a quarter note there, on the nearest quarter-note line. On its own it never re-writes what the app heard — changing it does not move a single note. Hold Option while dragging to ignore it.',
+    'The columns drawn on the piano roll, and the size of a note you add by hand: with 1/4 ' +
+    'selected, double-clicking an empty spot puts a quarter note there, on the nearest ' +
+    'quarter-note line. The sizes run from 1/4 down to 1/32, with Triplet (1/12) between 1/8 and ' +
+    '1/16 for music that swings in threes. Free draws the beat subdivisions but snaps to none of ' +
+    'them; Off draws bar lines only, for when you are reading the shape of a take rather than ' +
+    'editing it. On its own it never re-writes what the app heard — changing it does not move a ' +
+    'single note. Hold Option while dragging to ignore it.',
   /**
    * Snap to grid. The one control in the app that MOVES the player's notes, so its tip has to
    * say both halves out loud: what it does, and that it is undoable by switching it off.
    */
   rollSnap:
-    'Line every note up with the grid columns. Each note starts on the nearest line and keeps the length it had. Your recording is kept underneath exactly as you played it, so switching this off puts every note straight back — and changing the grid size measures again from the original, never from the last snap. While it is on, the sheet, the playback and anything you export all follow the lined-up version.',
+    'Line every note up with the grid columns. Each note starts on the nearest line and ends on ' +
+    'one too, never shorter than a single column. Your recording is kept underneath exactly as you played it, so switching this off puts every note straight back — and changing the grid size measures again from the original, never from the last snap. While it is on, the sheet, the playback and anything you export all follow the lined-up version.',
   clef:
     'Auto chooses one stable clef for the whole part. Treble and Bass force one clef; Grand stacks treble and bass for music that genuinely needs both ranges.',
   fingering:
@@ -327,20 +364,25 @@ export const TIPS = {
     'so a second attempt can simply come out better. It replaces the notes, so any changes you ' +
     'have made are lost — it asks first.',
   engineChip:
-    'The listening engine is running and using this much memory. It shuts itself down the moment ' +
-    'it has finished a transcription, so most of the time it is not running at all and this is ' +
-    'not here; click it to stop it early. It starts again by itself the next time you transcribe ' +
-    'something.',
+    'A listening engine is running on this machine right now. Click to shut it down and give its ' +
+    'memory back. It shuts itself down the moment it finishes a transcription, so most of the ' +
+    'time it is not running at all and this is not here — and it starts again by itself the next ' +
+    'time you transcribe something.',
   openAnother:
     'Return to the main menu to open a file, capture the DAW track, create a blank score, or resume current work.',
   rollZoom:
     'How tall the piano-roll rows are. The wheel over the keyboard on the left does the same, a trackpad pinch does it anywhere on the roll, and a double-click on the keyboard fits every note in the take on screen at once.',
   rollTimeZoom:
     'How much of the recording the piano roll shows across its width. The wheel over the time ' +
-    'ruler at the top of the roll does the same. With Align on, the sheet music magnifies to ' +
-    'match, so both views keep showing the same stretch of the take.',
+    'ruler at the top of the roll does the same, and the sheet music magnifies to match, so both ' +
+    'views keep showing the same stretch of the take.',
+  /**
+   * The old "Fit" button's tip. The button is deleted (G13); fitting the time axis is a
+   * double-click on the roll's ruler. The key stays for the same reason the two above it do.
+   */
   rollTimeFit:
-    'Show the whole recording across the roll again, from the first sound to the last.',
+    'Show the whole recording across the roll again, from the first sound to the last. ' +
+    'Double-click the time ruler at the top of the roll to do it.',
   rollFit:
     'Zoom the piano roll out until every note in the take fits. Useful once, to see the shape of ' +
     'the whole thing — but it is not how the roll opens any more, because fitting a wide-ranging ' +

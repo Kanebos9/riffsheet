@@ -103,6 +103,7 @@ import {
   FINGERING_STYLES,
   forgetRecent,
   loadRecent,
+  ROLL_SNAP_MODES,
   sameSettingValue,
   saveSettings,
   pushRecent,
@@ -139,6 +140,7 @@ import {
 import {
   mergeEditedOntoRaw,
   rollSnapUnitSec,
+  snapPerformanceToBeat,
   snapPerformanceToGrid,
   type RollPerformanceNote
 } from '../app/snap';
@@ -3576,7 +3578,7 @@ class App {
         showNoteNames: s.showNoteNames,
         grid: s.grid,
         rollGrid: s.rollGrid,
-        rollSnapToGrid: s.rollSnapToGrid,
+        rollSnap: s.rollSnap,
         tabMode: s.tabMode,
         tuningId: s.tuningId,
         customTuningMidi: [...s.customTuningMidi],
@@ -3673,7 +3675,7 @@ class App {
      * asserted (see `scheduleByGrid` below).
      *
      * `feedIsRawObjectWhenSnapOff` is the playback-unchanged proof, and it is a stronger one
-     * than comparing two dumps: with Snap to grid off, `performanceFeed()` returns the take's
+     * than comparing two dumps: with Snap on Off, `performanceFeed()` returns the take's
      * own array BY IDENTITY, so the fourth argument reaching `scoreToSynthNotes` is not merely
      * equal to what it was before this feature existed — it is the same object.
      *
@@ -3716,7 +3718,7 @@ class App {
         const source = this.runtime.get().source;
         if (!source?.detected || !this.runtime.get().score) return { error: 'no take' };
         const s = this.settings.get();
-        const original = { grid: s.grid, rollGrid: s.rollGrid, rollSnapToGrid: s.rollSnapToGrid };
+        const original = { grid: s.grid, rollGrid: s.rollGrid, rollSnap: s.rollSnap };
         const r6 = (n: number) => Number(n.toFixed(6));
 
         const readOut = () => {
@@ -3740,18 +3742,32 @@ class App {
         };
 
         // --- #36: four Quantize values over one performance ----------------------
-        this.settings.set({ rollSnapToGrid: false });
+        this.settings.set({ rollSnap: 'off' });
         const grids = ['auto', 'quarter', 'free', 'thirtysecond'] as const;
         const byGrid = grids.map((grid) => ({ grid, ...at({ grid }) }));
         const feedIsRawObjectWhenSnapOff =
           this.performanceFeed() === this.runtime.get().source?.detected?.notes;
 
         // --- #41: the snap layer, switched on and off and re-sized ---------------
-        const snapOff = at({ grid: original.grid, rollGrid: 'eighth', rollSnapToGrid: false });
-        const snapOn = at({ rollSnapToGrid: true });
+        const snapOff = at({ grid: original.grid, rollGrid: 'eighth', rollSnap: 'off' });
+        const snapOn = at({ rollSnap: 'grid' });
         const snapFine = at({ rollGrid: 'sixteenth' });
         const snapBack = at({ rollGrid: 'eighth' });
-        const snapOffAgain = at({ rollSnapToGrid: false });
+        const snapOffAgain = at({ rollSnap: 'off' });
+
+        // --- G25: the third state ------------------------------------------------
+        // BEAT is measured against GRID and against OFF, because the two ways it could be
+        // wrong are being a no-op and being a second name for grid mode. It is then taken back
+        // through Grid to Off, which is the reversibility claim stated across all three states
+        // rather than across the old switch's two.
+        const beatOn = at({ rollSnap: 'beat' });
+        // The ruler is Off — no cell anywhere — and Beat must still magnetise, because the
+        // pulse is a property of the tempo and not of the columns. Grid mode is the control:
+        // under the same ruler it must hand back the recording untouched.
+        const beatNoRuler = at({ rollGrid: 'off' });
+        const gridNoRuler = at({ rollSnap: 'grid' });
+        const beatBack = at({ rollGrid: 'eighth', rollSnap: 'beat' });
+        const beatToOff = at({ rollSnap: 'off' });
 
         this.settings.set(original);
         this.rebuildNotation({ keepEdits: true });
@@ -3772,7 +3788,21 @@ class App {
           snapChangesPlayback: snapOn.schedule !== snapOff.schedule,
           finerGridDiffers: snapFine.feed !== snapOn.feed,
           resnapFromRaw: snapBack.feed === snapOn.feed,
-          snapRoundTripsToRaw: snapOffAgain.feed === snapOff.feed
+          snapRoundTripsToRaw: snapOffAgain.feed === snapOff.feed,
+          // G25 — the three states, each proved against the two it is not.
+          beatMovesTheFeed: beatOn.feed !== snapOff.feed,
+          beatDiffersFromGrid: beatOn.feed !== snapOn.feed,
+          beatWorksWithoutARuler: beatNoRuler.feed !== snapOff.feed,
+          gridNeedsARuler: gridNoRuler.feed === snapOff.feed,
+          beatResnapsFromRaw: beatBack.feed === beatOn.feed,
+          beatRoundTripsToRaw: beatToOff.feed === snapOff.feed,
+          // Order is the promise the cascade makes, so it is read off the feed rather than
+          // trusted: the snapped list must be non-decreasing in time and hold the same notes.
+          beatKeepsOrder: (() => {
+            const starts = beatOn.feed.split('|').map((x) => Number(x.split('@')[1]?.split('-')[0]));
+            return starts.every((v, i) => i === 0 || v >= starts[i - 1]);
+          })(),
+          beatKeepsEveryNote: beatOn.feed.split('|').length === snapOff.feed.split('|').length
         };
       } catch (e) {
         return { error: (e as Error).message };
@@ -6225,9 +6255,9 @@ class App {
    */
   private snapBasisNotes: InputNote[] | null = null;
   private snapBasisKey = '';
-  private snapBasisValue: { tempoBpm: number; originSec: number } | null = null;
+  private snapBasisValue: SnapBasis | null = null;
 
-  private snapBasis(source: SourceAudio, raw: InputNote[]): { tempoBpm: number; originSec: number } | null {
+  private snapBasis(source: SourceAudio, raw: InputNote[]): SnapBasis | null {
     const hostGrid = this.effectiveHostGrid();
     const s = this.settings.get();
     // EVERY INPUT `buildScoreFrom` CAN SEE, or the memo hands back a basis measured under
@@ -6265,7 +6295,15 @@ class App {
       const score = this.buildScoreFrom(source, raw);
       this.snapBasisNotes = raw;
       this.snapBasisKey = key;
-      this.snapBasisValue = { tempoBpm: score.tempoBpm, originSec: this.originSec(score) };
+      this.snapBasisValue = {
+        tempoBpm: score.tempoBpm,
+        originSec: this.originSec(score),
+        // THE BEAT THE SHEET COUNTS IN (G25), not "a quarter note". `tempoBpm` is stored in
+        // quarters; the meter says what a beat is made of, so 6/8 is magnetised to its eighths
+        // and 2/2 to its halves — the same reading `beatUnit()` gives the tempo box, so the
+        // number on screen and the lines the notes land on cannot disagree.
+        beatSec: 60 / (score.tempoBpm || 100) / beatUnit(score.timeSignature).perQuarter
+      };
       return this.snapBasisValue;
     } catch {
       // A take the pipeline cannot build is a take with no grid to snap to. The raw notes are
@@ -6277,7 +6315,7 @@ class App {
   /**
    * ============================ THE TAP POINT ============================
    *
-   * The performance layer as everything downstream should see it: raw when Snap to grid is off,
+   * The performance layer as everything downstream should see it: raw when Snap is Off,
    * snapped when it is on. The roll draws this, the sheet is built from this, playback is
    * retimed to this, and every export comes off the sheet — so there is exactly ONE arrow out
    * of the performance and no way for the page to disagree with the file.
@@ -6380,13 +6418,20 @@ class App {
     const source = this.editedSource();
     const raw = source?.detected?.notes ?? [];
     const s = this.settings.get();
-    // The same reference when the switch is off, so nothing downstream can tell this function
+    // The same reference when the mode is Off, so nothing downstream can tell this function
     // was added — see the playback-unchanged proof in `__RIFFSHEET_SNAPFEED__`.
-    if (!s.rollSnapToGrid || s.rollGrid === 'free' || raw.length === 0 || !source) return raw;
+    if (s.rollSnap === 'off' || raw.length === 0 || !source) return raw;
+    // GRID needs a ruler with cells on it, and Free and Off are the two that have none (G14).
+    // BEAT does not: the pulse is a property of the tempo and the meter, so it magnetises a take
+    // whose ruler is drawing bar lines only — it just borrows the ruler's cell for its cascade
+    // when there is one, and falls back to a 1/16 when there is not.
+    if (s.rollSnap === 'grid' && (s.rollGrid === 'free' || s.rollGrid === 'off')) return raw;
     const basis = this.snapBasis(source, raw);
     if (!basis) return raw;
     const unitSec = rollSnapUnitSec(s.rollGrid, basis.tempoBpm);
-    return snapPerformanceToGrid(raw, unitSec, basis.originSec, basis.tempoBpm);
+    return s.rollSnap === 'beat'
+      ? snapPerformanceToBeat(raw, basis.beatSec, unitSec, basis.originSec, basis.tempoBpm)
+      : snapPerformanceToGrid(raw, unitSec, basis.originSec, basis.tempoBpm);
   }
 
   /**
@@ -7017,43 +7062,56 @@ class App {
               const rollGrid = (e.target as HTMLSelectElement).value as AppSettings['rollGrid'];
               this.settings.set({ rollGrid });
               this.pianoRoll?.setEditGrid(rollGrid);
-              // …UNLESS the notes are standing on it. With Snap to grid on, the columns ARE the
+              // …UNLESS the notes are standing on it. With Snap on Grid the columns ARE the
               // note positions, so a new size has to re-derive them — from the RAW take, which
               // is what `performanceFeed()` measures and why changing size repeatedly cannot
               // walk a note further and further from where it was played.
-              if (this.settings.get().rollSnapToGrid) this.rebuildNotation({ keepEdits: true });
+              if (this.settings.get().rollSnap !== 'off') this.rebuildNotation({ keepEdits: true });
             }
           },
           ...(['quarter', 'eighth', 'triplet', 'sixteenth', 'thirtysecond', 'free', 'off'] as const).map((value) =>
             el('option', { value, text: `Grid: ${ROLL_GRID_LABELS[value]}`, selected: s.rollGrid === value })
           )
         ),
-      // SNAP TO GRID (#41) — the second half of the roll's grid control. The menu above says
-      // where the columns are; this says whether the notes stand on them.
+      // SNAP (#41, G25) — the second half of the roll's grid control. The menu above says where
+      // the columns are; this says what, if anything, the notes are pulled onto.
       //
-      // Its own chip rather than another section inside that menu, because the menu answers
-      // "how big is a cell" with ONE value, and a second unrelated answer sharing the widget
-      // would make the value it displays a lie about one of the two. It also has to stay a
-      // plain list of grid words: `scripts/verify.mjs` drives it by value.
+      // THREE STATES, so it is a menu and no longer a switch. Off / Grid / Beat are not one
+      // question with a yes and a no: Grid lines the notes up with the ruler, Beat puts each
+      // attack on the pulse and lets a fast run keep its subdivisions, and a switch could only
+      // ever have offered one of the two. It stays its OWN control rather than becoming a
+      // fourth section of the grid menu, for the reason it always did — that menu answers "how
+      // big is a cell" with ONE value, and a second unrelated answer sharing the widget would
+      // make the value it displays a lie about one of the two.
+      //
+      // A `select.chip`, like the grid menu beside it, so the pair reads as one control in two
+      // halves; `.on` lights it whenever it is doing something, which is the one thing the old
+      // chip said that a dropdown does not say by itself. The option VALUES are the stored
+      // words: `scripts/verify.mjs` drives this by value.
       //
       // Everything it changes goes through `performanceFeed()`, so one rebuild moves the roll,
-      // the sheet, the playback and every export together — and switching it back off restores
-      // the recording exactly, because nothing was ever written over.
+      // the sheet, the playback and every export together — and switching it back to Off
+      // restores the recording exactly, because nothing was ever written over.
       rollOn &&
-        el('span', {
-          class: `chip${s.rollSnapToGrid ? ' on' : ''}`,
-          role: 'switch',
-          'aria-checked': String(s.rollSnapToGrid),
-          'data-role': 'roll-snap',
-          'data-setting': 'rollSnapToGrid',
-          text: 'Snap to grid',
-          title: t(TIPS.rollSnap),
-          onClick: () => {
-            this.settings.set({ rollSnapToGrid: !s.rollSnapToGrid });
-            this.rebuildNotation({ keepEdits: true });
-            this.renderMain();
-          }
-        }),
+        el(
+          'select',
+          {
+            'aria-label': 'Snap',
+            class: `chip${s.rollSnap === 'off' ? '' : ' on'}`,
+            'data-role': 'roll-snap',
+            'data-setting': 'rollSnap',
+            title: t(TIPS.rollSnap),
+            onChange: (e: Event) => {
+              const rollSnap = (e.target as HTMLSelectElement).value as AppSettings['rollSnap'];
+              this.settings.set({ rollSnap });
+              this.rebuildNotation({ keepEdits: true });
+              this.renderMain();
+            }
+          },
+          ...ROLL_SNAP_MODES.map((value) =>
+            el('option', { value, text: `Snap: ${ROLL_SNAP_LABELS[value]}`, selected: s.rollSnap === value })
+          )
+        ),
       // THE "USE DAW GRID" CHIP IS GONE FROM HERE (F19), and it is not merely moved.
       //
       // It was one half of a control whose other half — the BPM box and the time signature —
@@ -8535,13 +8593,13 @@ class App {
     this.pianoRoll?.setEditGrid(s.rollGrid);
     const rollGridChip = this.root.querySelector<HTMLSelectElement>('[data-role="roll-grid"]');
     if (rollGridChip && rollGridChip.value !== s.rollGrid) rollGridChip.value = s.rollGrid;
-    // The snap chip is the one view control that is NOT just a redraw — it moves notes — so it
+    // The snap menu is the one view control that is NOT just a redraw — it moves notes — so it
     // is restated here for the same reason the grid menu is, and no more than that: the value
-    // is pushed onto the chip, and the rebuild that acts on it belongs to whoever changed it.
-    const rollSnapChip = this.root.querySelector<HTMLElement>('[data-role="roll-snap"]');
+    // is pushed onto the control, and the rebuild that acts on it belongs to whoever changed it.
+    const rollSnapChip = this.root.querySelector<HTMLSelectElement>('[data-role="roll-snap"]');
     if (rollSnapChip) {
-      rollSnapChip.classList.toggle('on', s.rollSnapToGrid);
-      rollSnapChip.setAttribute('aria-checked', String(s.rollSnapToGrid));
+      if (rollSnapChip.value !== s.rollSnap) rollSnapChip.value = s.rollSnap;
+      rollSnapChip.classList.toggle('on', s.rollSnap !== 'off');
     }
   }
 
@@ -10388,6 +10446,17 @@ const ROLL_GRID_LABELS: Record<AppSettings['rollGrid'], string> = {
 };
 
 /**
+ * One word each, because the control sits on a bar that has to survive a 390px docked FX
+ * window and the tip carries the explanation. 'Grid' names the ruler beside it and 'Beat'
+ * names the pulse, which is the whole difference between the two.
+ */
+const ROLL_SNAP_LABELS: Record<AppSettings['rollSnap'], string> = {
+  off: 'Off',
+  grid: 'Grid',
+  beat: 'Beat'
+};
+
+/**
  * What "Auto" actually came out as, said in the option itself.
  *
  * A picker sitting on Auto tells you nothing about the page you are looking at, and "is this
@@ -10461,6 +10530,15 @@ function resizeTuning(current: number[], requested: number): number[] {
  * what a metronome mark in 6/8 is normally written against. Being literal is the right kind of
  * wrong here: it is the reading somebody can check against the number on screen.
  */
+/**
+ * What the snap measures against. See `App.snapBasis()`; `beatSec` is only read by Beat mode.
+ */
+interface SnapBasis {
+  tempoBpm: number;
+  originSec: number;
+  beatSec: number;
+}
+
 function beatUnit(sig: { numerator: number; denominator: number } | undefined): {
   glyph: string;
   name: string;

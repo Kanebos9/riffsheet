@@ -67,7 +67,7 @@ export type RollGrid =
   // BAR LINES ONLY (G14). Not a synonym for 'free': 'free' still draws the beat subdivisions
   // and only refuses to snap to them, while this draws no subdivision at all. It is the ruler
   // for reading the shape of a take rather than editing it, and `rollSnapUnitSec` returns 0 for
-  // it exactly as it does for 'free', so Snap to grid cannot move a note under it.
+  // it exactly as it does for 'free', so Snap's Grid mode cannot move a note under it.
   | 'off';
 
 /** The stored words each grid accepts. Exported so the UI and `migrate()` cannot drift apart. */
@@ -83,6 +83,24 @@ export const NOTATION_GRIDS: readonly NotationGrid[] = [
   'triplet',
   'free'
 ];
+/**
+ * What the roll's Snap control does to the performance — THREE states since G25.
+ *
+ * 'off'  — nothing. The roll draws the recording.
+ * 'grid' — the ruler. Starts and ends move to the selected `rollGrid` line (see
+ *          `snapPerformanceToGrid`).
+ * 'beat' — the pulse. Each attack moves to its NEAREST BEAT, several notes aiming at one beat
+ *          cascade onto the following subdivisions in the order they were played, and the ends
+ *          are tidied to a subdivision line (see `snapPerformanceToBeat`).
+ *
+ * Grid and Beat are two different questions and not two sizes of one, which is why this is a
+ * mode rather than a fourth entry in the grid menu: Grid asks where the columns are, Beat asks
+ * where the pulse is, and Beat still works when the ruler is Free or Off.
+ */
+export type RollSnapMode = 'off' | 'grid' | 'beat';
+/** The stored words, in the order the control shows them. */
+export const ROLL_SNAP_MODES: readonly RollSnapMode[] = ['off', 'grid', 'beat'];
+
 /** Coarsest to finest, then the two that do not round at all. The UI shows this order. */
 export const ROLL_GRIDS: readonly RollGrid[] = [
   'quarter',
@@ -133,22 +151,30 @@ export interface AppSettings {
    */
   rollGrid: RollGrid;
   /**
-   * Snap the roll's notes to the roll's own grid — a LAYER over the performance, not surgery.
+   * Snap the roll's notes — a LAYER over the performance, not surgery. See `RollSnapMode`.
    *
-   * OFF by default, which is the only honest default for anything that moves somebody's notes.
+   * 'off' by default, which is the only honest default for anything that moves somebody's notes.
    *
-   * The raw performance is always kept underneath. Switching this on DERIVES a snapped copy —
-   * every note's START and its END moved to the nearest `rollGrid` line, with a floor of one
-   * whole cell so nothing collapses (G9; see `snapPerformanceToGrid`) — and switching it off
-   * throws that copy away and shows the recording again, to the bit.
-   * Nothing is ever rewritten in place, so the round trip is lossless by construction rather
-   * than by care.
+   * The raw performance is always kept underneath. Choosing Grid or Beat DERIVES a snapped copy
+   * — Grid moves every note's START and its END to the nearest `rollGrid` line with a floor of
+   * one whole cell so nothing collapses (G9; see `snapPerformanceToGrid`), Beat moves every
+   * attack to its nearest beat and cascades collisions onto the following subdivisions (G25;
+   * see `snapPerformanceToBeat`) — and choosing Off throws that copy away and shows the
+   * recording again, to the bit. Nothing is ever rewritten in place, so the round trip is
+   * lossless by construction rather than by care.
    *
    * While it is on, the snapped copy is what the roll draws, what the sheet is built from, what
    * plays and what exports. That is one arrow and exactly one — `App.performanceFeed()` — so
-   * the page cannot show one thing while the file contains another. Changing `rollGrid` while
-   * it is on re-derives the copy FROM THE RAW performance, so 1/8 -> 1/16 -> 1/8 cannot
-   * accumulate drift the way a chain of in-place roundings would.
+   * the page cannot show one thing while the file contains another. Changing `rollGrid` or the
+   * mode itself re-derives the copy FROM THE RAW performance, so 1/8 -> 1/16 -> 1/8, or
+   * Grid -> Beat -> Grid, cannot accumulate drift the way a chain of in-place roundings would.
+   */
+  rollSnap: RollSnapMode;
+  /**
+   * DEAD SINCE v12, and kept so an older blob still round-trips rather than losing a key it
+   * wrote. `migrate()` reads it once (true -> 'grid') and nothing else ever reads it again;
+   * `rollSnap` above is the live field. Deleting it would silently drop the only evidence a v11
+   * profile left of what its owner had chosen.
    */
   rollSnapToGrid: boolean;
   fingering: FingeringStyle;
@@ -304,7 +330,7 @@ export interface AppSettings {
 }
 
 /** Raise this AND add a case in `migrate()` when a default has to change under people. */
-export const SETTINGS_VERSION = 11;
+export const SETTINGS_VERSION = 12;
 
 export const DEFAULT_SETTINGS: AppSettings = {
   // 'auto', NOT 'bass'. This is sent to the model as a HARD CONSTRAINT on what it is allowed to
@@ -344,8 +370,11 @@ export const DEFAULT_SETTINGS: AppSettings = {
   // one that makes a riff. It is only ever consulted for hand edits and for drawing the ruler.
   rollGrid: 'eighth',
   // OFF. The roll's job is to show what was played; a default that quietly moved every note
-  // onto a grid line would make the one view that is supposed to be a picture of the recording
-  // into a second opinion about it. See the field comment for why it is safe to switch on.
+  // onto a grid line — or onto a beat — would make the one view that is supposed to be a picture
+  // of the recording into a second opinion about it. See the field comment for why it is safe
+  // to switch on.
+  rollSnap: 'off',
+  // The dead v11 field, at its old default so an old blob's shape survives a round trip.
   rollSnapToGrid: false,
   fingering: 'low-positions',
   // First position. The pipeline's own default for the same reason: it is where a hand goes
@@ -831,6 +860,19 @@ function migrate(settings: AppSettings, stored: Partial<AppSettings>, floor = 0)
   // literal `true`; this is what keeps the STORED copy honest.
   if (from < 11) settings.alignViews = true;
 
+  // v11 -> v12: Snap stops being a switch and becomes Off / Grid / Beat (G25).
+  //
+  // A TRANSLATION, not a forced value, and that is the difference between this case and v10's.
+  // The boolean said exactly one thing — "line the notes up with the ruler" — and that is
+  // precisely what 'grid' means, so a stored `true` carries over as a decision the player
+  // already made rather than being reset to the new default. Nobody is moved to 'beat' by a
+  // migration: it moves notes to places the old switch never would have, and a mode nobody
+  // chose must not arrive already on.
+  //
+  // The boolean itself survives (see its field comment) so an older blob round-trips; this is
+  // the only line that ever reads it.
+  if (from < 12) settings.rollSnap = settings.rollSnapToGrid === true ? 'grid' : 'off';
+
   const sampled = new Set([
     'finger-bass',
     'upright-piano',
@@ -873,6 +915,11 @@ function migrate(settings: AppSettings, stored: Partial<AppSettings>, floor = 0)
   }
   if (typeof settings.rollSnapToGrid !== 'boolean') {
     settings.rollSnapToGrid = DEFAULT_SETTINGS.rollSnapToGrid;
+  }
+  // Stored JSON is untrusted, and this one MOVES NOTES: a word nothing recognises must fall
+  // back to Off rather than reach `performanceFeed()` and be read as "some kind of on".
+  if (!(ROLL_SNAP_MODES as readonly string[]).includes(settings.rollSnap)) {
+    settings.rollSnap = DEFAULT_SETTINGS.rollSnap;
   }
 
   if (!(FINGERING_STYLES as readonly string[]).includes(settings.fingering)) {

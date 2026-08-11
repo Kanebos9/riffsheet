@@ -274,6 +274,14 @@ const PROBE = `(() => {
     notationGridOptions: [...q('[data-role="notation-grid"] option')].map(o => o.value),
     rollGridView: document.querySelector('[data-role="roll-grid"]')?.value ?? null,
     rollGridOptions: [...q('[data-role="roll-grid"] option')].map(o => o.value),
+    // G25: Snap is a THREE-state control beside the grid menu, not a switch. Read off the DOM
+    // as values rather than labels, because the stored words are what the document and the
+    // performance feed key on — a renamed label is cosmetic, a renamed value is a bug.
+    rollSnapView: document.querySelector('[data-role="roll-snap"]')?.value ?? null,
+    rollSnapOptions: [...q('[data-role="roll-snap"] option')].map(o => o.value),
+    rollSnapLabels: [...q('[data-role="roll-snap"] option')].map(o => o.textContent.trim()),
+    // The old switch. It must not come back beside the menu that replaced it.
+    rollSnapSwitches: [...q('[role="switch"]')].filter(e => /snap/i.test(e.textContent)).length,
     soundChoices: [...q('[data-role="sound-picker"] option')].map(o => ({
       value: o.value, text: o.textContent
     })),
@@ -1893,7 +1901,13 @@ async function main() {
       // the literal. The BEHAVIOUR is checked harder than a switch ever checked it: see the
       // align block below, which no longer has an off state to weaken its bounds.
       alignViews:
-        'dead: forced true by the v11 migration — alignment is unconditional and the chip is gone (G11)'
+        'dead: forced true by the v11 migration — alignment is unconditional and the chip is gone (G11)',
+      // The fifth, added in G25. The boolean became the three-state `rollSnap` mode; the v12
+      // migration reads it exactly once (true -> "grid") and nothing reads it afterwards. The
+      // field survives so a v11 blob still round-trips rather than silently losing the only
+      // evidence of what its owner had chosen. The MODE has a control, and it is checked above.
+      rollSnapToGrid:
+        'dead: translated once by the v12 migration into rollSnap (Off/Grid/Beat), which is the control on screen (G25)'
     };
 
     /** Every `[data-setting]` on screen right now, counted. */
@@ -3171,6 +3185,19 @@ async function main() {
         'grids: the roll offers 1/32 and Off, in fineness order',
         JSON.stringify(result.rollGridOptions ?? []) ===
           JSON.stringify(['quarter', 'eighth', 'triplet', 'sixteenth', 'thirtysecond', 'free', 'off'])
+      ],
+      [
+        // G25. Snap stopped being a switch: Off / Grid / Beat, in that order, as a chip select
+        // beside the grid menu. The VALUES are asserted because they are the stored words.
+        'snap: the control offers Off, Grid and Beat',
+        JSON.stringify(result.rollSnapOptions ?? []) === JSON.stringify(['off', 'grid', 'beat']) &&
+          (result.rollSnapLabels ?? []).every((l) => /^Snap: /.test(l))
+      ],
+      [
+        // …and it starts on Off, because a default that quietly moved somebody's notes would
+        // make the roll a second opinion about the recording rather than a picture of it.
+        'snap: it starts on Off, and the old switch has not come back',
+        result.rollSnapView === 'off' && result.rollSnapSwitches === 0
       ],
       [
         'grids: changing the roll grid changes the roll',
@@ -4707,6 +4734,30 @@ async function main() {
         !!result.snapFeed && result.snapFeed.snapMovesTheFeed === true &&
           result.snapFeed.finerGridDiffers === true && result.snapFeed.resnapFromRaw === true &&
           result.snapFeed.snapRoundTripsToRaw === true
+      ],
+      [
+        // G25 — Beat is a third state and not a second name for Grid. Both halves are asserted:
+        // it has to MOVE the feed (or it is a no-op) and it has to move it somewhere Grid does
+        // not (or the menu has three entries and two behaviours).
+        'snap feed: Beat moves the take, and not to where Grid moves it',
+        !!result.snapFeed && result.snapFeed.beatMovesTheFeed === true &&
+          result.snapFeed.beatDiffersFromGrid === true
+      ],
+      [
+        // The pulse is a property of the tempo and the meter, so Beat magnetises a take whose
+        // ruler is drawing bar lines only. Grid under the same ruler is the control: no cells,
+        // nothing to stand on, the recording comes back untouched.
+        'snap feed: Beat works without a ruler, where Grid correctly does nothing',
+        !!result.snapFeed && result.snapFeed.beatWorksWithoutARuler === true &&
+          result.snapFeed.gridNeedsARuler === true
+      ],
+      [
+        // The same reversibility contract Grid keeps, plus the cascade's own promise: order
+        // preserved and nothing lost, read off the feed rather than trusted.
+        'snap feed: Beat re-derives from raw, returns to it, and keeps every note in order',
+        !!result.snapFeed && result.snapFeed.beatResnapsFromRaw === true &&
+          result.snapFeed.beatRoundTripsToRaw === true &&
+          result.snapFeed.beatKeepsOrder === true && result.snapFeed.beatKeepsEveryNote === true
       ],
 
       [

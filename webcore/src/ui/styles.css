@@ -560,6 +560,20 @@ input[type="number"], input[type="text"], select {
   border-radius: 999px;
   cursor: pointer;
 }
+/*
+ * …and a chip select that is DOING something is lit, like any other chip.
+ *
+ * `.chip.on` already says this, but the rule above it is more specific (it has to restate
+ * colour and background to beat the platform's own select styling), so it wins and a Snap set
+ * to Grid or Beat would look identical to one set to Off. This is the same fill, stated at a
+ * specificity that survives — not a second appearance for the same state.
+ */
+.view-tools select.chip.on {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: var(--accent-ink);
+  font-weight: 600;
+}
 .view-tools .chip-detail { margin-left: 6px; opacity: 0.72; font-size: 10.5px; }
 
 .tuner-host { flex: 0 0 auto; padding: 4px 8px; background: var(--bg-raised); border-bottom: 1px solid var(--border); }

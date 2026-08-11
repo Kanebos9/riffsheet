@@ -9,7 +9,11 @@
  *  2. #41 — Snap to grid is REVERSIBLE. Switching it off restores the recording exactly, and
  *     re-deriving at a different size measures from the recording rather than from the last
  *     snap, so a round trip through three grid sizes lands back on the original numbers.
- *  3. Settings v11 — the Quantize default goes back to 'auto', once, and never again.
+ *  3. Settings v11/v12 — the Quantize default goes back to 'auto' once and never again, and the
+ *     snap switch becomes the three-state Off/Grid/Beat mode without moving anybody's notes.
+ *  4. G25 (§9) — SNAP TO BEAT. Nearest beat, collisions cascading onto the following
+ *     subdivisions in played order, ends tidied to a cell, and the same reversibility contract
+ *     Grid keeps.
  *
  * Everything under test is a pure function or a pure migration, which is why this runs in node
  * with no DOM. The one part it cannot reach is the wiring inside `ui/app.ts`; that is what
@@ -22,6 +26,7 @@ import { straightRiff, tripletRiff } from '../src/score/fixtures';
 import {
   mergeEditedOntoRaw,
   rollSnapUnitSec,
+  snapPerformanceToBeat,
   snapPerformanceToGrid
 } from '../src/app/snap';
 import { DEFAULT_SETTINGS, SETTINGS_VERSION, mergeStoredSettings, type AppSettings } from '../src/app/state';
@@ -201,12 +206,12 @@ assert(new Set(sheets.values()).size > 1, 'changing Quantize must change what th
 assert(fingerprint(raw) === rawBefore, 'building at four grids must leave the performance layer alone');
 
 // ---------------------------------------------------------------------------
-// 7. Settings v10
+// 7. Settings v10 … v12
 // ---------------------------------------------------------------------------
 
-assert(SETTINGS_VERSION === 11, 'this test is written against settings v11');
+assert(SETTINGS_VERSION === 12, 'this test is written against settings v12');
 assert(DEFAULT_SETTINGS.grid === 'auto', "a new user's Quantize default is Auto again");
-assert(DEFAULT_SETTINGS.rollSnapToGrid === false, 'Snap to grid is off until asked for');
+assert(DEFAULT_SETTINGS.rollSnap === 'off', 'Snap is off until asked for');
 assert(DEFAULT_SETTINGS.alignViews === true, 'alignment is on and is not a choice');
 
 // The v8 -> … -> v11 chain, in one hop, which is how a real blob arrives. v10 moves this blob's
@@ -223,9 +228,9 @@ const fromV8 = mergeStoredSettings({
 assert(fromV8.grid === 'auto', 'a v8 blob lands on Auto after the v10/v11 pair');
 assert(fromV8.rollAllNoteNames === true && fromV8.rollEditing === true, 'v9 still forces the two roll switches');
 assert(fromV8.preciseBeats === false, 'v9 still forces the drifting-tempo pass off');
-assert(fromV8.rollSnapToGrid === false, 'a migrated blob does not arrive with notes already snapped');
+assert(fromV8.rollSnap === 'off', 'a migrated blob does not arrive with notes already snapped');
 assert(fromV8.alignViews === true, 'v11 forces alignment on — the chip is gone (G11)');
-assert(fromV8.settingsVersion === 11, 'the migrated blob is stamped v11');
+assert(fromV8.settingsVersion === 12, 'the migrated blob is stamped v12');
 
 // A v9 blob that had explicitly chosen 'sixteenth' is still carried across v10 — which forced
 // everything to 'free' — and v11 then reads that 'free' as v10's doing rather than as a choice,
@@ -251,11 +256,28 @@ assert(wasFree.grid === 'auto', "v11 moves every v10 'free' to Auto exactly once
 // the menu every time the app started.
 const chosen = mergeStoredSettings({ settingsVersion: 11, grid: 'free', rollSnapToGrid: true } as Partial<AppSettings>);
 assert(chosen.grid === 'free', "after v11 the player's own Quantize choice is never re-flipped");
-assert(chosen.rollSnapToGrid === true, 'after v11 a chosen snap setting survives');
+
+// v11 -> v12: the switch becomes a mode, by TRANSLATION rather than by reset. The boolean said
+// exactly one thing and 'grid' means exactly that, so somebody who had switched it on stays on.
+assert(chosen.rollSnap === 'grid', "a stored `true` carries over as the player's own Grid choice");
+assert(chosen.rollSnapToGrid === true, 'the dead boolean survives so an old blob still round-trips');
+const wasOff = mergeStoredSettings({ settingsVersion: 11, rollSnapToGrid: false } as Partial<AppSettings>);
+assert(wasOff.rollSnap === 'off', 'a stored `false` carries over as Off');
+// NOBODY IS MIGRATED ONTO BEAT. It moves notes to places the old switch never would have, and a
+// mode nobody chose must not arrive already on.
+assert(
+  mergeStoredSettings({ settingsVersion: 9, rollSnapToGrid: true } as Partial<AppSettings>).rollSnap !== 'beat',
+  'no migration may land a profile on Beat'
+);
+// …and once on v12, the chosen mode is theirs, including the new one.
+const onBeat = mergeStoredSettings({ settingsVersion: 12, rollSnap: 'beat' } as Partial<AppSettings>);
+assert(onBeat.rollSnap === 'beat', 'after v12 a chosen Beat is never re-flipped');
 
 // Stored JSON is untrusted: a garbage snap value must normalise rather than reach the feed.
 const junk = mergeStoredSettings({ settingsVersion: 11, rollSnapToGrid: 'yes' } as unknown as Partial<AppSettings>);
-assert(junk.rollSnapToGrid === false, 'a non-boolean snap setting falls back to off');
+assert(junk.rollSnap === 'off', 'a non-boolean legacy snap setting falls back to Off');
+const junkMode = mergeStoredSettings({ settingsVersion: 12, rollSnap: 'sort-of' } as unknown as Partial<AppSettings>);
+assert(junkMode.rollSnap === 'off', 'a snap mode nothing recognises falls back to Off, not to "some kind of on"');
 // And a garbage roll grid falls back rather than reaching the ruler — the vocabulary grew by two
 // words in G14, so the guard has to know both of them.
 const goodGrid = mergeStoredSettings({ settingsVersion: 11, rollGrid: 'off' } as Partial<AppSettings>);
@@ -316,8 +338,163 @@ assert(
   `free must stay near 1:1 on triplet material: ${triplet.notes.length} played -> ${freeTriplet.glyphs} glyphs`
 );
 
+// ---------------------------------------------------------------------------
+// 9. SNAP TO BEAT (G25)
+// ---------------------------------------------------------------------------
+//
+// 120 bpm in 4/4, so the beat is exactly half a second and the 1/16 cascade cell is exactly
+// 0.125 — every number below is a round one, and a wrong denominator cannot hide behind a float.
+// The origin is still 1s into the recording, because the one bug this arithmetic invites is
+// measuring the pulse from the top of the FILE rather than from written second 0.
+const BEAT = 0.5;
+const CELL16 = 0.125;
+const onBeatLine = (sec: number): boolean =>
+  Math.abs((sec - originSec) / BEAT - Math.round((sec - originSec) / BEAT)) < 1e-9;
+
+// --- 9a. A SPARSE TAKE: every note lands on a beat, and none of them collides --------------
+//
+// Human timing, a few tens of milliseconds either side of the pulse, and one note (s3) played
+// LATE enough that flooring to the preceding beat would drag it back a whole half-second. The
+// nearest beat is the right answer for all four.
+const sparse: InputNote[] = [
+  { id: 's0', startSec: 1.02, endSec: 1.44, midi: 40 },
+  { id: 's1', startSec: 1.47, endSec: 1.93, midi: 43 },
+  { id: 's2', startSec: 2.03, endSec: 2.4, midi: 45 },
+  { id: 's3', startSec: 2.52, endSec: 2.99, midi: 47 }
+];
+const sparseBefore = fingerprint(sparse);
+const onBeats = snapPerformanceToBeat(sparse, BEAT, CELL16, originSec, 120);
+
+assert(fingerprint(sparse) === sparseBefore, 'beat snap must not mutate the performance it was handed');
+assert(onBeats.length === sparse.length, 'beat snap must not add or drop notes');
+for (const note of onBeats) assert(onBeatLine(note.startSec), `${note.id} must start on a beat`);
+assert(
+  new Set(onBeats.map((n) => n.startSec)).size === onBeats.length,
+  'a sparse take needs no cascade at all — four attacks, four beats'
+);
+assert(
+  onBeats.map((n) => `${n.id}@${n.startSec}`).join(' ') === 's0@1 s1@1.5 s2@2 s3@2.5',
+  'each note goes to its NEAREST beat, counted from the origin'
+);
+// Ends are tidied to a cell so nothing rings a ragged 40 ms across the next beat, and the last
+// note — which has nothing after it to be capped by — keeps the length it rounded to.
+for (const note of onBeats) {
+  const off = Math.abs((note.endSec - originSec) / CELL16 - Math.round((note.endSec - originSec) / CELL16));
+  assert(off < 1e-9, `${note.id} must END on a subdivision line`);
+  assert(note.endSec - note.startSec >= CELL16 - 1e-9, `${note.id} must be at least one cell long`);
+}
+// …and an end may not be pushed past the next attack, because the recording did not hold those
+// two together: s0 was released at 1.44 and s1 struck at 1.47.
+assert(onBeats[0].endSec <= onBeats[1].startSec + 1e-9, 'a tidied end may not swallow the next attack');
+
+// A note played shorter than a cell is widened to one rather than rounded out of existence.
+const stub = snapPerformanceToBeat([{ id: 'x', startSec: 1.02, endSec: 1.05, midi: 40 }], BEAT, CELL16, originSec, 120);
+assert(
+  Math.abs(stub[0].startSec - 1) < 1e-9 && Math.abs(stub[0].endSec - 1.125) < 1e-9,
+  'a note shorter than a cell is floored at one cell, not flattened to nothing'
+);
+
+// --- 9b. A CROWDED BEAT: the cascade ------------------------------------------------------
+//
+// Four 1/16s of a fast run, all four of them nearest to the beat at 2.0. Stacking them there
+// would delete the run; the earliest takes the beat and the rest step onto the following
+// subdivisions, which is what "fast runs keep their subdivisions" means.
+const run: InputNote[] = [
+  { id: 'r0', startSec: 1.98, endSec: 2.05, midi: 60 },
+  { id: 'r1', startSec: 2.06, endSec: 2.13, midi: 62 },
+  { id: 'r2', startSec: 2.13, endSec: 2.2, midi: 64 },
+  { id: 'r3', startSec: 2.19, endSec: 2.3, midi: 65 }
+];
+const cascaded = snapPerformanceToBeat(run, BEAT, CELL16, originSec, 120);
+assert(
+  cascaded.map((n) => `${n.id}@${n.startSec}`).join(' ') === 'r0@2 r1@2.125 r2@2.25 r3@2.375',
+  'the earliest note takes the beat and the rest cascade onto the following 1/16s'
+);
+assert(new Set(cascaded.map((n) => n.startSec)).size === 4, 'no two notes may share a position');
+// THE CELL IS THE SELECTED GRID'S. At 1/32 the same four notes pack twice as tightly, which is
+// the whole reason changing the roll grid has to re-derive the feed in Beat mode too.
+const cascaded32 = snapPerformanceToBeat(run, BEAT, rollSnapUnitSec('thirtysecond', 120), originSec, 120);
+assert(
+  cascaded32.map((n) => n.startSec).join(' ') === '2 2.0625 2.125 2.1875',
+  'the cascade steps by the SELECTED grid cell'
+);
+// …and with no ruler at all (Free or Off report no unit) it falls back to a 1/16, so Beat still
+// works under a grid that draws bar lines only.
+const cascadedNoRuler = snapPerformanceToBeat(run, BEAT, rollSnapUnitSec('off', 120), originSec, 120);
+assert(
+  fingerprint(cascadedNoRuler) === fingerprint(cascaded),
+  'with no ruler the cascade falls back to a 1/16 rather than refusing to run'
+);
+
+// A CHORD IS ONE EVENT. Three notes struck together are not a collision to be cascaded — doing
+// so would arpeggiate every chord in the take — so they share the beat they were aimed at.
+const chord: InputNote[] = [
+  { id: 'c0', startSec: 1.03, endSec: 1.48, midi: 40 },
+  { id: 'c1', startSec: 1.035, endSec: 1.49, midi: 47 },
+  { id: 'c2', startSec: 1.04, endSec: 1.47, midi: 52 }
+];
+const chorded = snapPerformanceToBeat(chord, BEAT, CELL16, originSec, 120);
+assert(
+  chorded.every((n) => Math.abs(n.startSec - 1) < 1e-9),
+  'a strummed chord stays a chord — one attack, one position'
+);
+
+// --- 9c. ORDER IS PRESERVED ----------------------------------------------------------------
+//
+// The §2 take, whose ids are deliberately not in time order. Beat mode may move every note, but
+// it may never let two of them swap: the cascade hands out positions strictly after the last
+// one it gave away, so this is a property of the construction rather than of the input.
+const beatRaw = snapPerformanceToBeat(raw, BEAT, CELL16, originSec, 120);
+const playedOrder = [...raw].sort((a, b) => a.startSec - b.startSec).map((n) => n.id);
+assert(
+  beatRaw.map((n) => n.id).join(',') === playedOrder.join(','),
+  'the snapped take is in the order it was played'
+);
+for (let i = 1; i < beatRaw.length; i++) {
+  assert(beatRaw[i].startSec >= beatRaw[i - 1].startSec, 'starts must be non-decreasing');
+}
+assert(beatRaw.length === raw.length, 'beat snap must not add or drop notes');
+// n1 and n4 were both reaching for the beat at 1.0 that n0 got, so they follow it a cell apart.
+assert(
+  beatRaw.map((n) => `${n.id}@${n.startSec}`).join(' ') === 'n0@1 n1@1.125 n4@1.25 n2@1.5 n3@2.5',
+  'a real cascade over the §2 take, note by note'
+);
+
+// --- 9d. THE SAME REVERSIBILITY CONTRACT GRID KEEPS ----------------------------------------
+
+assert(fingerprint(raw) === rawBefore, 'beat snap leaves the recording untouched — Off restores it exactly');
+// Beat is not Grid under another name…
+assert(fingerprint(beatRaw) !== fingerprint(atEighth), 'Beat and Grid must place notes differently');
+// …and Grid is not disturbed by Beat existing: §2's numbers, re-measured after the shared
+// `restate()` refactor.
+assert(
+  fingerprint(snapPerformanceToGrid(raw, rollSnapUnitSec('eighth', 120), originSec, 120)) === fingerprint(atEighth),
+  'grid mode is byte-identical to what it was before Beat was added'
+);
+// RE-DERIVE, NEVER RE-ROUND. Changing the roll grid in Beat mode measures the pulse from the
+// recording again; feeding it its own output walks n4 a cell further out and n2 off its beat
+// entirely, which is exactly the drift the contract forbids.
+const beatAt32 = snapPerformanceToBeat(raw, BEAT, rollSnapUnitSec('thirtysecond', 120), originSec, 120);
+const beatBackAt16 = snapPerformanceToBeat(raw, BEAT, CELL16, originSec, 120);
+assert(fingerprint(beatAt32) !== fingerprint(beatRaw), 'a finer grid must actually pack the cascade differently');
+assert(fingerprint(beatBackAt16) === fingerprint(beatRaw), 'Beat -> 1/32 -> Beat lands where the first Beat did');
+const beatCumulative = snapPerformanceToBeat(beatRaw, BEAT, CELL16, originSec, 120);
+assert(
+  fingerprint(beatCumulative) !== fingerprint(beatRaw),
+  'snapping an already-snapped take must differ — otherwise this proves nothing about measuring from raw'
+);
+// And a hand edit through the Beat layer stores the dragged position as the new raw, exactly as
+// it does through Grid: one shared merge, so there is one answer.
+const beatDrag = mergeEditedOntoRaw(raw, beatRaw.map((n) => (n.id === 'n2' ? { ...n, startSec: 1.75, endSec: 1.97 } : n)), new Set(['n2']));
+assert(beatDrag.find((n) => n.id === 'n2')!.startSec === 1.75, 'the dragged note keeps where it was dropped');
+assert(
+  beatDrag.find((n) => n.id === 'n0')!.startSec === raw.find((n) => n.id === 'n0')!.startSec,
+  'every note the gesture did not name comes back from the recording'
+);
+
 console.log(
   `roll-snap-test: free/straight ${freeStraight.glyphs}g ${freeStraight.rests}r ${freeStraight.ties}t · ` +
-    `free/triplet ${freeTriplet.glyphs}g ${freeTriplet.rests}r ${freeTriplet.ties}t`
+    `free/triplet ${freeTriplet.glyphs}g ${freeTriplet.rests}r ${freeTriplet.ties}t · ` +
+    `beat/cascade ${cascaded.map((n) => n.startSec).join('/')}`
 );
 console.log('roll-snap-test: all assertions passed');

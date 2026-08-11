@@ -314,12 +314,17 @@ export const TIPS = {
     'editing it. On its own it never re-writes what the app heard — changing it does not move a ' +
     'single note. Hold Option while dragging to ignore it.',
   /**
-   * Snap to grid. The one control in the app that MOVES the player's notes, so its tip has to
-   * say both halves out loud: what it does, and that it is undoable by switching it off.
+   * Snap — Off / Grid / Beat. The one control in the app that MOVES the player's notes, so its
+   * tip has to say all of it out loud: one line per state, then the promise that covers all
+   * three — the recording is kept underneath and Off puts every note straight back.
    */
   rollSnap:
-    'Line every note up with the grid columns. Each note starts on the nearest line and ends on ' +
-    'one too, never shorter than a single column. Your recording is kept underneath exactly as you played it, so switching this off puts every note straight back — and changing the grid size measures again from the original, never from the last snap. While it is on, the sheet, the playback and anything you export all follow the lined-up version.',
+    'Off: the roll shows your recording exactly as you played it. ' +
+    'Grid: every note starts on the nearest grid column and ends on one too, never shorter than a single column. ' +
+    'Beat: each note moves to its nearest beat — the cleanest sheet; fast runs keep their subdivisions, ' +
+    'because when several notes are reaching for the same beat the first one takes it and the rest follow on the next grid steps. ' +
+    'Your recording is kept underneath whichever you pick, so going back to Off puts every note straight back — and changing the grid size ' +
+    'measures again from the original, never from the last snap. While Grid or Beat is on, the sheet, the playback and anything you export all follow the lined-up version.',
   clef:
     'Auto chooses one stable clef for the whole part. Treble and Bass force one clef; Grand stacks treble and bass for music that genuinely needs both ranges.',
   fingering:

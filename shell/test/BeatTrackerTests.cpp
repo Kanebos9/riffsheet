@@ -768,7 +768,15 @@ public:
             // sidecar was deleted, because wave 5's SidecarAdapter needs it. An
             // unbuilt header rots; this keeps it compiled and true.
             juce::ChildProcess child;
+
+            // echo is a cmd.exe builtin on Windows, not a program - there is no
+            // /bin/echo to start there, which is all the Windows runner was
+            // reporting.
+           #if JUCE_WINDOWS
+            const juce::StringArray command { "cmd.exe", "/c", "echo", "riffsheet" };
+           #else
             const juce::StringArray command { "/bin/echo", "riffsheet" };
+           #endif
 
             if (child.start (command, juce::ChildProcess::wantStdOut | juce::ChildProcess::wantStdErr))
             {
@@ -779,7 +787,7 @@ public:
             }
             else
             {
-                expect (false, "could not start /bin/echo");
+                expect (false, "could not start " + command.joinIntoString (" "));
             }
         }
     }

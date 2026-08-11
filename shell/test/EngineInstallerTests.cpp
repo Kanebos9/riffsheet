@@ -418,7 +418,16 @@ private:
         oldHome.deleteRecursively();
         newHome.deleteRecursively();
 
+        // PEP 405 puts the console scripts in Scripts on Windows and bin
+        // everywhere else, and retargetVenvScripts() looks in whichever one this
+        // platform's venv module would have written. A fixture that always laid
+        // out a POSIX venv was a venv the Windows build was right to refuse.
+       #if JUCE_WINDOWS
+        const auto bin = newHome.getChildFile ("venv").getChildFile ("Scripts");
+       #else
         const auto bin = newHome.getChildFile ("venv").getChildFile ("bin");
+       #endif
+
         expect (bin.createDirectory().wasOk());
 
         // pip's real two-line /bin/sh shim, which is what it writes when the
@@ -436,13 +445,21 @@ private:
         expect (writeScript (shim, "#!/bin/sh\n'''exec' \"" + oldHome.getFullPathName()
                                    + "/venv/bin/python\" \"$0\" \"$@\"\n' '''\n"
                                      "from transkun.transcribe import main\n"));
+
+        // There is no execute bit to set on Windows, and JUCE says so by
+        // returning false rather than by pretending it worked.
+       #if ! JUCE_WINDOWS
         expect (shim.setExecutePermission (true));
+       #endif
 
         // ...and the ordinary shebang form, for a short path.
         const auto plain = bin.getChildFile ("pip");
         expect (writeScript (plain, "#!" + oldHome.getFullPathName() + "/venv/bin/python\n"
                                     "import sys\n"));
+
+       #if ! JUCE_WINDOWS
         expect (plain.setExecutePermission (true));
+       #endif
 
         // Something that mentions nothing and must be left exactly alone.
         const auto unrelated = bin.getChildFile ("untouched");

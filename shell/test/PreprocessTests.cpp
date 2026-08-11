@@ -169,9 +169,17 @@ public:
     static std::vector<double> findClicks (const juce::AudioBuffer<float>& buffer, double rate)
     {
         std::vector<double> times;
+
+        // A rate of zero would make the refractory window zero samples wide, and
+        // the loop below would then never advance past the first burst - it
+        // would push a click per iteration until the vector exhausted the heap.
+        // A caller with no rate has no audio either; say so instead of hanging.
+        if (rate <= 0.0 || buffer.getNumChannels() < 1 || buffer.getNumSamples() < 1)
+            return times;
+
         const auto* in = buffer.getReadPointer (0);
         const auto frames = buffer.getNumSamples();
-        const auto refractory = (int) (rate * 0.05);
+        const auto refractory = juce::jmax (1, (int) (rate * 0.05));
         const auto halfWindow = (int) (rate * 0.004);
 
         auto n = 0;
@@ -613,9 +621,14 @@ public:
         const auto expectedRatio = std::pow (2.0, -detunedResult.cents / 1200.0);
         expectWithinAbsoluteError (detunedResult.pitchRatio, expectedRatio, 1.0e-12);
 
+        // Two statements, not one call: `findClicks (readWav (file, rate), rate)`
+        // reads `rate` and calls readWav() in an order the standard leaves
+        // unspecified, so Clang passed the rate readWav had just filled in while
+        // GCC and MSVC passed the zero it still held - which is why this test
+        // died on the Linux and Windows runners and passed here.
         double referenceRate = 0.0, correctedRate = 0.0;
-        const auto referenceClicks = findClicks (readWav (referenceResult.file, referenceRate),
-                                                 referenceRate);
+        const auto referenceAudio = readWav (referenceResult.file, referenceRate);
+        const auto referenceClicks = findClicks (referenceAudio, referenceRate);
         const auto correctedAudio = readWav (detunedResult.file, correctedRate);
         const auto correctedClicks = findClicks (correctedAudio, correctedRate);
 

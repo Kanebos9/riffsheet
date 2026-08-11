@@ -12,6 +12,26 @@ namespace BasicPitchNotes
         constexpr int kNoteBins    = BasicPitchFrontend::kNoteBins;     // 88
         constexpr int kMaxNoteIdx  = kNoteBins - 1;                     // 87
 
+        /*  HOW CLOSE TWO NEIGHBOURING ONSET VALUES HAVE TO BE TO COUNT AS A TIE.
+
+            argrelmax rejects a plateau because neither shoulder is STRICTLY
+            greater than the other, and inferredOnsets() manufactures plateaus on
+            purpose: the frame holding the largest note-diff is rescaled to
+            exactly `maxOnset`, so it lands bit-for-bit on the frame holding the
+            largest onset. That equality is only exact while the arithmetic is;
+            with the ~5e-7 of drift there is between two ONNX Runtime builds of
+            the same graph it becomes a 1-ULP coin toss, and the toss decides
+            whether the note is reported at the plateau or at the real onset a
+            few frames earlier. On the shipped fixture that is note 10 starting
+            at frame 283 on macOS and 286 on Linux and Windows.
+
+            A tenth of a millipoint of posteriorgram is a plateau by any measure
+            that means anything - it is two orders of magnitude below the 2e-3
+            the end-to-end test already allows between builds, and four below the
+            smallest prominence any real peak here has. Treating that band as a
+            tie is what makes the note list the same on every platform. */
+        constexpr float kPeakTieTolerance = 1.0e-5f;
+
         /** NeuralNote NoteUtils::hzToMidi. */
         int hzToMidi (float hz) noexcept
         {
@@ -216,7 +236,10 @@ namespace BasicPitchNotes
             it accepts ties, and it makes frame 0 its own left neighbour so a
             take that starts loud always gets a note at time zero. That is one
             spurious note per take, and it is exactly the kind of difference a
-            golden captured from upstream catches and a smoke test does not. */
+            golden captured from upstream catches and a smoke test does not.
+
+            "Strictly greater" is read to the tolerance above rather than to the
+            last bit, for the reason written out at kPeakTieTolerance. */
         for (int frameIdx = lastFrame - 1; frameIdx >= 1; --frameIdx)
         {
             for (int noteIdx = maxNoteIdx; noteIdx >= minNoteIdx; --noteIdx)
@@ -225,7 +248,9 @@ namespace BasicPitchNotes
                 const auto previous = onsets[(size_t) frameIdx - 1][(size_t) noteIdx];
                 const auto next = onsets[(size_t) frameIdx + 1][(size_t) noteIdx];
 
-                if (onset < params.onsetThreshold || onset <= previous || onset <= next)
+                if (onset < params.onsetThreshold
+                      || onset <= previous + kPeakTieTolerance
+                      || onset <= next + kPeakTieTolerance)
                     continue;
 
                 // Walk forward while there is energy at this pitch.
@@ -291,8 +316,21 @@ namespace BasicPitchNotes
                 for (int noteIdx = 0; noteIdx < noteCount; ++noteIdx)
                     byEnergy.push_back ({ remainingEnergy[(size_t) frameIdx][(size_t) noteIdx], frameIdx, noteIdx });
 
-            std::sort (byEnergy.begin(), byEnergy.end(),
-                       [] (const Cell& a, const Cell& b) { return a.value > b.value; });
+            /*  A TOTAL ORDER, not just "louder first": std::sort is not stable,
+                so cells of equal energy - and a posteriorgram has thousands of
+                them - come out in whatever order the standard library's
+                introsort happens to leave them in, which is not the same order
+                in libc++, libstdc++ and MSVC's STL. The frame and note
+                tie-breakers are upstream's: basic-pitch takes np.argmax of the
+                remaining energy, and argmax returns the FIRST maximum in C
+                order, which is the lowest frame and then the lowest bin. */
+            std::sort (byEnergy.begin(), byEnergy.end(), [] (const Cell& a, const Cell& b)
+            {
+                if (a.value > b.value)          return true;
+                if (b.value > a.value)          return false;
+                if (a.frameIdx != b.frameIdx)   return a.frameIdx < b.frameIdx;
+                return a.noteIdx < b.noteIdx;
+            });
 
             const auto inhibit = [frameThreshold, noteCount] (Posteriorgram& pg, int frame, int note, int k)
             {
@@ -366,10 +404,15 @@ namespace BasicPitchNotes
             }
         }
 
+        // Pitch is in the order for the same reason the melodia pass's sort has
+        // tie-breakers: two notes that start and end on the same frames would
+        // otherwise be left in whichever order this platform's std::sort chose,
+        // and the caller compares note lists across platforms.
         std::sort (events.begin(), events.end(), [] (const Event& a, const Event& b)
         {
-            return a.startFrame < b.startFrame
-                     || (a.startFrame == b.startFrame && a.endFrame < b.endFrame);
+            if (a.startFrame != b.startFrame)   return a.startFrame < b.startFrame;
+            if (a.endFrame != b.endFrame)       return a.endFrame < b.endFrame;
+            return a.pitch < b.pitch;
         });
 
         return events;

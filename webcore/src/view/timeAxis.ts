@@ -285,14 +285,54 @@ export interface GridDetail {
   subs: boolean;
   /** Draw every Nth bar line's LABEL. 1 = all of them. Lines are always drawn for every bar. */
   labelEvery: number;
+  /**
+   * How many equal parts a BEAT is cut into by the finest level.
+   *
+   * Carried on the detail rather than baked into `gridMarks` because it is the EDIT GRID's
+   * number, not the zoom's: the roll snaps a drag to the unit the player picked in the Grid
+   * selector, and a drawn grid at a different subdivision is a ruler that disagrees with the
+   * thing it is ruling. 3 is a triplet, and a triplet-snapped note landing between two drawn
+   * columns was exactly the reported symptom.
+   */
+  subsPerBeat: number;
 }
 
 /** Below this many pixels apart, a set of lines stops being a grid and becomes a tint. */
 const MIN_LINE_GAP_PX = 7;
 /** A bar number needs about this much room or the numbers collide. */
 const MIN_LABEL_GAP_PX = 34;
-/** How many subdivisions of a beat the finest level draws. */
-const SUBS_PER_BEAT = 4;
+/** How many subdivisions of a beat the finest level draws when nobody has said otherwise. */
+export const SUBS_PER_BEAT = 4;
+
+/**
+ * The edit grid, as a number of parts per BEAT.
+ *
+ * The vocabulary is the piano roll's Grid selector (`PianoRollEditGrid`), taken as a plain
+ * string union so this module still imports nothing. A beat is a quarter note on the meters
+ * this app writes, so 'eighth' is two parts and 'sixteenth' four; 'triplet' is three, which is
+ * the whole reason this exists — the drawn grid was hard-wired to four and a triplet-snapped
+ * note therefore sat between two drawn columns.
+ *
+ * 'free' snaps to nothing, so there is no unit it could draw; it falls back to the default
+ * quarter-division rather than drawing no subdivisions at all, because the ruler is still
+ * useful when the notes are not on it.
+ */
+export function subdivisionsPerBeat(
+  grid: 'quarter' | 'eighth' | 'sixteenth' | 'triplet' | 'free'
+): number {
+  switch (grid) {
+    case 'quarter':
+      return 1;
+    case 'eighth':
+      return 2;
+    case 'sixteenth':
+      return 4;
+    case 'triplet':
+      return 3;
+    case 'free':
+      return SUBS_PER_BEAT;
+  }
+}
 
 /**
  * How much grid to draw, decided by SPACING rather than by zoom.
@@ -300,13 +340,22 @@ const SUBS_PER_BEAT = 4;
  * Spacing, because the same window is a different picture on a 390 px plugin pane and a 1600 px
  * desktop one. `medianBeatSec` is used rather than the exact local beat so the answer does not
  * flicker between two levels while the pointer moves through a tempo-less passage.
+ *
+ * `subsPerBeat` is the EDIT GRID's subdivision (see `subdivisionsPerBeat`). It changes both what
+ * is drawn and whether there is room to draw it: three columns per beat fit where four do not.
+ * 1 means the beat is the finest unit there is, so there are no subdivisions to draw at all.
  */
-export function gridDetail(medianBeatSec: number, secondsPerPixel: number): GridDetail {
+export function gridDetail(
+  medianBeatSec: number,
+  secondsPerPixel: number,
+  subsPerBeat: number = SUBS_PER_BEAT
+): GridDetail {
+  const parts = Number.isFinite(subsPerBeat) ? Math.max(1, Math.round(subsPerBeat)) : SUBS_PER_BEAT;
   const beatPx = secondsPerPixel > 0 ? medianBeatSec / secondsPerPixel : Number.POSITIVE_INFINITY;
   const bars = true;
   const beats = beatPx >= MIN_LINE_GAP_PX;
-  const subs = beatPx / SUBS_PER_BEAT >= MIN_LINE_GAP_PX;
-  return { bars, beats, subs, labelEvery: labelStep(beatPx) };
+  const subs = parts > 1 && beatPx / parts >= MIN_LINE_GAP_PX;
+  return { bars, beats, subs, labelEvery: labelStep(beatPx), subsPerBeat: parts };
 }
 
 function labelStep(beatPx: number): number {
@@ -358,9 +407,11 @@ export function gridMarks(
       out.push({ sec, level: 'beat', label: null });
     }
     if (!detail.subs) continue;
-    const sub = bar.beatSec / SUBS_PER_BEAT;
+    // The EDIT GRID's subdivision, carried on the detail. See `GridDetail.subsPerBeat`.
+    const parts = Math.max(1, Math.round(detail.subsPerBeat || SUBS_PER_BEAT));
+    const sub = bar.beatSec / parts;
     for (let b = 0; b < bar.beats; b++) {
-      for (let s = 1; s < SUBS_PER_BEAT; s++) {
+      for (let s = 1; s < parts; s++) {
         const sec = bar.startSec + b * bar.beatSec + s * sub;
         if (sec < win.fromSec || sec > win.toSec) continue;
         out.push({ sec, level: 'sub', label: null });
@@ -417,6 +468,14 @@ export const ALIGN_GUTTER_PX = 34;
  *
  * Null when the sheet cannot place that second yet (nothing engraved), which is a normal state
  * and means "leave the scroll alone this frame".
+ *
+ * IT PARKS, IT DOES NOT GO NEGATIVE (F13). Scroll the roll left of the first note — into the
+ * leading silence, which the roll and the waveform quite rightly go on drawing — and the second
+ * asked for here is before written second 0. There is no page there, so the answer is 0: the
+ * sheet sits still at its start while the other two strips keep scrolling. The alternative, a
+ * negative scroll clamped by the browser to 0 anyway, is the same picture arrived at through a
+ * value nothing else can reason about; and letting it wrap to the far end would make the sheet
+ * jump, which is what was reported.
  */
 export function sheetScrollForSec(
   sec: number,
@@ -430,21 +489,118 @@ export function sheetScrollForSec(
 }
 
 /**
+ * How far the ENGRAVING actually reaches, in content pixels.
+ *
+ * `firstX` is the first engraved beat's x and `lastX` the right edge of the final bar — the two
+ * ends of the tick axis, which is the only stretch of the page where "which second is at this
+ * x" has been measured rather than extrapolated.
+ */
+export interface EngravedExtent {
+  firstX: number;
+  lastX: number;
+}
+
+/**
+ * Hold an x inside the engraving before anybody turns it into a time.
+ *
+ * THE BUG THIS EXISTS FOR. `x -> tick` extrapolates past both ends on purpose (a note's tail
+ * that runs a fraction past the last beat has to land somewhere). Feed it the sheet's RIGHT
+ * VIEWPORT EDGE, though, and the extrapolation is not a rounding detail: on a take whose
+ * engraving is narrower than the pane — a short riff, or any take at a deep zoom-out — the edge
+ * is hundreds of pixels past the last bar, so the derived window ends well past the end of the
+ * recording. `clampWindow` then slides that window back inside the take KEEPING ITS SPAN, which
+ * moves `fromSec` away from the second the sheet's left edge is really showing. The roll and the
+ * sheet are then looking at different music at different scales, and the next coupled zoom
+ * computes its ratio from the wrong previous span and compounds it. Measured as ~578 px of
+ * drift.
+ *
+ * Clamping is the honest answer rather than a fudge: past the last engraved bar there is no more
+ * music, so the last engraved moment IS what that edge is showing.
+ */
+export function clampXToEngraving(x: number, extent: EngravedExtent | null | undefined): number {
+  if (!extent) return x;
+  const { firstX, lastX } = extent;
+  if (!Number.isFinite(firstX) || !Number.isFinite(lastX) || !(lastX > firstX)) return x;
+  return Math.max(firstX, Math.min(lastX, x));
+}
+
+/**
  * The window the roll should show to match what the sheet is showing.
  *
  * The sheet is the one being read here: its left edge and its right edge are turned into
  * seconds and become the window. Null when the sheet cannot answer.
+ *
+ * `engraved` is the stretch of page that has actually been engraved; pass it and both edges are
+ * held inside it first. See `clampXToEngraving` for why that is not optional in practice.
  */
 export function windowFromSheet(
   view: SheetViewport,
   secAtContentX: (x: number) => number | null,
-  limits: TimeLimits
+  limits: TimeLimits,
+  engraved?: EngravedExtent | null
 ): TimeWindow | null {
-  const from = secAtContentX(view.scrollLeft + ALIGN_GUTTER_PX);
-  const to = secAtContentX(view.scrollLeft + view.viewportWidth);
+  const from = secAtContentX(clampXToEngraving(view.scrollLeft + ALIGN_GUTTER_PX, engraved));
+  const to = secAtContentX(clampXToEngraving(view.scrollLeft + view.viewportWidth, engraved));
   if (from === null || to === null || !Number.isFinite(from) || !Number.isFinite(to)) return null;
   if (!(to > from)) return null;
   return clampWindow({ fromSec: from, toSec: to }, limits);
+}
+
+// ---------------------------------------------------------------------------
+// The origin: where bar 1 sits on the recording's clock
+// ---------------------------------------------------------------------------
+
+/**
+ * WRITTEN SECOND 0 ON THE RECORDING'S CLOCK, derived from the FIRST NOTE rather than from the
+ * top of the file.
+ *
+ * THE BUG THIS EXISTS FOR (F13). A take with leading silence engraves its first attack in bar 1
+ * — the pipeline anchors the music, not the tape — while the roll and the waveform draw that
+ * same attack where it was actually played, two seconds in. `scoreOriginSec()` answers this
+ * question from `barOneSec`, which is 0 unless somebody has dragged the bar-1 marker, so the
+ * sheet claimed bar 1 was at second 0 and Align had no way to bring the two together: every
+ * mapping was uniformly wrong by the length of the silence.
+ *
+ * One attack pins the two clocks together, and it is the first one because it is the only event
+ * both pictures are certain to contain:
+ *
+ *     audioSec = writtenSec + origin,  where  origin = firstPerformedSec - firstWrittenSec
+ *
+ * Returns `fallbackSec` when either end is missing (no notes yet, or a score with no performed
+ * times), so a blank document still has a defined origin rather than a NaN that would poison
+ * every x on the page.
+ *
+ * NOT CLAMPED TO ZERO. A negative origin is a real state — a pickup engraved before bar 1 whose
+ * first attack was played earlier than written second 0 — and forcing it up to 0 would re-open
+ * the same misalignment from the other side. What must not go negative is a SCROLL, and that is
+ * `sheetScrollForSec`'s job, not this one.
+ */
+export function alignOriginSec(
+  firstWrittenSec: number | null | undefined,
+  firstPerformedSec: number | null | undefined,
+  fallbackSec = 0
+): number {
+  if (
+    firstWrittenSec === null ||
+    firstWrittenSec === undefined ||
+    firstPerformedSec === null ||
+    firstPerformedSec === undefined ||
+    !Number.isFinite(firstWrittenSec) ||
+    !Number.isFinite(firstPerformedSec)
+  ) {
+    return Number.isFinite(fallbackSec) ? fallbackSec : 0;
+  }
+  return firstPerformedSec - firstWrittenSec;
+}
+
+/** A recording second as a WRITTEN one, against an origin. The pair below cannot drift apart. */
+export function writtenSecAt(audioSec: number, originSec: number): number {
+  return audioSec - originSec;
+}
+
+/** A written second as a RECORDING one. The exact inverse of `writtenSecAt`. */
+export function audioSecAt(writtenSec: number, originSec: number): number {
+  return writtenSec + originSec;
 }
 
 /**

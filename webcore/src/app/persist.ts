@@ -26,11 +26,14 @@
  *     the process while a path survives a project reload.
  */
 
+import { strFromU8, strToU8, unzipSync, zipSync, type Zippable } from 'fflate';
+
 import type { InputNote } from '../pipeline';
 import type { EditSpec } from '../edit/actions';
 import type { NativeBridge } from '../bridge';
 import type { TrimResult } from '../audio/trim';
 import type { AppSettings, HostGrid, SourceAudio } from './state';
+import { normalizeCuts, type CutSpan } from '../edit/cuts';
 
 /** Raise this AND add a case in `readSession()` when the shape has to change under people. */
 export const SESSION_VERSION = 1;
@@ -75,6 +78,19 @@ export interface PersistedSource {
   peaks?: PersistedPeaks;
   /** The detections. THIS is what makes a restore free — no re-transcription. */
   detected?: { notes: InputNote[]; beats?: number[]; downbeats?: number[] };
+  /**
+   * F16 — the spans the player cut out, in AUDIO seconds (`edit/cuts.ts`).
+   *
+   * Has to be written, and cannot be recomputed: a cut is a decision, not a derivation. Leaving
+   * it out of the blob meant a restore came back with the full take — the silence back at the
+   * front, the edited clock reset — while the notation edits, which are keyed on note ids that
+   * a cut deliberately does not renumber, replayed on top of it. The list is the cheapest thing
+   * in the whole blob: a handful of number pairs.
+   *
+   * Omitted rather than written as `[]` when there are no cuts, so a take that was never cut
+   * serialises to exactly the bytes it did before this field existed.
+   */
+  cuts?: CutSpan[];
 }
 
 export interface PersistedSession {
@@ -171,7 +187,11 @@ export function encodeSource(source: SourceAudio | null): PersistedSource | null
     // a note sitting on a grid boundary must land on the same side of it after a restore.
     detected: source.detected
       ? { notes: source.detected.notes, beats: source.detected.beats, downbeats: source.detected.downbeats }
-      : undefined
+      : undefined,
+    // Copied, not aliased: the blob is handed to `JSON.stringify` asynchronously (SessionStore
+    // debounces), and a list that keeps changing underneath the writer is a race nobody would
+    // find. Empty stays undefined — see the field's note.
+    cuts: source.cuts?.length ? source.cuts.map((c) => ({ fromSec: c.fromSec, toSec: c.toSec })) : undefined
   };
 }
 
@@ -193,8 +213,20 @@ export function decodeSource(source: PersistedSource | null | undefined): Source
     documentBars: finiteInRange(source.documentBars, 1, 512, true),
     detected: Array.isArray(source.detected?.notes)
       ? { notes: source.detected.notes, beats: source.detected.beats, downbeats: source.detected.downbeats }
-      : undefined
+      : undefined,
+    // Through the SAME gate the live app uses. Everything downstream of `state.source.cuts`
+    // assumes a normalized list — disjoint, sorted, in range — and none of it re-checks, so a
+    // hand-edited or truncated blob carrying overlapping spans would silently break the
+    // audio<->edited clocks being inverses of each other. Normalizing on the way in costs a
+    // sort of a handful of pairs and makes the restored list indistinguishable from a live one.
+    cuts: decodeCuts(source.cuts, Number(source.durationSec) || 0)
   };
+}
+
+function decodeCuts(value: unknown, durationSec: number): CutSpan[] | undefined {
+  if (!Array.isArray(value)) return undefined;
+  const cuts = normalizeCuts(value as CutSpan[], durationSec);
+  return cuts.length ? cuts : undefined;
 }
 
 function finiteInRange(value: unknown, min: number, max: number, integer = false): number | undefined {
@@ -219,37 +251,83 @@ function validTimeSignature(value: unknown): { numerator: number; denominator: n
  * What this build WRITES. Readers accept anything from v1 up to this — see
  * `readRiffsheetDocument` — so a document made before the audio moved inside still opens.
  */
-export const RIFFSHEET_DOCUMENT_VERSION = 2;
+export const RIFFSHEET_DOCUMENT_VERSION = 3;
+
+/**
+ * THE CONTAINER, and why it changed twice.
+ *
+ * v1 carried only a REFERENCE — a path and a name — which made a `.riffsheet` a note about a
+ * recording rather than a copy of one. Mail it to somebody, open it on another machine, or simply
+ * move the wav, and the sheet arrived with a silent Original fader and a dead "Listen again".
+ *
+ * v2 put the bytes inside the file, base64'd into the JSON. That fixed portability and bought a
+ * memory problem with it. Saving a 50 MB take meant, at the peak, all of these alive at once: the
+ * audio itself, a base64 STRING of it (4/3 the bytes, and a JS string is UTF-16, so 8/3 the
+ * memory), the whole `JSON.stringify` output with that string inside it, and the UTF-8 encoding of
+ * THAT — before the bridge then base64'd the lot a second time on its way to the shell. Roughly
+ * seven to eight times the recording, to write a file that is meant to be about the size of the
+ * recording.
+ *
+ * v3 is a ZIP, which is the format that was always right for "a document plus a media file":
+ *
+ *   score.json          — the document, DEFLATE'd. It is JSON and compresses well.
+ *   audio/<filename>    — the recording, STORED (uncompressed).
+ *
+ * The audio is STORED rather than deflated for two reasons. Compressed audio (mp3, flac, m4a) does
+ * not shrink — running deflate over it spends CPU and memory to save a fraction of a percent — and
+ * STORE means the bytes sit in the file verbatim, so writing is a copy and reading is a slice.
+ * That is what makes the round trip byte-identical by construction rather than by luck.
+ *
+ * The name inside `audio/` is the take's own file name, so anyone who renames a `.riffsheet` to
+ * `.zip` and opens it finds their recording under the name they gave it.
+ */
+const SCORE_ENTRY = 'score.json';
+const AUDIO_DIR = 'audio/';
+
+/**
+ * The most audio a document may carry, going in and coming out.
+ *
+ * There is no product reason for a ceiling at all; this one exists so that a corrupt or hostile
+ * file cannot ask the process to allocate without limit. It is enforced on the WRITE side too —
+ * an open-ended save that dies somewhere inside the allocator is worse than a refusal that says
+ * what happened.
+ */
+export const MAX_DOCUMENT_AUDIO_BYTES = 512 * 1024 * 1024;
 
 /**
  * The take's actual audio, inside the document (#34).
  *
- * v1 documents carried only a REFERENCE — a path and a name — which made a `.riffsheet` a note
- * about a recording rather than a copy of one. Mail it to somebody, open it on another machine,
- * or simply move the wav, and the sheet arrived with a silent Original fader and a dead "Listen
- * again". v2 puts the bytes in the file, so the document is the whole document.
+ * `bytes` is RAW here, and raw all the way to the zip entry. It used to be a base64 string,
+ * because the v2 container was JSON and a JSON string cannot hold arbitrary bytes; a zip entry
+ * can, so the encode/decode pair either side of it is simply gone. That is the single biggest
+ * saving on both paths — see the container note above.
  *
- * BASE64 IN JSON, deliberately, and the cost is real: about 4/3 of the audio's size on top of
- * the audio itself. The document goes through the JUCE bridge as a STRING (`exportFile` takes
- * bytes, but the session blob beside it is `JSON.stringify`d and handed over as text), and a
- * JSON string cannot hold arbitrary bytes — a raw 0x00..0xFF run is not valid UTF-16 and does
- * not survive the round trip. Base64 is the representation that is safe in every hop of that
- * chain, and 33% of a wav is a price worth paying for a file that actually contains the music.
- *
- * `bytes` is the ORIGINAL FILE verbatim wherever there was one, so an mp3 stays an mp3 and
- * re-opening it decodes exactly what the player imported. Only a recorded take, which never had
- * a container of its own, is encoded here — as WAV, by `encodeWavPcm16`.
+ * The bytes are the ORIGINAL FILE verbatim wherever there was one, so an mp3 stays an mp3 and
+ * re-opening it decodes exactly what the player imported. Only a recorded take, which never had a
+ * container of its own, is encoded here — as WAV, by `encodeWavPcm16`.
  */
 export interface EmbeddedAudio {
   /** The original file's name, so a re-export can offer it back under the name it came in as. */
   name: string;
   /** The container actually stored, e.g. 'audio/wav'. Empty when the import did not say. */
   mime: string;
-  /** Only 'base64' exists; named so a future raw form can be told apart rather than guessed. */
-  encoding: 'base64';
-  bytes: string;
+  bytes: Uint8Array;
   durationSec: number;
   /** Present for takes this app encoded itself; absent for a verbatim copy of an import. */
+  sampleRate?: number;
+}
+
+/**
+ * The audio block as it appears inside a v3 `score.json`: everything about the recording EXCEPT
+ * the recording, which is the zip entry named by `entry`.
+ */
+interface StoredAudioRef {
+  name: string;
+  mime: string;
+  /** 'zip' in v3. The legacy 'base64' form is read from plain JSON documents only. */
+  encoding: 'zip';
+  entry: string;
+  durationSec: number;
   sampleRate?: number;
 }
 
@@ -282,6 +360,44 @@ export interface RiffsheetDocument {
    * Only the durable half of `PersistedAudio` is written — see `portableAudioRef`.
    */
   audio?: PersistedAudio | null;
+}
+
+/**
+ * What has to happen before a document's embedded recording can actually SOUND.
+ *
+ * THE BUG THIS ENCODES THE FIX FOR. Opening a document with audio inside it reported the Original
+ * as available and then played silence. `Transport` sounds the Original through `bridge.play()`,
+ * the JUCE shell addresses audio by TOKEN, and the restore called `loadOriginal` with a ref that
+ * carried bytes and no token — which that shell answers with `durationSec: 0`, having done
+ * nothing. Nobody read the answer. The browser's mock bridge decodes `ref.bytes` directly and
+ * genuinely works, so every test that ran outside a DAW passed.
+ *
+ * Pulled out of ui/app.ts as a pure function for one reason: it is a RULE, not a gesture, and a
+ * rule that can only be exercised by building a WebView and clicking play is a rule that gets
+ * broken again. `scripts/riffsheet-doc-test.ts` checks all three branches directly.
+ *
+ * The rule: never report an Original that will be silent.
+ */
+export type OriginalPlayback =
+  /** The host took the bytes. Playable now. */
+  | { state: 'ready' }
+  /** The host wants a token. Playable once one is minted — lazily, on the first press of play. */
+  | { state: 'needs-token' }
+  /** No route to sound at all. The fader must go dark, and the player must be told why. */
+  | { state: 'unplayable'; message: string };
+
+export function originalPlaybackAfterLoad(
+  loadedDurationSec: number,
+  canLoadAudioBytes: boolean
+): OriginalPlayback {
+  if (loadedDurationSec > 0) return { state: 'ready' };
+  if (canLoadAudioBytes) return { state: 'needs-token' };
+  return {
+    state: 'unplayable',
+    message:
+      'The recording is inside this document and the waveform and tuner can read it, but this ' +
+      'version of the app cannot hand it to the player. Update the app to hear the original again.'
+  };
 }
 
 /**
@@ -351,6 +467,23 @@ export function stagingNameForAudio(name: string, mime: string): string {
 }
 
 /**
+ * The name the recording gets INSIDE the zip, under `audio/`.
+ *
+ * A zip entry name is a path, so anything that could be read as one has to go: a take called
+ * `../../etc/passwd` must not become that on extraction, and a Windows name carrying a backslash
+ * must not become a directory on a Mac. Everything is flattened to its last segment, and a name
+ * that survives none of that borrows an extension from the mime type — the same fallback
+ * `stagingNameForAudio` uses, and for the same reason: whatever unpacks this should be able to
+ * tell what the file is.
+ */
+export function audioEntryName(name: string, mime: string): string {
+  const flat = name.split(/[\\/]/).pop()?.trim() ?? '';
+  // '.' and '..' are directory names, not file names, and both are empty once you take the
+  // extension off. Treated as "no usable name" rather than escaped into something odd.
+  return stagingNameForAudio(/^\.+$/.test(flat) ? '' : flat, mime);
+}
+
+/**
  * Mono 16-bit PCM WAV from the decoded samples.
  *
  * For RECORDED takes only. An imported file is copied verbatim instead — re-encoding somebody's
@@ -392,23 +525,45 @@ export function encodeWavPcm16(pcm: Float32Array, sampleRate: number): Uint8Arra
 }
 
 /**
- * The embedded take, made safe to use. Null for anything malformed, which costs the document
- * its audio and nothing else — the sheet and the edits are independent of it.
+ * The metadata around an embedded take, from either container. Null for anything malformed, which
+ * costs the document its audio and nothing else — the sheet and the edits are independent of it.
+ *
+ * The BYTES are not resolved here, because where they live is exactly what differs between the two
+ * formats: a v3 reader looks up a zip entry, a legacy reader decodes a base64 string. Both hand
+ * the result to `withAudioBytes` below.
  */
-function decodeEmbeddedAudio(value: unknown): EmbeddedAudio | null {
+function decodeAudioMeta(
+  value: unknown
+): { meta: Omit<EmbeddedAudio, 'bytes'>; encoding: 'zip' | 'base64'; entry: string; b64: string } | null {
   if (!value || typeof value !== 'object') return null;
-  const v = value as Partial<EmbeddedAudio>;
-  if (v.encoding !== 'base64' || typeof v.bytes !== 'string' || v.bytes.length === 0) return null;
+  const v = value as Partial<StoredAudioRef> & { bytes?: unknown };
+  const encoding = v.encoding === 'zip' ? 'zip' : v.encoding === 'base64' ? 'base64' : null;
+  if (!encoding) return null;
+  const entry = typeof v.entry === 'string' ? v.entry : '';
+  const b64 = typeof v.bytes === 'string' ? v.bytes : '';
+  // Each form has one thing it cannot be missing: an entry to find, or a string to decode.
+  if (encoding === 'zip' ? !entry : !b64) return null;
   return {
-    name: typeof v.name === 'string' ? v.name : '',
-    mime: typeof v.mime === 'string' ? v.mime : '',
-    encoding: 'base64',
-    bytes: v.bytes,
-    durationSec: Number.isFinite(Number(v.durationSec)) ? Math.max(0, Number(v.durationSec)) : 0,
-    ...(Number.isFinite(Number(v.sampleRate)) && Number(v.sampleRate) > 0
-      ? { sampleRate: Number(v.sampleRate) }
-      : {})
+    encoding,
+    entry,
+    b64,
+    meta: {
+      name: typeof v.name === 'string' ? v.name : '',
+      mime: typeof v.mime === 'string' ? v.mime : '',
+      durationSec: Number.isFinite(Number(v.durationSec)) ? Math.max(0, Number(v.durationSec)) : 0,
+      ...(Number.isFinite(Number(v.sampleRate)) && Number(v.sampleRate) > 0
+        ? { sampleRate: Number(v.sampleRate) }
+        : {})
+    }
   };
+}
+
+function withAudioBytes(
+  meta: Omit<EmbeddedAudio, 'bytes'>,
+  bytes: Uint8Array | undefined
+): EmbeddedAudio | null {
+  if (!bytes || bytes.byteLength === 0) return null;
+  return { ...meta, bytes };
 }
 
 function decodeAudioRef(value: unknown): PersistedAudio | null {
@@ -428,33 +583,207 @@ export function isRiffsheetFile(name: string): boolean {
   return name.toLowerCase().endsWith('.riffsheet');
 }
 
-export function writeRiffsheetDocument(document: RiffsheetDocument): Uint8Array {
-  return new TextEncoder().encode(`${JSON.stringify(document, null, 2)}\n`);
+/**
+ * A zip entry's timestamp is a DOS date: 1980 to 2099, and nothing else exists. Anything outside
+ * that — 0 for a document with no save time, a clock set to 1970, a corrupt far-future number —
+ * becomes the floor rather than an exception thrown out of the save button.
+ */
+const ZIP_TIME_FLOOR = Date.UTC(1980, 0, 1);
+const ZIP_TIME_CEIL = Date.UTC(2099, 11, 31);
+
+function zipSafeTime(savedAt: number): number {
+  return Number.isFinite(savedAt) && savedAt >= ZIP_TIME_FLOOR && savedAt <= ZIP_TIME_CEIL
+    ? savedAt
+    : ZIP_TIME_FLOOR;
 }
 
-export function readRiffsheetDocument(bytes: Uint8Array): RiffsheetDocument {
-  // 512 MB. It was 32 MB, which was generous for a document holding a few thousand notes and
-  // far too small for one holding a recording: base64 inflates the audio by about a third, so
-  // the old ceiling turned away any take over roughly 24 MB — a few minutes of wav. There is no
-  // product reason for a cap at all now; this one exists so a corrupt or hostile file cannot ask
-  // the process to allocate without limit, and it says what it is rather than "too large".
-  if (bytes.byteLength > 512 * 1024 * 1024) {
+const OVERSIZE_MESSAGE =
+  'That Riffsheet document is over 512 MB, which is larger than a document with a recording inside ' +
+  'it should ever be. It may be damaged.';
+
+/**
+ * Write a v3 document. ALWAYS v3 — there is no way to ask for the old container, because the only
+ * reason to want one would be to open it in a build that predates this one, and that build is not
+ * the one holding the file.
+ *
+ * COPIES OF THE AUDIO ON THIS PATH: one. The recording goes into `zipSync`'s output buffer and
+ * nothing else touches it — no base64, no intermediate JSON string, no separate UTF-8 encode. What
+ * happens after this function returns is the bridge's business and is not free (see BRIDGE note in
+ * ui/app.ts `saveRiffsheetDocument`), but nothing here adds to it.
+ */
+export function writeRiffsheetDocument(document: RiffsheetDocument): Uint8Array {
+  const audio = document.audioData ?? null;
+  // Refused HERE rather than left to fail somewhere inside the allocator, so the user gets a
+  // sentence instead of a dead button. The read side enforces the same ceiling.
+  if (audio && audio.bytes.byteLength > MAX_DOCUMENT_AUDIO_BYTES) {
     throw new Error(
-      'That Riffsheet document is over 512 MB, which is larger than a document with a recording inside it should ever be. It may be damaged.'
+      // CEIL, not round: this number is only ever printed for a size that is strictly over the
+      // ceiling, and rounding 512 MB + 1 byte down to "512 MB" produces the sentence "that
+      // recording is 512 MB, and the limit is 512 MB", which reads as a bug in the app.
+      `That recording is ${Math.ceil(audio.bytes.byteLength / (1024 * 1024))} MB, and a Riffsheet ` +
+        'document can carry at most 512 MB of audio. Export the MusicXML or MIDI instead, or trim ' +
+        'the take and try again.'
     );
   }
-  let parsed: Partial<RiffsheetDocument>;
+
+  const entry = audio ? AUDIO_DIR + audioEntryName(audio.name, audio.mime) : '';
+  const stored: StoredAudioRef | null = audio
+    ? {
+        name: audio.name,
+        mime: audio.mime,
+        encoding: 'zip',
+        entry,
+        durationSec: audio.durationSec,
+        ...(audio.sampleRate ? { sampleRate: audio.sampleRate } : {})
+      }
+    : null;
+
+  const score: Omit<RiffsheetDocument, 'audioData'> & { audioData: StoredAudioRef | null } = {
+    ...document,
+    version: RIFFSHEET_DOCUMENT_VERSION,
+    audioData: stored
+  };
+
+  // `mtime` is pinned to the document's own timestamp rather than left to default to "now", so
+  // writing the same document twice produces the same bytes. A format that changes under a
+  // byte-comparison for no reason is a format nobody can test.
+  //
+  // CLAMPED, because a zip timestamp is a DOS date and cannot represent a year outside 1980-2099
+  // — fflate throws rather than truncating. `savedAt` is 0 for a document that never carried one
+  // (every v1 file, and anything hand-built in a test), and 0 is 1970: passing it straight through
+  // turned "save this document" into an exception. The floor is used for anything out of range,
+  // which keeps the write deterministic instead of falling back to "now".
+  const mtime = zipSafeTime(document.savedAt);
+  const files: Zippable = {
+    [SCORE_ENTRY]: [strToU8(`${JSON.stringify(score, null, 2)}\n`), { level: 6, mtime }]
+  };
+  // level 0 is STORE. See the container note: audio does not compress, and storing it keeps the
+  // round trip byte-identical by construction.
+  if (audio) files[entry] = [audio.bytes, { level: 0, mtime }];
+  return zipSync(files, { mtime });
+}
+
+/**
+ * Read any document this app has ever written, told apart by its FIRST FOUR BYTES rather than by
+ * its extension or by a guess:
+ *
+ *   50 4B 03 04  ('PK\x03\x04')  a zip — v3
+ *   '{'                          plain JSON — v1 (no audio) or v2 (base64 audio)
+ *
+ * Anything else is refused with the same sentence a corrupt file gets, because from the user's
+ * side those are the same event.
+ */
+export function readRiffsheetDocument(bytes: Uint8Array): RiffsheetDocument {
+  if (bytes.byteLength > MAX_DOCUMENT_AUDIO_BYTES) throw new Error(OVERSIZE_MESSAGE);
+  if (isZip(bytes)) return readZipDocument(bytes);
+  if (isJsonStart(bytes)) return readJsonDocument(bytes);
+  throw new Error('That is not a readable Riffsheet document.');
+}
+
+function isZip(bytes: Uint8Array): boolean {
+  return (
+    bytes.length >= 4 && bytes[0] === 0x50 && bytes[1] === 0x4b && bytes[2] === 0x03 && bytes[3] === 0x04
+  );
+}
+
+/** The first non-whitespace byte is `{`. Leading whitespace is legal JSON and costs nothing here. */
+function isJsonStart(bytes: Uint8Array): boolean {
+  for (let i = 0; i < bytes.length && i < 64; i++) {
+    const b = bytes[i];
+    if (b === 0x20 || b === 0x09 || b === 0x0a || b === 0x0d) continue;
+    // A UTF-8 BOM before the brace: written by no version of this app, but trivially survivable.
+    if (b === 0xef || b === 0xbb || b === 0xbf) continue;
+    return b === 0x7b;
+  }
+  return false;
+}
+
+/**
+ * The `score.json` TEXT inside a document, whatever the container.
+ *
+ * For diagnostics only (`__RIFFSHEET_DOCUMENT__`). It exists because the probe used to read the
+ * whole file as UTF-8 and search it for strings that must not be there — a dead token, say — and
+ * a zip is not text: the score is deflated, so that search would answer "not present" for
+ * everything and pass while proving nothing.
+ */
+export function documentScoreText(bytes: Uint8Array): string {
+  if (!isZip(bytes)) return new TextDecoder().decode(bytes);
+  try {
+    const files = unzipSync(bytes, { filter: (file) => file.name === SCORE_ENTRY });
+    const score = files[SCORE_ENTRY];
+    return score ? strFromU8(score) : '';
+  } catch {
+    return '';
+  }
+}
+
+function readZipDocument(bytes: Uint8Array): RiffsheetDocument {
+  let oversize = 0;
+  let files: Record<string, Uint8Array>;
+  try {
+    files = unzipSync(bytes, {
+      // Checked BEFORE the entry is decompressed, which is the whole point of doing it in the
+      // filter: a deflate bomb is refused on its declared size rather than after it has been
+      // handed the memory it asked for.
+      filter: (file) => {
+        if (file.originalSize > MAX_DOCUMENT_AUDIO_BYTES) {
+          oversize = Math.max(oversize, file.originalSize);
+          return false;
+        }
+        return true;
+      }
+    });
+  } catch {
+    throw new Error('That is not a readable Riffsheet document.');
+  }
+  if (oversize > 0) throw new Error(OVERSIZE_MESSAGE);
+
+  const scoreBytes = files[SCORE_ENTRY];
+  if (!scoreBytes) throw new Error('That is not a readable Riffsheet document.');
+  let parsed: Partial<RiffsheetDocument> & { audioData?: unknown };
+  try {
+    parsed = JSON.parse(strFromU8(scoreBytes)) as Partial<RiffsheetDocument>;
+  } catch {
+    throw new Error('That is not a readable Riffsheet document.');
+  }
+
+  const meta = decodeAudioMeta(parsed.audioData);
+  // ONE copy of the audio on the read path: the slice `unzipSync` returns for a STORED entry.
+  // It is handed onward as-is.
+  const audioData = meta ? withAudioBytes(meta.meta, files[meta.entry]) : null;
+  return hydrate(parsed, audioData);
+}
+
+function readJsonDocument(bytes: Uint8Array): RiffsheetDocument {
+  let parsed: Partial<RiffsheetDocument> & { audioData?: unknown };
   try {
     parsed = JSON.parse(new TextDecoder().decode(bytes)) as Partial<RiffsheetDocument>;
   } catch {
     throw new Error('That is not a readable Riffsheet document.');
   }
+  const meta = decodeAudioMeta(parsed.audioData);
+  let audioData: EmbeddedAudio | null = null;
+  if (meta && meta.encoding === 'base64') {
+    try {
+      audioData = withAudioBytes(meta.meta, base64ToBytes(meta.b64));
+    } catch {
+      // Corrupt base64 costs the document its audio, not its notes.
+      audioData = null;
+    }
+  }
+  return hydrate(parsed, audioData);
+}
+
+/** Everything both containers agree on: validate the document, and answer with a whole one. */
+function hydrate(
+  parsed: Partial<RiffsheetDocument> & { audioData?: unknown },
+  audioData: EmbeddedAudio | null
+): RiffsheetDocument {
   // A RANGE, not an equality. The old check refused anything that was not exactly the current
   // number, which meant every version bump silently orphaned every document already written —
-  // the reason `audio` had to be smuggled in as an optional field rather than versioned. v2 adds
-  // one optional key, so a v1 document is a v2 document with no recording in it and is read as
-  // such. Only a FUTURE version is refused, because that one genuinely may contain something
-  // this build would misread.
+  // the reason `audio` had to be smuggled in as an optional field rather than versioned. A v1
+  // document is a v3 document with no recording in it and is read as such. Only a FUTURE version
+  // is refused, because that one genuinely may contain something this build would misread.
   const version = Number(parsed.version);
   if (parsed.app !== 'riffsheet-document' || !Number.isInteger(version) || version < 1) {
     throw new Error('That is not a readable Riffsheet document.');
@@ -483,7 +812,7 @@ export function readRiffsheetDocument(bytes: Uint8Array): RiffsheetDocument {
     audio: decodeAudioRef(parsed.audio),
     // Null for every v1 document. The caller falls back to `audio` above and reopens by path,
     // which is exactly what it did before this field existed.
-    audioData: decodeEmbeddedAudio(parsed.audioData)
+    audioData
   };
 }
 

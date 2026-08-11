@@ -57,6 +57,7 @@ note value that hides the middle of the bar. Those are engraving rules, and they
 | 3 | `key.ts`, `spelling.ts`, `clef.ts` | key signature, enharmonic spelling, accidental display, clef |
 | 4 | `chords.ts` | chord grouping (before quantization), overlap clamp |
 | 5 | `tab.ts` | legato pairs (before assignment), string/fret DAG |
+| 5b | `beaming.ts` | beam grouping, tuplet brackets, and the per-staff projection both are recomputed over |
 | 6 | `musicxml.ts`, `midi.ts`, `alphatab.ts` | emitters |
 | 7 | `guards.ts` | past-end filter, repeat-loop suspects |
 | — | `rational.ts` | exact rational arithmetic; no float ever enters a metric decision |

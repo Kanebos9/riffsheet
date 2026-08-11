@@ -18,7 +18,7 @@
 
 import { describe, it, expect } from 'vitest';
 import { buildScore } from '../src/buildScore.js';
-import { readMusicXml, parseXml, findAll, type ReadScore } from './xmlReader.js';
+import { readMusicXml, parseXml, findAll, type ReadNote, type ReadScore } from './xmlReader.js';
 import { grid, playedNotes, settings } from './helpers.js';
 import type { BuildSettings, GridSetting, InputNote } from '../src/types.js';
 import type { RiffsheetIR } from '../src/ir.js';
@@ -69,6 +69,105 @@ function expectBalanced(read: ReadScore, ir: RiffsheetIR, staves: number, label:
       );
     }
   }
+}
+
+/** Every note of one staff of one measure, in cursor order, chord members excluded. */
+function perStaffRuns(read: ReadScore): Map<string, ReadNote[]> {
+  const runs = new Map<string, ReadNote[]>();
+  for (const note of read.notes) {
+    if (note.chord) continue;
+    const key = `m${note.measure}/s${note.staff}/v${note.voice}`;
+    const run = runs.get(key) ?? [];
+    run.push(note);
+    runs.set(key, run);
+  }
+  return runs;
+}
+
+/**
+ * S1 (beams). A `<beam>` group is a state machine PER STAFF PER LEVEL: begin, then any number of
+ * continues, then end. `continue` or `end` with nothing open, or a `begin` still open at the
+ * barline, is a malformed group — which is exactly what a grand staff produced when the beam
+ * states were computed over the merged rhythm and then split down the middle of a group.
+ */
+function beamErrorsPerStaff(read: ReadScore): string[] {
+  const errors: string[] = [];
+  for (const [where, run] of perStaffRuns(read)) {
+    const open: boolean[] = [];
+    for (const note of run) {
+      note.beams.forEach((state, level) => {
+        if (state === 'begin') {
+          if (open[level]) errors.push(`${where}: beam level ${level + 1} begun while already open`);
+          open[level] = true;
+        } else if (state === 'continue' || state === 'end') {
+          if (!open[level]) errors.push(`${where}: beam "${state}" at level ${level + 1} with nothing open`);
+          if (state === 'end') open[level] = false;
+        }
+      });
+    }
+    open.forEach((isOpen, level) => {
+      if (isOpen) errors.push(`${where}: beam level ${level + 1} left open at the barline`);
+    });
+  }
+  return errors;
+}
+
+/** S1 (tuplets). The same state machine for `<tuplet type="start"/>` .. `<tuplet type="stop"/>`. */
+function tupletErrorsPerStaff(read: ReadScore): string[] {
+  const errors: string[] = [];
+  for (const [where, run] of perStaffRuns(read)) {
+    let depth = 0;
+    for (const note of run) {
+      for (const type of note.tuplets) {
+        if (type === 'start') depth++;
+        else if (type === 'stop') {
+          depth--;
+          if (depth < 0) errors.push(`${where}: tuplet stop with nothing open`);
+        }
+      }
+    }
+    if (depth > 0) errors.push(`${where}: ${depth} tuplet bracket(s) left open at the barline`);
+  }
+  return errors;
+}
+
+/** Written whole-note fraction of each <type>, in quarter notes. */
+const TYPE_QUARTERS: Record<string, number> = {
+  whole: 4,
+  half: 2,
+  quarter: 1,
+  eighth: 0.5,
+  '16th': 0.25,
+  '32nd': 0.125
+};
+
+/**
+ * S2, PROVED FROM THE OUTSIDE. The emitter asserts this on the way out; this re-derives it from
+ * the re-read file, so the test would still fail if the assertion itself were removed.
+ * `type x dots x normal/actual` must equal `<duration>` for every note and rest that has a type.
+ */
+function typeDurationErrors(read: ReadScore): string[] {
+  const errors: string[] = [];
+  for (const note of read.notes) {
+    // A measure rest has no <type> at all: it is a whole-bar symbol, not a whole note.
+    if (!note.type) continue;
+    const quarters = TYPE_QUARTERS[note.type];
+    if (quarters === undefined) {
+      errors.push(`m${note.measure}/s${note.staff}: unknown <type>${note.type}</type>`);
+      continue;
+    }
+    const dotted = (Math.pow(2, note.dots + 1) - 1) / Math.pow(2, note.dots);
+    const tm = note.timeModification;
+    const expected = quarters * read.divisions * dotted * (tm ? tm.normal / tm.actual : 1);
+    if (Math.abs(expected - note.duration) > 1e-9) {
+      errors.push(
+        `m${note.measure}/s${note.staff}: <type>${note.type}</type>${'<dot/>'.repeat(note.dots)}${
+          tm ? ` x ${tm.normal}/${tm.actual}` : ''
+        } is ${expected} ticks but <duration> is ${note.duration}`
+      );
+    }
+  }
+  return errors;
 }
 
 /** Ties must open and close within one staff, and never dangle at the end of it. */
@@ -478,4 +577,233 @@ describe('#38 — ties and attack counts survive the split, per staff', () => {
     for (const id of upper) expect(lower.has(id), `${id} on both staves`).toBe(false);
     expect(new Set([...upper, ...lower]).size).toBe(new Set(idsOf(2)).size);
   });
+});
+
+// ---- S1/S2: what the split does to beam groups and tuplet brackets ----------------------------
+
+/**
+ * THE BUG THESE FIXTURES WERE BUILT FOR.
+ *
+ * A grand staff is one merged single-voice rhythm, split by `IRNote.staffIndex` at emit time.
+ * Beam states and tuplet edges were computed BEFORE that split, over the merged sequence, and
+ * then handed to both staves verbatim. Any group that straddled middle C therefore left one
+ * staff holding a `<beam>continue` whose `begin` had gone to the other, or a
+ * `<tuplet type="stop"/>` with no start — malformed MusicXML, and the same on screen.
+ *
+ * Both fixtures straddle it deliberately, and every group in them does:
+ *
+ *   SIXTEENTHS  4 per beat, the first two above middle C and the last two below. One beam group
+ *               per beat in the merge; two notes of it on each staff, so the merged
+ *               begin/continue/continue/end tears exactly in half.
+ *   TRIPLETS    3 per beat, the LAST one above middle C. The merged group therefore STARTS on
+ *               the lower staff and STOPS on the upper one: the bracket edges land on different
+ *               staves, which is the worst case — a start left open on one and a stop with
+ *               nothing open on the other. Recomputed per staff, each bracket now opens on a
+ *               rest or closes on one, so both of those paths are exercised too.
+ */
+const SPLIT_SIXTEENTHS: InputNote[] = playedNotes(
+  Array.from({ length: 32 }, (_, i) => ({ beat: Math.floor(i / 4) + (i % 4) / 4, midi: i % 4 < 2 ? 72 : 48 })),
+  0.9
+);
+
+const SPLIT_TRIPLETS: InputNote[] = playedNotes(
+  Array.from({ length: 24 }, (_, i) => ({ beat: Math.floor(i / 3) + (i % 3) / 3, midi: i % 3 === 2 ? 72 : 48 })),
+  0.9
+);
+
+const SPLIT_FIXTURES: { name: string; notes: InputNote[]; grid: GridSetting }[] = [
+  { name: 'beamed sixteenths', notes: SPLIT_SIXTEENTHS, grid: '1/16' },
+  { name: 'triplets', notes: SPLIT_TRIPLETS, grid: 'auto' }
+];
+
+const SPLIT_LAYOUTS: { name: string; over: Partial<BuildSettings>; staves: number }[] = [
+  { name: 'grand', over: { instrument: 'staff', tuningMidi: [], clefMode: 'grand' }, staves: 2 },
+  { name: 'grand+tab', over: { instrument: 'bass6', tuningMidi: BASS6, clefMode: 'grand' }, staves: 3 }
+];
+
+describe('#S1/#S2 — beams and tuplet brackets are recomputed PER STAFF after the split', () => {
+  for (const fixture of SPLIT_FIXTURES) {
+    for (const layout of SPLIT_LAYOUTS) {
+      const built = buildScore(
+        { notes: fixture.notes, ...grid(2) },
+        settings({ ...layout.over, grid: fixture.grid })
+      );
+      const label = `${fixture.name} / ${layout.name}`;
+
+      it(`${label}: the fixture really does straddle middle C in every group`, () => {
+        expect(built.ir.grandStaff).toBe(true);
+        const staffIndices = new Set(
+          built.ir.bars.flatMap((bar) =>
+            bar.voices.flatMap((voice) => voice.beats.flatMap((beat) => beat.notes.map((note) => note.staffIndex)))
+          )
+        );
+        expect([...staffIndices].sort(), 'both staves are in play').toEqual([0, 1]);
+      });
+
+      it(`${label}: the file is well formed and every staff lands on the barline`, () => {
+        const xml = built.toMusicXML();
+        expect(() => parseXml(xml)).not.toThrow();
+        const read = readMusicXml(xml);
+        expectBalanced(read, built.ir, layout.staves, label);
+        expect(tieErrorsPerStaff(read)).toEqual([]);
+      });
+
+      it(`${label}: MusicXML beams open and close within one staff`, () => {
+        const read = readMusicXml(built.toMusicXML());
+        expect(beamErrorsPerStaff(read)).toEqual([]);
+        // Not vacuous: the split leaves real beam groups on the notation staves.
+        if (fixture.name === 'beamed sixteenths') {
+          expect(read.notes.some((note) => note.staff === 1 && note.beams.includes('begin'))).toBe(true);
+          expect(read.notes.some((note) => note.staff === 2 && note.beams.includes('begin'))).toBe(true);
+        }
+      });
+
+      it(`${label}: MusicXML tuplet brackets open and close within one staff`, () => {
+        const read = readMusicXml(built.toMusicXML());
+        expect(tupletErrorsPerStaff(read)).toEqual([]);
+        if (fixture.name === 'triplets') {
+          for (const staff of [1, 2]) {
+            const onStaff = read.notes.filter((note) => note.staff === staff);
+            expect(onStaff.filter((note) => note.tuplets.includes('start')).length, `staff ${staff} starts`).toBe(
+              onStaff.filter((note) => note.tuplets.includes('stop')).length
+            );
+            expect(onStaff.some((note) => note.tuplets.includes('start')), `staff ${staff} has a bracket`).toBe(true);
+          }
+        }
+      });
+
+      it(`${label}: every emitted <type> agrees with its <duration>`, () => {
+        expect(typeDurationErrors(readMusicXml(built.toMusicXML()))).toEqual([]);
+      });
+
+      it(`${label}: the alphaTab hand-off carries the same per-staff beams`, () => {
+        const staves = built.toAlphaTabModelData().tracks[0].staves;
+        expect(staves).toHaveLength(layout.staves);
+        for (const [index, staff] of staves.entries()) {
+          for (const bar of staff.bars) {
+            for (const voice of bar.voices) {
+              const open: boolean[] = [];
+              for (const beat of voice.beats) {
+                // The screen-side shape of the same bug: the merged rhythm's beam states were
+                // copied onto EVERY beat of every staff, including the ones the split had just
+                // emptied. A rest is not part of a beam group — it breaks one.
+                if (beat.isEmpty) {
+                  expect(beat.beams ?? [], `${label}: staff ${index} bar ${bar.index} beamed an empty beat`).toEqual([]);
+                }
+                (beat.beams ?? []).forEach((state, level) => {
+                  if (state === 'begin') open[level] = true;
+                  else if (state === 'continue' || state === 'end') {
+                    expect(open[level], `${label}: staff ${index} bar ${bar.index} "${state}" with nothing open`).toBe(true);
+                    if (state === 'end') open[level] = false;
+                  }
+                });
+              }
+              open.forEach((isOpen, level) =>
+                expect(isOpen, `${label}: staff ${index} bar ${bar.index} beam level ${level + 1} left open`).toBeFalsy()
+              );
+            }
+          }
+        }
+      });
+    }
+  }
+
+  it('triplets: a member that moved to the other staff becomes a rest that still declares its tuplet', () => {
+    const built = buildScore(
+      { notes: SPLIT_TRIPLETS, ...grid(2) },
+      settings({ instrument: 'staff', tuningMidi: [], clefMode: 'grand' })
+    );
+    const read = readMusicXml(built.toMusicXML());
+    const tupletRests = read.notes.filter((note) => note.isRest && note.timeModification);
+    expect(tupletRests.length, 'the split creates tuplet rests').toBeGreaterThan(0);
+    for (const rest of tupletRests) {
+      // The whole point of S2: an eighth is 12 ticks, a triplet eighth is 8, and the <type>
+      // stayed "eighth" — so the <time-modification> is what makes the two numbers agree.
+      expect(rest.timeModification).toEqual({ actual: 3, normal: 2 });
+      expect(rest.type).toBe('eighth');
+      expect(rest.duration).toBe(8);
+    }
+  });
+
+  it('projecting a staff never mutates the IR the other staff is projected from', () => {
+    const built = buildScore(
+      { notes: SPLIT_TRIPLETS, ...grid(2) },
+      settings({ instrument: 'bass6', tuningMidi: BASS6, clefMode: 'grand' })
+    );
+    const snapshot = JSON.stringify(built.ir);
+    const once = built.toMusicXML();
+    const twice = built.toMusicXML();
+    expect(JSON.stringify(built.ir), 'emitting mutated the IR').toBe(snapshot);
+    expect(twice, 'a second emit differs from the first').toBe(once);
+    // The same, through the other emitter, and in the other order.
+    JSON.stringify(built.toAlphaTabModelData());
+    expect(JSON.stringify(built.ir)).toBe(snapshot);
+  });
+});
+
+// ---- F2a: the TAB staff prints fingers, not rests ---------------------------------------------
+
+describe('#F2a — a TAB staff under notation staves shows no rest glyphs', () => {
+  // Deliberately gappy: one note per beat held for 60% of it, so every beat ends in a rest that
+  // both the notation staff and (before the fix) the tab staff printed.
+  const GAPPY = playedNotes(
+    [
+      { beat: 0, midi: 40 },
+      { beat: 1, midi: 74 },
+      { beat: 2, midi: 45 },
+      { beat: 3, midi: 71 },
+      { beat: 4, midi: 38 },
+      { beat: 5, midi: 76 },
+      { beat: 6, midi: 43 },
+      { beat: 7, midi: 69 }
+    ],
+    0.6
+  );
+
+  const CASES: { name: string; over: Partial<BuildSettings>; staves: number; tabStaff: number }[] = [
+    { name: 'notation + tab', over: { instrument: 'bass6', tuningMidi: BASS6, clefMode: 'bass' }, staves: 2, tabStaff: 2 },
+    { name: 'grand + tab', over: { instrument: 'bass6', tuningMidi: BASS6, clefMode: 'grand' }, staves: 3, tabStaff: 3 }
+  ];
+
+  for (const layout of CASES) {
+    const built = buildScore({ notes: GAPPY, ...grid(2) }, settings(layout.over));
+    const xml = built.toMusicXML();
+    const read = readMusicXml(xml);
+
+    it(`${layout.name}: every rest on the TAB staff is print-object="no"`, () => {
+      const tabRests = read.notes.filter((note) => note.staff === layout.tabStaff && note.isRest);
+      expect(tabRests.length, 'the fixture has tab rests to hide').toBeGreaterThan(0);
+      for (const rest of tabRests) expect(rest.printed, `visible tab rest at m${rest.measure}`).toBe(false);
+    });
+
+    it(`${layout.name}: the notation staves keep every one of their rests`, () => {
+      const notationRests = read.notes.filter((note) => note.staff !== layout.tabStaff && note.isRest);
+      expect(notationRests.length).toBeGreaterThan(0);
+      for (const rest of notationRests) expect(rest.printed, `hidden notation rest at m${rest.measure}`).toBe(true);
+    });
+
+    it(`${layout.name}: hiding the glyph does NOT change the cursor — every staff still balances`, () => {
+      // The <note> and its <duration> stay: print-object is about ink, not about time. If it
+      // were implemented by dropping the rest, this is the assertion that would catch it.
+      expectBalanced(read, built.ir, layout.staves, `${layout.name} tab rests`);
+      const hidden = findAll(parseXml(xml), 'note').filter((note) => note.attrs['print-object'] === 'no');
+      for (const note of hidden) {
+        expect(note.children.some((c) => c.name === 'duration'), 'a hidden note lost its duration').toBe(true);
+      }
+    });
+
+    it(`${layout.name}: the alphaTab hand-off says so too`, () => {
+      const staves = built.toAlphaTabModelData().tracks[0].staves;
+      expect(staves).toHaveLength(layout.name === 'grand + tab' ? 3 : 1);
+      const tab = staves[staves.length - 1];
+      // A one-staff part draws its rests once, on the notation it shares with the tab; a
+      // dedicated TAB staff must be told, because alphaTab's own default is to show them.
+      expect(tab.showRests).toBe(layout.name === 'grand + tab' ? false : true);
+      // The beats themselves are all still there, at full length — the glyph goes, the time stays.
+      for (const [index, bar] of tab.bars.entries()) {
+        const ticks = bar.voices.flatMap((v) => v.beats).reduce((sum, beat) => sum + beat.durTicks, 0);
+        expect(ticks, `tab bar ${index} is short`).toBe(built.ir.bars[index].durTicks);
+      }
+    });
+  }
 });

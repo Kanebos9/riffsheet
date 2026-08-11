@@ -8,7 +8,8 @@
  * See IR.md for the RiffsheetIR contract and the station-by-station map.
  */
 
-export { buildScore, applyBeams } from './buildScore.js';
+export { buildScore } from './buildScore.js';
+export { applyBeams, markTupletEdges, projectStaffBeats } from './beaming.js';
 export type { BuildResult, BuildDiagnostics } from './buildScore.js';
 
 export type {

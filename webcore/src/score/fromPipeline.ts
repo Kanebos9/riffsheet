@@ -220,6 +220,7 @@ export function buildAlphaTabScore(
             const rest = new alphaTab.model.Beat();
             rest.duration = alphaTab.model.Duration.Whole;
             rest.isEmpty = true;
+            if (!staffData.showRests) hideTabRests(rest);
             voice.addBeat(rest);
             continue;
           }
@@ -235,6 +236,8 @@ export function buildAlphaTabScore(
               beat.isEmpty = true;
               // A full-bar rest is a whole rest regardless of the meter.
               if (beatData.isFullBarRest) beat.duration = alphaTab.model.Duration.Whole;
+              // F2a: the pipeline says whether this staff prints rests. See `hideTabRests`.
+              if (!staffData.showRests) hideTabRests(beat);
               voice.addBeat(beat);
               continue;
             }
@@ -321,6 +324,49 @@ export function buildAlphaTabScore(
   score.finish(settings);
 
   return { score, index };
+}
+
+/**
+ * Fully transparent — the paint that makes a glyph not appear without moving anything.
+ *
+ * `Color` takes r,g,b,a; alpha 0 is a no-op fill in both the SVG and the canvas engine.
+ */
+const INVISIBLE = new alphaTab.model.Color(0, 0, 0, 0);
+
+/**
+ * F2a — SUPPRESS THE REST GLYPHS ON A STAFF THAT DOES NOT PRINT THEM, AND NOTHING ELSE.
+ *
+ * The pipeline sets `staves[].showRests = false` on the tab-only staff of a grand + tab
+ * arrangement, because alphaTab decides for itself with `TabBarRenderer.showRests`, which it
+ * turns ON for any staff whose own `showStandardNotation` is off — true of exactly that one
+ * layout, which is why exactly that one layout grew a duplicate column of rests under the tab.
+ *
+ * HOW, and why it is not the obvious thing. The obvious thing is to leave `Beat.isEmpty` false
+ * on a note-less beat, and it does not work: alphaTab's `Beat.isRest` is
+ * `isEmpty || (!deadSlapped && notes.length === 0)`, so a beat with no notes is a rest either
+ * way and `TabBeatGlyph` builds a `TabRestGlyph` for it regardless. The only thing that beat
+ * flag would change is whether the NOTATION staves print their rests too, which is not what was
+ * asked for and would be wrong.
+ *
+ * What `TabRestGlyph.paint` actually consults is the canvas colour, opened from
+ * `ElementStyleHelper.beat(canvas, BeatSubElement.GuitarTabRests, beat)` — a per-beat style
+ * override alphaTab provides for exactly this purpose. Setting that one sub-element to a
+ * transparent colour paints the rest and leaves no ink.
+ *
+ * SOUND-SACRED, AND PROVABLY SO. This writes a COLOUR. It does not touch `isEmpty`, the
+ * duration, the dots, the tuplet, the notes or the order of beats, so nothing that decides when
+ * a note sounds or for how long can see it — the harness asserts that by dumping every beat's
+ * `absolutePlaybackStart`, `playbackDuration` and note list with and without the flag and
+ * requiring the two dumps to be byte-identical ("playback dump is byte-identical").
+ *
+ * THE BEAT STAYS, AT FULL LENGTH. That is the pipeline's contract and the reason the glyph is
+ * hidden rather than the beat dropped: the rest carries the bar's timing, and a tab staff short
+ * of a beat would not line up with the notation above it.
+ */
+function hideTabRests(beat: alphaTab.model.Beat): void {
+  const style = beat.style ?? new alphaTab.model.BeatStyle();
+  style.colors.set(alphaTab.model.BeatSubElement.GuitarTabRests, INVISIBLE);
+  beat.style = style;
 }
 
 /**

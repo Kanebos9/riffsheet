@@ -72,6 +72,20 @@ export interface ExportBarOptions {
    * not offered, which is how this stays a drop-in for a caller that has no document to save.
    */
   saveDocument?: () => void;
+  /**
+   * Is there a recording behind the sheet? Asked every time the menu opens, so it must be cheap —
+   * `getAudio` may have to encode the whole take, and deciding whether to grey a row out is not
+   * worth that.
+   */
+  hasAudio?: () => boolean;
+  /**
+   * The take's audio as a saveable file, built only when the player picks Audio.
+   *
+   * A `.riffsheet` has carried the recording since v2 and there was no way to get it back out
+   * again — the document could be opened but the audio inside it could not be reached. Same owner
+   * and same reasoning as `saveDocument`: ui/app.ts holds the bytes, this bar holds the menu.
+   */
+  getAudio?: () => ExportPayload | null;
 }
 
 interface MidiChoice {
@@ -446,6 +460,19 @@ export class ExportBar {
       hint: 'The engraved page, ready to print.',
       onPick: () => void this.exportPdf()
     });
+    if (this.opts.getAudio) {
+      // Greyed rather than hidden. A row that vanishes leaves the player wondering whether they
+      // misremembered it; one that is visible and dim answers the question it raises.
+      const hasAudio = this.opts.hasAudio?.() ?? true;
+      items.push({
+        label: 'Audio',
+        hint: hasAudio
+          ? 'The recording itself, exactly as Riffsheet has it.'
+          : 'There is no recording behind this sheet.',
+        disabled: !hasAudio,
+        onPick: () => void this.exportAudio()
+      });
+    }
     if (this.opts.saveDocument) {
       items.push({
         label: 'Save as Riffsheet',
@@ -539,6 +566,35 @@ export class ExportBar {
   }
 
   // -------------------------------------------------------------------------
+  // Audio
+  // -------------------------------------------------------------------------
+
+  /**
+   * Save the take's own audio back out.
+   *
+   * The SAME mechanism as every other row — `bridge.exportFile`, then `report`, which stays quiet
+   * on a cancel. Nothing is re-encoded on the way: the payload is the original file's bytes where
+   * there was one, and a recorded take's WAV where there was not.
+   */
+  private async exportAudio(): Promise<void> {
+    let file: ExportPayload | null;
+    try {
+      file = this.opts.getAudio?.() ?? null;
+    } catch (e) {
+      return this.opts.toast('danger', 'Audio', (e as Error).message);
+    }
+    if (!file) {
+      return this.opts.toast('danger', 'Audio', 'There is no recording behind this sheet to save.');
+    }
+    try {
+      const outcome = await this.opts.bridge.exportFile(file.name, file.bytes, file.mimeType);
+      this.report(outcome, 'Audio saved — the recording exactly as Riffsheet has it.');
+    } catch (e) {
+      this.opts.toast('danger', 'Audio', (e as Error).message);
+    }
+  }
+
+  // -------------------------------------------------------------------------
   // PDF
   // -------------------------------------------------------------------------
 
@@ -609,6 +665,9 @@ export interface MenuItem {
   label: string;
   hint?: string;
   checked?: boolean;
+  /** Shown, dimmed, and not pickable. For a row whose absence would be more confusing than its
+   * being unavailable — see the Audio item. */
+  disabled?: boolean;
   onPick: () => void;
 }
 
@@ -679,7 +738,12 @@ export class MenuPopover {
             class: `menu-item${item.checked ? ' on' : ''}`,
             role: 'menuitemradio',
             'aria-checked': String(!!item.checked),
+            disabled: item.disabled ? 'true' : undefined,
+            // styles.css belongs to the integrator and has no rule for a disabled row, so the
+            // dimming lives here rather than depending on a stylesheet that may not have it.
+            style: item.disabled ? { opacity: '0.45', cursor: 'default' } : undefined,
             onClick: () => {
+              if (item.disabled) return;
               this.close();
               item.onPick();
             }

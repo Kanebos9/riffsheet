@@ -17,7 +17,7 @@
  * once. Silence that was played is printed as a rest, including a short one.
  */
 
-import { DIVISIONS, type IRBar, type IRBeat, type IRKeySignature, type IRNote, type IRVoice, type RiffsheetIR, type BeamState, type DurationType } from './ir.js';
+import { DIVISIONS, type IRBar, type IRBeat, type IRKeySignature, type IRNote, type IRVoice, type RiffsheetIR, type DurationType } from './ir.js';
 import { Rational } from './rational.js';
 import { resolveSettings, type BuildInput, type BuildSettings, type InputNote } from './types.js';
 import { applyGuards } from './guards.js';
@@ -30,6 +30,7 @@ import { detectKey } from './key.js';
 import { accidentalDisplayForMeasure, spellNoteList, type DisplayNote } from './spelling.js';
 import { chooseClefs, grandClefPair, grandStaffSplitter } from './clef.js';
 import { assignStrings, detectLegatoPairs, survivingLegato, type TabNoteInput } from './tab.js';
+import { applyBeams, markTupletEdges } from './beaming.js';
 import { toMusicXML } from './musicxml.js';
 import { toMidi } from './midi.js';
 import { toAlphaTabModelData, type AlphaTabScoreData } from './alphatab.js';
@@ -55,8 +56,6 @@ interface PlacedEvent {
   offTick: number;
   tupletId?: string;
 }
-
-const BEAM_LEVEL: Partial<Record<DurationType, number>> = { eighth: 1, '16th': 2, '32nd': 3 };
 
 function median(xs: number[]): number {
   if (!xs.length) return 0;
@@ -552,7 +551,17 @@ function buildBars(
   /** `grid: 'free'`: print the fewest glyphs that add up, not the metric split (#36). */
   freeSymbols: boolean
 ): BuiltBars {
-  const tupletById = new Map(tuplets.map((t) => [t.id, t]));
+  // Groups sorted by position. Everything the bar emits — notes and rests alike — is cut at
+  // their edges, so a group is looked up by TICK and never by the id an event was tagged with:
+  // a span can cross into a group its own event never joined.
+
+  const groupsInOrder = [...tuplets].sort((a, b) => a.startTick - b.startTick);
+  const groupAt = (tick: number): (typeof tuplets)[number] | undefined =>
+    groupsInOrder.find((g) => tick >= g.startTick && tick < g.endTick);
+  const nextGroupStartAfter = (tick: number): number => {
+    for (const g of groupsInOrder) if (g.startTick > tick) return g.startTick;
+    return Infinity;
+  };
   const bars: IRBar[] = [];
   const stats = {
     noteGlyphs: 0,
@@ -581,24 +590,40 @@ function buildBars(
     const emitNote = (ev: PlacedEvent, from: number, to: number, tieInFirst: boolean, tieOutLast: boolean): void => {
       if (to <= from) return;
       sawNote = true;
-      const group = ev.tupletId ? tupletById.get(ev.tupletId) : undefined;
-      const span = Rational.fromTicks(to - from, DIVISIONS);
-      const pieces: Rational[] = group
-        ? [span]
-        : freeSymbols
-          ? simplestDurationList(span)
-          : toDurationList(metric, Rational.fromTicks(from - barStart, DIVISIONS), span, 'note');
 
-      // RESOLVE THE PIECES TO TICKS FIRST, then decide which one is first and which is last.
-      // Doing it inside the emit loop meant a piece that clipped to zero was skipped AFTER its
-      // predecessor had already been given `tieStart: true` for not being last — a dangling tie
-      // start, which is a broken file in MusicXML and a hanging slur on screen (#31 invariant d).
-      const tickPieces = resolveTickPieces(pieces, to - from);
+      // WHICH DOMAIN A SPAN IS WRITTEN IN IS DECIDED BY WHERE IT SITS, not by whose group the
+      // event was admitted to. `ev.tupletId` answers "did this attack join a tuplet"; the
+      // question here is "what does each part of this span cross", and a note is perfectly
+      // entitled to start on a straight beat and ring on into a triplet one. When it did, the
+      // whole span went to the straight splitter, which cannot spell the third of a beat hanging
+      // off the end of it and fell through to its un-notatable remainder. The span is therefore
+      // cut at every group edge; the piece inside a group is one tuplet glyph, the pieces outside
+      // are the metric split, and the tie machinery below already joins them.
+      const pieces: { ticks: number; group?: (typeof tuplets)[number] }[] = [];
+      let segFrom = from;
+      while (segFrom < to) {
+        const group = groupAt(segFrom);
+        const segTo = group ? Math.min(to, group.endTick) : Math.min(to, nextGroupStartAfter(segFrom));
+        if (group) {
+          pieces.push({ ticks: segTo - segFrom, group });
+        } else {
+          const span = Rational.fromTicks(segTo - segFrom, DIVISIONS);
+          const split = freeSymbols
+            ? simplestDurationList(span)
+            : toDurationList(metric, Rational.fromTicks(segFrom - barStart, DIVISIONS), span, 'note');
+          // RESOLVE THE PIECES TO TICKS FIRST, then decide which one is first and which is last.
+          // Doing it inside the emit loop meant a piece that clipped to zero was skipped AFTER
+          // its predecessor had already been given `tieStart: true` for not being last — a
+          // dangling tie start, a broken MusicXML file and a hanging slur on screen (#31 d).
+          for (const ticks of resolveTickPieces(split, segTo - segFrom)) pieces.push({ ticks });
+        }
+        segFrom = segTo;
+      }
 
       let t = from;
-      tickPieces.forEach((ticks, pi) => {
+      pieces.forEach(({ ticks, group }, pi) => {
         const tieStop = pi === 0 ? tieInFirst : true;
-        const tieStart = pi === tickPieces.length - 1 ? tieOutLast : true;
+        const tieStart = pi === pieces.length - 1 ? tieOutLast : true;
         // Written value inside a tuplet is the SOUNDING value scaled by actual/normal; the
         // MusicXML <type> is the written one while <duration> stays the sounding one.
         //
@@ -644,6 +669,54 @@ function buildBars(
           durationType: 'whole',
           dots: 0,
           measureRest: true,
+          notes: []
+        });
+        return;
+      }
+      // A REST INSIDE A TUPLET IS A TUPLET REST. meter.ts states the rule for notes — "a tuplet
+      // group is laid out in its own unit domain and never handed to `toDurationList`" — and the
+      // silence between two triplet members is in that domain just as much as the members are.
+      // Handing it to the straight splitter instead asked for a third of a beat in straight
+      // values, which no vocabulary contains: `greedyDecompose` fell through to its documented
+      // "un-notatable remainder" and emitted 1/16 + 1/48, which reached the page as a 32nd rest
+      // claiming 2 ticks where a 32nd is 3. MusicXML's <type>-vs-<duration> assertion threw on
+      // it, and with it the whole build — the shuffle figure (play, rest, play) is the shortest
+      // route to that crash, which is why "Quantize: Triplet" could produce no score at all.
+      //
+      // The span is therefore cut at every group edge it crosses; each piece is written in the
+      // domain it belongs to, and only the pieces outside any group see the metric splitter.
+      let segStart = from;
+      while (segStart < to) {
+        const group = groupAt(segStart);
+        const segEnd = group ? Math.min(to, group.endTick) : Math.min(to, nextGroupStartAfter(segStart));
+        emitRestSegment(segStart, segEnd, group);
+        segStart = segEnd;
+      }
+    };
+
+    const emitRestSegment = (
+      from: number,
+      to: number,
+      group: (typeof tuplets)[number] | undefined
+    ): void => {
+      if (to <= from) return;
+      if (group) {
+        // One glyph for the whole in-group silence, its WRITTEN value being the sounding units
+        // scaled by normal/actual — the same arithmetic the notes in the group get. Onsets and
+        // off-times are both snapped to the group's lattice upstream, so the unit count is whole.
+        const units = Math.max(1, Math.round((to - from) / group.unitTicks));
+        const shown = typeOf(tupletWrittenLen(metric.beatLen, units, group.normal));
+        stats.restGlyphs++;
+        // Measured on the WRITTEN value: a one-unit rest inside an eighth-triplet is an eighth
+        // rest on the page, and §3.1's "no rest shorter than an eighth" is about the page.
+        if (tupletWrittenLen(metric.beatLen, units, group.normal).lt(EIGHTH)) stats.restsShorterThanEighth++;
+        beats.push({
+          startTick: from - barStart,
+          durTicks: to - from,
+          isRest: true,
+          durationType: shown.durationType,
+          dots: shown.dots,
+          tuplet: { id: group.id, actual: group.actual, normal: group.normal, start: false, stop: false },
           notes: []
         });
         return;
@@ -696,18 +769,9 @@ function buildBars(
     if (cursor < barEnd) emitRest(cursor, barEnd);
     void sawNote;
 
-    // tuplet start/stop markers, per group, per bar
-    const seenGroups = new Map<string, IRBeat[]>();
-    for (const b of beats) {
-      if (!b.tuplet) continue;
-      const g = seenGroups.get(b.tuplet.id) ?? [];
-      g.push(b);
-      seenGroups.set(b.tuplet.id, g);
-    }
-    for (const group of seenGroups.values()) {
-      group[0].tuplet!.start = true;
-      group[group.length - 1].tuplet!.stop = true;
-    }
+    // tuplet start/stop markers, per group, per bar (beaming.ts owns the rule; a grand staff
+    // re-runs it per staff after the split, which is the only way the edges can balance there).
+    markTupletEdges(beats);
     for (const b of beats) if (b.isRest && b.tuplet) stats.tupletRests++;
 
     const voices: IRVoice[] = [{ id: 1, beats }];
@@ -732,74 +796,3 @@ function buildBars(
   return { bars, stats };
 }
 
-// ---- beaming -------------------------------------------------------------------------------------
-
-/**
- * §3.6: beam grouping is "which partition of the beam MeterSequence does this note's offset
- * fall into". Since v1 supports {4/4, 3/4, 2/4} plus overrides, the partition collapses to one
- * group per beat. THE RULE READERS ACTUALLY RELY ON: never beam across a beat boundary in 4/4.
- * A rest, a quarter-or-longer value, a boundary straddle, or a tuplet-group change all break an
- * open group; singletons keep their flag.
- */
-export function applyBeams(beats: IRBeat[], boundaries: number[]): void {
-  const windowOf = (b: IRBeat): number => {
-    for (let w = 0; w + 1 < boundaries.length; w++) {
-      if (b.startTick >= boundaries[w] && b.startTick + b.durTicks <= boundaries[w + 1]) return w;
-    }
-    return -1;
-  };
-  let group: IRBeat[] = [];
-  let groupWindow = -1;
-  let groupTuplet: string | undefined;
-
-  const flush = (): void => {
-    if (group.length >= 2) {
-      group.forEach((b, i) => {
-        const state: BeamState = i === 0 ? 'begin' : i === group.length - 1 ? 'end' : 'continue';
-        b.beams = [state];
-      });
-      for (let lvl = 2; lvl <= 3; lvl++) {
-        let runStart = -1;
-        for (let i = 0; i <= group.length; i++) {
-          const has = i < group.length && (BEAM_LEVEL[group[i].durationType] ?? 0) >= lvl;
-          if (has && runStart < 0) runStart = i;
-          if (!has && runStart >= 0) {
-            if (i - runStart === 1) {
-              const hook: BeamState = runStart === 0 ? 'forward hook' : 'backward hook';
-              group[runStart].beams!.push(hook);
-            } else {
-              for (let k = runStart; k < i; k++) {
-                const state: BeamState = k === runStart ? 'begin' : k === i - 1 ? 'end' : 'continue';
-                group[k].beams!.push(state);
-              }
-            }
-            runStart = -1;
-          }
-        }
-      }
-    }
-    group = [];
-    groupWindow = -1;
-    groupTuplet = undefined;
-  };
-
-  for (const b of beats) {
-    const level = b.isRest ? 0 : BEAM_LEVEL[b.durationType] ?? 0;
-    if (level < 1) {
-      flush();
-      continue;
-    }
-    const w = windowOf(b);
-    if (w < 0) {
-      flush();
-      continue;
-    }
-    if (group.length && (w !== groupWindow || b.tuplet?.id !== groupTuplet)) flush();
-    if (!group.length) {
-      groupWindow = w;
-      groupTuplet = b.tuplet?.id;
-    }
-    group.push(b);
-  }
-  flush();
-}

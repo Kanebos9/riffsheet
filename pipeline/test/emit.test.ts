@@ -109,9 +109,19 @@ describe('STATION 6a — MusicXML round-trip through a real reader', () => {
   });
 
   it('throws loudly if a measure does not add up', () => {
+    // Drop a whole glyph: every remaining beat still describes itself correctly, so the ONLY
+    // thing wrong is the cursor — which is precisely what G.4 exists to catch.
+    const broken = structuredCloneIsh(r.ir);
+    broken.bars[0].voices[0].beats.pop();
+    expect(() => toMusicXML(broken)).toThrow('advanced');
+  });
+
+  it('throws loudly if <type> and <duration> describe different lengths', () => {
+    // S2's assertion. Stretching one beat's ticks without changing its written value is exactly
+    // the contradiction a grand-staff projection used to emit on a tuplet rest.
     const broken = structuredCloneIsh(r.ir);
     broken.bars[0].voices[0].beats[0].durTicks += 3;
-    expect(() => toMusicXML(broken)).toThrow('advanced');
+    expect(() => toMusicXML(broken)).toThrow('but <duration> is');
   });
 
   it('emits a whole-bar rest as <rest measure="yes"/>', () => {
@@ -165,6 +175,22 @@ describe('STATION 6a — tuplet MusicXML (both halves are required)', () => {
       expect(built.ir.bars[0].voices[0].beats[0].durationType).toBe('eighth');
       expect(built.ir.bars[0].voices[0].beats[0].durTicks).toBe(8);
     }
+  });
+
+  it('G.5 refuses a half-open bracket, and it is checking the EMITTED layer', () => {
+    // It used to be handed the unprojected merged rhythm, where the edges balance by
+    // construction — so it could not fail, on a grand staff least of all. Knocking one stop out
+    // of the IR has to be enough to stop the file now.
+    const positions: { beat: number; midi: number }[] = [];
+    for (let b = 0; b < 4; b++) for (let u = 0; u < 3; u++) positions.push({ beat: b + u / 3, midi: 40 });
+    const built = buildScore({ notes: playedNotes(positions, 0.9), ...grid(2) }, settings());
+    const broken = structuredCloneIsh(built.ir);
+    const stop = broken.bars
+      .flatMap((bar) => bar.voices.flatMap((voice) => voice.beats))
+      .find((beat) => beat.tuplet?.stop);
+    expect(stop, 'the fixture produced no tuplet to break').toBeDefined();
+    stop!.tuplet!.stop = false;
+    expect(() => toMusicXML(broken)).toThrow('exactly one start and one stop');
   });
 });
 

@@ -56,7 +56,8 @@ export interface StringLetter {
 export function stringLettersFromBounds(
   lookup: alphaTab.rendering.BoundsLookup | null | undefined,
   tuningLowToHigh: ReadonlyArray<number>,
-  gapPx = STRING_LETTER_GAP_PX
+  gapPx = STRING_LETTER_GAP_PX,
+  columnX: number | null = null
 ): StringLetter[] {
   const out: StringLetter[] = [];
   const strings = tuningLowToHigh.length;
@@ -88,10 +89,14 @@ export function stringLettersFromBounds(
 
     // `visualBounds` spans the outermost tab lines, so N strings give N-1 gaps between them.
     const step = tab.h / (strings - 1);
+    // `columnX` is the caller's column — the right end of the clef/key/meter prefix, so the
+    // letters land in the same x-column the time signature is printed in (F8). Without one the
+    // old behaviour stands: right-aligned in the reserved page padding, just left of the staff.
+    const rightX = columnX !== null && Number.isFinite(columnX) ? columnX : tab.x - gapPx;
     for (let line = 0; line < strings; line++) {
       const stringIndex = strings - 1 - line; // top line is the thinnest string
       out.push({
-        x: tab.x - gapPx,
+        x: rightX,
         y: tab.y + line * step,
         text: midiNoteName(tuningLowToHigh[stringIndex]),
         stringIndex,

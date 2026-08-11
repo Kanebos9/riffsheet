@@ -205,6 +205,30 @@ even when the app is about to adopt one on 8222. Nothing in webcore reads it.
 `engineStatus().port` is the truthful answer — `0` when nothing is running.
 
 ```ts
+getAppVersion(): Promise<{ ok: true, version: string }>   // "0.1.0"
+```
+
+The same string `getShellInfo().version` reports, from the same
+`RIFFSHEET_VERSION` (the CMake project version) — a narrower view of one value,
+never a second source of it. It exists so an About box can print the version
+without paying for the whole shell probe. Registration is the capability test as
+usual: an older shell answers `hasNativeFunction('getAppVersion')` with false and
+the page falls back to the host info it already has.
+
+```ts
+openExternal(url: string): Promise<{ ok: true, url: string } | { ok: false, error: string }>
+```
+
+Opens a link in the user's real browser. **`http` and `https` only** — anything
+else comes back `{ ok:false }` without reaching the OS. `launchInDefaultBrowser`
+hands the string to `open` on macOS and `ShellExecute` on Windows, both of which
+would happily act on `file:`, `mailto:` or a scheme some other application
+registered, so the scheme is checked here rather than trusted downstream. The
+page must never navigate away from itself: inside a DAW there is no back button
+and no address bar, and a link that navigated in place would strand the user in a
+web page with their unsaved session behind it.
+
+```ts
 getHostInfo(): Promise<{
   isPlugin: boolean,                        // false in Standalone
   format: string,                           // "VST3" | "AudioUnit" | "Standalone"
@@ -303,6 +327,15 @@ a take from the bytes instead: staged under a random name in the system temp dir
 exactly like `importDroppedFile` (with which it shares `NativeBridge::stageBytesAndReply`), and
 promoted to the durable `takes` directory before the `AudioRef` is returned; the staging file is
 owned by the `PcmStore::Entry` and dies with it.
+
+Both of those calls are **capped at 550 MB of base64** (about 412 MB of audio) and are refused
+with a plain `{ ok:false, error }` above it rather than attempted; an allocation the machine
+declines comes back the same way instead of crashing. Neither the decode nor the staging write
+happens on the message thread — `stageBytesAndReply` runs the whole thing on the same worker pool
+`decodeAndReply` uses, because both halves cost time proportional to the payload and a
+half-gigabyte drop would otherwise freeze the WebView, and in a plugin the host's UI, for the
+length of a disk write. The reply contract is unchanged: exactly one reply per call, same shapes,
+delivered from a pool thread exactly as the success path always has been.
 
 It is deliberately **not** gated the way `loadAudioPath` is, and that is not an exception to the
 trust boundary above — it is outside it. The gate exists because a *path* names something this
@@ -1753,6 +1786,65 @@ Two paths, because the WebView usually eats native drops before JUCE sees them:
    bounded `InputBytes` and enter the same universal web importer.
 
 Handle both; they are not mutually exclusive.
+
+### Dragging a media ITEM out of REAPER onto us does not work, and cannot without a rework
+
+Investigated because a Finder file drag works and a REAPER arrange-view item drag
+onto the same window does nothing at all. It is not our drop handler being fussy:
+there is nothing on the pasteboard for anyone in this process to read.
+
+What REAPER offers. REAPER's UI is SWELL (Cockos' Win32 shim), and its whole
+drag-source vocabulary is three pasteboard types and two initiators — from
+`/Applications/REAPER.app/Contents/MacOS/REAPER`:
+
+```
+$ nm -u REAPER | grep -i pboard
+_NSDragPboard  _NSFilenamesPboardType  _NSFilesPromisePboardType  _NSStringPboardType
+
+$ strings REAPER | grep -iE 'SWELL_Initiate|dragPromised|namesOfPromised'
+SWELL_InitiateDragDrop
+SWELL_InitiateDragDropOfFileList
+dragPromisedFilesOfTypes:fromRect:source:slideBack:event:
+namesOfPromisedFilesDroppedAtDestination:
+```
+
+`SWELL_InitiateDragDropOfFileList` puts real paths on `NSFilenamesPboardType` —
+that is the Media Explorer / project-bay drag, and that one would work. A media
+**item** goes through `SWELL_InitiateDragDrop`, which is `NSFilesPromisePboardType`
+plus `dragPromisedFilesOfTypes:` — the **legacy, pre-10.12 file-promise protocol**,
+where the pasteboard carries only a filename extension and the receiver must call
+`namesOfPromisedFilesDroppedAtDestination:` with a directory for the source to
+render the item into. There is no path, no file URL and no data until someone asks.
+Note also what is *absent*: no `NSFilePromiseProvider`, so `NSFilePromiseReceiver`
+— the modern API — is not the counterpart to this.
+
+Why neither of our two paths sees it:
+
+- **Path 1 (HTML5).** The drop lands on the `WKWebView`, which covers the whole
+  editor. WebKit fills `DataTransfer.files` from real file URLs; a legacy promise
+  produces no `File`, so the page's `drop` handler fires with an empty list, or
+  the view consumes the drag and never dispatches at all. That is the observed
+  "nothing happens".
+- **Path 2 (JUCE `filesDropped`).** Even when the drag reaches the peer, JUCE
+  discards it. `juce_NSViewComponentPeer_mac.mm` registers
+  `kPasteboardTypeFileURLPromise`, but `getDroppedFiles()` only resolves a promise
+  when the pasteboard *also* carries iTunes' `'itun'` flavour; otherwise it falls
+  through to `readObjectsForClasses:@[NSURL]`, which returns nothing for a promise.
+  `dragInfo.files` ends up empty, `isEmpty()` is true, and the callback is never
+  made.
+
+Why nothing was implemented. Accepting this would mean owning the drag destination
+that currently belongs to the `WKWebView` — subclassing or swizzling a view JUCE
+creates, or floating an overlay `NSView` above it (which would break every ordinary
+page drag) — and then implementing the *deprecated* promise protocol, since
+`NSFilePromiseReceiver` does not pair with what REAPER sends. `juce_gui_extra`'s
+`juce_WebBrowserComponent_mac.mm` contains no drag code at all, so there is no seam
+to extend. That is a native drag-handling rework, not a contained change to
+`RiffsheetAudioProcessorEditor::filesDropped`, and it is deliberately not attempted
+here.
+
+The workaround that already works: drag the item's **source file** from REAPER's
+Media Explorer or from Finder, or use Open. Both go down path 1 normally.
 
 ---
 

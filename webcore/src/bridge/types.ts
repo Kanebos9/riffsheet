@@ -743,6 +743,27 @@ export interface NativeBridge {
   /** Open the engine setup flow (the "2-minute setup" link). */
   openEngineSetup?(): Promise<void>;
 
+  /**
+   * The shell's own version string, e.g. "0.1.0".
+   *
+   * `getHostInfo().version` carries the same value and is the right thing to read when you
+   * are already asking for host info; this exists so an About box does not have to probe
+   * the whole shell (and the whole DAW) to print one number. Optional like everything else
+   * here — in the browser and on an older shell it is simply absent, and the caller shows
+   * whatever it already knows.
+   */
+  getAppVersion?(): Promise<string | null>;
+
+  /**
+   * Open an http/https link in the user's real browser.
+   *
+   * The webview must never navigate away from the app itself — inside a DAW there is no
+   * back button and no address bar, so a link that navigated in place would strand the
+   * user in a web page with their unsaved session behind it. The host refuses anything
+   * that is not http or https; resolves false when it declined or the OS would not open it.
+   */
+  openExternal?(url: string): Promise<boolean>;
+
   // --- audio the shell is holding for us ------------------------------------------------
   /**
    * Declare the complete set of takes this session is using.

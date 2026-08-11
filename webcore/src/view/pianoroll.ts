@@ -194,6 +194,7 @@ import {
   isFullWindow,
   medianBeatSec,
   secToFrac,
+  subdivisionsPerBeat,
   MIN_WINDOW_SEC,
   TIME_ZOOM_IN_FACTOR,
   TIME_ZOOM_OUT_FACTOR,
@@ -207,6 +208,49 @@ import {
   type TimeLimits,
   type TimeWindow
 } from './timeAxis';
+
+/**
+ * The default ruler for a document with no score yet: 4/4 at the app's fallback tempo.
+ *
+ * `100` and `24` are not new numbers. They are the same fallbacks every other second<->tick
+ * conversion in this app uses when a score cannot answer (`60 / (tempoBpm || 100)`, and the IR's
+ * doubled `DIVISIONS`), stated here so a blank pane and a loaded one draw the same picture of
+ * the same tempo rather than two pictures that happen to look similar.
+ */
+const BLANK_GRID_BPM = 100;
+const BLANK_GRID_BEATS = 4;
+const BLANK_GRID_DIVISIONS = 24;
+/** A blank pane still shows this much of a ruler even before any take has been measured. */
+const BLANK_GRID_MIN_SEC = 8;
+
+/**
+ * A plain 4/4 grid covering the take, in `barGrid`'s own output shape.
+ *
+ * Built THROUGH `barGrid` rather than beside it, so a blank grid and a real one cannot disagree
+ * about what a `BarSpan` means or about how the origin is applied.
+ */
+function blankBarGrid(durationSec: number, originSec: number): BarSpan[] {
+  const secPerBar = (60 / BLANK_GRID_BPM) * BLANK_GRID_BEATS;
+  const span = Math.max(
+    BLANK_GRID_MIN_SEC,
+    Number.isFinite(durationSec) && durationSec > 0 ? durationSec : 0
+  );
+  // One past the end, so the last bar line is drawn rather than the grid stopping mid-bar.
+  const count = Math.max(1, Math.ceil(span / secPerBar) + 1);
+  const durTicks = BLANK_GRID_DIVISIONS * BLANK_GRID_BEATS;
+  const bars = [];
+  for (let i = 0; i < count; i++) {
+    bars.push({
+      index: i,
+      number: i + 1,
+      implicit: false,
+      startTick: i * durTicks,
+      durTicks,
+      timeSig: [BLANK_GRID_BEATS, 4] as const
+    });
+  }
+  return barGrid({ tempoBpm: BLANK_GRID_BPM, divisions: BLANK_GRID_DIVISIONS, bars }, originSec);
+}
 
 export interface PianoRollNote {
   startSec: number;
@@ -1100,6 +1144,10 @@ export class PianoRoll {
     this.ctx = this.canvas.getContext('2d')!;
     this.editGrid = opts.editGrid ?? 'eighth';
     this.readColors();
+    // A ruler from the very first frame (F3a). `setDuration`/`setBarOne`/`setScore` all replace
+    // it, but none of them is guaranteed to have been called on a document nobody has opened
+    // anything into — which is exactly the state the missing grid was reported in.
+    this.rebuildBars();
 
     this.canvas.addEventListener('pointerdown', this.onPointerDown);
     this.canvas.addEventListener('pointermove', this.onPointerMove);
@@ -1171,6 +1219,9 @@ export class PianoRoll {
    */
   setDuration(durationSec: number): void {
     this.durationSec = durationSec;
+    // The BLANK grid is laid out to cover the take, so a take that has just been measured is a
+    // new grid. Cheap and a no-op once there is a score, whose bars are its own.
+    if (!this.score) this.rebuildBars();
     this.draw();
   }
 
@@ -1258,7 +1309,17 @@ export class PianoRoll {
   private rebuildBars(): void {
     const score = this.score;
     if (!score) {
-      this.bars = [];
+      // A BLANK DOCUMENT STILL GETS A RULER (F3a).
+      //
+      // It used to get an empty list, so `gridMarks()` returned nothing, so the pane was a flat
+      // wash with a sentence in the middle of it until the app had listened and a score existed.
+      // That is the one moment the grid is most useful: it is what tells a player that the pane
+      // has a time axis at all, that it is 4/4, and where the bars will land when they play.
+      //
+      // The grid is honest about being a default rather than a measurement — it is the same
+      // 4/4-at-the-fallback-tempo the rest of this file falls back to (`60 / (tempoBpm || 100)`)
+      // — and the moment a real score arrives, `setScore` replaces every line of it.
+      this.bars = blankBarGrid(this.durationSec, this.originSec);
       return;
     }
     this.bars = barGrid(
@@ -3821,15 +3882,29 @@ export class PianoRoll {
      * for, and the strongest weight at any position wins so nothing is drawn twice.
      */
     const marks = this.gridMarks();
+    ctx.save();
     for (const mark of marks) {
       const x = this.secToX(mark.sec);
       if (!Number.isFinite(x) || x < g - 1 || x > w) continue;
-      ctx.save();
-      ctx.globalAlpha = mark.level === 'bar' ? 0.85 : mark.level === 'beat' ? 0.34 : 0.15;
-      ctx.fillStyle = this.colors.line;
-      ctx.fillRect(Math.round(x), 0, 1, ph);
-      ctx.restore();
+      // THE THREE WEIGHTS, stepped up (F3b).
+      //
+      // They were 0.85 / 0.34 / 0.15 of `--border` — a token chosen to separate two panels of
+      // near-identical dark grey, which is a job that wants a whisper. Drawn over the roll's
+      // striped rows it was a whisper against a pattern, and the beat lines in particular were
+      // reported as invisible: 0.34 of a colour a shade off the background is nothing.
+      //
+      // So bars and beats are drawn in the LABEL colour, which is a text token and therefore
+      // legible against this pane by definition, and subdivisions keep the quiet border colour
+      // — a subdivision is a hint about where a drag will land, not a landmark. Bars stay
+      // clearly the strongest of the three, and 2px wide, because "which one is the downbeat"
+      // is the one question the ruler exists to answer at a glance.
+      const bar = mark.level === 'bar';
+      const beat = mark.level === 'beat';
+      ctx.globalAlpha = bar ? 0.9 : beat ? 0.55 : 0.28;
+      ctx.fillStyle = bar || beat ? this.colors.label : this.colors.line;
+      ctx.fillRect(Math.round(x), 0, bar ? 2 : 1, ph);
     }
+    ctx.restore();
 
     this.rects = this.layoutRects(rowH, yFor, w, g);
     this.outlinedRects = 0;
@@ -3879,7 +3954,15 @@ export class PianoRoll {
     const bars = this.bars;
     if (bars.length === 0) return [];
     const win = this.getTimeWindow();
-    const detail = gridDetail(medianBeatSec(bars), (win.toSec - win.fromSec) / Math.max(1, this.plotWidth));
+    const detail = gridDetail(
+      medianBeatSec(bars),
+      (win.toSec - win.fromSec) / Math.max(1, this.plotWidth),
+      // THE SELECTED GRID, and it never used to get here. `setEditGrid` changed what a drag
+      // SNAPPED to and nothing else, so the drawn subdivisions stayed at four per beat whatever
+      // the Grid selector said — pick triplets and every snapped note landed neatly between two
+      // drawn columns, which reads as the snapping being broken rather than the ruler.
+      subdivisionsPerBeat(this.editGrid)
+    );
     return gridMarks(bars, win, detail);
   }
 
@@ -3915,10 +3998,13 @@ export class PianoRoll {
       // Ticks: a bar gets the full height of the band, a beat a stub, a subdivision nothing —
       // at that density the band would be a solid block.
       if (mark.level === 'sub') continue;
-      ctx.globalAlpha = mark.level === 'bar' ? 0.7 : 0.3;
-      ctx.fillStyle = this.colors.line;
+      // Same weights as the plot's own lines below, so a bar tick in the band and the bar line
+      // under it read as one mark rather than two of different strengths. See the grid in
+      // `drawPlot` for why the label token and not the border one.
+      ctx.globalAlpha = mark.level === 'bar' ? 0.9 : 0.55;
+      ctx.fillStyle = this.colors.label;
       const tickH = mark.level === 'bar' ? rh - 1 : 4;
-      ctx.fillRect(Math.round(x), rh - 1 - tickH, 1, tickH);
+      ctx.fillRect(Math.round(x), rh - 1 - tickH, mark.level === 'bar' ? 2 : 1, tickH);
       if (!mark.label) continue;
       ctx.globalAlpha = 0.85;
       ctx.fillStyle = this.colors.label;

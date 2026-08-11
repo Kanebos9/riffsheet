@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
+  <!-- Riffsheet app icon. Built on BASAMAK's icon grid (Resources/Icon/
+       basamak-icon.svg): same 700-unit em placed by translate(81,431)
+       scale(0.5,-0.5), same 133-unit stem, same 114-unit bar, same
+       45-degree chamfers, same full-bleed rounded square at rx=112.
+       Only the palette moves: Riffsheet's --accent on its own --bg. -->
+  <rect width="512" height="512" rx="112" fill="#16181d"/>
+  <g transform="translate(81,431) scale(0.5,-0.5)" fill="#e8734a">
+    <path d="M65,0 198,0 198,700 65,700Z"/>
+    <path d="M332.386,470 465.386,470 613.785,58.7854 555,0 502,0Z"/>
+    <path fill-rule="evenodd" d="M65,700 445,700 545,600 545,404 504,363 65,363ZM198,470 375,470 411,506 411,551 376,586 198,586Z"/>
+  </g>
+</svg>

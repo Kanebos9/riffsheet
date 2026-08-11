@@ -1277,6 +1277,25 @@ export function createMockBridge(options: MockOptions = {}): NativeBridge {
       alert('In the real app this opens the engine setup. (Browser mock.)');
     },
 
+    // Matches the shell's `getShellInfo().version` in this mock (see getHostInfo above), so
+    // the two ways of asking never disagree in dev either.
+    async getAppVersion(): Promise<string | null> {
+      return 'dev';
+    },
+
+    // The mock applies the SAME http/https rule the shell does, so a caller that hands over
+    // a `file:` or custom-scheme URL fails in dev instead of only inside the plugin.
+    async openExternal(url: string): Promise<boolean> {
+      let parsed: URL;
+      try {
+        parsed = new URL(url);
+      } catch {
+        return false;
+      }
+      if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return false;
+      return window.open(parsed.href, '_blank', 'noopener,noreferrer') !== null;
+    },
+
     // --- per-instance persistence -------------------------------------------------------
     // The plugin parks this on its processor, which is the thing that survives the editor
     // being destroyed. A browser tab has no processor, so localStorage stands in — the same

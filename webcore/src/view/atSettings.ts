@@ -136,11 +136,46 @@ export const DEFAULT_VIEW_SETTINGS: ViewSettings = {
  */
 export const STAFF_TAB_GAP = 12;
 
-/** Apply the staff<->tab gap for the current names state. Safe to call on a live Settings. */
-export function applyStaffTabGap(settings: alphaTab.Settings, namesGap: boolean): void {
+/**
+ * The gap between staves of a MULTI-STAVE score, in px. Bigger, and the reason is content.
+ *
+ * On one staff showing notation and tab, the only thing hanging below the notation staff is a
+ * stem or a beam on a single voice, and alphaTab's own 48px of overflow absorbs it. A GRAND
+ * STAFF is a different picture: the treble staff carries the whole right hand, so deep beams,
+ * ledger lines below the staff and the tails of a chord all reach down toward the bass staff at
+ * once, and they were reported bleeding into it. Grand + tab is the same problem twice over.
+ *
+ * A FIXED, SAFELY LARGER NUMBER rather than a per-system measurement. alphaTab decides staff
+ * distance during layout and exposes it only as these padding settings — there is no callback
+ * that says "this system needs 9 more px" and no way to feed one back in without re-engraving
+ * the whole score to measure it, which is a render per render. `notationStaffPaddingTop` applies
+ * to every main notation stave except the first, so one number widens every gap in the system,
+ * which is what "the staves must not touch" wants anyway.
+ *
+ * The cost is vertical space on a score that did not need it. That is the right way round: a
+ * beam through a bass clef is a misreading, extra white space is a preference.
+ */
+export const MULTI_STAFF_GAP = 26;
+
+/**
+ * Apply the staff<->staff gap for the current names state. Safe to call on a live Settings.
+ *
+ * `multiStaff` is true when the track renders more than one stave — a grand staff, or a grand
+ * staff plus tab. The two reasons to open the gap are independent (a row to fit in it; content
+ * that would otherwise collide), so the larger of the two wins rather than one overriding the
+ * other: turning the note names off must not close a gap that exists to keep beams off a clef.
+ */
+export function applyStaffTabGap(
+  settings: alphaTab.Settings,
+  namesGap: boolean,
+  multiStaff = false
+): void {
   // 0 is alphaTab's own default, which still leaves the 48px of overflow — plenty for two
   // staves to read as two once there is no row to fit between them.
-  settings.display.notationStaffPaddingTop = namesGap ? STAFF_TAB_GAP : 0;
+  settings.display.notationStaffPaddingTop = Math.max(
+    namesGap ? STAFF_TAB_GAP : 0,
+    multiStaff ? MULTI_STAFF_GAP : 0
+  );
 }
 
 /**

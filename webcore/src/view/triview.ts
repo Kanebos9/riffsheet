@@ -28,7 +28,11 @@ import { TIMELINE_GUTTER_PX } from './pianoroll';
 import { buildAlphaTabScore, soundingMidi, type ScoreIndex } from '../score/fromPipeline';
 import { midiToName, accidentalsForKey, type Accidentals } from '../score/notes';
 import { assignFret } from '../score/tuning';
-import { stringLettersFromBounds, tuningLowToHighFromScore } from './stringLetters';
+import {
+  STRING_LETTER_GAP_PX,
+  stringLettersFromBounds,
+  tuningLowToHighFromScore
+} from './stringLetters';
 import {
   soleStaveKind,
   staveKindsFromBars,
@@ -36,6 +40,7 @@ import {
   tabStaveIndex,
   type StaveKind
 } from './staveKinds';
+import { clampXToEngraving, type EngravedExtent } from './timeAxis';
 import { countRendererCredits, stripRendererCredit } from './watermark';
 import { t, TIPS } from '../ui/tips';
 import type { RiffScore } from '../pipeline';
@@ -210,6 +215,30 @@ const LEFT_INSET_PX = TIMELINE_GUTTER_PX;
 let leftInkOverhangPerScale = 9;
 
 /**
+ * The floor on that overhang for a BRACED system, per unit of `display.scale`.
+ *
+ * A grand staff is two staves joined by an accolade — a brace, plus the bracket and the sideways
+ * track name — and all of it is drawn to the left of the system line. The measured single-staff
+ * value (9) does not cover it, so the very first frame of a grand-staff score put the brace, and
+ * with it the left edge of the clef and time signature, outside the scroller and the container
+ * cut them off. It was reported from a photograph of exactly that.
+ *
+ * `tuneLeftInset()` still measures and still wins afterwards; this only stops the FIRST render
+ * from being the wrong one, which on a score that never re-renders is the only render there is.
+ * Deliberately generous rather than exact: over-reserving costs a few px of white space at the
+ * left, under-reserving costs a clipped clef.
+ */
+const BRACED_LEFT_OVERHANG_PER_SCALE = 22;
+
+/**
+ * How many corrective left-inset renders one score (or one zoom) may cost.
+ *
+ * Two, not one: the first pass measures and corrects, the second exists only for the case where
+ * the first still left ink outside the container. See `TriView.insetTuneBudget`.
+ */
+const INSET_TUNE_PASSES = 2;
+
+/**
  * alphaTab display scale limits. 1.0 is the default; below 0.4 the tab digits stop being readable.
  *
  * Exported because Align's coupled zoom is computed OUTSIDE this class — `coupledSheetScale`
@@ -291,7 +320,8 @@ export class TriView {
   private accidentals: Accidentals = 'sharps';
   private labels: NameLabel[] = [];
   private tabMarks: NameLabel[] = [];
-  private stringLetters: NameLabel[] = [];
+  /** The letters keep their y too: the pinned x is rewritten on scroll and needs the pair. */
+  private stringLetters: Array<NameLabel & { y: number }> = [];
   /** noteId -> semitones the TAB position was folded by. Empty for anything in range. */
   private tabShifts = new Map<string, number>();
   private opts: TriViewOptions;
@@ -320,8 +350,59 @@ export class TriView {
   /** ALIGN's pending anchor: the tick that must be at the music column's left edge (#30). */
   private alignAnchorTick: number | null = null;
   private scrollAnchorAtStart = false;
-  /** True while a left-inset correction is being rendered — the hard stop on any loop. */
-  private insetTuneInFlight = false;
+  /**
+   * THE RENDER GATE. Nothing may ask alphaTab to render while alphaTab is rendering.
+   *
+   * With `useWorkers` and `enableLazyLoading` both off — which they are, and must stay (see
+   * view/atSettings.ts) — a render is entirely SYNCHRONOUS: `api.render()` lays out, paints
+   * every partial, fires `partialRenderFinished` for each one and then `postRenderFinished`,
+   * all on one stack. This view listens to both of those, and both listeners call OUT: the
+   * partial one rebuilds the overlays and publishes a viewport, the post one publishes a render
+   * and a viewport. A listener that comes back in through `setZoom`, `applyGap` or
+   * `tuneLeftInset` therefore starts a SECOND render inside the first.
+   *
+   * That is not merely wasteful, it is how two engravings end up on screen at once. alphaTab's
+   * browser facade holds one placeholder `<div>` per partial and reuses them BY INDEX, resetting
+   * its index counter on every `preRender` (`BrowserUiFacade.beginAppendRenderResults`, and the
+   * counter is `_totalResultCount`). A render nested inside another resets that counter to 0 and
+   * refills the placeholders from the top; when the outer stack unwinds, its remaining partials
+   * no longer find a placeholder to reuse and APPEND fresh ones instead — absolutely positioned,
+   * at the outer render's coordinates. Two engravings then sit on top of each other, offset by
+   * exactly the difference in scale or page padding between them, and the trailing "remove the
+   * placeholders nobody claimed" sweep cannot see it because the counter is now too high.
+   *
+   * ONE SUCH NEST IS REAL TODAY: `tuneLeftInset()` is called from `postRenderFinished` and used
+   * to render straight back into the render that was finishing. It nests at the very END of the
+   * outer render, so it happens to be survivable; it is one reordering away from not being, and
+   * nothing about the arrangement said so.
+   *
+   * So every render this class starts goes through `startRender`, which runs it now if the
+   * stack is clear and otherwise runs it the moment the current one has finished. Never nested,
+   * never dropped.
+   */
+  private renderInFlight = false;
+  private queuedRender: (() => void) | null = null;
+  /**
+   * True from the moment a render is asked for until one finishes. See `renderPending`.
+   *
+   * A flag rather than a request/finish counter on purpose: alphaTab renders on its own account
+   * too (a container resize goes straight to `resizeRender`), so a counter this class keeps
+   * would drift the moment it was not the only one asking, and a drifted counter answers the
+   * anchor's question wrongly for the rest of the session.
+   */
+  private awaitingRender = false;
+  /**
+   * How many more corrective left-inset renders this score may have. The hard stop on any loop.
+   *
+   * It was a single boolean, which allowed exactly one correction per render and was the right
+   * number while the relationship was linear with slope one. A BRACED system broke that
+   * assumption in the only way that matters: if the first pass still leaves ink outside the
+   * container, there was no second pass and the clef stayed clipped. A small budget is bounded
+   * in exactly the same way a boolean is and covers the case.
+   */
+  private insetTuneBudget = 0;
+  /** True when the score renders more than one stave — a grand staff, or grand staff + tab. */
+  private multiStaff = false;
   /** Highest playable fret. Only used to decide whether a drag is possible. */
   private maxFret: number;
   /** The key signature, for turning staff positions into semitones. */
@@ -407,6 +488,49 @@ export class TriView {
   // Score loading and re-rendering
   // -------------------------------------------------------------------------
 
+  /**
+   * Run a render, or hold it until the one on the stack has finished. See the render gate.
+   *
+   * The queue is one deep on purpose. Two requests raised during one render are two descriptions
+   * of the SAME wanted state — a new scale, a new padding — and running both would engrave a
+   * frame nobody will ever see. The last one wins because it is the most recent statement of
+   * what the page should look like.
+   */
+  private startRender(run: () => void): void {
+    this.awaitingRender = true;
+    if (this.renderInFlight) {
+      this.queuedRender = run;
+      return;
+    }
+    this.renderInFlight = true;
+    try {
+      this.renderStartedAt = performance.now();
+      run();
+    } finally {
+      this.renderInFlight = false;
+    }
+    const queued = this.queuedRender;
+    if (!queued) return;
+    this.queuedRender = null;
+    // Not recursion in any meaningful sense: the stack is clear again, and the queue is one
+    // deep, so this runs at most once more per render that asked for one.
+    this.startRender(queued);
+  }
+
+  /**
+   * True while a re-engrave is still owed to somebody.
+   *
+   * The question a PENDING anchor has to ask before it arms itself: an anchor that no render
+   * will consume is not a promise, it is a landmine that goes off on the next unrelated render.
+   * Because renders are synchronous (see the render gate), the usual answer after `setZoom` has
+   * returned is FALSE — the re-engrave has already happened — and the only times it is true are
+   * a render that alphaTab has deferred (container not renderable yet) and one this class has
+   * queued behind the current stack.
+   */
+  private renderPending(): boolean {
+    return this.awaitingRender;
+  }
+
   /** Full load: build the alphaTab object graph from the pipeline's data and render it. */
   load(score: RiffScore): void {
     this.currentScore = score;
@@ -423,8 +547,36 @@ export class TriView {
     const built = buildAlphaTabScore(score.data, this.api.settings);
     this.index = built.index;
     this.builtModel = built.score;
-    this.renderStartedAt = performance.now();
-    this.api.renderScore(built.score, [0]);
+    // A braced system needs a wider reserved column than a single staff, and it needs it BEFORE
+    // the first render rather than one corrective render later. See BRACED_LEFT_OVERHANG_PER_SCALE.
+    this.reserveLeftColumnFor(built.score);
+    this.insetTuneBudget = INSET_TUNE_PASSES;
+    this.startRender(() => this.api.renderScore(built.score, [0]));
+  }
+
+  /**
+   * Widen the reserved left column when the score about to be engraved carries a brace.
+   *
+   * Read off the MODEL rather than the bounds, because the bounds do not exist yet — that is
+   * the whole point: this runs before the first render of this score, which is the frame the
+   * clipping report was a photograph of.
+   */
+  private reserveLeftColumnFor(score: alphaTab.model.Score): void {
+    const staves = score.tracks[0]?.staves.length ?? 1;
+    // Same measurement, second consumer: a braced system is also the one whose staves need more
+    // air between them (F2b). Recorded before the render so the first frame already has it.
+    this.multiStaff = staves > 1;
+    applyStaffTabGap(this.api.settings, this.needsGap(), this.multiStaff);
+    const overhang = this.multiStaff
+      ? Math.max(leftInkOverhangPerScale, BRACED_LEFT_OVERHANG_PER_SCALE)
+      : leftInkOverhangPerScale;
+    const wanted = LEFT_INSET_PX + overhang * this.api.settings.display.scale;
+    if (Math.abs(wanted - (this.api.settings.display.padding[0] ?? 0)) >= 0.5) {
+      setLeftPadding(this.api.settings, wanted);
+    }
+    // Unconditional: the gap above may have changed even when the padding did not, and there is
+    // no render in flight yet — `load()` starts one immediately after this returns.
+    this.api.updateSettings();
   }
 
   /**
@@ -439,8 +591,11 @@ export class TriView {
    * find that alphaTab has changed. (spike-results/spike.json holds the numbers.)
    */
   rerenderAfterEdit(): void {
-    this.renderStartedAt = performance.now();
-    this.api.render({ reuseViewport: true });
+    // The one place `reuseViewport` is still asked for, and the only one where it is safe: the
+    // display scale and the page padding are unchanged, so a partial that has not been repainted
+    // yet is showing ink in exactly the right place and leaving it there avoids a flash. Every
+    // render that CHANGES the geometry passes false instead — see `setZoom`.
+    this.startRender(() => this.api.render({ reuseViewport: true }));
   }
 
   /** Regenerate the player's MIDI after an edit that changed pitch or rhythm. */
@@ -521,11 +676,12 @@ export class TriView {
   private applyGap(): boolean {
     const wanted = this.needsGap();
     const before = this.api.settings.display.notationStaffPaddingTop;
-    applyStaffTabGap(this.api.settings, wanted);
+    applyStaffTabGap(this.api.settings, wanted, this.multiStaff);
     if (this.api.settings.display.notationStaffPaddingTop === before) return false;
     this.api.updateSettings();
-    this.renderStartedAt = performance.now();
-    this.api.render({ reuseViewport: true });
+    // Geometry change: every stave below the first moves, so nothing already painted is still
+    // in the right place and `reuseViewport` would only license a ghost. See `setZoom`.
+    this.startRender(() => this.api.render({ reuseViewport: false }));
     return true;
   }
 
@@ -534,6 +690,11 @@ export class TriView {
   // -------------------------------------------------------------------------
 
   private onPostRender(): void {
+    // FIRST, before anything below can ask for another render: this render is done, whatever
+    // else happens in this method. `renderPending()` is read by the Align anchor and it must see
+    // a request `tuneLeftInset` is about to raise, not the one that has just been served — so
+    // this is cleared here and `startRender` sets it again if there is more to come.
+    this.awaitingRender = false;
     const info = this.rebuildOverlays();
     this.lastRenderInfo = {
       durationMs: performance.now() - this.renderStartedAt,
@@ -667,7 +828,12 @@ export class TriView {
     // The tab's own legend. Derived from the SAME bounds as everything else above, so it
     // re-places itself on every render — a zoom, an edit or a re-flow cannot leave it behind.
     this.syncStringLetters(
-      stringLettersFromBounds(lookup, tuningLowToHighFromScore(this.builtModel))
+      stringLettersFromBounds(
+        lookup,
+        tuningLowToHighFromScore(this.builtModel),
+        STRING_LETTER_GAP_PX,
+        this.stringLetterColumnX()
+      )
     );
     // The highlight rectangles were drawn against the OLD geometry. Redraw them from the
     // new bounds, or a zoom (or any edit) would leave the selection behind.
@@ -983,15 +1149,39 @@ export class TriView {
   }
 
   /**
+   * How far the engraving reaches, in content pixels: the first engraved beat and the right
+   * edge of the final bar. Null until something has been engraved.
+   *
+   * Published because it is the honest limit of every answer this class gives about time: past
+   * `lastX` there is no music, only page. See `timeAxis.clampXToEngraving`.
+   */
+  engravedExtent(): EngravedExtent | null {
+    const axis = this.ensureAxis();
+    if (!axis || axis.xs.length < 2) return null;
+    return { firstX: axis.xs[0], lastX: axis.xs[axis.xs.length - 1] };
+  }
+
+  /**
    * The inverse: which tick is under this x. O(log n), by bisecting the same axis.
    *
-   * Outside the engraved range it extrapolates rather than clamping, so it round-trips
-   * with `tickToContentX` and a click in the empty margin still means something.
+   * HELD INSIDE THE ENGRAVING, which is a change of behaviour and the fix for the pane drift.
+   *
+   * The bisection itself still extrapolates past both ends — `axisTickAt` is the exact mirror
+   * of `axisXAt` and has to stay that way — but every CALLER of this method is asking a
+   * question about the viewport ("which second is at my left/right edge?"), and past the last
+   * engraved bar there is no answer to give but "the last engraved moment". Extrapolating there
+   * produced a time beyond the end of the recording whenever the pane was wider than the
+   * engraving, which is the ordinary state of a short riff; the align window then overran the
+   * take, `clampWindow` slid it back keeping its span, and the sheet and the roll ended up at
+   * different scales showing different music. Measured at ~578 px of drift.
+   *
+   * `exact: true` opts back out, for anything that genuinely wants the extrapolated inverse.
    */
-  contentXToTick(x: number): number | null {
+  contentXToTick(x: number, exact = false): number | null {
     const axis = this.ensureAxis();
     if (!axis) return null;
-    return axisTickAt(axis, x);
+    if (exact) return axisTickAt(axis, x);
+    return axisTickAt(axis, clampXToEngraving(x, this.engravedExtent()));
   }
 
   /**
@@ -1172,8 +1362,20 @@ export class TriView {
     // new scale or the reserved column would come out wider or narrower than the roll's.
     setLeftPadding(this.api.settings, LEFT_INSET_PX + leftInkOverhangPerScale * next);
     this.api.updateSettings();
-    this.renderStartedAt = performance.now();
-    this.api.render({ reuseViewport: true });
+    // A new scale is a new measurement problem, so the corrective budget is refilled.
+    this.insetTuneBudget = INSET_TUNE_PASSES;
+    // NOT `reuseViewport`, and this is the other half of the ghosting.
+    //
+    // `reuseViewport: true` tells alphaTab's facade to leave the previous partial's ink in its
+    // placeholder rather than blanking it first (`if (!renderResult.reuseViewport) placeholder
+    // .textContent = ""`, BrowserUiFacade.beginAppendRenderResults). It is the right trade when
+    // the geometry is unchanged and the only risk is a flash between two identical pictures. At
+    // a NEW `display.scale` every engraved coordinate has moved, so a placeholder the new render
+    // does not overwrite is left holding a differently-scaled copy of the same music, a few
+    // pixels off — which is what the reports look like. Blanked placeholders cannot ghost at
+    // all, whatever else goes wrong upstream, and a zoom re-engraves every partial anyway so
+    // there is nothing worth reusing.
+    this.startRender(() => this.api.render({ reuseViewport: false }));
   }
 
   /**
@@ -1212,12 +1414,28 @@ export class TriView {
    *
    * Pass null to drop a pending anchor — switching Align off, for instance — and leave the
    * plain zoom anchor (`setZoom`'s own, which keeps the left edge where it was) in charge.
+   *
+   * THE ANCHOR ONLY ARMS WHEN A RENDER WILL CONSUME IT, and that is the fix rather than a
+   * detail. It used to arm unconditionally, which was wrong in both directions. Renders here
+   * are synchronous, so by the time the caller reaches this line after a coupled zoom the
+   * re-engrave has ALREADY finished — the "and again afterwards" had nothing left to wait for
+   * and simply sat in the field. And when `setZoom` starts no render at all (the scale was
+   * unchanged, or the coupling asked for one outside [MIN_ZOOM, MAX_ZOOM] and it clamped back
+   * to where it already was) there was never going to be a render either. Either way the tick
+   * survived, and the next unrelated re-engrave — an edit, a names toggle, a resize — restored
+   * it and yanked the sheet somewhere the player had not asked to be.
+   *
+   * So: scroll now, always, because the geometry on screen is the current geometry. Arm only if
+   * `renderPending()` says a re-engrave is still owed.
    */
   alignScrollToTick(tick: number | null): void {
-    this.alignAnchorTick = tick;
-    if (tick === null) return;
+    if (tick === null) {
+      this.alignAnchorTick = null;
+      return;
+    }
     const x = this.tickToContentX(tick);
     if (x !== null) this.setScrollLeft(x - LEFT_INSET_PX);
+    this.alignAnchorTick = this.renderPending() ? tick : null;
   }
 
   private restoreScrollAnchor(): void {
@@ -1264,10 +1482,7 @@ export class TriView {
    * render loop. Returns true when a correcting render was started.
    */
   private tuneLeftInset(): boolean {
-    if (this.insetTuneInFlight) {
-      this.insetTuneInFlight = false;
-      return false;
-    }
+    if (this.insetTuneBudget <= 0) return false;
     const scale = this.api.settings.display.scale;
     const ink = this.measureLeftInk();
     if (ink === null || scale <= 0) return false;
@@ -1275,13 +1490,18 @@ export class TriView {
     const pad = this.api.settings.display.padding[0] ?? 0;
     leftInkOverhangPerScale = (pad - ink) / scale;
     const wanted = LEFT_INSET_PX + leftInkOverhangPerScale * scale;
-    if (Math.abs(wanted - pad) < 0.5) return false;
+    // The deadband is skipped when the ink is OUTSIDE the stack (a negative x is ink the
+    // container is clipping, not ink half a pixel out of place), so a clipped brace is always
+    // worth another pass while there is budget for one.
+    if (ink >= 0 && Math.abs(wanted - pad) < 0.5) return false;
 
     setLeftPadding(this.api.settings, wanted);
     this.api.updateSettings();
-    this.insetTuneInFlight = true;
-    this.renderStartedAt = performance.now();
-    this.api.render({ reuseViewport: true });
+    this.insetTuneBudget--;
+    // Through the gate, and NOT `reuseViewport`: this call is made from inside the finishing
+    // render's own `postRenderFinished`, so without the gate it would nest; and it moves the
+    // whole engraving sideways, so nothing already painted is where it belongs. See `setZoom`.
+    this.startRender(() => this.api.render({ reuseViewport: false }));
     return true;
   }
 
@@ -1333,20 +1553,48 @@ export class TriView {
   }
 
   /**
+   * The column the letters are right-aligned against: just right of the time signature, just
+   * left of the first notehead. Null when nothing has been engraved, which leaves the letters
+   * in the reserved left padding as before.
+   *
+   * The first engraved beat's x is the handle. alphaTab publishes no bounds for the clef, the
+   * key signature or the time signature individually, but everything between the start of the
+   * staff and the first beat IS that prefix, so its right end is where the time signature
+   * finishes. Right-aligning the letters a hair left of the first beat therefore puts them in
+   * the same column as the meter, which is the column a tab book puts them in — and, once the
+   * whole row is pinned to the viewport below, the column they stay in.
+   */
+  private stringLetterColumnX(): number | null {
+    const axis = this.ensureAxis();
+    if (!axis || axis.xs.length === 0) return null;
+    return axis.xs[0] - STRING_LETTER_GAP_PX;
+  }
+
+  /**
    * The open-string letters, same reuse discipline as the names row.
    *
    * `translate(x, y)` then `translate(-100%, -50%)`: x is the RIGHT edge (the letters are
    * right-aligned against the staff, so a two-character name and a one-character one end at
    * the same place) and y is the LINE, so the text is centred on it rather than hanging below.
+   *
+   * PINNED TO THE VIEWPORT (F8). The x stored here is the CONTENT x, and what is written into
+   * the transform is that x plus the current scroll — so the letters sit in a fixed screen
+   * column instead of sliding off the left edge the moment Align scrolls the sheet. They are a
+   * legend for the staff, not a mark on the music: scrolling to bar 30 does not stop the third
+   * line from being a D, and a legend you have to scroll back to is the thing this row replaced.
+   * `restringLetterPositions()` re-applies it on every scroll.
    */
   private syncStringLetters(wanted: Array<{ x: number; y: number; text: string }>): void {
     while (this.stringLetters.length < wanted.length) {
       const el = document.createElement('span');
       el.className = 'string-letter';
+      // The plate the pinned row needs to be readable over music lives in `.string-letter`
+      // (ui/styles.css). It was set inline here while the row was being built; nothing about
+      // it depends on anything this file knows, so it is a stylesheet's job.
       const tip = t(TIPS.stringLetters);
       if (tip) el.setAttribute('title', tip);
       this.stringLettersRow.appendChild(el);
-      this.stringLetters.push({ el, x: 0 });
+      this.stringLetters.push({ el, x: 0, y: 0 });
     }
     while (this.stringLetters.length > wanted.length) {
       this.stringLetters.pop()!.el.remove();
@@ -1355,8 +1603,17 @@ export class TriView {
       const w = wanted[i];
       const m = this.stringLetters[i];
       if (m.el.textContent !== w.text) m.el.textContent = w.text;
-      m.el.style.transform = `translate(${w.x}px, ${w.y}px) translate(-100%, -50%)`;
       m.x = w.x;
+      m.y = w.y;
+    }
+    this.placeStringLetters();
+  }
+
+  /** Write the pinned transform for every letter. Cheap enough to call on every scroll frame. */
+  private placeStringLetters(): void {
+    const left = this.scroller.scrollLeft;
+    for (const m of this.stringLetters) {
+      m.el.style.transform = `translate(${m.x + left}px, ${m.y}px) translate(-100%, -50%)`;
     }
   }
 
@@ -2125,6 +2382,9 @@ export class TriView {
    * scroll event, because a trackpad flick fires dozens of them per frame.
    */
   private onScroll = (): void => {
+    // Synchronously, not in the frame below: the letters are pinned to the viewport, so they
+    // have to move WITH the scroll or they lag a frame behind it and visibly swim.
+    this.placeStringLetters();
     if (this.viewportFrame) return;
     this.viewportFrame = requestAnimationFrame(() => {
       this.viewportFrame = 0;

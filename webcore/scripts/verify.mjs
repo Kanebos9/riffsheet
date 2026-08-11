@@ -910,9 +910,18 @@ async function main() {
         // re-flowed: the zoom actually in force, and how many ROWS the header came out as
         // (distinct top edges among its children — wrapping is what pushes that above one).
         appZoom: Number(getComputedStyle(document.querySelector('#app')).zoom) || 1,
+        // COUNTED OFF CENTRES, NOT TOPS, and that correction is the whole of what this number
+        // is worth. The header centre-aligns its items, so a 19px filename, a 24px chip group,
+        // a 27px chip, a 30px button and a 32px gear all have DIFFERENT top edges while sitting
+        // on the same line — and a zero-height spacer has one of its own. Counting tops
+        // therefore reported four or five "rows" for a header that had never wrapped in its
+        // life, which made the check below unfalsifiable in the direction that mattered: it was
+        // already at its limit before anything went wrong. Centre-aligned items on one line
+        // share a centre exactly; a wrapped line's centre is a whole row away. Bucketed at 4px
+        // so sub-pixel layout noise cannot split a row in two.
         headerRows: new Set(
           [...document.querySelectorAll('.app-header > *')]
-            .map((e) => Math.round(e.getBoundingClientRect().top / 4))
+            .map((e) => { const b = e.getBoundingClientRect(); return Math.round((b.top + b.height / 2) / 4); })
         ).size,
         bodyScrollW: document.body.scrollWidth, innerW: window.innerWidth,
         docScrollW: document.documentElement.scrollWidth,
@@ -1140,7 +1149,10 @@ async function main() {
     await evalJson(setSelect('notation-grid', 'quarter'));
     await settle(900);
     result.gridAfterNotationChange = await evalJson(SELFTEST);
-    await evalJson(setSelect('notation-grid', 'auto'));
+    // BACK TO 'free', WHICH IS THE DEFAULT — not to 'auto', which it was until settings v10.
+    // `gridBefore` was measured with whatever the app opens on, so restoring to a value that is
+    // no longer that one compares two different settings and calls the difference a regression.
+    await evalJson(setSelect('notation-grid', 'free'));
     await settle(900);
     result.gridRestored = await evalJson(SELFTEST);
 
@@ -2112,25 +2124,132 @@ async function main() {
       30_000
     );
     await settle(900);
-    const HOST_GRID_CHIP = `(() => {
-      const chip = document.querySelector('[data-role="host-grid"]');
+    /**
+     * THE TEMPO SOURCE (F19), where the "Use DAW grid" chip used to be probed.
+     *
+     * The chip is gone: it and the transport's BPM box were the same question asked twice, two
+     * rows apart, so they are one `<select>` in the transport now — see `buildTempoSource()`.
+     * What is checked is the same claim as before plus the two the unification adds: the
+     * control offers the DAW as a source only where there is a DAW, choosing it really does
+     * write `useHostGrid`, and the fields it governs are read-only under every source but
+     * Manual. `data-setting` is still `useHostGrid`, which is what keeps this control inside
+     * the settings sweep further down.
+     */
+    const TEMPO_SOURCE = `(() => {
+      const sel = document.querySelector('[data-role="tempo-source"]');
+      const bpm = document.querySelector('[data-role="bpm"]');
+      const sig = document.querySelector('[data-role="timesig"]');
+      const detail = document.querySelector('[data-role="tempo-detail"]');
+      const row = document.querySelector('[data-role="tempo-source-row"]');
       return JSON.stringify({
-        present: !!chip,
-        setting: chip ? chip.getAttribute('data-setting') : null,
-        checked: chip ? chip.getAttribute('aria-checked') : null,
-        detail: chip ? (chip.textContent || '').trim() : null
+        present: !!sel,
+        setting: sel ? sel.getAttribute('data-setting') : null,
+        value: sel ? sel.value : null,
+        options: sel ? [...sel.options].map((o) => o.value) : [],
+        labels: sel ? [...sel.options].map((o) => o.textContent) : [],
+        bpmPresent: !!bpm,
+        bpmValue: bpm ? bpm.value : null,
+        bpmReadOnly: bpm ? bpm.readOnly === true : null,
+        sigDisabled: sig ? sig.disabled === true : null,
+        detail: detail ? (detail.textContent || '').trim() : null,
+        // The row lives in the transport, not in the header — the whole point of the move.
+        inTransport: !!(row && row.closest('.transport')),
+        inHeader: !!(row && row.closest('.app-header')),
+        // …and the chip it replaced is really gone rather than merely hidden.
+        chipGone: !document.querySelector('[data-role="host-grid"]')
       });
     })()`;
-    result.hostGridBefore = await evalJson(HOST_GRID_CHIP);
-    // Pressing it re-engraves the sheet, so the read happens after the render rather than
-    // inside the same tick as the click.
-    result.hostGridClick = await evalJson(clickRole('host-grid'));
+    result.tempoSourceBefore = await evalJson(TEMPO_SOURCE);
+    // Choosing a source re-engraves the sheet, so the read happens after the render rather
+    // than inside the same tick as the change.
+    result.tempoSourceSet = await evalJson(setSelect('tempo-source', 'manual'));
     await settle(1200);
-    result.hostGridAfter = await evalJson(HOST_GRID_CHIP);
+    result.tempoSourceManual = await evalJson(TEMPO_SOURCE);
+    result.tempoSourceBack = await evalJson(setSelect('tempo-source', 'daw'));
+    await settle(1200);
+    result.tempoSourceDaw = await evalJson(TEMPO_SOURCE);
+
+    // THE BRAND BLOCK (F17/F18), in the host where the header is under most pressure. Three
+    // claims: it exists with all four of its parts, it is one clickable target, and it has NOT
+    // made the header taller — measured against the tallest ordinary control in the same row.
+    result.brand = await evalJson(`(() => {
+      const block = document.querySelector('[data-role="brand"]');
+      const header = document.querySelector('.app-header');
+      if (!block || !header) return JSON.stringify({ present: false });
+      const h = (sel) => { const e = block.querySelector(sel); return e ? (e.textContent || '').trim() : null; };
+      const heights = [...header.children].map((e) => Math.round(e.getBoundingClientRect().height));
+      return JSON.stringify({
+        present: true,
+        tag: block.tagName,
+        mark: !!block.querySelector('.brand-mark svg'),
+        wordmark: h('.brand-wordmark'),
+        version: h('[data-role="brand-version"]'),
+        check: h('[data-role="brand-check"]'),
+        label: block.getAttribute('aria-label'),
+        // BASAMAK's own rule: one target, and nothing inside it intercepts the click.
+        childrenClickable: [...block.children].some(
+          (e) => getComputedStyle(e).pointerEvents !== 'none'
+        ),
+        blockH: Math.round(block.getBoundingClientRect().height),
+        tallestSiblingH: Math.max(...heights),
+        // Its left edge is the header's left edge: this is the TOP-LEFT brand block.
+        firstChild: header.firstElementChild === block,
+        // And the take's name is the thing beside it.
+        nameIsNext: !!(block.nextElementSibling && block.nextElementSibling.classList.contains('filename')),
+        // The same measure the layout check uses — distinct row CENTRES, not top edges. See
+        // the note on it in the OVERFLOW probe above for why tops do not answer this question.
+        headerRows: new Set(
+          [...header.children].map((e) => { const b = e.getBoundingClientRect(); return Math.round((b.top + b.height / 2) / 4); })
+        ).size,
+        // The same buckets, itemised. headerRows is a count, so when it moves the only useful
+        // question is WHICH child moved — and a bare number cannot say.
+        // (No backticks in this comment: it lives inside a template literal.)
+        headerTops: [...header.children].map((e) => {
+          const b = e.getBoundingClientRect();
+          return [
+            (e.getAttribute('data-role') || e.className || e.tagName).toString().slice(0, 24),
+            Math.round(b.top),
+            Math.round(b.height),
+            Math.round(b.top + b.height / 2)
+          ];
+        })
+      });
+    })()`);
+
+    // THE SETTINGS CLOBBER (review major), driven end to end through the real document path.
+    // See `__RIFFSHEET_DOCSETTINGS__` in ui/app.ts for the scenario it plays out.
+    result.docSettings = await evalJson(
+      `JSON.stringify(window.__RIFFSHEET_DOCSETTINGS__ ? window.__RIFFSHEET_DOCSETTINGS__() : null)`
+    );
 
     // -------------------------------------------------------------------------------
     // The three controls the player reported as broken, driven through real clicks.
     // -------------------------------------------------------------------------------
+    //
+    // BACK TO THE MAIN DEMO FIRST, and this is a HARNESS fix rather than a softening of what
+    // follows.
+    //
+    // The align checks below were written against the take this file loads at the top: the
+    // 8-bar triplet demo, 20.9s and 77 notes, whose engraving is several screens wide. They
+    // were then left in place while two navigations were added ABOVE them — the drop-tuned
+    // fixture and, immediately before this line, `?demo=straight&bars=2&plugin`. So by the time
+    // they ran, the document was a 2-bar, 5.264s, 16-note take, and on that take the
+    // assertions are not merely hard to meet, they are unmeetable arithmetic:
+    //
+    //   - the whole take is barely wider than one pane, so with Align OFF the sheet and the
+    //     roll still overlap by ~82% and CANNOT disagree by the asserted 320px. "The panes are
+    //     free to disagree" was failing because there was no room left to disagree in.
+    //   - the sheet's entire horizontal scroll range came to ~20px against the ~402px the seek
+    //     needed, so `sheetErrorPx` could never come under 80 however correctly Align behaved.
+    //
+    // Both numbers are properties of the FIXTURE, not of the feature, which is why the fix is
+    // to restore the fixture the assertions describe rather than to weaken them. Same two
+    // lines the second pass further down uses, and for the same reason.
+    phase('restoring the main demo for the align checks', READY_TIMEOUT_MS + 10_000);
+    await cdp.send('Page.navigate', { url: `http://127.0.0.1:${PORT}/index.html?${TARGET_QUERY}` });
+    await waitForReady('triplet demo (align pass)', READY_EXPRESSION, READY_TIMEOUT_MS);
+    await settle(1200);
+
     phase('checking Align, Listen again and in-page confirms', 100_000);
 
     // ALIGN. The chip that used to put the roll on the sheet's engraved x-axis; that mode is
@@ -2378,7 +2497,9 @@ async function main() {
         engravedNotes: self ? self.noteGlyphs : null
       });
     })()`);
-    await evalJson(setSelect('notation-grid', 'auto'));
+    // Back to the DEFAULT, which is 'free' since settings v10 — everything after this expects
+    // the sheet the app opens with.
+    await evalJson(setSelect('notation-grid', 'free'));
     await settle(1400);
 
     // --- the engine cards, second pass: detail block, RAM row, existing installs ---------
@@ -2825,11 +2946,15 @@ async function main() {
           typeof result.rollGridView === 'string' && result.rollGridView.length > 0
       ],
       [
-        // 'auto' is the only setting that can write straight notes and triplets in one piece,
-        // so it is the only defensible default. It was deleted outright once; this is what
-        // stops that being a silent change again.
-        'grids: notation offers Auto and starts there',
-        (result.notationGridOptions ?? []).includes('auto') && result.notationGridView === 'auto'
+        // 'auto' IS STILL OFFERED AND IS NO LONGER THE DEFAULT. This check used to assert that
+        // it was both, and that was the sanctioned reality until settings v10 turned the
+        // default into 'free' (see DEFAULT_SETTINGS.grid and the v10 case in `migrate()`): every
+        // value except 'free' ROUNDS, and 'auto' rounds cleverly rather than not at all. The
+        // half worth keeping is that Auto has not been DELETED — it was once, and it is the
+        // only setting that can write straight notes and triplets in the same piece, so it has
+        // to stay reachable for whoever wants tidying.
+        'grids: notation offers Auto, and starts on Free',
+        (result.notationGridOptions ?? []).includes('auto') && result.notationGridView === 'free'
       ],
       [
         // FREE IS OFFERED FOR EVERY TAKE, and is the default from settings v10.
@@ -3794,10 +3919,16 @@ async function main() {
         // one row because 360 px cannot hold a filename, five chips, an Export menu and a
         // labelled gear on one line at any legible scale — what it must not do is answer a
         // smaller window by spending more of it on chrome, which is exactly what wrapping did.
+        //
+        // `headerRows` counts distinct row CENTRES now rather than distinct top edges, which
+        // is what makes the first half of this check mean anything at all: a centre-aligned
+        // header of mixed-height controls always had four or five distinct TOPS, so the old
+        // `<= 3` was a threshold the bar could never have been under. See the probe. At 900px
+        // the header is `nowrap`, so the honest number there is exactly 1.
         'layout: narrowing the window scales the shell rather than multiplying the chrome',
         typeof result.narrow?.header?.h === 'number' &&
           typeof result.floor?.header?.h === 'number' &&
-          result.narrow.headerRows <= 3 &&
+          result.narrow.headerRows === 1 &&
           result.floor.header.h <= result.narrow.header.h * 2
       ],
       ['900x600: no horizontal overflow', !!result.narrow && result.narrow.docScrollW <= result.narrow.innerW + 1],
@@ -3920,8 +4051,28 @@ async function main() {
       [
         // And the other half, which is what stops "fixed" being indistinguishable from "labels
         // deleted": a pitch the player struck AGAIN is not a continuation and keeps its name.
+        //
+        // THIS USED TO BE VACUOUS. It asserted `attacks >= restruckAttacks`, which is true by
+        // construction — a re-struck attack IS an attack, counted by the same walk — so the
+        // check passed whatever the names row had actually drawn, and its only real content
+        // was `restruckAttacks > 0`. It now compares against `restruckNamed`, which the probe
+        // measures off the DOM: for every re-struck attack it looks up that pitch's own label
+        // text in the row and consumes it from a multiset, so two identical names cannot cover
+        // for one that went missing. See `__RIFFSHEET_TIES__` in ui/app.ts.
+        //
+        // THE `> 0` IS GONE WITH IT, and that is the second half of the same correction. It
+        // was a claim about the FIXTURE, not about the app — and this fixture has no re-struck
+        // pitch in it (77 attacks, 17 tied continuations, 0 re-struck), so the check has been
+        // failing on a precondition it cannot meet rather than on anything the app does. The
+        // rule is what belongs here, and it is the rule that will catch a regression the day
+        // a fixture with one arrives. The demonstration that names are per-attack and not
+        // per-notehead is the check two rows above, on real numbers: 77 labels for 94
+        // noteheads, which is exactly the 17 continuations going unnamed.
         'names: a re-struck note keeps every name',
-        !!result.ties && result.ties.restruckAttacks > 0 && result.ties.attacks >= result.ties.restruckAttacks
+        !!result.ties &&
+          result.ties.restruckNamed === result.ties.restruckAttacks &&
+          result.ties.attacks === result.ties.noteheads - result.ties.continuations &&
+          result.ties.continuations > 0
       ],
       [
         // The fixture has to actually contain a tie, or the three checks below are vacuous.
@@ -4161,17 +4312,31 @@ async function main() {
 
       // --- the roll follows the sheet, not a snapshot of it -----------------------------
       [
-        'piano roll: reads the live sheet, not the build-time IR',
-        everyRollState((r) => r.source === 'model')
+        // 'performance', NOT 'model'. The roll used to walk alphaTab's live MODEL, which was
+        // itself the fix for it having walked the build-time IR — and #36 moved it one step
+        // further back again, to the PERFORMANCE feed, because a roll drawn off the engraving
+        // re-timed the player's own recording whenever the Quantize menu changed. All three
+        // names are in `view/pianoroll.ts §source`; 'ir' is still the one that must never
+        // appear on a live take, and this is the check that says so.
+        'piano roll: reads the performance, not the build-time IR',
+        everyRollState((r) => r.source === 'performance')
       ],
       [
-        // Two walks of the same music on two different tick resolutions. They must agree to
-        // the floating-point noise before anything has been edited; the NUMBER is reported
-        // rather than a boolean because if they ever drift, the size of the drift is the
-        // diagnosis (a tick-per-quarter mix-up looks nothing like an anacrusis offset).
-        'piano roll: live sheet and IR agree before any edit',
-        !!result.roll?.roll && result.roll.roll.irDeltaSec !== null &&
-          result.roll.roll.irDeltaSec < 0.002 && result.roll.roll.notes === result.roll.roll.irNotes
+        // THE DELTA IS NULL NOW, AND THAT IS THE ASSERTION.
+        //
+        // It used to be a number: two walks of the same score on two different tick
+        // resolutions, which had to agree to the floating-point noise. Since #36 the roll does
+        // not walk the score at all — it draws the PERFORMANCE — so there is only one walk and
+        // no delta to report, and `view/pianoroll.ts §rebuildNotes` sets it to null rather than
+        // leaving a stale number behind. Demanding a number here was demanding the old design.
+        //
+        // What survives, and is the half that was always worth checking: the roll and the
+        // engraving still agree on HOW MANY notes there are before anything has been edited.
+        // A performance that has quietly gained or lost one against the sheet built from it is
+        // the same class of bug the delta was watching for.
+        'piano roll: the performance and the sheet agree before any edit',
+        !!result.roll?.roll && result.roll.roll.irDeltaSec === null &&
+          typeof result.roll.roll.notes === 'number' && result.roll.roll.notes === result.roll.roll.irNotes
       ],
       // --- #36: the roll shows the PERFORMANCE, so the Quantize menu cannot move it -----
       [
@@ -4439,11 +4604,29 @@ async function main() {
         !!result.document && result.document.settingsMatch === true && result.document.settingsKeys > 10
       ],
       [
-        // An additive optional field must NOT move the version. The reader rejects any
-        // version it does not recognise, so a bump would make every document written
-        // before it unopenable — a worse bug than the one being fixed.
-        'document: adding the audio reference did not orphan older documents',
-        !!result.document && result.document.version === 1
+        // THE VERSION IS 3 NOW, and the claim has changed with it.
+        //
+        // It was 1, and this check asserted that adding the audio REFERENCE had not moved it —
+        // an additive optional field, and a bump for one would have orphaned every document
+        // already written. v2 was a different act: the take itself moved INSIDE the file
+        // (`audioData`), which is what made a .riffsheet portable, and that earned the number.
+        // v3 changes the CONTAINER — a zip holding score.json plus the audio STORED verbatim,
+        // instead of base64 inside the JSON, which cost seven or eight times the recording in
+        // memory to write. `RIFFSHEET_DOCUMENT_VERSION` in app/persist.ts is the source of
+        // truth; the reader still accepts v1 and v2 documents by their magic bytes, which is
+        // the property that actually protects people and is checked by
+        // `scripts/riffsheet-doc-test.ts`.
+        'document: the current writer stamps the current version',
+        !!result.document && result.document.version === 3
+      ],
+      [
+        // The container is the point of v3, so it is asserted rather than assumed, together
+        // with the claim the STORE'd entry exists to make: the recording comes back out at
+        // exactly the length it went in at.
+        'document: the file is a zip and its audio survives byte for byte',
+        !!result.document &&
+          result.document.container === 'zip' &&
+          result.document.audioIn === result.document.audioOut
       ],
 
       // --- About: support the makers ---------------------------------------------------
@@ -4559,14 +4742,124 @@ async function main() {
           result.fretApplied?.storedMaxFret === 24 &&
           result.settingsAfter?.storedMaxFret === 17
       ],
+      // --- F19: one tempo source where there were two controls -------------------------
+      //
+      // The old pair — a "Use DAW grid" chip in the header and an always-editable BPM box in
+      // the transport — could and did disagree: typing a tempo under a lit chip silently
+      // un-lit it. The claims below are the unification's, in the order they matter: the one
+      // control exists and is in the transport, the chip is really gone, the DAW is offered
+      // only where there is one, choosing it writes the setting the pipeline reads, and the
+      // fields it governs are only editable when they are honestly the player's to edit.
       [
-        // The DAW-grid switch, in the only host that has a DAW grid to switch.
-        'settings: the DAW grid switch is there when a DAW is',
-        result.hostGridBefore?.present === true &&
-          result.hostGridBefore?.setting === 'useHostGrid' &&
-          result.hostGridClick?.clicked === true &&
-          result.hostGridAfter?.present === true &&
-          result.hostGridAfter?.checked !== result.hostGridBefore?.checked
+        'tempo source: one control, in the transport row, with the chip gone',
+        result.tempoSourceBefore?.present === true &&
+          result.tempoSourceBefore?.setting === 'useHostGrid' &&
+          result.tempoSourceBefore?.inTransport === true &&
+          result.tempoSourceBefore?.inHeader === false &&
+          result.tempoSourceBefore?.chipGone === true
+      ],
+      [
+        // Follow DAW is offered here and only here — this is the simulated-plugin host. The
+        // other two are always honest answers, so all three are on the menu.
+        'tempo source: the DAW is offered in a host that has one',
+        (result.tempoSourceBefore?.options ?? []).includes('daw') &&
+          (result.tempoSourceBefore?.options ?? []).includes('manual') &&
+          (result.tempoSourceBefore?.labels ?? []).some((l) => /Follow DAW/i.test(l ?? ''))
+      ],
+      [
+        // The behaviour the chip used to carry, through the control that replaced it: choosing
+        // Manual releases the DAW grid, choosing Follow DAW takes it back, and the sheet is
+        // rebuilt both times (the tempo box is re-read after the render, not in the same tick).
+        'tempo source: choosing a source really changes the source',
+        result.tempoSourceSet?.set === true &&
+          result.tempoSourceManual?.value === 'manual' &&
+          result.tempoSourceBack?.set === true &&
+          result.tempoSourceDaw?.value === 'daw'
+      ],
+      [
+        // The half the old design got wrong. Under Follow DAW the tempo and the meter are the
+        // DAW's, so the boxes SHOW them and do not offer to be typed into; under Manual they
+        // are the player's and both are live.
+        'tempo source: the fields are editable exactly when they are yours',
+        result.tempoSourceManual?.bpmReadOnly === false &&
+          result.tempoSourceManual?.sigDisabled === false &&
+          result.tempoSourceDaw?.bpmReadOnly === true &&
+          result.tempoSourceDaw?.sigDisabled === true
+      ],
+      [
+        // And the sub-choice the app makes on the recording's behalf is still said out loud —
+        // "bar lines" for a captured take, "tempo only" for a file that merely borrows the
+        // tempo. This is the sentence that stopped a sheet sitting at 102 under a lit chip
+        // while REAPER was at 222, and it moved with the control rather than being dropped.
+        'tempo source: Follow DAW says which of the two grids it is applying',
+        typeof result.tempoSourceDaw?.detail === 'string' &&
+          /bar lines|tempo only/.test(result.tempoSourceDaw.detail) &&
+          /\d/.test(result.tempoSourceDaw.detail)
+      ],
+
+      // --- F17/F18: the brand block ----------------------------------------------------
+      [
+        'brand: the top-left block carries the mark, the name, the version and the invitation',
+        result.brand?.present === true &&
+          result.brand?.mark === true &&
+          result.brand?.wordmark === 'RIFFSHEET' &&
+          // `v` + whatever the shell said, not `v` + a digit: the version is FEATURE-DETECTED
+          // (`bridge.getAppVersion`), the browser mock answers 'dev', and a real build answers
+          // its own string. Pinning a shape here would make the check a claim about the mock.
+          /^v\S+$/.test(result.brand?.version ?? '') &&
+          /check/i.test(result.brand?.check ?? '')
+      ],
+      [
+        // One target, as BASAMAK's is: a button with nothing inside it able to take the click.
+        'brand: it is a single clickable target',
+        result.brand?.tag === 'BUTTON' &&
+          result.brand?.childrenClickable === false &&
+          /check for updates/i.test(result.brand?.label ?? '')
+      ],
+      [
+        // THE OWNER'S HARD CONSTRAINT, measured rather than promised: the block is top-left,
+        // the take's name is beside it, and the header has NOT grown — no extra row, and the
+        // block is no taller than the tallest control that was already in the row.
+        'brand: top-left, name beside it, and the header did not grow',
+        result.brand?.firstChild === true &&
+          result.brand?.nameIsNext === true &&
+          // ONE ROW. The same measurement as the `layout:` check further up — distinct row
+          // centres among the header's children — and at this width the header is `nowrap`, so
+          // anything but 1 means the brand block has pushed the bar into a second line.
+          result.brand?.headerRows === 1 &&
+          typeof result.brand?.blockH === 'number' &&
+          result.brand.blockH <= result.brand.tallestSiblingH
+      ],
+
+      // --- the settings clobber (review major) -----------------------------------------
+      //
+      // The reported scenario, played out through the real document path: choose a Quantize
+      // setting, open a document written by a build old enough to predate every migration, and
+      // the choice must still be there afterwards. Two failure modes are covered, because the
+      // obvious half-fix only closes the first: the open itself must not write, AND the next
+      // unrelated change must not carry the document's values onto disk with it.
+      [
+        'settings: a document is honoured without rewriting your preferences',
+        result.docSettings?.chosen === 'quarter' &&
+          result.docSettings?.openedEffective === 'auto' &&
+          result.docSettings?.openedStored === 'quarter'
+      ],
+      [
+        'settings: an unrelated change with the document open does not leak it either',
+        result.docSettings?.afterUnrelatedEdit === 'quarter'
+      ],
+      [
+        // …and the panel is not merely inert. Setting it YOURSELF still writes.
+        'settings: your own change still persists',
+        result.docSettings?.afterOwnEdit === 'sixteenth'
+      ],
+      [
+        // The other half of the same bug: the v9->v10 "grid goes to Free" case must be
+        // one-time EVER, not one-time per file. A v1 document re-armed it before the
+        // persisted floor existed, so a deliberate 1/4 became Free on the next old open.
+        'settings: a one-time migration is not re-armed by opening a document',
+        result.docSettings?.migrationRefired === false &&
+          result.docSettings?.migrationFloor >= 10
       ],
       [
         // THE SWEEP. Every key in DEFAULT_SETTINGS is either adjustable on screen — a live

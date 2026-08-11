@@ -494,7 +494,14 @@ juce::WebBrowserComponent::Options NativeBridge::configure (juce::WebBrowserComp
         // call that will never be answered.
         .withNativeFunction ("stopExternalEngine", bind (&NativeBridge::fnStopExternalEngine))
         .withNativeFunction ("transcribeCancel",  bind (&NativeBridge::fnTranscribeCancel))
-        .withNativeFunction ("hostTimelineProbe", bind (&NativeBridge::fnHostTimelineProbe));
+        .withNativeFunction ("hostTimelineProbe", bind (&NativeBridge::fnHostTimelineProbe))
+        // The version on its own. getShellInfo() has always carried it, but an
+        // About box wants one cheap answer rather than the whole shell probe,
+        // and the same registration-is-the-capability-test rule applies: an
+        // older shell answers hasNativeFunction('getAppVersion') with false and
+        // the page falls back to the host info it already has.
+        .withNativeFunction ("getAppVersion",     bind (&NativeBridge::fnGetAppVersion))
+        .withNativeFunction ("openExternal",      bind (&NativeBridge::fnOpenExternal));
 }
 
 //==============================================================================
@@ -589,6 +596,65 @@ void NativeBridge::fnGetShellInfo (const juce::Array<juce::var>&, Completion com
         { "debug", juce::SystemStats::getEnvironmentVariable ("RIFFSHEET_DEBUG", {}).getIntValue() != 0 },
         { "muscriptorBaseUrl", proc.getMuScriptor().getBaseUrl() },
         { "pcmUrlPrefix", "/native/pcm/" } }));
+}
+
+/**
+    The build's version string, and nothing else.
+
+    Same number getShellInfo() reports (RIFFSHEET_VERSION, set from the CMake
+    project version), deliberately: two places that could disagree about what
+    version this is would be a bug, so this is a narrower view of the one value
+    rather than a second source of it.
+*/
+void NativeBridge::fnGetAppVersion (const juce::Array<juce::var>&, Completion completion)
+{
+    completion (makeObject ({ { "ok", true }, { "version", RIFFSHEET_VERSION } }));
+}
+
+/**
+    Opens a link in the user's real browser.
+
+    HTTP AND HTTPS ONLY. juce::URL::launchInDefaultBrowser hands the string to
+    the OS opener, which on macOS is `open` and on Windows ShellExecute - both of
+    which will happily act on `file:`, `mailto:` or a custom scheme registered by
+    some other application. The page is remote-ish content by nature (it is a
+    webview running our bundle, but the URLs it passes come from documents,
+    engine metadata and eventually user text), so anything that is not a plain
+    web link is refused here rather than trusted to the OS.
+*/
+void NativeBridge::fnOpenExternal (const juce::Array<juce::var>& args, Completion completion)
+{
+    const auto raw = stringArg (args, 0).trim();
+
+    if (raw.isEmpty())
+    {
+        completion (makeError ("openExternal needs (url)"));
+        return;
+    }
+
+    const auto scheme = raw.upToFirstOccurrenceOf ("://", false, true).toLowerCase();
+
+    if (! raw.contains ("://") || (scheme != "http" && scheme != "https"))
+    {
+        completion (makeError ("only http and https links can be opened"));
+        return;
+    }
+
+    const juce::URL url (raw);
+
+    if (! url.isWellFormed() || url.getDomain().isEmpty())
+    {
+        completion (makeError ("that is not a link this can open: " + raw));
+        return;
+    }
+
+    if (! url.launchInDefaultBrowser())
+    {
+        completion (makeError ("the system would not open " + raw));
+        return;
+    }
+
+    completion (makeObject ({ { "ok", true }, { "url", url.toString (true) } }));
 }
 
 void NativeBridge::fnGetHostInfo (const juce::Array<juce::var>&, Completion completion)
@@ -3315,29 +3381,83 @@ void NativeBridge::stageBytesAndReply (const juce::String& displayName, const ju
                                        double targetRate, Completion completion,
                                        const juce::String& stageTag)
 {
-    juce::MemoryOutputStream decoded;
+    // OFF THE MESSAGE THREAD. Both halves of staging - the base64 decode and the
+    // temp-file write - cost time proportional to the payload, and a dropped WAV
+    // is routinely hundreds of megabytes. Run on `workers`, the same pool
+    // decodeAndReply() uses, so the webview (and in a plugin the host's UI
+    // thread) is never blocked for the length of a disk write.
+    //
+    // Nothing about the reply changes: every path below still answers exactly
+    // once with the same payloads, and replying from a pool thread is what
+    // decodeAndReply() - the success path's own last step - has always done.
+    // `base64` is a copy-on-write juce::String, so this capture does not
+    // duplicate the payload.
+    workers.addJob ([this, displayName, base64, targetRate, stageTag,
+                     reply = std::move (completion)]() mutable
+                    {
+                        // The hard ceiling, checked before a single byte is
+                        // allocated. Base64 spends 4 characters per 3 bytes, so
+                        // this also bounds the decoded audio at ~412 MB and the
+                        // transient peak (payload + decode buffer) at ~1 GB.
+                        constexpr size_t maxPayloadBytes = 550ull * 1024ull * 1024ull;
+                        const size_t payloadBytes = (size_t) base64.getNumBytesAsUTF8();
 
-    if (! juce::Base64::convertFromBase64 (decoded, base64) || decoded.getDataSize() == 0)
-    {
-        completion (makeError ("the audio contents were not valid base64"));
-        return;
-    }
+                        if (payloadBytes > maxPayloadBytes)
+                        {
+                            reply (makeError ("that file is too large to import: "
+                                              + juce::File::descriptionOfSizeInBytes ((juce::int64) payloadBytes)
+                                              + " of encoded data, and the limit is "
+                                              + juce::File::descriptionOfSizeInBytes ((juce::int64) maxPayloadBytes)
+                                              + ". Use Open to load it from disk instead."));
+                            return;
+                        }
 
-    const auto temp = juce::File::getSpecialLocation (juce::File::tempDirectory)
-                          .getChildFile ("riffsheet-" + stageTag + "-"
-                                         + juce::String::toHexString (juce::Random::getSystemRandom().nextInt64())
-                                         + "-" + juce::File::createLegalFileName (displayName));
+                        juce::MemoryOutputStream decoded;
+                        bool decodeOk = false;
 
-    if (! temp.replaceWithData (decoded.getData(), decoded.getDataSize()))
-    {
-        completion (makeError ("could not stage the audio at " + temp.getFullPathName()));
-        return;
-    }
+                        // A 400 MB buffer is a request the machine is allowed to
+                        // refuse. JUCE's MemoryBlock signals that with a null
+                        // pointer rather than an exception, so both are handled:
+                        // the catch covers anything under it that does throw.
+                        try
+                        {
+                            decoded.preallocate (payloadBytes / 4 * 3 + 3);
+                            decodeOk = juce::Base64::convertFromBase64 (decoded, base64);
+                        }
+                        catch (const std::bad_alloc&)
+                        {
+                            reply (makeError ("not enough memory to decode that file"));
+                            return;
+                        }
 
-    // The original name is carried separately from the random staging name.
-    // decodeAndReply promotes the decoded audio to durable app-support storage
-    // before returning, while the entry cleans up this temporary input file.
-    decodeAndReply (temp, targetRate, std::move (completion), true, displayName);
+                        if (! decodeOk || decoded.getDataSize() == 0)
+                        {
+                            reply (makeError ("the audio contents were not valid base64"));
+                            return;
+                        }
+
+                        if (decoded.getData() == nullptr)
+                        {
+                            reply (makeError ("not enough memory to decode that file"));
+                            return;
+                        }
+
+                        const auto temp = juce::File::getSpecialLocation (juce::File::tempDirectory)
+                                              .getChildFile ("riffsheet-" + stageTag + "-"
+                                                             + juce::String::toHexString (juce::Random::getSystemRandom().nextInt64())
+                                                             + "-" + juce::File::createLegalFileName (displayName));
+
+                        if (! temp.replaceWithData (decoded.getData(), decoded.getDataSize()))
+                        {
+                            reply (makeError ("could not stage the audio at " + temp.getFullPathName()));
+                            return;
+                        }
+
+                        // The original name is carried separately from the random staging name.
+                        // decodeAndReply promotes the decoded audio to durable app-support storage
+                        // before returning, while the entry cleans up this temporary input file.
+                        decodeAndReply (temp, targetRate, std::move (reply), true, displayName);
+                    });
 }
 
 void NativeBridge::fnOmrStatus (const juce::Array<juce::var>&, Completion completion)

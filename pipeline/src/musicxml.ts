@@ -29,10 +29,11 @@
  * so `<staves>` is 1 (plain), 2 (notation + tab, or a grand staff) or 3 (grand staff + tab).
  */
 
-import type { IRBar, IRBeat, IRNote, RiffsheetIR } from './ir.js';
+import type { DurationType, IRBar, IRBeat, IRNote, RiffsheetIR } from './ir.js';
 import { musicXmlStringFromIrString, staffTuningLineFromIrString } from './tab.js';
 import { tpcToStep } from './spelling.js';
 import { grandClefPair } from './clef.js';
+import { projectStaffBeats } from './beaming.js';
 
 const esc = (s: string): string =>
   s
@@ -74,14 +75,6 @@ export interface MusicXmlOptions {
 function pitchName(midi: number): string {
   const names = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B'];
   return `${names[((midi % 12) + 12) % 12]}${Math.floor(midi / 12) - 1}`;
-}
-
-function projectedBeats(beats: IRBeat[], include: (note: IRNote) => boolean): IRBeat[] {
-  return beats.map((beat) => {
-    const notes = beat.notes.filter(include);
-    if (beat.isRest || notes.length) return { ...beat, notes };
-    return { ...beat, isRest: true, notes: [], beams: undefined };
-  });
 }
 
 const NOTE_INDENT = '      ';
@@ -267,8 +260,12 @@ export function toMusicXML(ir: RiffsheetIR, options: MusicXmlOptions = {}): stri
      */
     const layers: { beats: IRBeat[]; options: EmitOptions }[] = useGrand
       ? [
-          { beats: projectedBeats(voice.beats, onStaff(0)), options: notationLayer(1, 1) },
-          { beats: projectedBeats(voice.beats, onStaff(1)), options: notationLayer(2, 2) }
+          // BEAMS AND TUPLET BRACKETS ARE RECOMPUTED BY THE PROJECTION, not inherited from the
+          // merged rhythm the bars were built from. A group that straddles the split otherwise
+          // hands this staff a `<beam>continue` whose `begin` went to the other one — malformed
+          // MusicXML, and the same for a `<tuplet type="stop"/>` with no start. See beaming.ts.
+          { beats: projectStaffBeats(voice.beats, bar, onStaff(0)), options: notationLayer(1, 1) },
+          { beats: projectStaffBeats(voice.beats, bar, onStaff(1)), options: notationLayer(2, 2) }
         ]
       : [{ beats: voice.beats, options: notationLayer(1, useTab ? 1 : undefined) }];
     if (useTab) {
@@ -300,9 +297,12 @@ export function toMusicXML(ir: RiffsheetIR, options: MusicXmlOptions = {}): stri
       if (index > 0 && advanced > 0) L.push(`      <backup><duration>${advanced}</duration></backup>`);
       advanced = emitBeats(L, layer.beats, layer.options);
       assertMeasureLength(advanced, bar);
+      // G.5 ON WHAT IS ACTUALLY EMITTED. It used to be called once, on `voice.beats` — the
+      // UNPROJECTED merged rhythm — so it balanced by construction and could not see the very
+      // thing it exists to catch: a per-staff bracket left open by the grand-staff split.
+      if (layer.options.withTuplets) assertTupletBalance(layer.beats, bar, layer.options.staff);
     });
 
-    assertTupletBalance(voice.beats, bar);
     L.push('    </measure>');
   });
 
@@ -336,6 +336,7 @@ interface EmitOptions {
 function emitBeats(L: string[], beats: IRBeat[], o: EmitOptions): number {
   let advanced = 0;
   for (const beat of beats) {
+    assertTypeMatchesDuration(beat, o);
     if (beat.isRest) {
       emitRest(L, beat, o);
       advanced += beat.durTicks;
@@ -348,7 +349,14 @@ function emitBeats(L: string[], beats: IRBeat[], o: EmitOptions): number {
 }
 
 function emitRest(L: string[], beat: IRBeat, o: EmitOptions): void {
-  L.push(`${NOTE_INDENT}<note>`);
+  // F2a — A TAB STAFF PRINTS FINGERS, NOT RESTS. The rests belong to the notation staves it sits
+  // under, and a duplicate column of rest glyphs under the tab is exactly what an engraver would
+  // strike out. The <note> STAYS, with its full <duration>: deleting it would leave the tab staff
+  // short of the barline and break the <backup> that follows. print-object="no" is the standard
+  // mechanism for "this is here for the cursor, not for the eye" — the same one already used for
+  // tied tab continuations below.
+  const hideTabRest = o.isTab;
+  L.push(`${NOTE_INDENT}<note${hideTabRest ? ' print-object="no"' : ''}>`);
   L.push(`${NOTE_INDENT}  ${beat.measureRest ? '<rest measure="yes"/>' : '<rest/>'}`);
   L.push(`${NOTE_INDENT}  <duration>${beat.durTicks}</duration>`);
   L.push(`${NOTE_INDENT}  <voice>${o.voice}</voice>`);
@@ -356,7 +364,22 @@ function emitRest(L: string[], beat: IRBeat, o: EmitOptions): void {
   if (!beat.measureRest) {
     L.push(`${NOTE_INDENT}  <type>${beat.durationType}</type>${'<dot/>'.repeat(beat.dots)}`);
   }
+  // A REST INSIDE A TUPLET NEEDS THE SAME <time-modification> A NOTE DOES. Without it the
+  // <type> (the WRITTEN value, an eighth) contradicts the <duration> (the SOUNDING one, two
+  // thirds of an eighth) and the reader has no way to reconcile them. The grand-staff split is
+  // what creates these rests: a triplet member whose notehead went to the other staff.
+  if (beat.tuplet) {
+    L.push(
+      `${NOTE_INDENT}  <time-modification><actual-notes>${beat.tuplet.actual}</actual-notes><normal-notes>${beat.tuplet.normal}</normal-notes></time-modification>`
+    );
+  }
   if (o.staff !== undefined) L.push(`${NOTE_INDENT}  <staff>${o.staff}</staff>`);
+  // ...and the bracket spans it, so a group that begins or ends on this staff with a rest still
+  // opens and closes. Dropping the edge here is how the balance assertion used to be able to fail.
+  const notations: string[] = [];
+  if (o.withTuplets && beat.tuplet?.start) notations.push('<tuplet type="start" number="1" bracket="yes"/>');
+  if (o.withTuplets && beat.tuplet?.stop) notations.push('<tuplet type="stop" number="1"/>');
+  if (notations.length) L.push(`${NOTE_INDENT}  <notations>${notations.join('')}</notations>`);
   L.push(`${NOTE_INDENT}</note>`);
 }
 
@@ -393,8 +416,10 @@ function emitNote(L: string[], beat: IRBeat, n: IRNote, isChordMember: boolean, 
   const notations: string[] = [];
   if (n.tieStop) notations.push('<tied type="stop"/>');
   if (n.tieStart) notations.push('<tied type="start"/>');
-  if (o.withTuplets && beat.tuplet?.start) notations.push('<tuplet type="start" number="1" bracket="yes"/>');
-  if (o.withTuplets && beat.tuplet?.stop) notations.push('<tuplet type="stop" number="1"/>');
+  // The bracket belongs to the BEAT, so it is written once — on the note that carries the beat,
+  // never repeated onto every member of a chord. Same rule the beams above already follow.
+  if (o.withTuplets && !isChordMember && beat.tuplet?.start) notations.push('<tuplet type="start" number="1" bracket="yes"/>');
+  if (o.withTuplets && !isChordMember && beat.tuplet?.stop) notations.push('<tuplet type="stop" number="1"/>');
   if (n.staccato && !o.isTab) notations.push('<articulations><staccato/></articulations>');
   if (o.withTechnical && !suppressTabContinuation && n.string !== undefined && n.fret !== undefined && !n.unplayable) {
     // THE FLIP: the IR counts 1 from the lowest string, MusicXML from the highest (§8.1).
@@ -419,15 +444,73 @@ function assertMeasureLength(advanced: number, bar: IRBar): void {
   }
 }
 
-/** G.5: tuplet starts and stops must balance per measure. */
-function assertTupletBalance(beats: IRBeat[], bar: IRBar): void {
-  const open = new Map<string, number>();
+/**
+ * G.5: tuplet starts and stops must balance per measure — AND PER STAFF, which is the form that
+ * matters. `<tuplet type="start">` on staff 1 with its stop on staff 2 is not a tuplet; readers
+ * either drop the group or refuse the file. Called once per emitted layer with that layer's own
+ * beats, so it sees exactly what was written.
+ */
+function assertTupletBalance(beats: IRBeat[], bar: IRBar, staff?: number): void {
+  const edges = new Map<string, { start: number; stop: number }>();
   for (const b of beats) {
     if (!b.tuplet) continue;
-    if (b.tuplet.start) open.set(b.tuplet.id, (open.get(b.tuplet.id) ?? 0) + 1);
-    if (b.tuplet.stop) open.set(b.tuplet.id, (open.get(b.tuplet.id) ?? 0) - 1);
+    // Registering the group on sight, not on its first edge, is what turns "the start and the
+    // stop went to different staves" into a failure: the staff left holding neither still has
+    // members here, and a bracketless group of them is as wrong as a half-open one.
+    const edge = edges.get(b.tuplet.id) ?? { start: 0, stop: 0 };
+    if (b.tuplet.start) edge.start++;
+    if (b.tuplet.stop) edge.stop++;
+    edges.set(b.tuplet.id, edge);
   }
-  for (const [id, n] of open) {
-    if (n !== 0) throw new Error(`MusicXML measure ${bar.number}: tuplet ${id} start/stop unbalanced (${n})`);
+  for (const [id, edge] of edges) {
+    if (edge.start !== 1 || edge.stop !== 1) {
+      throw new Error(
+        `MusicXML measure ${bar.number}${staff === undefined ? '' : ` staff ${staff}`}: tuplet ${id} needs exactly one start and one stop, got ${edge.start}/${edge.stop}`
+      );
+    }
+  }
+}
+
+/** Written whole-note fraction of each <type>, as its denominator. */
+const TYPE_DENOMINATOR: Record<DurationType, number> = {
+  whole: 1,
+  half: 2,
+  quarter: 4,
+  eighth: 8,
+  '16th': 16,
+  '32nd': 32
+};
+
+/**
+ * S2: <type> AND <duration> MUST DESCRIBE THE SAME LENGTH.
+ *
+ * <type> is the WRITTEN symbol, <duration> the SOUNDING ticks, and <time-modification> is the
+ * only thing allowed to stand between them. `type x dots x normal/actual` therefore has to come
+ * out at exactly `duration`, and when it does not the file is a lie no reader can unpick — it
+ * renders a shape whose length it also has to honour, and the two disagree.
+ *
+ * The failure this was written for: a grand-staff projection turned a triplet member into a rest
+ * on the other staff, kept the written <type> and dropped the <time-modification> with the
+ * notehead, so an eighth rest claimed 8 ticks where an eighth is 12. Both halves of that are
+ * fixed above; this assertion is what stops it coming back, and it covers every note and rest of
+ * every layer, not just the tuplets.
+ *
+ * A measure rest is exempt by construction: it deliberately carries no <type> at all.
+ */
+function assertTypeMatchesDuration(beat: IRBeat, o: EmitOptions): void {
+  if (beat.measureRest) return;
+  const denominator = TYPE_DENOMINATOR[beat.durationType];
+  // A dotted value is `(2^(d+1) - 1) / 2^d` of the plain one: 1, 3/2, 7/4.
+  const dotNumerator = (1 << (beat.dots + 1)) - 1;
+  const dotDenominator = 1 << beat.dots;
+  const numerator = o.divisions * 4 * dotNumerator * (beat.tuplet ? beat.tuplet.normal : 1);
+  const divisor = denominator * dotDenominator * (beat.tuplet ? beat.tuplet.actual : 1);
+  if (numerator % divisor !== 0 || numerator / divisor !== beat.durTicks) {
+    const written = numerator / divisor;
+    throw new Error(
+      `MusicXML voice ${o.voice}: <type>${beat.durationType}</type>${'<dot/>'.repeat(beat.dots)}${
+        beat.tuplet ? ` x ${beat.tuplet.normal}/${beat.tuplet.actual}` : ''
+      } is ${written} ticks but <duration> is ${beat.durTicks}`
+    );
   }
 }

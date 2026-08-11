@@ -20,8 +20,9 @@
  * click-to-edit work, and it replaces the old app's `RenderAtom` sidecar entirely.
  */
 
-import type { DurationType, RiffsheetIR } from './ir.js';
+import type { DurationType, IRNote, RiffsheetIR } from './ir.js';
 import { grandClefPair } from './clef.js';
+import { projectStaffBeats } from './beaming.js';
 
 /** alphaTab `Duration` enum names. */
 export type AlphaTabDuration =
@@ -127,6 +128,24 @@ export interface AlphaTabScoreData {
     staves: {
       showStandardNotation: boolean;
       showTablature: boolean;
+      /**
+       * F2a — WHETHER THIS STAFF PRINTS REST GLYPHS. False on a TAB staff that sits under
+       * notation staves: the rests are already on those, and a second column of them under the
+       * tab is duplication an engraver would strike out. Tablature shows fingers.
+       *
+       * It is not cosmetic and it is not alphaTab's default. alphaTab decides for itself with
+       * `TabBarRenderer.showRests`, which is ON whenever the staff's own `showStandardNotation`
+       * is off — true of the third staff of a grand + tab arrangement, and the reason that
+       * layout (and only that layout) grew a column of tab rests. The consumer must honour this
+       * flag rather than that inference.
+       *
+       * THE BEATS STAY. A staff with `showRests: false` still receives every rest beat, at full
+       * length: they carry the bar's timing and dropping them would leave the staff short. The
+       * consumer suppresses the GLYPH (alphaTab: leave `Beat.isEmpty` false on a beat with no
+       * notes), exactly as the MusicXML emitter writes `print-object="no"` and keeps the
+       * `<duration>`.
+       */
+      showRests: boolean;
       /** HIGH to LOW — alphaTab's order, the inverse of the IR's. */
       tuningsHighToLow: number[];
       capo: number;
@@ -172,23 +191,28 @@ export function toAlphaTabModelData(ir: RiffsheetIR): AlphaTabScoreData {
    */
   const makeBars = (
     clefOverride?: 'F4' | 'G2',
-    include?: (note: IRNoteForAlphaTab) => boolean,
+    include?: (note: IRNote) => boolean,
     withPositions = true
   ): AlphaTabBarData[] => ir.bars.map((bar) => ({
     index: bar.index,
     clef: clefOverride ?? (bar.clef.sign === 'G' ? 'G2' : 'F4'),
     voices: bar.voices.map((v) => ({
-      beats: v.beats.map((beat) => ({
+      // THE SPLIT AND EVERYTHING THAT DEPENDS ON IT, from the one place that owns it. Filtering
+      // the notes here and keeping the merged rhythm's `beams` was the screen-side half of the
+      // same bug the MusicXML emitter had: this staff inherited a `continue` whose `begin` had
+      // gone to the other one. `projectStaffBeats` recomputes beams and tuplet edges over the
+      // sequence this staff actually prints.
+      beats: (include ? projectStaffBeats(v.beats, bar, include) : v.beats).map((beat) => ({
         startTick: beat.startTick,
         durTicks: beat.durTicks,
         duration: DURATION_MAP[beat.durationType],
         dots: beat.dots,
-        isEmpty: beat.isRest || (!!include && !beat.notes.some(include)),
+        isEmpty: beat.isRest,
         ...(beat.measureRest ? { isFullBarRest: true } : {}),
         tupletNumerator: beat.tuplet ? beat.tuplet.actual : 1,
         tupletDenominator: beat.tuplet ? beat.tuplet.normal : 1,
         ...(beat.beams?.length ? { beams: [...beat.beams] } : {}),
-        notes: beat.notes.filter((note) => !include || include(note)).map((n) => ({
+        notes: beat.notes.map((n) => ({
           id: n.id,
           midi: n.midi,
           // alphaTab model Note.octave is its raw 12-semitone bucket, not scientific-pitch
@@ -223,12 +247,13 @@ export function toAlphaTabModelData(ir: RiffsheetIR): AlphaTabScoreData {
   const [upperClef, lowerClef] = ir.grandStaffClefs ?? grandClefPair();
   const signOf = (sign: string): 'F4' | 'G2' => (sign === 'G' ? 'G2' : 'F4');
   // The split itself was decided in the IR (clef.ts `grandStaffSplitter`); this only reads it.
-  const onStaff = (index: 0 | 1) => (note: IRNoteForAlphaTab): boolean => (note.staffIndex ?? 0) === index;
+  const onStaff = (index: 0 | 1) => (note: IRNote): boolean => (note.staffIndex ?? 0) === index;
   const staves = ir.grandStaff
     ? [
         {
           showStandardNotation: true,
           showTablature: false,
+          showRests: true,
           tuningsHighToLow: [],
           capo: 0,
           displayTranspositionPitch,
@@ -237,18 +262,21 @@ export function toAlphaTabModelData(ir: RiffsheetIR): AlphaTabScoreData {
         {
           showStandardNotation: true,
           showTablature: false,
+          showRests: true,
           tuningsHighToLow: [],
           capo: 0,
           displayTranspositionPitch,
           bars: makeBars(signOf(lowerClef.sign), onStaff(1), false)
         },
         // The tab staff shows the WHOLE part: tablature is one fretboard, and it is not split by
-        // the notation's middle-C boundary.
+        // the notation's middle-C boundary. It shows no rests either — the two staves above it
+        // already print every one of them (F2a).
         ...(hasStrings
           ? [
               {
                 showStandardNotation: false,
                 showTablature: true,
+                showRests: false,
                 tuningsHighToLow,
                 capo: ir.instrument.capo,
                 displayTranspositionPitch,
@@ -261,6 +289,9 @@ export function toAlphaTabModelData(ir: RiffsheetIR): AlphaTabScoreData {
         {
           showStandardNotation: true,
           showTablature: hasStrings,
+          // One staff carrying both notation and tab: its rests are the notation's, printed
+          // once, above the fret numbers. Nothing to suppress.
+          showRests: true,
           tuningsHighToLow,
           capo: ir.instrument.capo,
           displayTranspositionPitch,
@@ -288,5 +319,3 @@ export function toAlphaTabModelData(ir: RiffsheetIR): AlphaTabScoreData {
     grandStaff: ir.grandStaff
   };
 }
-
-type IRNoteForAlphaTab = RiffsheetIR['bars'][number]['voices'][number]['beats'][number]['notes'][number];

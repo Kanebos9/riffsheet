@@ -27,11 +27,17 @@ import {
 import {
   ALIGN_GUTTER_PX,
   MIN_WINDOW_SEC,
+  SUBS_PER_BEAT,
   TIME_ZOOM_IN_FACTOR,
   TIME_ZOOM_OUT_FACTOR,
   absoluteSheetScale,
+  alignOriginSec,
+  audioSecAt,
   barGrid,
   clampWindow,
+  clampXToEngraving,
+  subdivisionsPerBeat,
+  writtenSecAt,
   coupledSheetScale,
   fracToSec,
   fullWindow,
@@ -305,7 +311,7 @@ windowIs(windowShowing(5, 0, 4, limits), 5, 9, 'windowShowing at the left edge')
     { index: 1, number: 2, implicit: false, startSec: 2, endSec: 4, beats: 4, beatSec: 0.5 },
     { index: 2, number: 3, implicit: false, startSec: 4, endSec: 6, beats: 4, beatSec: 0.5 }
   ];
-  const all = gridMarks(spans, { fromSec: 0, toSec: 6 }, { bars: true, beats: true, subs: false, labelEvery: 1 });
+  const all = gridMarks(spans, { fromSec: 0, toSec: 6 }, { bars: true, beats: true, subs: false, labelEvery: 1, subsPerBeat: 4 });
   assert(all.filter((m) => m.level === 'bar').length === 3, 'three bar lines');
   assert(all.filter((m) => m.level === 'beat').length === 9, 'three beats between the four bar positions of each bar');
   assert(
@@ -322,13 +328,13 @@ windowIs(windowShowing(5, 0, 4, limits), 5, 9, 'windowShowing at the left edge')
   );
   assert(all.map((m) => m.label).filter(Boolean).join() === '1,2,3', 'every bar is labelled at labelEvery 1');
 
-  const thinned = gridMarks(spans, { fromSec: 0, toSec: 6 }, { bars: true, beats: false, subs: false, labelEvery: 2 });
+  const thinned = gridMarks(spans, { fromSec: 0, toSec: 6 }, { bars: true, beats: false, subs: false, labelEvery: 2, subsPerBeat: 4 });
   assert(thinned.map((m) => m.label).join() === '1,,3', 'labelEvery 2 labels every other bar');
 
   const windowed = gridMarks(
     spans,
     { fromSec: 2.6, toSec: 4.2 },
-    { bars: true, beats: true, subs: false, labelEvery: 1 }
+    { bars: true, beats: true, subs: false, labelEvery: 1, subsPerBeat: 4 }
   );
   assert(
     windowed.every((m) => m.sec >= 2.6 && m.sec <= 4.2),
@@ -342,7 +348,7 @@ windowIs(windowShowing(5, 0, 4, limits), 5, 9, 'windowShowing at the left edge')
   const subs = gridMarks(
     [spans[0]],
     { fromSec: 0, toSec: 2 },
-    { bars: true, beats: true, subs: true, labelEvery: 1 }
+    { bars: true, beats: true, subs: true, labelEvery: 1, subsPerBeat: 4 }
   );
   assert(subs.filter((m) => m.level === 'sub').length === 12, 'four beats give twelve subdivisions');
 
@@ -353,13 +359,13 @@ windowIs(windowShowing(5, 0, 4, limits), 5, 9, 'windowShowing at the left edge')
   const withPickup = gridMarks(
     anacrusis,
     { fromSec: 0, toSec: 7 },
-    { bars: true, beats: false, subs: false, labelEvery: 1 }
+    { bars: true, beats: false, subs: false, labelEvery: 1, subsPerBeat: 4 }
   );
   assert(withPickup.length === 4, 'the pickup bar still gets a bar line');
   assert(withPickup[0].label === null, 'an implicit bar prints no number');
   assert(withPickup.map((m) => m.label).join() === ',1,2,3', 'and does not shift the numbering after it');
 
-  assert(gridMarks([], { fromSec: 0, toSec: 1 }, { bars: true, beats: true, subs: true, labelEvery: 1 }).length === 0,
+  assert(gridMarks([], { fromSec: 0, toSec: 1 }, { bars: true, beats: true, subs: true, labelEvery: 1, subsPerBeat: 4 }).length === 0,
     'no bars, no marks');
 }
 
@@ -562,6 +568,304 @@ assert(countRendererCredits(undefined) === 0, 'no root, nothing counted');
   assert(
     tabLast.tuningLowToHigh.join() === tabFirst.tuningLowToHigh.join(),
     'the same score in either track order must produce the same fretboard'
+  );
+}
+
+// ---------------------------------------------------------------------------
+// F3c — the drawn grid follows the Grid selector, triplets included
+// ---------------------------------------------------------------------------
+
+{
+  assert(subdivisionsPerBeat('quarter') === 1, 'a quarter-note grid has no subdivision of the beat');
+  assert(subdivisionsPerBeat('eighth') === 2, 'eighths are two per beat');
+  assert(subdivisionsPerBeat('sixteenth') === 4, 'sixteenths are four per beat');
+  assert(subdivisionsPerBeat('triplet') === 3, 'a triplet is THREE per beat — the whole point of F3c');
+  assert(subdivisionsPerBeat('free') === SUBS_PER_BEAT, 'free placement falls back to the default');
+
+  // Plenty of room, so the only thing deciding the answer is the selector.
+  const roomy = 0.5 / 60;
+  assert(gridDetail(0.5, roomy, 3).subsPerBeat === 3, 'the detail carries the selected subdivision');
+  assert(!gridDetail(0.5, roomy, 1).subs, 'a quarter grid draws no subdivisions at all');
+
+  const bar: BarSpan[] = [
+    { index: 0, number: 1, implicit: false, startSec: 0, endSec: 2, beats: 4, beatSec: 0.5 }
+  ];
+  const win = { fromSec: 0, toSec: 2 };
+
+  const triplets = gridMarks(bar, win, gridDetail(0.5, roomy, 3));
+  const tripletSecs = triplets.filter((m) => m.level === 'sub').map((m) => m.sec);
+  assert(tripletSecs.length === 8, 'four beats at three parts each give eight subdivision lines');
+  // THE REPORTED SYMPTOM, as arithmetic: a triplet-snapped note sits a third of a beat in, and
+  // there has to be a drawn line there. At four subdivisions the nearest column is a 12th of a
+  // beat away, which on a zoomed-in pane is the gap the user photographed.
+  assert(
+    tripletSecs.some((sec) => Math.abs(sec - 0.5 / 3) < 1e-9),
+    'a line is drawn exactly where a triplet-snapped note lands'
+  );
+  const quarters = gridMarks(bar, win, gridDetail(0.5, roomy, 4));
+  assert(
+    !quarters.some((sec) => Math.abs(sec.sec - 0.5 / 3) < 1e-9),
+    'and the old fixed grid of four had none there — which is the bug'
+  );
+  assert(
+    quarters.filter((m) => m.level === 'sub').length === 12,
+    'four subdivisions per beat is still twelve lines, so nothing else changed'
+  );
+
+  assert(
+    gridMarks(bar, win, gridDetail(0.5, roomy, 1)).every((m) => m.level !== 'sub'),
+    'a quarter grid draws bars and beats and nothing finer'
+  );
+
+  // Three columns fit where four do not: the density check has to use the chosen number.
+  assert(gridDetail(0.5, 0.5 / 24, 3).subs, 'three subdivisions fit in 24px a beat');
+  assert(!gridDetail(0.5, 0.5 / 24, 4).subs, 'four do not');
+}
+
+// ---------------------------------------------------------------------------
+// Review MAJOR — the align window is clamped to what is actually engraved
+// ---------------------------------------------------------------------------
+
+{
+  const extent = { firstX: 40, lastX: 400 };
+  assert(clampXToEngraving(200, extent) === 200, 'an x inside the engraving is left alone');
+  assert(clampXToEngraving(900, extent) === 400, 'an x past the last bar becomes the last bar');
+  assert(clampXToEngraving(-50, extent) === 40, 'an x before the first beat becomes the first beat');
+  assert(clampXToEngraving(900, null) === 900, 'with no extent measured, nothing is clamped');
+  assert(
+    clampXToEngraving(900, { firstX: 400, lastX: 40 }) === 900,
+    'a nonsense extent is ignored rather than inverting the answer'
+  );
+
+  // THE FAILURE, END TO END, with the numbers written out.
+  //
+  // A 20 s take engraved at 36 px per second: the first beat is at content x 40 and the last bar
+  // ends at x 760. The page is 900 px wide (alphaTab's trailing padding), the pane is 500 px,
+  // and the reader has scrolled to 400 — so the sheet is showing 10.94 s .. 20 s, and its right
+  // viewport edge (x 900) is 140 px PAST the end of the music.
+  const limits: TimeLimits = { durationSec: 20, minSpanSec: MIN_WINDOW_SEC };
+  const secAt = (x: number): number => (x - 40) / 36;
+  const music = { firstX: 40, lastX: 760 };
+  const view = { scrollLeft: 400, viewportWidth: 500, contentWidth: 900, scale: 1 };
+  const sheetLeftSec = secAt(400 + ALIGN_GUTTER_PX);
+
+  // Extrapolated, x 900 reads as 23.89 s. The window is then 12.94 s wide but ends past the end
+  // of the take, so `clampWindow` SLIDES it back keeping its span — and the left edge, which was
+  // the one number Align exists to get right, moves 3.9 s (about 140 px) away from the music the
+  // sheet is really showing. That is the drift.
+  const unclamped = windowFromSheet(view, secAt, limits)!;
+  assert(
+    Math.abs(unclamped.fromSec - sheetLeftSec) > 3,
+    'unclamped, the window no longer starts where the sheet does'
+  );
+  assert(unclamped.toSec > limits.durationSec - 1e-9, 'and it has been shoved against the end');
+
+  const clamped = windowFromSheet(view, secAt, limits, music)!;
+  near(clamped.fromSec, sheetLeftSec, 'clamped, the left edge is the second the sheet shows');
+  near(clamped.toSec, 20, 'and the right edge is the end of the engraving, not somewhere past it');
+  assert(clamped.toSec <= limits.durationSec + 1e-9, 'the window never runs off the end of the take');
+
+  // Scrolled into the middle of a long engraving, the clamp must do nothing at all.
+  const wide = { firstX: 40, lastX: 5000 };
+  const mid = { scrollLeft: 200, viewportWidth: 500, contentWidth: 5000, scale: 1 };
+  const a = windowFromSheet(mid, secAt, limits)!;
+  const b = windowFromSheet(mid, secAt, limits, wide)!;
+  near(a.fromSec, b.fromSec, 'inside the engraving the clamp changes nothing (from)');
+  near(a.toSec, b.toSec, 'inside the engraving the clamp changes nothing (to)');
+}
+
+// ---------------------------------------------------------------------------
+// F13 — bar 1 is pinned to the FIRST NOTE, not to the top of the tape
+// ---------------------------------------------------------------------------
+
+{
+  // A take with 2.5 s of silence in front of it. The pipeline engraves the first attack in
+  // bar 1 (written second 0); the roll and the waveform draw it at 2.5 s, where it was played.
+  const origin = alignOriginSec(0, 2.5);
+  near(origin, 2.5, 'written second 0 sits 2.5 s into the recording');
+  near(audioSecAt(0, origin), 2.5, 'bar 1 maps to the first note, not to the start of the tape');
+  near(writtenSecAt(2.5, origin), 0, 'and back again');
+
+  // Round trip, at an arbitrary moment, is the property everything else rests on.
+  near(writtenSecAt(audioSecAt(1.75, origin), origin), 1.75, 'written -> audio -> written is identity');
+
+  // A pickup: the first attack was played BEFORE written second 0, so the origin is negative
+  // and must stay negative. Clamping it to 0 re-opens the same misalignment from the other end.
+  const pickup = alignOriginSec(0.5, 0.2);
+  near(pickup, -0.3, 'a pickup gives a negative origin, and it is kept');
+
+  assert(alignOriginSec(null, 2.5, 7) === 7, 'no first note falls back');
+  assert(alignOriginSec(0, null, 7) === 7, 'no performed time falls back');
+  assert(alignOriginSec(0, Number.NaN, 7) === 7, 'a NaN is a missing answer, not an answer');
+  assert(alignOriginSec(null, null) === 0, 'and the default fallback is zero');
+
+  // The sheet PARKS at its start rather than scrolling negative. Everything left of the first
+  // note is silence the roll and the waveform still draw; the sheet simply has no page there.
+  const sheet = { scrollLeft: 0, viewportWidth: 800, contentWidth: 2000, scale: 1 };
+  const contentXAt = (sec: number): number => 40 + sec * 36; // written seconds -> content x
+  assert(
+    sheetScrollForSec(-2.5, contentXAt, sheet) === 0,
+    'a second before bar 1 parks the sheet at its start'
+  );
+  assert(
+    sheetScrollForSec(-100, contentXAt, sheet) === 0,
+    'and it stays parked however far left the other strips scroll — no jump to the far end'
+  );
+  assert(
+    sheetScrollForSec(4, contentXAt, sheet) === 40 + 4 * 36 - ALIGN_GUTTER_PX,
+    'inside the take it is the plain mapping, gutter removed'
+  );
+  assert(
+    sheetScrollForSec(1000, contentXAt, sheet) === 2000 - 800,
+    'and it stops at the end of the page rather than scrolling past it'
+  );
+}
+
+// ---------------------------------------------------------------------------
+// F2a — hiding the tab rests changes the picture and NOT the playback
+//
+// The sound-sacred proof for score/fromPipeline.ts: every beat's playback identity is dumped
+// with and without the flag and the two dumps must be byte-identical. See `hideTabRests`.
+// ---------------------------------------------------------------------------
+
+{
+  const request = {
+    notes: [
+      { id: 'a', startSec: 0, endSec: 0.4, midi: 45 },
+      { id: 'b', startSec: 1.0, endSec: 1.4, midi: 52 }
+    ],
+    beats: [0, 0.5, 1, 1.5, 2]
+  };
+  const built = buildScore(request, {
+    grid: '1/8',
+    fillGaps: true,
+    instrument: 'guitar',
+    tuningMidi: [40, 45, 50, 55, 59, 64],
+    fingeringStyle: 'minMovement',
+    clefMode: 'grand'
+  });
+  const data = built.toAlphaTabModelData();
+
+  const tabStaves = data.tracks.flatMap((t) => t.staves).filter((s) => s.showTablature);
+  assert(tabStaves.length > 0, 'the grand + tab fixture really does carry a tab staff');
+
+  /** Everything that decides WHEN a beat sounds and for how long. Nothing about how it looks. */
+  const playbackDump = (score: alphaTab.model.Score): string => {
+    const rows: string[] = [];
+    for (const track of score.tracks) {
+      for (const staff of track.staves) {
+        for (const bar of staff.bars) {
+          for (const voice of bar.voices) {
+            for (const beat of voice.beats) {
+              rows.push(
+                [
+                  beat.absolutePlaybackStart,
+                  beat.playbackDuration,
+                  beat.duration,
+                  beat.dots,
+                  beat.isEmpty ? 1 : 0,
+                  beat.isRest ? 1 : 0,
+                  beat.notes.map((n) => `${n.realValue}:${n.string ?? ''}:${n.fret ?? ''}`).join('+')
+                ].join('|')
+              );
+            }
+          }
+        }
+      }
+    }
+    return rows.join('\n');
+  };
+
+  const withFlag = buildAlphaTabScore(data, new alphaTab.Settings()).score;
+  // The control: the same data with every staff claiming it prints its rests, which is the
+  // branch `hideTabRests` is never reached from.
+  const control = buildAlphaTabScore(
+    {
+      ...data,
+      tracks: data.tracks.map((t) => ({
+        ...t,
+        staves: t.staves.map((s) => ({ ...s, showRests: true }))
+      }))
+    },
+    new alphaTab.Settings()
+  ).score;
+
+  assert(
+    playbackDump(withFlag) === playbackDump(control),
+    'playback dump is byte-identical with and without the hidden tab rests'
+  );
+
+  /** Beats carrying the transparent GuitarTabRests override, per staff. */
+  const hidden = (score: alphaTab.model.Score): number[] =>
+    score.tracks.flatMap((t) =>
+      t.staves.map((s) =>
+        s.bars.reduce(
+          (n, bar) =>
+            n +
+            bar.voices.reduce(
+              (m, v) =>
+                m +
+                v.beats.filter((b) =>
+                  b.style?.colors.has(alphaTab.model.BeatSubElement.GuitarTabRests)
+                ).length,
+              0
+            ),
+          0
+        )
+      )
+    );
+
+  assert(hidden(control).every((n) => n === 0), 'a staff that prints its rests is left untouched');
+  const marked = hidden(withFlag);
+  assert(marked.some((n) => n > 0), 'the tab-only staff of grand + tab has its rests suppressed');
+  // Exactly one staff: the notation staves must keep their rests, which is what makes the tab's
+  // column a duplicate rather than the only one.
+  assert(marked.filter((n) => n > 0).length === 1, 'and it is the ONLY staff that does');
+  const colors = withFlag.tracks
+    .flatMap((t) => t.staves)
+    .flatMap((s) => s.bars)
+    .flatMap((b) => b.voices)
+    .flatMap((v) => v.beats)
+    .map((b) => b.style?.colors.get(alphaTab.model.BeatSubElement.GuitarTabRests))
+    .filter((c) => c !== undefined);
+  assert(colors.length > 0 && colors.every((c) => c!.a === 0), 'the override is fully transparent');
+
+  // AND THE LIVE RENDER AGREES. alphaTab's own SVG engine, in Node, on the grand + tab score:
+  // the flagged render must lay the page out identically to the control and differ from it only
+  // in ink. That is the whole claim in one comparison — no rest glyph moved, none was removed,
+  // and the ones on the tab staff are painted with nothing.
+  const renderMarkup = (score: alphaTab.model.Score): string => {
+    const s = new alphaTab.Settings();
+    s.core.engine = 'svg';
+    s.core.enableLazyLoading = false;
+    s.core.useWorkers = false;
+    s.display.layoutMode = alphaTab.LayoutMode.Horizontal;
+    const r = new alphaTab.rendering.ScoreRenderer(s);
+    r.width = 900;
+    const out: string[] = [];
+    const errs: string[] = [];
+    r.partialRenderFinished.on((e) => out.push(String((e as { renderResult?: unknown }).renderResult ?? '')));
+    r.error.on((e) => errs.push(String(e)));
+    r.renderScore(score, [0]);
+    assert(errs.length === 0, `grand + tab failed to render: ${errs.join('; ')}`);
+    assert(out.length > 0, 'the grand + tab render produced no partials');
+    return out.join('\n');
+  };
+
+  const hiddenMarkup = renderMarkup(withFlag);
+  const shownMarkup = renderMarkup(control);
+  const transparent = (m: string): number => (m.match(/rgba\(\d+,\s*\d+,\s*\d+,\s*0\)/g) ?? []).length;
+  assert(transparent(hiddenMarkup) > 0, 'the tab rests are painted with a transparent fill');
+  assert(transparent(shownMarkup) === 0, 'and the control paints nothing transparent at all');
+  // Colour out — `fill`/`stroke`, which is where the override lands — and alphaTab's group
+  // classes out with it, because they carry beat ids and ids are a global counter, so the second
+  // score built in this process gets higher numbers for the same music. Everything that survives
+  // is geometry: transforms, coordinates, glyph codepoints, in order.
+  const inkless = (m: string): string =>
+    m.replace(/ (fill|stroke|class)="[^"]*"/g, '');
+  assert(
+    inkless(hiddenMarkup) === inkless(shownMarkup),
+    'the two renders are byte-identical once colour is removed: nothing moved, nothing was dropped'
   );
 }
 

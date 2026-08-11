@@ -1306,6 +1306,25 @@ export function createJuceBridge(): NativeBridge {
       ? async () => ((await call<Record<string, unknown>>('playbackDiagnostics')) ?? {})
       : undefined,
 
+    // Gated on registration like every other optional call: an unregistered native name
+    // never settles its promise, so an About box on an older shell must see `undefined`
+    // here rather than await forever.
+    getAppVersion: hasNativeFunction('getAppVersion')
+      ? async (): Promise<string | null> => {
+          const result = await call<{ version?: string }>('getAppVersion').catch(() => null);
+          return typeof result?.version === 'string' && result.version.length > 0
+            ? result.version
+            : null;
+        }
+      : undefined,
+
+    openExternal: hasNativeFunction('openExternal')
+      ? async (url: string): Promise<boolean> => {
+          const result = await call<{ ok?: boolean }>('openExternal', url).catch(() => null);
+          return result?.ok === true;
+        }
+      : undefined,
+
     // --- per-instance persistence -------------------------------------------------------
     // Gated, not attempted: calling a native name the shell has not registered never
     // settles its promise (see hasNativeFunction). A boot that awaits session restore

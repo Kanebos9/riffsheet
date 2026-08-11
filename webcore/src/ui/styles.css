@@ -135,6 +135,82 @@ input[type="number"], input[type="text"], select {
   flex-wrap: wrap;
 }
 /*
+ * ------------------------------------------------------------------ the brand block (F17/F18)
+ *
+ * Top-left, with the take's name beside it, modelled on BASAMAK's — see `buildBrandBlock()` in
+ * ui/app.ts for the measured comparison. Three parts on one line: the R, the wordmark, and a
+ * two-line stack of version over "Click to check updates", exactly as BASAMAK stacks its own.
+ *
+ * THE ONE RULE THIS FILE ENFORCES: THE HEADER MUST NOT GET TALLER. Every number below is
+ * line-height 1 and the whole block is capped with `max-height`, so the tallest thing in the
+ * row stays what it has always been — an ordinary button, about 30px. A brand that pushed the
+ * sheet down by a row would be the opposite of what it was added for.
+ */
+.brand-block {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  flex: 0 0 auto;
+  /* Not a button to look at. It is a click target around a logo, the way BASAMAK's invisible
+     HyperlinkButton is — so no plate, no border, and no padding worth the name. */
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  padding: 2px 6px;
+  cursor: pointer;
+  text-align: left;
+  /*
+   * STRETCHED, NOT CENTRED, and this is a real constraint rather than a taste.
+   *
+   * `.app-header` centres its items, so a child of an unusual height gets an unusual TOP — and
+   * `scripts/verify.mjs` counts distinct top edges among the header's children to tell a bar
+   * that scaled from one that wrapped into extra rows. A 26px block between 30px buttons reads
+   * to that measurement as a new row of chrome, which is the one thing this header is forbidden
+   * to grow. Stretching makes the block share the row's own top edge with the tallest control
+   * beside it, so it adds no bucket — and it cannot make the row taller, because `max-height`
+   * below is above the tallest thing already in it and the contents are centred inside.
+   */
+  align-self: stretch;
+  max-height: 34px;
+}
+.brand-block:hover:not(:disabled) { border-color: var(--border); background: var(--bg-panel); }
+.brand-block:focus-visible { outline: 1px solid var(--accent); outline-offset: 1px; }
+/* The whole block is one target: nothing inside it may take the click, which is BASAMAK's
+   `setInterceptsMouseClicks(false, false)` on both of its labels. */
+.brand-block > * { pointer-events: none; }
+.brand-mark { display: flex; align-items: center; color: var(--accent); }
+.brand-mark svg { display: block; }
+.brand-wordmark {
+  /* BASAMAK's wordmark is vector art, so its weight and tracking are baked into the outlines.
+     Ours is text and has to say the same thing out loud: caps, heavy, and generously tracked,
+     which is what makes a word read as a logotype rather than as a label. */
+  font-size: 13px;
+  line-height: 1;
+  font-weight: 800;
+  letter-spacing: 0.14em;
+  color: var(--text);
+  white-space: nowrap;
+}
+.brand-meta { display: flex; flex-direction: column; align-items: center; gap: 1px; }
+.brand-version {
+  font-size: 10px;
+  line-height: 1;
+  font-weight: 700;
+  color: var(--accent);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+.brand-check {
+  font-size: 8.5px;
+  line-height: 1;
+  font-weight: 700;
+  /* Dimmed by COLOUR, not by alpha — BASAMAK picks a darker gold (#B98A2E under #E8BF4D)
+     rather than fading its caption, so the two lines stay equally crisp. */
+  color: color-mix(in srgb, var(--accent) 72%, var(--bg-raised));
+  white-space: nowrap;
+}
+
+/*
  * THE BUTTONS DO NOT GIVE, AND THEIR WORDS DO NOT BREAK.
  *
  * A button is a flex item like any other, so a squeezed header shrank "Main menu" until it set
@@ -168,23 +244,59 @@ input[type="number"], input[type="text"], select {
 
 /* ------------------------------------------------------------------ drop zone */
 
+/*
+ * THE MAIN MENU: TWO COLUMNS, NO PAGE SCROLL (F12).
+ *
+ * It was one centred column of `width: min(640px, 92vw)` blocks, which failed twice on the same
+ * window: at 1440px the screen was 640px of content between two 400px voids, and the stack —
+ * engine picker, current work, drop zone, blank score, capture, Recent, footer — was taller than
+ * the pane, so the very first screen of the app opened with a scrollbar.
+ *
+ * `grid`, not flex, and the columns are `minmax(0, …)` on both sides: a grid track's default
+ * `min-width: auto` is the widest thing inside it, and the drop zone's headline is long enough
+ * to have blown the left track wide and pushed Recent off the edge.
+ *
+ * `align-items: start` rather than centring. The two columns are different heights by nature
+ * (one has a 240px drop zone in it), and centring them independently would leave the Recent
+ * heading floating at some arbitrary height with nothing to line up with.
+ */
 .dropzone-screen {
   flex: 1;
   min-height: 0;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 300px);
+  align-items: start;
+  gap: clamp(14px, 2.5vw, 32px);
+  /* The margins were `clamp(12px, 3vw, 32px)` of padding on top of a 640px cap — nearly the
+     whole width on a wide window. The cap is gone (the columns share the room) and the padding
+     is what is left, which is a margin rather than a void. */
+  padding: clamp(12px, 2vw, 24px);
+  /* A safety net, not the layout. At the sizes this app promises, nothing here overflows. */
+  overflow-y: auto;
+}
+/*
+ * Each column is its own column. `min-width: 0` on both for the same reason the tracks are
+ * `minmax(0, …)`: without it a long filename in Recent makes the whole grid wider than the pane.
+ */
+.menu-actions, .menu-side {
   display: flex;
   flex-direction: column;
-  align-items: center;
-  /*
-   * `safe` matters. Plain `center` on an overflowing flex column centres the content and then
-   * puts its overflow on BOTH sides — and the half above the top edge is unreachable, because
-   * a scroll container cannot scroll to a negative offset. The top of this screen therefore
-   * disappeared as soon as it grew taller than the window. `safe` falls back to flex-start the
-   * moment the content does not fit, which is the only state in which centring can hurt.
-   */
-  justify-content: safe center;
   gap: clamp(10px, 2vh, 18px);
-  padding: clamp(12px, 3vw, 32px);
-  overflow-y: auto;
+  min-width: 0;
+}
+.menu-actions { align-items: center; }
+.menu-side { align-items: stretch; }
+
+/*
+ * BELOW 900px THERE IS ONE COLUMN AGAIN, and Recent goes back under the actions.
+ *
+ * Two columns in a 360px-wide docked FX window would be two columns of about 160px, which is
+ * narrower than the drop zone's own headline. The breakpoint is the product's stated floor
+ * (900x600) because that is the width the two-column layout was measured to work at.
+ */
+@media (max-width: 900px) {
+  .dropzone-screen { grid-template-columns: minmax(0, 1fr); justify-content: safe center; }
+  .menu-side { align-items: center; }
 }
 
 .dropzone {
@@ -207,15 +319,29 @@ input[type="number"], input[type="text"], select {
 .dropzone .headline { font-size: clamp(16px, 2.4vw, 21px); font-weight: 600; }
 .dropzone .explainer { font-size: 13.5px; color: var(--text-dim); max-width: 46ch; line-height: 1.5; }
 
-.recent { width: min(640px, 92vw); }
+/* Its column decides its width now. The old `min(640px, 92vw)` was a whole column of its own
+   and is exactly the rule that made the menu a single centred stack. */
+.recent { width: 100%; max-width: min(640px, 92vw); min-width: 0; }
 .recent h2 { font-size: 12px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--text-dim); margin: 0 0 6px; }
+/*
+ * SIX ROWS, THEN IT SCROLLS ITSELF.
+ *
+ * Eight entries are remembered and all eight are still reachable — what is capped is how much
+ * of the screen the list may take from the things above it. A row is 12.5px text in 6px of
+ * padding plus its radius: ~30px, so six of them is 180px, and the `+ 4px` is the scroller's
+ * own breathing room so a seventh row is visibly cut rather than perfectly hidden (a list that
+ * ends flush at its cap does not look scrollable).
+ */
+.recent-list { max-height: 184px; overflow-y: auto; overscroll-behavior: contain; }
 .recent-item {
   display: flex; align-items: center; gap: 8px;
   padding: 6px 9px; border-radius: 6px; cursor: pointer; font-size: 12.5px;
+  min-width: 0;
 }
+.recent-item > span:first-child { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .recent-item:hover { background: var(--bg-panel); }
-.recent-item .when { margin-left: auto; color: var(--text-dim); font-size: 11.5px; }
-.opening-footer { width: min(640px, 92vw); display: flex; justify-content: center; }
+.recent-item .when { margin-left: auto; flex: 0 0 auto; color: var(--text-dim); font-size: 11.5px; }
+.opening-footer { width: 100%; display: flex; justify-content: center; margin-top: auto; }
 .legal-link { color: var(--text-dim); text-decoration: underline; text-underline-offset: 2px; }
 
 .current-work {
@@ -380,6 +506,41 @@ input[type="number"], input[type="text"], select {
 
 .tuner-host { flex: 0 0 auto; padding: 4px 8px; background: var(--bg-raised); border-bottom: 1px solid var(--border); }
 .tuner-host[hidden] { display: none; }
+
+/*
+ * F16 — THE TAKE'S OWN EDIT ROW, directly under the waveform it acts on.
+ *
+ * It takes no room at all when it has nothing to say, which is most of the time: a take with no
+ * leading silence and nothing selected shows nothing here, and this window is already more
+ * chrome than music. It is deliberately NOT in the header — the trim offer and the "Cut out"
+ * button are both about a span of the strip, and a control for a picture belongs against the
+ * picture rather than in a bar of global switches.
+ */
+.take-edits {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 8px;
+  background: var(--bg-raised);
+  border-bottom: 1px solid var(--border);
+}
+.take-edits[hidden] { display: none; }
+.take-chip { display: inline-flex; align-items: center; gap: 0; }
+/* The offer and its refusal read as one object, so they share an outline rather than float. */
+.take-chip-go { border-top-right-radius: 0; border-bottom-right-radius: 0; }
+.take-chip-dismiss {
+  border-top-left-radius: 0;
+  border-bottom-left-radius: 0;
+  border-left: none;
+  padding-left: 6px;
+  padding-right: 6px;
+  opacity: 0.75;
+}
+.take-chip-dismiss:hover { opacity: 1; }
+.take-cut { border-color: var(--danger, #e2725b); color: var(--danger, #e2725b); }
+.take-cut:hover:not(:disabled) { background: var(--danger, #e2725b); color: #06131f; }
+.take-cut-note { font-size: 11px; opacity: 0.7; cursor: help; }
 
 /*
  * IT SCALES, AND ONLY WRAPS AT THE FLOOR.
@@ -563,6 +724,25 @@ input[type="number"], input[type="text"], select {
    "can I undo this?" away at exactly the moment somebody is asking it. */
 .undo-btn:disabled { opacity: 0.35; cursor: default; }
 
+/*
+ * THE TEMPO SOURCE (F19) — one control where there used to be a header chip and a stray box.
+ *
+ * `gap: 6px` rather than the row's 8: the select and the two fields it governs are one control
+ * with three parts, and they have to read as tighter than the space between them and the fader.
+ * Nothing here is allowed to grow the transport row — the select is the same height as the
+ * number box beside it, and the detail is inline text.
+ */
+.tempo-source { gap: 6px; }
+.tempo-source-select { max-width: 12em; }
+.tempo-source input[readonly] {
+  /* Read-only, not broken. Dimmed enough to say "not yours to type in right now" and still
+     legible, because the NUMBER is what most people came to this row to read. */
+  opacity: 0.75;
+  cursor: default;
+}
+.tempo-source select:disabled { opacity: 0.75; cursor: default; }
+.tempo-source .tempo-detail { font-size: 11px; font-variant-numeric: tabular-nums; white-space: nowrap; }
+
 .fader { display: flex; align-items: center; gap: 8px; min-width: 0; }
 .fader label { font-size: 11.5px; color: var(--text-dim); }
 .fader input[type="range"] { width: clamp(76px, 12vw, 132px); min-width: 0; }
@@ -719,7 +899,26 @@ button[data-drag="midi"]:hover .drag-grip { opacity: 0.9; }
 .settings-gear .gear-label { white-space: nowrap; }
 
 .zoom-pair { display: inline-flex; gap: 2px; align-items: center; }
-.zoom-pair .chip { padding: 3px 7px; font-variant-numeric: tabular-nums; }
+/*
+ * Shorter than they were (was 3px 7px). The axis captions beside them cost width, the header is
+ * not allowed to grow a row, and a −/+ needs no side padding to stay hittable — so the pairs
+ * give the captions their own space back rather than taking it from the filename.
+ */
+.zoom-pair .chip { padding: 3px 6px; font-variant-numeric: tabular-nums; }
+/*
+ * WHICH AXIS. Sits INSIDE the pair, tight against the first button, so it reads as that pair's
+ * caption rather than as a separator between the two. It must not add height: no padding, no
+ * border, line-height 1, and a font a shade smaller than the chips it labels.
+ */
+.zoom-pair .zoom-label {
+  font-size: 11px;
+  line-height: 1;
+  padding: 0 1px 0 3px;
+  color: var(--text-dim);
+  cursor: default;
+  user-select: none;
+}
+.zoom-pair .zoom-label:first-child { padding-left: 0; }
 
 /*
  * The open-string letters at the left of every tab staff — the legend the old one-line
@@ -746,6 +945,16 @@ button[data-drag="midi"]:hover .drag-grip { opacity: 0.9; }
   white-space: nowrap;
   pointer-events: auto;
   cursor: help;
+  /*
+   * THE PLATE. The row is pinned to the viewport (F8), so the letters no longer sit in the
+   * empty left padding — they cross the music, and a letter over a beam is not a legend. The
+   * paper-coloured wash is what keeps them readable there. It lived inline in
+   * view/triview.ts until now, which put a presentational decision in the file that decides
+   * WHERE the letters go rather than in the one that decides what they look like.
+   */
+  background: rgba(248, 246, 240, 0.88);
+  padding: 1px 2px;
+  border-radius: 2px;
 }
 .string-letter:hover { color: var(--accent); }
 
@@ -953,6 +1162,51 @@ button[data-drag="midi"]:hover .drag-grip { opacity: 0.9; }
   overflow-x: auto; white-space: nowrap; max-width: 100%;
 }
 
+/*
+ * THE SOURCE LINK AND ITS COPY BUTTON (F11).
+ *
+ * Both are <button>s, because both DO something — but neither may look like a button or take a
+ * button's height: they sit inside a `.status-row` that is 11.5px text, and a control with a
+ * plate and 5px of padding in it would make that row taller than the two above it. So: no
+ * background, no border, no vertical padding, and `line-height: inherit` so the row's height is
+ * decided by the row.
+ */
+.engine-card .source-link,
+.engine-card .source-copy {
+  background: none;
+  border: 0;
+  border-radius: 3px;
+  padding: 0;
+  margin: 0;
+  line-height: inherit;
+  font: inherit;
+  vertical-align: baseline;
+  cursor: pointer;
+}
+.engine-card .source-link {
+  font-size: 11px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  color: #ff9a74;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+  /* The address is already shortened in `sourceLine()`; this is what stops a long one from
+     widening the panel if a manifest ever supplies a host longer than the card. */
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.engine-card .source-link:hover { color: var(--accent); }
+.engine-card .source-copy {
+  margin-left: 4px;
+  font-size: 11px;
+  color: var(--text-dim);
+}
+.engine-card .source-copy:hover { color: var(--text); }
+.engine-card .source-copy.copied { color: var(--ok); }
+.engine-card .source-link:focus-visible,
+.engine-card .source-copy:focus-visible { outline: 1px solid var(--accent); outline-offset: 1px; }
+
 /* ------------------------------------------------------------- engine cards */
 /*
  * One card per engine. The border is the only thing separating them, because a panel this
@@ -1125,6 +1379,10 @@ button[data-drag="midi"]:hover .drag-grip { opacity: 0.9; }
   .app-header { padding: 7px 10px; }
   button { padding: 5px 8px; }
   .fader label, .fader .end { font-size: 11px; }
+  /* The brand keeps its mark, its name and its version and loses only the invitation — the
+     version is still a link and the tooltip still says so. Same trade as the gear's word. */
+  .brand-check { display: none; }
+  .brand-block { padding: 2px 4px; gap: 6px; }
 }
 
 /*
@@ -1155,6 +1413,11 @@ button[data-drag="midi"]:hover .drag-grip { opacity: 0.9; }
      only while there is space. */
   .settings-gear .gear-label { display: none; }
   .settings-gear { padding: 5px 9px; }
+  /* And the brand keeps its mark and its version and loses the word, by the same rule and for
+     the same reason: at REAPER's 360px floor the header is already wrapping, and a logotype is
+     the one thing in the row that is not a control anybody has to reach. The R is still the R,
+     the version is still a link, and the tooltip still says what pressing it does. */
+  .brand-wordmark { display: none; }
 }
 
 /* ------------------------------------------------------- toolbars scale */

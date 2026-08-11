@@ -836,6 +836,10 @@ export class SettingsPanel {
       replace(
         host,
         this.guideStatusRow(this.engine),
+        // The read-out belongs to MuScriptor, and on a shell this old MuScriptor is the only
+        // engine there is — so it lands here rather than being left orphaned. Same element,
+        // re-parented; see `render()`.
+        ...(this.engineReadout ? [this.engineReadout] : []),
         ...this.modelChooser(SINGLE_ENGINE_STAND_IN),
         ...this.guideBody(this.engine)
       );
@@ -894,6 +898,17 @@ export class SettingsPanel {
     // read; every other card gets the generic role. One row either way, never two.
     rows.push(isGuide ? this.guideStatusRow(st) : this.engineStateRow(engine));
 
+    // THE LIVE READ-OUT, ON THE CARD IT IS ABOUT (F10). Which server is up, whose it is, which
+    // weights are on this machine, how much memory is free, who is using it right now — all of
+    // it is MuScriptor's, and all of it used to sit under the generic "Transcription engine"
+    // heading where it read as being about whatever engine you had chosen. Directly under the
+    // state sentence, because the two are the same subject at two levels of detail.
+    //
+    // The ELEMENT is re-parented rather than rebuilt: `renderEngineReadout()` writes into it on
+    // its own two-second poll, and a fresh element here would leave that poll updating an
+    // orphan. `appendChild` moves a node, so this is also what removes it from wherever it was.
+    if (isGuide && this.engineReadout) rows.push(this.engineReadout);
+
     // THE DETAIL BLOCK. Three lines, each answering a different question somebody comparing
     // engines actually asks, in the order they ask them: what is it good at, what will it cost
     // me, and whose is it. It used to be one run-on line — "Good at: Bass · 57 MB to download ·
@@ -950,6 +965,72 @@ export class SettingsPanel {
     );
   }
 
+  /**
+   * Open a URL outside the app, feature-detected both ways.
+   *
+   * `openExternal` is the shell's and is the only one that works inside a plugin: a JUCE
+   * WebView is not a browser tab, so `window.open` there does nothing and does it silently.
+   * The fallback is for a plain browser tab and for a shell whose call answers false.
+   */
+  private openExternal(url: string): void {
+    if (!url) return;
+    const pending = this.bridge.openExternal?.(url);
+    if (!pending) {
+      window.open(url, '_blank', 'noopener');
+      return;
+    }
+    void pending
+      .then((ok) => {
+        if (!ok) window.open(url, '_blank', 'noopener');
+      })
+      .catch(() => {
+        window.open(url, '_blank', 'noopener');
+      });
+  }
+
+  /**
+   * Put text on the clipboard, and say so on the button that did it.
+   *
+   * `navigator.clipboard` is not always there — it is secure-context only, and a WebView
+   * loading from a custom scheme is not always one — so there is a `document.execCommand`
+   * fallback behind it. The confirmation is the glyph changing to a tick for a moment rather
+   * than a toast: a notice for a copy is an interruption for something that either obviously
+   * worked or obviously did not.
+   */
+  private async copyText(text: string, button: HTMLElement | null): Promise<void> {
+    if (!text) return;
+    let ok = false;
+    try {
+      await navigator.clipboard?.writeText(text);
+      ok = true;
+    } catch {
+      ok = false;
+    }
+    if (!ok) {
+      try {
+        const box = document.createElement('textarea');
+        box.value = text;
+        box.setAttribute('readonly', '');
+        box.style.position = 'fixed';
+        box.style.opacity = '0';
+        document.body.appendChild(box);
+        box.select();
+        ok = document.execCommand('copy');
+        box.remove();
+      } catch {
+        ok = false;
+      }
+    }
+    if (!button) return;
+    const was = button.textContent;
+    button.textContent = ok ? '✓' : '✕';
+    button.classList.toggle('copied', ok);
+    window.setTimeout(() => {
+      button.textContent = was;
+      button.classList.remove('copied');
+    }, 1200);
+  }
+
   /** Line 1 of the detail block: "Good at: Bass, Guitar and Piano". */
   private capabilityLine(engine: EngineSummary): string {
     return engine.instrumentStrengths.length > 0
@@ -1002,9 +1083,35 @@ export class SettingsPanel {
     const host = engine.sourceUrl.replace(/^https?:\/\//, '').replace(/\/$/, '');
     const bits: HTMLElement[] = [];
     if (host) {
+      // THE ADDRESS IS REACHABLE NOW (F11). It has always been TRUNCATED — the scheme and any
+      // trailing slash are dropped so a long URL does not push the licence off the card — and
+      // truncated text that cannot be opened or copied is a citation nobody can follow. Both
+      // ways out are here and neither costs a row: the text itself opens the full URL, and one
+      // small glyph beside it puts the full URL on the clipboard.
+      //
+      // The displayed string is unchanged, deliberately. Making it the whole URL would fix the
+      // copying problem by causing the layout one, and the copy button exists precisely so the
+      // display can stay short.
       bits.push(
         el('span', { text: 'Source:' }),
-        el('code', { class: 'path', 'data-role': 'engine-card-source-url', text: host })
+        el('button', {
+          class: 'path source-link',
+          'data-role': 'engine-card-source-url',
+          'data-url': engine.sourceUrl,
+          type: 'button',
+          text: host,
+          title: t(`${TIPS.engineSourceLink} ${engine.sourceUrl}`),
+          onClick: () => this.openExternal(engine.sourceUrl)
+        }),
+        el('button', {
+          class: 'icon source-copy',
+          'data-role': 'engine-card-source-copy',
+          type: 'button',
+          text: '⧉',
+          'aria-label': `Copy ${engine.sourceUrl}`,
+          title: t(TIPS.engineSourceCopy),
+          onClick: (e: MouseEvent) => void this.copyText(engine.sourceUrl, e.currentTarget as HTMLElement)
+        })
       );
     }
     if (engine.license) {
@@ -1818,6 +1925,12 @@ export class SettingsPanel {
 
     // Built here and filled in afterwards, so the two-second poll has a stable element to
     // refresh without redrawing the controls around it.
+    //
+    // It is NOT appended here any more (F10): `engineCard()` re-parents this very element onto
+    // MuScriptor's card on every `renderEngineSetup()`. Created here regardless, and kept on
+    // the instance, because `renderEngineReadout()` runs on its own two-second poll and must
+    // always have somewhere to write — including in the moment before the engine list arrives
+    // and there are no cards at all.
     const engineReadout = el('div', { 'data-role': 'engine-readout' });
     this.engineReadout = engineReadout;
     const engineSetup = el('div', { class: 'engine-setup', 'data-role': 'engine-setup' });
@@ -1975,7 +2088,17 @@ export class SettingsPanel {
         // weights it selects — see `modelChooser()` in the Engine setup group below. Sitting
         // here it named no engine, applied to exactly one of the four, and did nothing at all
         // for anybody running the other three.
-        engineReadout,
+        //
+        // AND NEITHER IS THE ENGINE READ-OUT, for exactly the same reason and by the same
+        // route (F10). "The transcription server is not running", "Riffsheet started the
+        // transcription server itself on port 8765", "the small weights are not on this machine
+        // yet" — every one of those sentences is about MuScriptor and only MuScriptor. Under a
+        // heading that says "Transcription engine" they read as facts about whichever engine
+        // you are running, so somebody on Basic Pitch was told a server was down that their
+        // engine does not have and does not need. `renderEngineReadout()` still fills the same
+        // element on the same poll; `engineCard()` now parents it, on the guided engine's card.
+        // What is LEFT here is the only line in the group that is true of all of them: whether
+        // the app can transcribe at all, and in which host.
 
         // --- what happens to the audio before an engine hears it ------------
         // Two real transformations of the player's own recording, so they are the player's to

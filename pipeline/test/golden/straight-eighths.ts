@@ -160,7 +160,7 @@ export default `<?xml version="1.0" encoding="UTF-8" standalone="no"?>
         <staff>2</staff>
         <notations><technical><string>2</string><fret>2</fret></technical></notations>
       </note>
-      <note>
+      <note print-object="no">
         <rest/>
         <duration>6</duration>
         <voice>5</voice>
@@ -175,7 +175,7 @@ export default `<?xml version="1.0" encoding="UTF-8" standalone="no"?>
         <staff>2</staff>
         <notations><technical><string>2</string><fret>2</fret></technical></notations>
       </note>
-      <note>
+      <note print-object="no">
         <rest/>
         <duration>6</duration>
         <voice>5</voice>
@@ -190,7 +190,7 @@ export default `<?xml version="1.0" encoding="UTF-8" standalone="no"?>
         <staff>2</staff>
         <notations><technical><string>1</string><fret>0</fret></technical></notations>
       </note>
-      <note>
+      <note print-object="no">
         <rest/>
         <duration>6</duration>
         <voice>5</voice>
@@ -205,7 +205,7 @@ export default `<?xml version="1.0" encoding="UTF-8" standalone="no"?>
         <staff>2</staff>
         <notations><technical><string>1</string><fret>2</fret></technical></notations>
       </note>
-      <note>
+      <note print-object="no">
         <rest/>
         <duration>6</duration>
         <voice>5</voice>
@@ -220,7 +220,7 @@ export default `<?xml version="1.0" encoding="UTF-8" standalone="no"?>
         <staff>2</staff>
         <notations><technical><string>1</string><fret>4</fret></technical></notations>
       </note>
-      <note>
+      <note print-object="no">
         <rest/>
         <duration>6</duration>
         <voice>5</voice>
@@ -235,7 +235,7 @@ export default `<?xml version="1.0" encoding="UTF-8" standalone="no"?>
         <staff>2</staff>
         <notations><technical><string>1</string><fret>2</fret></technical></notations>
       </note>
-      <note>
+      <note print-object="no">
         <rest/>
         <duration>6</duration>
         <voice>5</voice>
@@ -250,7 +250,7 @@ export default `<?xml version="1.0" encoding="UTF-8" standalone="no"?>
         <staff>2</staff>
         <notations><technical><string>1</string><fret>0</fret></technical></notations>
       </note>
-      <note>
+      <note print-object="no">
         <rest/>
         <duration>6</duration>
         <voice>5</voice>
@@ -265,7 +265,7 @@ export default `<?xml version="1.0" encoding="UTF-8" standalone="no"?>
         <staff>2</staff>
         <notations><technical><string>2</string><fret>2</fret></technical></notations>
       </note>
-      <note>
+      <note print-object="no">
         <rest/>
         <duration>6</duration>
         <voice>5</voice>
@@ -388,7 +388,7 @@ export default `<?xml version="1.0" encoding="UTF-8" standalone="no"?>
         <staff>2</staff>
         <notations><technical><string>2</string><fret>2</fret></technical></notations>
       </note>
-      <note>
+      <note print-object="no">
         <rest/>
         <duration>6</duration>
         <voice>5</voice>
@@ -403,7 +403,7 @@ export default `<?xml version="1.0" encoding="UTF-8" standalone="no"?>
         <staff>2</staff>
         <notations><technical><string>2</string><fret>2</fret></technical></notations>
       </note>
-      <note>
+      <note print-object="no">
         <rest/>
         <duration>6</duration>
         <voice>5</voice>
@@ -418,7 +418,7 @@ export default `<?xml version="1.0" encoding="UTF-8" standalone="no"?>
         <staff>2</staff>
         <notations><technical><string>1</string><fret>0</fret></technical></notations>
       </note>
-      <note>
+      <note print-object="no">
         <rest/>
         <duration>6</duration>
         <voice>5</voice>
@@ -433,7 +433,7 @@ export default `<?xml version="1.0" encoding="UTF-8" standalone="no"?>
         <staff>2</staff>
         <notations><technical><string>1</string><fret>2</fret></technical></notations>
       </note>
-      <note>
+      <note print-object="no">
         <rest/>
         <duration>6</duration>
         <voice>5</voice>
@@ -448,7 +448,7 @@ export default `<?xml version="1.0" encoding="UTF-8" standalone="no"?>
         <staff>2</staff>
         <notations><technical><string>1</string><fret>4</fret></technical></notations>
       </note>
-      <note>
+      <note print-object="no">
         <rest/>
         <duration>6</duration>
         <voice>5</voice>
@@ -463,7 +463,7 @@ export default `<?xml version="1.0" encoding="UTF-8" standalone="no"?>
         <staff>2</staff>
         <notations><technical><string>1</string><fret>2</fret></technical></notations>
       </note>
-      <note>
+      <note print-object="no">
         <rest/>
         <duration>6</duration>
         <voice>5</voice>
@@ -478,7 +478,7 @@ export default `<?xml version="1.0" encoding="UTF-8" standalone="no"?>
         <staff>2</staff>
         <notations><technical><string>1</string><fret>0</fret></technical></notations>
       </note>
-      <note>
+      <note print-object="no">
         <rest/>
         <duration>6</duration>
         <voice>5</voice>

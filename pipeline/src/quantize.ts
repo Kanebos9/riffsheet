@@ -147,7 +147,17 @@ function statesFor(grid: QuantGrid, ticksPerBeat: number, compound: boolean): Rh
     return out;
   }
   add('beat', 1, false);
-  if (grid !== '1/4' && grid !== '1/8T') add('straight-8', 2, false);
+  // '1/8T' IS THE TRIPLET GRID, NOT A TRIPLET-ONLY GRID. It used to withhold `straight-8`, on
+  // the reading that a caller asking for triplets wants nothing else. That is not what it did.
+  // The tuplet gates below are deliberately strict (all three positions occupied, a 25% margin
+  // over the straight reading), so any beat they reject fell through to the ONLY other state
+  // left — `beat`, a whole-beat lattice. A straight eighth then snapped a HALF BEAT onto its
+  // neighbour's tick, where the collision fuse deleted one of the two attacks; a "two of three"
+  // shuffle figure lost a note the same way. A grid setting chooses what the page may SAY, and
+  // no setting is allowed to delete a note that was played. `1/4` collapses on purpose because
+  // the quarter IS its finest word; the triplet grid's finest straight word is the eighth, which
+  // is what tieMerge.test.ts's STEP table has always declared it to be.
+  if (grid !== '1/4') add('straight-8', 2, false);
   if (grid === 'auto' || fine) add('straight-16', 4, false);
   // 1/32 IS OPT-IN, never offered by 'auto'. FiloBass's 46,281 human glyphs are 0.009% 32nds
   // (§0.1); handing the Viterbi a 1/32 lattice by default buys nothing and gives sloppy playing
@@ -332,6 +342,15 @@ export function quantizeOnsets(
   const jitter = robustJitter(windows, states.length);
 
   // ---- tuplet admission (deliberately stricter than the DP objective) ------------------------
+  //
+  // §6.4's coverage rule exists to kill FALSE triplets — readings 'auto' proposes on its own
+  // initiative and has to be talked out of. When the caller named the triplet grid, the triplet
+  // is not a hypothesis under suspicion, it is the instruction; demanding all three slots there
+  // refuses the commonest triplet figure of all, the shuffle that plays slots 1 and 3 and leaves
+  // the middle silent. Two of three is still a floor (one lone onset is not evidence of a
+  // tuplet), and every other gate below — the off-lattice uniqueness test and both RMS margins,
+  // which are what actually separate a triplet from straight eighths — is unchanged.
+  const tupletRequested = opts.grid === '1/8T';
   const admitted = windows.map((w) =>
     states.map((state, s) => {
       if (!state.tuplet) return true;
@@ -340,7 +359,11 @@ export function quantizeOnsets(
       // COVERAGE. §6.4 rule 3: a triplet needs all three positions occupied — "this single rule
       // kills most false triplets". A sextuplet is held to two thirds of its six, because a
       // genuine 16th-triplet figure often leaves one slot silent.
-      const required = state.division === 3 ? 3 : Math.ceil((state.division * 2) / 3);
+      const required = tupletRequested
+        ? Math.min(2, state.division)
+        : state.division === 3
+          ? 3
+          : Math.ceil((state.division * 2) / 3);
       let covered = 0;
       for (let p = 0; p < unitsPerBeat; p++) if (positions.has(p)) covered++;
       if (covered < required) return false;
@@ -417,9 +440,25 @@ export function quantizeOnsets(
     const unit = candidate ? candidate.unitTicks : state.grid;
     const startTick = snapTo(n.rawStartTick, unit, origin);
     const rawDur = Math.max(0, n.rawOffTick - n.rawStartTick);
-    // A member whose onset rounds all the way to the beat boundary has left the group on
-    // position evidence alone; it is a straight note at the next beat.
-    const group = candidate && startTick < candidate.endTick ? candidate : undefined;
+    // MEMBERSHIP FOLLOWS THE TICK THE NOTE LANDED ON, NOT THE BEAT IT WAS PLAYED IN.
+    //
+    // The state that decides the snapping unit has to come from the raw beat — there is nothing
+    // else to look it up by. Where the note ENDS UP is a different question, and snapping can
+    // move it across a barline of the beat grid in either direction:
+    //
+    //   out of a group   the last member rounds up to the beat boundary; it is a straight note
+    //                    at the next beat and must not keep the group it left (the old rule,
+    //                    preserved by the range test below);
+    //   into a group     a note played in a straight beat rounds FORWARD onto the downbeat of a
+    //                    triplet beat. It used to keep no group at all while sitting squarely
+    //                    inside one, so buildScore split its 8 sounding ticks on the straight
+    //                    metric into 6 + 2 and typed the remainder `32nd` — a glyph whose <type>
+    //                    says 3 ticks and whose <duration> says 2. MusicXML's S2 assertion threw
+    //                    on it and the whole build died with no score at all.
+    //
+    // A group spans exactly its beat, so the landed tick names its group unambiguously.
+    const landed = tupletByBeat.get(Math.floor(startTick / opts.ticksPerBeat));
+    const group = landed && startTick >= landed.startTick && startTick < landed.endTick ? landed : undefined;
 
     // SPEC RULE R4: the off-time snaps on the SAME grid as its onset, never independently —
     // and "the same grid" means the same grid, with no finer escape hatch for short notes.
@@ -435,11 +474,29 @@ export function quantizeOnsets(
     // decided per beat and can be as coarse as the beat itself; charging a note the whole beat
     // because its neighbours happened to decode coarsely would invent sustain, which is the one
     // thing simplify.ts exists to prevent. Inside a tuplet the step is the tuplet's own unit.
-    const durUnit = group ? unit : finestStraight;
+    // `group.unitTicks`, not the snapping `unit`: after a cross-beat landing the group the note
+    // is IN can differ from the group its raw beat was snapped BY, and the length has to be
+    // measured in the units of the tuplet it will actually be printed inside.
+    const durUnit = group ? group.unitTicks : finestStraight;
     const units = Math.max(1, Math.round(rawDur / durUnit));
     let offTick = startTick + units * durUnit;
     if (group) offTick = Math.min(group.endTick, offTick);
     if (offTick <= startTick) offTick = startTick + durUnit;
+    // EVERY TICK A NOTE CONTRIBUTES LIES ON THE LATTICE OF WHATEVER GROUP CONTAINS IT — the
+    // off-time as much as the onset. A straight note ringing on into a later triplet beat used
+    // to stop wherever its own 1/8 step happened to fall, e.g. tick 36 inside a group whose
+    // units are 24/32/40. Nothing downstream can print the 4-tick gap that leaves: it is not a
+    // straight value and not a whole tuplet unit either, so the rest splitter fell off the
+    // vocabulary. Ending it on the group's own lattice keeps the sounding length within half a
+    // unit and keeps every span on the page notatable.
+    if (!group) {
+      const host = tupletByBeat.get(Math.floor(offTick / opts.ticksPerBeat));
+      // A non-member's onset is necessarily before the group, so rounding down to the group's
+      // own start still leaves a positive length; no floor is needed.
+      if (host && offTick > host.startTick && offTick < host.endTick) {
+        offTick = host.startTick + Math.round((offTick - host.startTick) / host.unitTicks) * host.unitTicks;
+      }
+    }
     out.push({
       id: n.id,
       startTick,

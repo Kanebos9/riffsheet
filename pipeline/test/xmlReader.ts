@@ -110,6 +110,14 @@ export interface ReadNote {
   string?: number;
   fret?: number;
   chord: boolean;
+  /** false when the note carries print-object="no" — present for the cursor, not for the eye. */
+  printed: boolean;
+  /** <beam> states, beam level 1 first. Empty when the note is flagged or unbeamable. */
+  beams: string[];
+  /** <notations><tuplet> types on this note, in document order. */
+  tuplets: string[];
+  /** <time-modification>, the only thing allowed to stand between <type> and <duration>. */
+  timeModification: { actual: number; normal: number } | null;
 }
 
 export interface ReadScore {
@@ -192,8 +200,10 @@ export function readMusicXml(xml: string): ReadScore {
           STEP_PC[textOf(child(pitch, 'step'))] +
           numberOf(child(pitch, 'alter'), 0)
         : null;
-      const technical = child(child(el, 'notations') ?? { name: '', attrs: {}, children: [], text: '' }, 'technical');
+      const notations = child(el, 'notations') ?? { name: '', attrs: {}, children: [], text: '' };
+      const technical = child(notations, 'technical');
       const ties = children(el, 'tie');
+      const timeMod = child(el, 'time-modification');
       const tick = isChord ? lastNoteTick : cursor;
       notes.push({
         measure: number,
@@ -208,7 +218,13 @@ export function readMusicXml(xml: string): ReadScore {
         tieStart: ties.some((t) => t.attrs.type === 'start'),
         tieStop: ties.some((t) => t.attrs.type === 'stop'),
         ...(technical ? { string: numberOf(child(technical, 'string'), 0), fret: numberOf(child(technical, 'fret'), 0) } : {}),
-        chord: isChord
+        chord: isChord,
+        printed: el.attrs['print-object'] !== 'no',
+        beams: children(el, 'beam').map((b) => b.text),
+        tuplets: children(notations, 'tuplet').map((t) => t.attrs.type ?? ''),
+        timeModification: timeMod
+          ? { actual: numberOf(child(timeMod, 'actual-notes'), 1), normal: numberOf(child(timeMod, 'normal-notes'), 1) }
+          : null
       });
       if (!isChord) {
         lastNoteTick = cursor;

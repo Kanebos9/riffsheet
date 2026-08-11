@@ -297,6 +297,16 @@ if(WIN32 AND NOT JUCE_WEBVIEW2_PACKAGE_LOCATION)
 endif()
 
 juce_add_plugin(Riffsheet
+    # The app icon: an "R" cut on BASAMAK's icon grid (see Resources/Icon/
+    # riffsheet-icon.svg for the shared metrics), in Riffsheet's accent on its
+    # own canvas. JUCE turns these two PNGs into the macOS .icns inside every
+    # bundle's Contents/Resources and stamps CFBundleIconFile in the generated
+    # Info.plist, into the Windows .exe, and into the Linux window icon - which
+    # is why they are PNGs here rather than the Riffsheet.icns sitting beside
+    # them. That .icns is the hand-built, full 16-1024 iconset, kept for
+    # anything outside this target (installers, the website, Finder previews).
+    ICON_BIG   "Resources/Icon/riffsheet-icon-512.png"
+    ICON_SMALL "Resources/Icon/riffsheet-icon-128.png"
     COMPANY_NAME "OZ"
     VERSION ${PROJECT_VERSION}
     IS_SYNTH FALSE

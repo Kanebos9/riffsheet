@@ -124,6 +124,20 @@ otherwise the split is middle C on sounding pitch. Each projected notation staff
 measure rhythm by replacing the other staff's notes with rests, while the TAB staff always shows
 the whole part — a fretboard is not split by a notation boundary.
 
+Beam groups and tuplet brackets belong to ONE STAFF'S sequence, so both are recomputed per staff
+AFTER the projection (`beaming.ts`), never inherited from the merged rhythm the bars were built
+from: a group straddling the split otherwise leaves one staff a beam `continue` whose `begin` went
+to the other, or a `<tuplet type="stop"/>` with no start. A rest created by the projection inside a
+tuplet keeps the group's `<time-modification>` and can carry a bracket edge, because a written
+`<type>` and a sounding `<duration>` may only ever differ by that element — and both emitters
+assert it, on every note and rest they write.
+
+A TAB staff that sits under notation staves prints no rest glyphs: the rests are already on the
+notation. The rest is not removed — MusicXML keeps the `<note>` and its `<duration>` and marks it
+`print-object="no"`, and the alphaTab hand-off flags the staff `showRests: false` while still
+sending every rest beat at full length. Deleting them instead would leave the staff short of the
+barline and corrupt the `<backup>` that follows.
+
 Staff numbering is 1-based, top to bottom, notation first and TAB last, so MusicXML `<staves>` is
 1, 2 or 3 and the TAB clef/`<staff-details>` carry whichever number is last. The measure body is a
 stack of layers: emit a layer, assert its cursor reached the barline, back up by exactly what it

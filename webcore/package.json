@@ -4,7 +4,7 @@
   "private": true,
   "license": "AGPL-3.0-only",
   "type": "module",
-  "description": "Riffsheet web core \u2014 tri-view (staff + note names + tab) UI, rendering and editing. Runs in a JUCE WebView or a plain browser.",
+  "description": "Riffsheet web core — tri-view (staff + note names + tab) UI, rendering and editing. Runs in a JUCE WebView or a plain browser.",
   "scripts": {
     "dev": "vite",
     "build": "tsc --noEmit && vite build",
@@ -22,7 +22,8 @@
     "build:debug": "RIFFSHEET_SOURCEMAP=1 vite build"
   },
   "dependencies": {
-    "@coderline/alphatab": "1.8.4"
+    "@coderline/alphatab": "1.8.4",
+    "fflate": "^0.8.3"
   },
   "devDependencies": {
     "@coderline/alphatab-vite": "^1.8.4",

@@ -167,6 +167,25 @@ export const TIPS = {
     'Slide between your actual recording and the app\'s version of what it heard. Sitting in the middle plays both at once — the fastest way to spot a note it got wrong.',
   bpm:
     'The tempo — how many beats per minute. Unless it came from your DAW, the app worked this out from the recording by ear, so it can be wrong; if the rhythm on the sheet looks wrong, fixing this number is the FIRST thing to try.',
+  /**
+   * The one control the "Use DAW grid" chip and the BPM box became (F19). It has to answer
+   * three questions at once — what the choices mean, why the fields grey out, and where the
+   * chip went — because everybody who used the old pair will look for it here first.
+   */
+  tempoSource:
+    'Where the tempo and the time signature come from. Follow DAW takes both from your DAW: for a ' +
+    'take made with "Capture from track" the bar lines land exactly where your DAW\'s are, because ' +
+    'the app wrote them down while you were playing, and for a file you dropped in it borrows the ' +
+    'tempo but counts the bars from the bar-1 marker instead — the line beside the numbers says ' +
+    'which of the two you are getting. Manual lets you type both yourself. From recording uses ' +
+    'what the app worked out by ear, which is a guess and can come out wrong. The tempo and ' +
+    'signature boxes are only yours to type in on Manual; on the other two they show you what is ' +
+    'being applied. This used to be a "Use DAW grid" chip in the top bar and a separate BPM box ' +
+    'down here, which could disagree with each other.',
+  tempoRedetect:
+    'Work the tempo and the time signature out from your playing again, and rebuild the sheet with ' +
+    'them. Worth pressing after you have moved the bar-1 marker. It does not listen to your audio ' +
+    'from scratch — that is "Start over" in the Main menu.',
   timesig:
     'How many beats are in each bar. Most rock and pop is 4/4. If your bars look chopped in the wrong places, try another one.',
 
@@ -183,6 +202,12 @@ export const TIPS = {
     'The dimmed parts are silence at the start and end that the app is ignoring, so your riff starts at bar 1 instead of three seconds in.',
   barOneMarker:
     'Where bar 1 begins. The app put it where the recording stops being silent; drag it if the count-in should start somewhere else. Moving it re-draws the sheet — it does not listen to your audio again.',
+  trimSilence:
+    'Takes the quiet run-up (and the quiet ending) off the take, so the music starts where the music starts. Your recording is not touched — nothing is deleted from it — and one undo puts the silence back exactly as it was.',
+  cutOut:
+    'Removes the part you have selected and closes the gap, as if you had never played it. The sheet, the piano roll and every file you export all get shorter to match. Your recording is not touched: undo puts it back, and you can do this as many times as you like.',
+  cutSummary:
+    'How much of the take is currently hidden by your cuts. The recording still has every second of it — a cut is something this page is leaving out, not something taken off your disk. Playing the ORIGINAL sound jumps over your cuts; you may hear a small click right at the join, because the jump happens on the sound rather than in it. The MIDI voice has no such join.',
   hostSync: HOST_SYNC_TIP,
   /** The old name for `hostSync`. Same text; kept so older callers keep working. */
   hostGrid: HOST_SYNC_TIP,
@@ -320,5 +345,17 @@ export const TIPS = {
     'Zoom the piano roll out until every note in the take fits. Useful once, to see the shape of ' +
     'the whole thing — but it is not how the roll opens any more, because fitting a wide-ranging ' +
     'take squashes every row until you cannot read it.',
-  settings: 'Open the settings panel.'
+  settings: 'Open the settings panel.',
+
+  // --- the brand block ------------------------------------------------------
+  brand:
+    'Which version of Riffsheet you are running. Click it to open the releases page in your ' +
+    'browser, where you can see whether there is a newer one and what changed in it. Riffsheet ' +
+    'never checks for updates by itself and never talks to the internet on its own — this button ' +
+    'is the only thing here that opens a web page, and only when you press it.',
+  /** The engine cards' truncated Source: link, and the copy button beside it. */
+  engineSourceLink:
+    'Where this engine comes from. The address is shortened to fit; click it to open the full page ' +
+    'in your browser.',
+  engineSourceCopy: 'Copy the full address to the clipboard.'
 } as const;

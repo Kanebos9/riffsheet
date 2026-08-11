@@ -89,6 +89,10 @@ private:
     void fnStopExternalEngine (const juce::Array<juce::var>&, Completion);
     void fnTranscribeCancel  (const juce::Array<juce::var>&, Completion);
     void fnHostTimelineProbe (const juce::Array<juce::var>&, Completion);
+    void fnGetAppVersion     (const juce::Array<juce::var>&, Completion);
+    /** Hands an http/https link to the OS browser. Any other scheme is refused
+        here - the OS opener would act on `file:` and on custom schemes. */
+    void fnOpenExternal      (const juce::Array<juce::var>&, Completion);
 
     // --- helpers -------------------------------------------------------------
     /** `fileIsOurTemp` marks browser-provided bytes staged by the shell. They
@@ -105,7 +109,13 @@ private:
         decodeAndReply() promotes the decoded audio to durable app-support
         storage, and the staging file stays entry-owned so ~PcmStore::Entry
         deletes it. Shared by importDroppedFile() and loadAudioBytes() so the
-        two cannot drift; `stageTag` only distinguishes them in /tmp listings. */
+        two cannot drift; `stageTag` only distinguishes them in /tmp listings.
+
+        Everything happens on `workers`, never on the caller's thread: the
+        decode and the write both scale with the payload, and this is reached
+        from the message thread. Payloads over 550 MB of base64 are refused with
+        an error reply rather than attempted, and an allocation the machine
+        refuses is reported the same way instead of crashing. */
     void stageBytesAndReply (const juce::String& displayName, const juce::String& base64,
                              double targetRate, Completion completion,
                              const juce::String& stageTag);

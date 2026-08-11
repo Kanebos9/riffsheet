@@ -11,6 +11,7 @@ import type { InputNote, RiffScore } from '../pipeline';
 import { DEFAULT_ROLL_HEIGHT_PX } from '../view/pianoroll';
 import type { SynthVoice } from '../audio/synth';
 import type { TrimResult } from '../audio/trim';
+import type { CutSpan } from '../edit/cuts';
 import type { HostInfo } from '../bridge';
 
 /**
@@ -404,6 +405,20 @@ export interface SourceAudio {
   documentBars?: number;
   /** Raw detections, kept so the notation can be rebuilt without re-transcribing. */
   detected?: { notes: InputNote[]; beats?: number[]; downbeats?: number[] };
+  /**
+   * F16 — the stretches of this take the player has cut out, in AUDIO seconds.
+   *
+   * NON-DESTRUCTIVE BY CONSTRUCTION. Everything above this line stays the whole recording:
+   * `durationSec` is still the file's length, `peaks` still covers all of it and
+   * `detected.notes` are still stamped with the seconds they were played at. A cut is a span
+   * the page agrees not to show, and the mapping between the two clocks lives in
+   * edit/cuts.ts. Splicing the audio instead would renumber every note and cost the player
+   * every notation edit they had made, because ids are what those are keyed on (§4.8).
+   *
+   * Absent or empty on every take that has never been cut, which is what lets the whole
+   * feature be inert — the app's `editedSource()` hands back this very object unchanged.
+   */
+  cuts?: CutSpan[];
 }
 
 export type Screen = 'opening' | 'main';
@@ -479,13 +494,50 @@ export const INITIAL_RUNTIME: RuntimeState = {
 
 const SETTINGS_KEY = 'riffsheet.settings';
 const RECENT_KEY = 'riffsheet.recent';
+/**
+ * The highest settings version THIS PROFILE has ever been carried through.
+ *
+ * A one-time migration has to be one-time EVER, and until this key existed it was one-time
+ * per blob: `migrate()` read the version out of whatever JSON it was handed, so a .riffsheet
+ * written by an old build re-ran v10 over the top of a choice the player had made since —
+ * the reported "I set Quantize to 1/4, opened an old document, and it went back to Free".
+ * The version inside a stored blob says how old THAT BLOB is; this says how far this
+ * INSTALLATION has already been moved, and no blob can wind it back.
+ */
+const MIGRATED_KEY = 'riffsheet.settingsMigratedTo';
+
+/** How far this installation has already been migrated. 0 when it never has been. */
+export function migrationFloor(): number {
+  try {
+    const raw = localStorage.getItem(MIGRATED_KEY);
+    const n = raw === null ? 0 : Number(raw);
+    return Number.isFinite(n) && n > 0 ? Math.min(n, SETTINGS_VERSION) : 0;
+  } catch {
+    return 0;
+  }
+}
+
+function stampMigrationFloor(): void {
+  try {
+    localStorage.setItem(MIGRATED_KEY, String(SETTINGS_VERSION));
+  } catch {
+    /* private browsing or quota — the floor just does not persist */
+  }
+}
 
 export function loadSettings(): AppSettings {
   try {
     const raw = localStorage.getItem(SETTINGS_KEY);
-    if (!raw) return { ...DEFAULT_SETTINGS };
-    return mergeStoredSettings(JSON.parse(raw) as Partial<AppSettings>);
+    const settings = raw
+      ? mergeStoredSettings(JSON.parse(raw) as Partial<AppSettings>)
+      : { ...DEFAULT_SETTINGS };
+    // Stamped on BOTH branches, including the fresh-install one: a profile that starts at the
+    // current defaults has nothing left to be migrated to, and saying so is what stops the
+    // first old document it ever opens from being treated as this profile's own history.
+    stampMigrationFloor();
+    return settings;
   } catch {
+    stampMigrationFloor();
     return { ...DEFAULT_SETTINGS };
   }
 }
@@ -500,7 +552,66 @@ export function loadSettings(): AppSettings {
  */
 export function mergeStoredSettings(stored: Partial<AppSettings>): AppSettings {
   // Merge over defaults so settings written by an older build never yield undefined.
-  return migrate({ ...DEFAULT_SETTINGS, ...stored }, stored);
+  return migrate({ ...DEFAULT_SETTINGS, ...stored }, stored, migrationFloor());
+}
+
+/**
+ * A DOCUMENT's settings, made effective for that document and for nothing else.
+ *
+ * THE SEPARATION THIS EXISTS FOR. A .riffsheet carries the settings its sheet was engraved
+ * with, and opening one used to call `mergeStoredSettings` and push the result straight into
+ * the settings store — which persists. Two things were wrong with that and they compound:
+ *
+ *  1. the player's own global preferences were REPLACED by whatever the file was saved with,
+ *     silently, by the act of looking at somebody's document; and
+ *  2. the file's `settingsVersion` re-armed every one-time migration in `migrate()`, so a v1
+ *     document re-fired the v9->v10 "grid goes to free" case over a deliberate 'quarter'.
+ *
+ * Both halves are answered here. The version cases are suppressed outright — the floor is
+ * pinned at SETTINGS_VERSION, so `from` can never be below any case — leaving only the
+ * unconditional SANITISATION, which is not a migration but a guard against untrusted JSON and
+ * must always run. And nothing is written: the caller applies `effective` to the open document
+ * and keeps `overridden` so it knows which keys are the document's rather than the player's.
+ *
+ * `overridden` is the list of keys where the document actually differs from the player. It is
+ * computed by comparison rather than taken from the blob's own key list, because a document
+ * that happens to agree with you about a setting is not overriding anything, and treating it
+ * as if it were would freeze that key out of persistence for no reason.
+ */
+export interface DocumentSettingsApplication {
+  /** What the open document should be shown and built with. */
+  effective: AppSettings;
+  /** The keys where that differs from the player's own preferences. */
+  overridden: Array<keyof AppSettings>;
+}
+
+export function applyDocumentSettings(
+  global: AppSettings,
+  stored: Partial<AppSettings>
+): DocumentSettingsApplication {
+  const effective = migrate({ ...global, ...stored }, stored, SETTINGS_VERSION);
+  const overridden = (Object.keys(effective) as Array<keyof AppSettings>).filter(
+    (key) => !sameSettingValue(effective[key], global[key])
+  );
+  return { effective, overridden };
+}
+
+/**
+ * Value equality for one settings field.
+ *
+ * Most of them are primitives and `Object.is` is the whole answer. Two are not —
+ * `customTuningMidi` is an array and `timeSignature` an object — and reference identity would
+ * report a change on every reload for those, which would make a key look permanently
+ * user-edited. JSON is exact enough for values this small and this flat.
+ */
+export function sameSettingValue(a: unknown, b: unknown): boolean {
+  if (Object.is(a, b)) return true;
+  if (a === null || b === null || typeof a !== 'object' || typeof b !== 'object') return false;
+  try {
+    return JSON.stringify(a) === JSON.stringify(b);
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -509,9 +620,13 @@ export function mergeStoredSettings(stored: Partial<AppSettings>): AppSettings {
  * Merging alone cannot do this: a value that was written *because* it was the old default is
  * indistinguishable from one the player chose, so it would pin them to the old behaviour
  * forever. The version number is what tells the two apart.
+ *
+ * `floor` is how far the INSTALLATION has already been carried (see `MIGRATED_KEY`). A case
+ * runs only when both the blob and the profile are below it, so every one of them fires at
+ * most once per profile, ever — not once per file opened.
  */
-function migrate(settings: AppSettings, stored: Partial<AppSettings>): AppSettings {
-  const from = stored.settingsVersion ?? 1;
+function migrate(settings: AppSettings, stored: Partial<AppSettings>, floor = 0): AppSettings {
+  const from = Math.max(stored.settingsVersion ?? 1, floor);
 
   // v1 -> v2: playback grew real sampled sounds. 'bass' was v1's default oscillator voice,
   // so anyone still on it never picked it — move them to the sampled bass. A player who
@@ -798,8 +913,21 @@ export interface AppStores {
   runtime: Store<RuntimeState>;
 }
 
+/**
+ * The stores, WITHOUT a persistence subscriber, and that omission is deliberate.
+ *
+ * It used to be `settings.subscribe(saveSettings)` right here, which reads as obviously
+ * correct and stopped being so the moment a document could carry settings of its own: the
+ * store holds what the OPEN DOCUMENT is being shown with, and that is no longer the same
+ * object as what the player prefers. A blanket write-back would put the document's values on
+ * disk the first time anything at all changed afterwards — the same clobber as before, merely
+ * delayed by one click.
+ *
+ * `ui/app.ts` §persistSettings owns the write now, because it is the only place that knows
+ * which keys are the document's (see `applyDocumentSettings`). There is exactly one caller of
+ * this function, and it installs that subscriber immediately.
+ */
 export function createStores(): AppStores {
   const settings = createStore<AppSettings>(loadSettings());
-  settings.subscribe((s) => saveSettings(s));
   return { settings, runtime: createStore<RuntimeState>({ ...INITIAL_RUNTIME }) };
 }

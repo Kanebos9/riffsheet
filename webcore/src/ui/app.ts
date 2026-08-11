@@ -78,6 +78,21 @@ import { Tuner } from './tuner';
 import { selfTest as pitchSelfTest } from '../audio/pitch';
 import { detectOnsets, type OnsetResult } from '../audio/onsets';
 import { soundingMidi } from '../score/fromPipeline';
+import {
+  buildPartedRiffScore,
+  importedPartName,
+  isNotationOnlyTrack,
+  livePartName,
+  LIVE_PART_ID,
+  MAX_SCORE_PARTS,
+  nudgeStepMs,
+  orderedPartSlots,
+  partOrderOf,
+  scoreParts,
+  snapNudgeMs,
+  type ImportedPart,
+  type PartSlot
+} from '../score/parts';
 import { accidentalsForKey, midiToName } from '../score/notes';
 import { TUNING_PRESETS, customTuning, parseTuning, tuningById, tuningLabel } from '../score/tuning';
 import { transcribeRiffsheet } from '../audio/riffsheetEngine';
@@ -96,9 +111,11 @@ import { buildPrintDocument, renderScorePdf } from '../export/pdf';
 import { ExportBar } from './exportBar';
 import { FINGER_BASS_SAMPLES, SampledBass, sampleStatus } from '../audio/sampler';
 import { schedulePad } from '../audio/pad';
-import { dropTunedRiff, straightRiff, tripletRiff } from '../score/fixtures';
+import { dropTunedRiff, GUITAR_PART_MUSICXML, straightRiff, tripletRiff } from '../score/fixtures';
 import {
   applyDocumentSettings,
+  takeScopedDefaults,
+  TAKE_SCOPED_SETTING_KEYS,
   createStores,
   FINGERING_STYLES,
   forgetRecent,
@@ -224,6 +241,18 @@ const REDO_SVG =
 const RELEASES_URL = 'https://github.com/Kanebos9/riffsheet/releases';
 
 /**
+ * How often the engine chip asks whether a listener is up (H8). See `pollEngine()`.
+ *
+ * TWO CADENCES, because the two states are asking different questions. While a server is UP the
+ * chip is showing a figure that moves, so ten seconds is about the rate at which it is worth
+ * redrawing. While it is DOWN the question is "has one appeared?" — which now has to be asked at
+ * all, because a server the player started themselves is invisible to everything else in the
+ * app — and eight seconds is what makes "within about ten" true rather than nearly true.
+ */
+const ENGINE_LIVE_POLL_MS = 10_000;
+const ENGINE_IDLE_POLL_MS = 8_000;
+
+/**
  * The version to show when the shell cannot be asked.
  *
  * A build-time constant, kept in step with `webcore/package.json` and `shell/CMakeLists.txt`
@@ -241,6 +270,17 @@ const OPEN_FILE_ACCEPT = [
   '.riffsheet',
   SCORE_IMAGE_ACCEPT
 ].join(',');
+
+/**
+ * What the `[+]` on the part row will take, and it is narrower than the open dialog on purpose.
+ *
+ * A PART IS A PRINTED STAFF. MusicXML is the format that describes one and travels between the
+ * programs people write them in; Guitar Pro and MIDI open as whole documents through the ordinary
+ * door and are not offered here. `.mxl` is the zipped flavour, which `parseScoreFile` reads
+ * already — it is the same importer, pointed at a part instead of at the document.
+ */
+const MUSICXML_ACCEPT = '.xml,.musicxml,.mxl';
+const MUSICXML_NAME = /\.(musicxml|mxl|xml)$/i;
 
 export function mountApp(root: HTMLElement): void {
   installTooltipLayer();
@@ -647,6 +687,35 @@ class App {
     this.openExternalUrl(RELEASES_URL);
   }
 
+  /**
+   * A NEW TAKE STARTS FROM THE FIXED DEFAULTS (H4).
+   *
+   * The reported fault: "I set the fret count to 22 once, and every project I have opened since
+   * starts at 22." Every setting lived in one persisted global blob, so a number typed about ONE
+   * instrument became a standing claim about every recording opened afterwards — and the same
+   * for the tuning, the capo, the clef, the key, the quantizer and the roll's grid.
+   *
+   * `TAKE_SCOPED_SETTING_KEYS` in app/state.ts carries the audit of which settings are the
+   * TAKE's answer and which are the PLAYER's; this stamps the first group back to
+   * `DEFAULT_SETTINGS` and leaves the second alone.
+   *
+   * WHERE IT IS CALLED, and where it deliberately is not:
+   *
+   *   called   `ingest()` (a dropped/chosen/captured recording, and a MIDI file),
+   *            `ingestScoreFile()` (MusicXML, Guitar Pro, and a recognised printed score),
+   *            `createBlankScore()`.
+   *   NOT      `ingestRiffsheetDocument()` and the session restore — a saved document carries
+   *            its own values and `applyDocumentSettingsToStore` is what honours them, which is
+   *            the exact opposite question. Nor `retranscribe()`, which is the SAME take heard
+   *            again and must keep the tuning you set for it.
+   *
+   * It runs BEFORE each caller's own `settings.set`, because those calls are the take's real
+   * answers (a score file's tuning, a blank score's clef) and must survive the reset.
+   */
+  private resetTakeScopedSettings(): void {
+    this.settings.set(takeScopedDefaults());
+  }
+
   /** Hand the store back to the player's own preferences. Called when a document is closed. */
   private releaseDocumentSettings(): void {
     if (this.documentOverrides.size === 0) return;
@@ -713,6 +782,13 @@ class App {
     }
 
     if (!options?.secondary) this.watchHostTimeline();
+    // The engine watch runs for as long as this window is open (H8), so it needs to know when
+    // the window stops being one. Installed here rather than in `pollEngine()`, which is called
+    // from four places and would otherwise stack four listeners.
+    if (!options?.secondary) this.watchEngineVisibility();
+    // …and start asking. `pollEngine()` re-arms itself from here on, whether or not the first
+    // answer is "nothing running" — which is the whole of the externally-started-server fix.
+    this.pollEngine();
 
     // Which engines exist, and which one is in charge. Asked once at boot rather than polled:
     // the settings panel keeps it fresh while it is open, and the main menu only needs to be
@@ -770,6 +846,11 @@ class App {
     if (list.configuredEngine && list.configuredEngine !== this.settings.get().engineId) {
       this.settings.set({ engineId: list.configuredEngine });
     }
+    // The chip names an engine out of THIS list (H8, `listenerName()`), and the list arrives on
+    // its own schedule — a promise resolved some time after boot. Without this the chip keeps
+    // whatever it could say before the names were known, which on a machine with a server
+    // already running is "The listener" for the whole session.
+    this.refreshEngineChip();
     this.renderOpening();
   }
 
@@ -927,6 +1008,74 @@ class App {
     );
   }
 
+  /**
+   * RECENT FILES, AS ONE LINE UNDER "CHOOSE A FILE" (H12).
+   *
+   * It used to be a column of its own down the right-hand side of the menu — a heading, eight
+   * rows, and its own scroller — which made the first screen of the app half a file browser for
+   * work you had already finished. It is a drop-down now, directly under the button it belongs
+   * with: opening something you had open before is the same act as opening something new, and it
+   * is not the reason anybody arrives at this screen.
+   *
+   * IT IS AN ACTION, NOT A STATE. The first option is a label rather than a value, and the
+   * selection is put straight back to it after a pick, so the control never sits there claiming
+   * to be "on" a file. Picking one runs the same call the old rows did, confirm dialog and all.
+   *
+   * THE NAMES: middle-truncated, never end-truncated. `text-overflow` cuts the tail, and the
+   * tail of a filename is the half that identifies it — "Bass take 3 — bridge idea (fina…" and
+   * "Bass take 3 — bridge idea (fina…" are two different files with one name. Both ends survive,
+   * the age is appended, and the WHOLE name is in the option's own tooltip. A drop-down option is
+   * the one place the app is allowed to shorten a name, because the full one is always one hover
+   * away and the list would otherwise be as wide as somebody's deepest folder.
+   */
+  private buildRecentPicker(recent: RecentFile[], busy: boolean): HTMLElement | null {
+    if (recent.length === 0) return null;
+    return el(
+      'div',
+      {
+        class: 'recent-pick',
+        'data-role': 'recent-pick',
+        // The drop zone wraps this and opens the file picker on a click or an Enter anywhere
+        // inside itself. Without these the recent picker could not be used at all: every press
+        // on it would open the browse dialog over the top of it.
+        onClick: (e: MouseEvent) => e.stopPropagation(),
+        onKeydown: (e: KeyboardEvent) => e.stopPropagation()
+      },
+      el('label', { class: 'recent-pick-label', for: 'riffsheet-recent', text: 'Recent files' }),
+      el(
+        'select',
+        {
+          id: 'riffsheet-recent',
+          class: 'recent-select',
+          'data-role': 'recent-select',
+          disabled: busy,
+          title: t(TIPS.recent),
+          onChange: (e: Event) => {
+            const box = e.currentTarget as HTMLSelectElement;
+            const index = Number(box.value);
+            // Back to the label immediately, before the open — which may put up a confirm
+            // dialog, and a picker frozen on a file the player then declined would be a lie.
+            box.selectedIndex = 0;
+            const entry = recent[index];
+            if (entry && !busy) void this.openRecentFromMenu(entry);
+          }
+        },
+        el('option', {
+          value: '',
+          selected: true,
+          text: recent.length === 1 ? '1 recent file' : `${recent.length} recent files`
+        }),
+        ...recent.map((r, index) =>
+          el('option', {
+            value: String(index),
+            text: `${middleTruncate(r.name, 42)} · ${relativeTime(r.at)}`,
+            title: r.name
+          })
+        )
+      )
+    );
+  }
+
   private renderOpening(): void {
     if (this.runtime.get().screen !== 'opening') return;
     const rt = this.runtime.get();
@@ -971,7 +1120,8 @@ class App {
           e.stopPropagation();
           if (!rt.busy) void this.chooseFileFromMenu();
         }
-      })
+      }),
+      this.buildRecentPicker(recent, !!rt.busy)
     );
 
     // Depth-counted drag tracking: dragleave fires for every child, so a plain boolean
@@ -1045,22 +1195,20 @@ class App {
       el(
         'div',
         { class: 'dropzone-screen' },
-        // TWO COLUMNS, AND THE PAGE DOES NOT SCROLL (F12).
+        // ONE CENTRED COLUMN, AND THE PAGE DOES NOT SCROLL (H12).
         //
-        // It was one centred 640px column with everything stacked in it, which had two faults
-        // at once on any ordinary window: most of the width was empty margin, and the stack was
-        // taller than the pane, so the main menu — the first screen anybody sees — arrived with
-        // a scrollbar and its footer below the fold. The Recent list was the tallest thing in
-        // it and the least urgent.
+        // The history is worth keeping because this screen has now been laid out three ways.
+        // It was one centred 640px column of everything, which arrived with a scrollbar and its
+        // footer below the fold. It was then TWO columns — what you DO on the left, what you had
+        // done BEFORE on the right — which fixed the scrollbar by giving the Recent list a
+        // column of its own.
         //
-        // So: what you DO on the left, what you have done BEFORE on the right, side by side.
-        // Neither wrapper exists to be styled prettily — they exist because a grid cannot put
-        // six flat siblings into two columns without naming every one of them, and a list of
-        // `grid-row` numbers is a layout that breaks the next time a control is added.
-        //
-        // Below the breakpoint the two wrappers stack and the screen goes back to being one
-        // column, which is the right answer for a narrow plugin window and is what the CSS
-        // does with no help from here.
+        // The Recent LIST is gone (see `buildRecentPicker`): it is a drop-down under "Choose a
+        // file" now, one line instead of a third of the screen. With it gone there is no second
+        // column left to balance, and a two-track grid with one empty track is just an off-centre
+        // page — which is what it looked like. So: one column, centred in the pane, with the
+        // footer under it. The wrapper stays because a flex column is what packs these six
+        // siblings; it is no longer a "left-hand track".
         el(
           'div',
           { class: 'menu-actions', 'data-role': 'menu-actions' },
@@ -1125,55 +1273,18 @@ class App {
               el('span', { class: 'dim', text: 'Press play in your DAW — recording starts by itself.' })
           )
         ),
+        // THE RECENT LIST IS GONE FROM HERE (H12) — it is the drop-down under "Choose a file".
+        // The footer is what is left of the old side column, and it sits under the one column
+        // rather than beside it.
         el(
-          'div',
-          { class: 'menu-side', 'data-role': 'menu-side' },
-          recent.length > 0 &&
-            el(
-              'div',
-              { class: 'recent' },
-              el('h2', { text: 'Recent' }),
-              // The items get a scroller of their OWN, capped at about six rows (styles.css
-              // §.recent-list). Eight entries are remembered and eight are offered — the list
-              // is not shortened, only the space it is allowed to take from the things above
-              // it, which is what stopped the menu fitting on a screen in the first place.
-              el(
-                'div',
-                { class: 'recent-list', 'data-role': 'recent-list' },
-                ...recent.map((r) =>
-                  el(
-                    'div',
-                    {
-                      class: 'recent-item',
-                      title: t(TIPS.recent),
-                      // Actually opens it. This used to be a stub that answered the click with
-                      // "re-opening by name needs the host bridge" — which was simply untrue: the
-                      // path is stored right here and `loadAudioPath` has existed on the bridge all
-                      // along. Nobody wired the two together.
-                      onClick: () => void this.openRecentFromMenu(r)
-                    },
-                    // MIDDLE-TRUNCATED, NOT END-TRUNCATED (G1). CSS `text-overflow: ellipsis`
-                    // cuts the tail, and the tail of a filename is the half that identifies it
-                    // — "Bass take 3 — bridge idea (fina…" and "Bass take 3 — bridge idea
-                    // (fina…" are the same string for two different files. Keeping both ends
-                    // keeps the name and the take number, which is what anybody is scanning
-                    // this list for. The whole name is in the tooltip.
-                    el('span', { class: 'recent-name', text: middleTruncate(r.name, 34), title: r.name }),
-                    el('span', { class: 'when', text: relativeTime(r.at) })
-                  )
-                )
-              )
-            ),
-          el(
-            'footer',
-            { class: 'opening-footer' },
-            el('button', {
-              class: 'ghost legal-link',
-              text: 'About & licenses',
-              'data-role': 'about-licenses',
-              onClick: () => this.showAboutDialog()
-            })
-          )
+          'footer',
+          { class: 'opening-footer' },
+          el('button', {
+            class: 'ghost legal-link',
+            text: 'About & licenses',
+            'data-role': 'about-licenses',
+            onClick: () => this.showAboutDialog()
+          })
         )
       ),
       this.toastLayer()
@@ -1466,6 +1577,9 @@ class App {
     const [numerator, denominator] = options.meter.split('/').map(Number);
     const bars = Math.max(1, Math.min(512, Math.round(options.bars) || 8));
     const durationSec = bars * numerator * (4 / denominator) * (60 / tempo);
+    // A NEW SCORE is a new take (H4): the fret count, tuning, capo, quantizer and roll grid go
+    // back to the defaults, and the form's own answers below are then applied over them.
+    this.resetTakeScopedSettings();
     this.settings.set({
       instrument: 'auto',
       tabMode: options.tabMode,
@@ -2028,6 +2142,9 @@ class App {
       }
     }
 
+    // A NEW TAKE (H4). The reset happens after the part picker, so a cancelled import leaves
+    // the open take exactly as it was.
+    this.resetTakeScopedSettings();
     this.settings.set({
       // A symbolic file describes its own pitches. Never let a Bass/Guitar
       // choice left over from the previous take invent tablature positions or
@@ -2221,6 +2338,10 @@ class App {
   private async ingest(input: AudioFileRef | CaptureResult, displayName?: string): Promise<void> {
     try {
       const name = displayName ?? ('name' in input ? input.name : 'Captured take');
+      // A NEW TAKE, so the take's own settings start from the defaults rather than from
+      // whatever the last one was set to (H4). Before the per-format `settings.set` calls
+      // below, which are this take's real answers.
+      this.resetTakeScopedSettings();
 
       // --- MIDI: notes already known, no listening required -------------------
       if (!('pcm' in input) && input.bytes && isMidiFile(input.name, input.bytes)) {
@@ -2731,20 +2852,36 @@ class App {
   }
 
   /**
-   * Watch the listener, but only while there is something to watch.
+   * Watch the listener — and keep watching after it has gone (H8).
    *
    * The engine is a Python process holding about a gigabyte, and the player's objection was
-   * exactly that: it should not be sitting there when nothing is being transcribed. It now dies
-   * the moment a transcription ends, and this is what makes that visible — a chip that appears
-   * while it is up, says what it is costing, and disappears again on its own.
+   * exactly that: it should not be sitting there when nothing is being transcribed. It dies the
+   * moment a transcription ends, and this is what makes that visible — a chip that appears while
+   * it is up, says what it is costing, and disappears again on its own.
    *
-   * The poll stops as soon as the engine does, so an idle plugin polls nothing — which is now
-   * the normal state, not a five-minute exception. That is the whole reason it is gated on the
-   * answer rather than on the screen being open.
+   * THE REPORTED FAULT. "I started a MuScriptor server myself, in the browser, and the chip never
+   * appeared." The poll used to re-arm ITSELF ONLY WHILE THE ENGINE WAS UP — "an idle plugin
+   * polls nothing" — which is airtight for a server Riffsheet started, because Riffsheet knows
+   * when it starts one. It is exactly wrong for a server somebody ELSE started: down at boot
+   * means down forever, because the one thing that would have noticed had switched itself off.
+   * `EngineStatus.externalServer` is the shell's word for that case and `engineProcessAlive()`
+   * already reads it; nothing was ever asking again.
+   *
+   * SO IT ALWAYS RE-ARMS, at two cadences. Up: every 10s, which is the state where the figure on
+   * the chip is changing. Down: every `ENGINE_IDLE_POLL_MS`, which is what makes an
+   * externally-started server appear within about eight seconds and vanish about eight seconds
+   * after it is stopped. That is one cheap status call every eight seconds while a window is
+   * open — the payload is a compiled-in table plus a cached status on the shell side.
+   *
+   * AND ONLY WHILE THE WINDOW IS VISIBLE. A hidden plugin editor is not a window anybody is
+   * reading a chip in, and browsers throttle its timers to once a minute anyway, which would make
+   * the cadence a fiction. `watchEngineVisibility()` polls immediately on the way back, so
+   * returning to the window is never a wait.
    */
   private pollEngine(): void {
     if (!this.bridge.engineStatus) return;
     window.clearTimeout(this.engineTimer);
+    if (document.visibilityState === 'hidden') return;
     void this.bridge
       .engineStatus()
       .then((status) => {
@@ -2755,12 +2892,39 @@ class App {
         // exist stayed on screen and kept re-arming its own timer.
         const isUp = this.engineProcessAlive();
         if (wasUp !== isUp || (isUp && this.runtime.get().screen === 'main')) this.refreshEngineChip();
-        // Only keep asking while it is actually running.
-        if (isUp) this.engineTimer = window.setTimeout(() => this.pollEngine(), 10000);
+        this.armEnginePoll(isUp);
       })
       .catch(() => {
         this.engine = null;
+        // A failed status call is not proof there is no engine — a shell can be busy or briefly
+        // unreachable — and it must not be the thing that stops the watch for good. That is the
+        // same shape of bug as the one above, arrived at from the error path.
+        this.armEnginePoll(false);
       });
+  }
+
+  /** One writer for the poll timer, so the two cadences cannot drift apart. */
+  private armEnginePoll(isUp: boolean): void {
+    window.clearTimeout(this.engineTimer);
+    if (document.visibilityState === 'hidden') return;
+    this.engineTimer = window.setTimeout(
+      () => this.pollEngine(),
+      isUp ? ENGINE_LIVE_POLL_MS : ENGINE_IDLE_POLL_MS
+    );
+  }
+
+  /**
+   * Stop asking while nobody is looking, and ask again the moment they are.
+   *
+   * Installed once, from `start()`. Without the second half, coming back to a window that had
+   * been hidden for an hour would show whatever the chip said when it was hidden until the next
+   * tick — and the tick is what was hidden.
+   */
+  private watchEngineVisibility(): void {
+    document.addEventListener('visibilitychange', () => {
+      if (document.visibilityState === 'hidden') window.clearTimeout(this.engineTimer);
+      else this.pollEngine();
+    });
   }
 
   /**
@@ -2806,11 +2970,30 @@ class App {
     );
   }
 
-  /** The engine doing the listening, by the name the player chose it under. */
+  /**
+   * The engine ACTUALLY RUNNING, by the name it is offered under.
+   *
+   * THE PAYLOAD FIRST, and that is the fix (H8). This used to read the player's `engineId` and
+   * fall back to what `auto` resolved to — i.e. it named the engine that WOULD listen, and then
+   * that name was printed on a chip whose whole meaning is "a listener process is up right now".
+   * Those are two different questions, and the reported case is exactly where they part company:
+   * a MuScriptor server somebody started by hand, while the player has Riffsheet's own bass
+   * engine selected. `engineStatus().id` is the shell's word for which engine the status
+   * describes, so a chip drawn from it says whose process is holding the memory. The Stop button
+   * has always acted on that server rather than on the selection, so the two now agree.
+   *
+   * The old route stays as the fallback for a single-engine shell, which sends no `id` at all.
+   */
   private listenerName(): string {
     const list = this.engineList;
     const chosen = this.settings.get().engineId;
-    const id = chosen && chosen !== 'auto' ? chosen : (list?.resolvedEngine ?? '');
+    const running = this.engine?.id;
+    const id = running || (chosen && chosen !== 'auto' ? chosen : (list?.resolvedEngine ?? ''));
+    // "The listener" when the name is not known, and NEVER the raw id dressed up as one: an id
+    // is lower-case and a brand is not, so `muscriptor` comes out as "Muscriptor" — a name for
+    // a product nobody ships. A generic noun is honest; a mangled brand is not. The list is
+    // asked for at boot and the chip is redrawn when it lands (see `loadEngines`), so the
+    // unnamed case is a shell that does not publish a catalogue at all.
     return list?.engines.find((e) => e.id === id)?.name ?? 'The listener';
   }
 
@@ -4550,6 +4733,191 @@ class App {
     };
 
     /**
+     * H8 — the engine chip, for a server RIFFSHEET DID NOT START.
+     *
+     * THE REPORT: "I started a MuScriptor server myself and the chip never appeared." The poll
+     * used to re-arm only while the engine was up, so one negative answer at boot ended the
+     * watch for good; and the chip's label came from the player's engine SELECTION rather than
+     * from the status payload, so even when it did appear it could name the wrong engine.
+     *
+     * Both are driven here against a STUBBED `engineStatus`, because the browser mock's external
+     * server cannot be started again once stopped and neither half of this is about the mock.
+     * Phase one answers "nothing is running" and counts how many times the app asks anyway —
+     * a poll that died after a negative answer is asked exactly once. Phase two answers with a
+     * MuScriptor server the player has NOT selected, and reads the chip's own text back.
+     */
+    (window as unknown as Record<string, unknown>).__RIFFSHEET_ENGINEPOLL__ = async () => {
+      const realStatus = this.bridge.engineStatus;
+      const engineBefore = this.engine;
+      const chip = () => this.root.querySelector<HTMLElement>('[data-role="engine-chip"]');
+      const base = {
+        port: 0,
+        adopted: false,
+        model: 'stub',
+        installedModels: [],
+        busy: false,
+        queueLength: 0,
+        queuePosition: 0,
+        memoryMb: null
+      };
+      let asked = 0;
+      try {
+        // --- 1. NOTHING IS RUNNING, over and over -------------------------------------
+        this.bridge.engineStatus = (async () => {
+          asked += 1;
+          return { ...base, state: 'stopped', externalServer: false } as EngineStatus;
+        }) as typeof this.bridge.engineStatus;
+        this.pollEngine();
+        await new Promise((done) => setTimeout(done, ENGINE_IDLE_POLL_MS + 1500));
+        const askedWhileDown = asked;
+        const hiddenWhileDown = chip()?.style.display === 'none';
+
+        // --- 2. …AND THEN SOMEBODY ELSE'S SERVER APPEARS ------------------------------
+        // A MuScriptor the player has not chosen: `engineId` is whatever this run is set to,
+        // and the chip must name what is RUNNING rather than what is selected.
+        this.bridge.engineStatus = (async () => {
+          asked += 1;
+          return {
+            ...base,
+            state: 'ready',
+            port: 8223,
+            id: 'muscriptor',
+            externalServer: true,
+            canStopExternal: true,
+            memoryMb: 1300
+          } as EngineStatus;
+        }) as typeof this.bridge.engineStatus;
+        const appearedBy = Date.now();
+        // Not called directly — the WAIT is the claim. The timer armed by the negative answer
+        // above is the only thing that can notice this, which is the whole regression.
+        await new Promise((done) => setTimeout(done, ENGINE_IDLE_POLL_MS + 1500));
+        const box = chip();
+        return {
+          /** Asked more than once while the answer was "nothing running". The poll survived. */
+          askedWhileDown,
+          idlePollMs: ENGINE_IDLE_POLL_MS,
+          livePollMs: ENGINE_LIVE_POLL_MS,
+          hiddenWhileDown,
+          /** How long the chip took to notice a server nobody told the app about. */
+          noticedMs: Date.now() - appearedBy,
+          chipShown: !!box && box.style.display !== 'none',
+          chipText: box?.querySelector('[data-role="engine-text"]')?.textContent ?? null,
+          /** What the player has selected — deliberately NOT what the chip should be naming. */
+          selectedEngine: this.settings.get().engineId,
+          alive: this.engineProcessAlive()
+        };
+      } finally {
+        this.bridge.engineStatus = realStatus;
+        this.engine = engineBefore;
+        this.pollEngine();
+      }
+    };
+
+    /**
+     * H4 — "I set the fret count to 22 once and every project since starts at 22", driven end
+     * to end through the door the player actually uses.
+     *
+     * NOT a call to `resetTakeScopedSettings()`. That would prove the helper works and nothing
+     * about whether anything calls it, which is exactly the half that was missing. This answers
+     * the take's questions the way the reporter did, then makes A NEW TAKE through
+     * `createBlankScore` — including the "this will replace your current work" dialog, which is
+     * answered here the way a person answers it — and reads every take-scoped key back.
+     *
+     * It leaves the demo take behind it, so verify.mjs runs it last and reloads the fixture.
+     */
+    (window as unknown as Record<string, unknown>).__RIFFSHEET_TAKESCOPE__ = async () => {
+      const snapshot = () => {
+        const s = this.settings.get() as unknown as Record<string, unknown>;
+        const out: Record<string, unknown> = {};
+        for (const key of TAKE_SCOPED_SETTING_KEYS) out[key] = s[key];
+        return out;
+      };
+      const before = { ...this.settings.get() };
+      const globalBefore = { ...this.globalSettings };
+      const overridesBefore = new Set(this.documentOverrides);
+      try {
+        // 1. THE PLAYER ANSWERS THIS TAKE'S QUESTIONS. Every one of them a value nothing
+        //    defaults to, so "it came back to the default" cannot be an accident.
+        this.settings.set({
+          maxFret: 22,
+          capo: 4,
+          anchorFret: 7,
+          fingering: 'minimize-movement',
+          tabMode: 'guitar',
+          clefMode: 'treble',
+          grid: 'quarter',
+          rollGrid: 'quarter',
+          rollSnap: 'grid',
+          keyFifths: 3,
+          // …and one genuine APP PREFERENCE, which must survive: a new take must not put the
+          // sound, the note names or the roll back to how they shipped.
+          playbackVoice: 'marimba',
+          showNoteNames: !before.showNoteNames
+        });
+        const chosen = snapshot();
+        const prefChosen = {
+          playbackVoice: this.settings.get().playbackVoice,
+          showNoteNames: this.settings.get().showNoteNames
+        };
+
+        // 2. A NEW TAKE. The blank score is the one new-take door that needs no file, and it
+        //    goes through the same `resetTakeScopedSettings()` the audio and score paths do.
+        const created = this.createBlankScore({
+          title: 'take-scope probe',
+          tempo: 120,
+          meter: '4/4',
+          bars: 2,
+          keyFifths: 0,
+          clefMode: 'auto',
+          tabMode: 'off'
+        });
+        for (let i = 0; i < 60; i++) {
+          const ok = this.root.querySelector<HTMLButtonElement>('[data-role="confirm-ok"]');
+          if (ok) {
+            ok.click();
+            break;
+          }
+          await new Promise((done) => setTimeout(done, 25));
+        }
+        await created;
+
+        const after = snapshot();
+        const defaults = takeScopedDefaults() as unknown as Record<string, unknown>;
+        return {
+          keys: [...TAKE_SCOPED_SETTING_KEYS],
+          chosen,
+          after,
+          /** Every take-scoped key that did NOT come back to its default. Must be empty. */
+          leaked: [...TAKE_SCOPED_SETTING_KEYS].filter(
+            (key) => JSON.stringify(after[key]) !== JSON.stringify(defaults[key])
+          ),
+          /** The reported number itself, before and after. */
+          maxFretChosen: chosen.maxFret,
+          maxFretAfter: after.maxFret,
+          maxFretDefault: defaults.maxFret,
+          /** The app preferences, which a new take must leave exactly where they were. */
+          prefChosen,
+          prefAfter: {
+            playbackVoice: this.settings.get().playbackVoice,
+            showNoteNames: this.settings.get().showNoteNames
+          }
+        };
+      } finally {
+        this.documentOverrides = overridesBefore;
+        this.applyingDocumentSettings = true;
+        try {
+          this.settings.set(before);
+        } finally {
+          this.applyingDocumentSettings = false;
+        }
+        this.globalSettings = { ...globalBefore };
+        saveSettings(this.globalSettings);
+        // Put the fixture back: this probe really did replace the open take.
+        this.loadDemo(new URLSearchParams(location.search).get('demo') ?? 'triplet');
+      }
+    };
+
+    /**
      * "It forgot the original sound" — answered as a fact rather than a theory.
      *
      * Reports the whole chain in one call: what the saved blob actually contains, what the
@@ -6123,10 +6491,11 @@ class App {
           // (4) settings
           settingsKeys: Object.keys(restoredSettings).length,
           settingsMatch: JSON.stringify(restoredSettings) === JSON.stringify(settings),
-          // The version must NOT move for an additive field: the reader rejects any version it
-          // does not know, so a bump would make every document written before it unopenable. It
-          // moved to 3 for the ZIP container, which is not additive — the whole file changed
-          // shape — and the reader takes v1 and v2 by their magic bytes instead.
+          // The version moves only when a document written now would be MISREAD by the reader
+          // before it: v3 for the ZIP container (the whole file changed shape), v4 for PARTS
+          // (a v3 reader shows the take alone and then writes the parts back out of existence).
+          // A merely additive field does not move it, because the reader takes the whole v1..vN
+          // range and an older document must keep opening.
           version: liveTrip.back.version,
           sourceName: liveTrip.back.source.name,
           peakBuckets: liveTrip.back.source.peaks?.buckets ?? 0,
@@ -6145,6 +6514,247 @@ class App {
         };
       } catch (e) {
         return { error: String((e as Error).stack ?? e) };
+      }
+    };
+
+    /**
+     * PARTS, driven end to end through the doors a player uses.
+     *
+     * The whole feature in one scenario, because every claim in it is about a TRANSITION —
+     * one part to two, two to a different order, four to a refusal — and a probe that set up
+     * each state by hand would be checking its own arrangement rather than the app's.
+     *
+     * WHAT IT ASSERTS BY MEASURING, in order:
+     *   1. the row exists on a single-part take, with the live chip marked and nothing else;
+     *   2. `[+]` takes a MusicXML file through `parseScoreFile` and it becomes a PART — a
+     *      second chip, a second alphaTab track, a second `<part-name>` in the export;
+     *   3. PLAYBACK IS UNTOUCHED. The synth schedule with the guitar on the page is compared
+     *      byte for byte against the one-part schedule taken before it was added. This is the
+     *      contract: an imported part is engraved and never played;
+     *   4. dragging the guitar chip left of the bass chip changes the EMITTED order, on the
+     *      sheet and in the MusicXML part list — driven with the same pointer events a hand
+     *      sends, not by calling the reorder directly;
+     *   5. at four parts the plus is disabled and says why.
+     *
+     * It ENDS at the two-part state, guitar above bass, because that is the state the harness
+     * photographs. `__RIFFSHEET_PARTSRESET__` puts the take back to one part afterwards.
+     */
+    (window as unknown as Record<string, unknown>).__RIFFSHEET_PARTS__ = async () => {
+      const settle = (ms: number) => new Promise((ok) => setTimeout(ok, ms));
+      const bytes = () => new TextEncoder().encode(GUITAR_PART_MUSICXML);
+
+      /** The row as somebody looking at it would describe it. */
+      const row = () => {
+        const node = this.root.querySelector<HTMLElement>('[data-role="part-chips"]');
+        if (!node) return null;
+        const chips = [...node.querySelectorAll<HTMLElement>('[data-role="part-chip"]')].map((chip) => {
+          const box = chip.getBoundingClientRect();
+          return {
+            key: chip.getAttribute('data-part'),
+            text: (chip.textContent ?? '').trim(),
+            live: chip.classList.contains('live'),
+            dot: !!chip.querySelector('.part-dot'),
+            title: chip.getAttribute('title') ?? '',
+            box: { left: box.left, right: box.right, top: box.top, bottom: box.bottom }
+          };
+        });
+        const add = node.querySelector<HTMLButtonElement>('[data-role="part-add"]');
+        const box = node.getBoundingClientRect();
+        const sheet = this.root.querySelector<HTMLElement>('.triview')?.getBoundingClientRect() ?? null;
+        return {
+          chips,
+          addPresent: !!add,
+          addDisabled: !!add?.disabled,
+          addTitle: add?.getAttribute('title') ?? '',
+          // "No new ellipsis anywhere in the row": neither the character nor three dots.
+          ellipsis: /…|\.\.\./.test(node.textContent ?? ''),
+          height: box.height,
+          // Directly above the sheet, and clear of it.
+          aboveSheet: !!sheet && box.bottom <= sheet.top + 1,
+          overlapping: chips.some((chip, i) => i > 0 && chip.box.left < chips[i - 1].box.right - 0.5)
+        };
+      };
+
+      /** The schedule the synth would play, to the microsecond. */
+      const schedule = () => {
+        const score = this.runtime.get().score;
+        if (!score) return null;
+        return this.synthNotesFor(score).map((n) => [
+          Number(n.startSec.toFixed(6)),
+          Number(n.endSec.toFixed(6)),
+          n.midi,
+          n.velocity ?? null
+        ]);
+      };
+
+      const partNames = () => {
+        const score = this.runtime.get().score;
+        if (!score) return [];
+        return [...score.musicxml().matchAll(/<part-name>([^<]*)<\/part-name>/g)].map((m) => m[1]);
+      };
+
+      const shape = () => {
+        const score = this.runtime.get().score;
+        return {
+          row: row(),
+          tracks: score?.data.tracks.length ?? 0,
+          notationOnly: (score?.data.tracks ?? []).map((track) => track.notationOnly === true),
+          parts: scoreParts(score).map((part) => `${part.role}:${part.name}`),
+          partNames: partNames(),
+          // What the SHEET actually engraved: alphaTab renders one staff system per track it
+          // was given, so this is the count a screenshot would show.
+          renderedTracks: this.triview?.api.tracks?.length ?? 0,
+          midiBytes: score ? score.midi(true).length : 0
+        };
+      };
+
+      const dragChip = (key: string, toX: number) => {
+        const chip = this.root.querySelector<HTMLElement>(`[data-part="${key}"]`);
+        if (!chip) return false;
+        const box = chip.getBoundingClientRect();
+        const base = {
+          bubbles: true,
+          button: 0,
+          buttons: 1,
+          pointerId: 7,
+          pointerType: 'mouse',
+          clientY: box.top + box.height / 2
+        };
+        chip.dispatchEvent(new PointerEvent('pointerdown', { ...base, clientX: box.left + box.width / 2 }));
+        chip.dispatchEvent(new PointerEvent('pointermove', { ...base, clientX: toX }));
+        chip.dispatchEvent(new PointerEvent('pointerup', { ...base, clientX: toX }));
+        return true;
+      };
+
+      try {
+        if (!this.runtime.get().score) return { error: 'no score' };
+        const single = { ...shape(), schedule: schedule() };
+
+        await this.addPartFromMusicXml('Guitar demo.musicxml', bytes());
+        await settle(30);
+        const two = { ...shape(), schedule: schedule() };
+
+        // Guitar above bass: drop it to the left of the live chip's left edge.
+        const liveBox = two.row?.chips.find((chip) => chip.key === 'live')?.box;
+        const dragged = dragChip('imp1', (liveBox?.left ?? 40) - 20);
+        await settle(30);
+        const reordered = { ...shape(), schedule: schedule() };
+
+        // --- the chip's own menu: rename, nudge, remove -----------------------------------
+        // Opened the way a finger opens it: press and release on the chip without moving.
+        const clickChip = (key: string) => {
+          const chip = this.root.querySelector<HTMLElement>(`[data-part="${key}"]`);
+          if (!chip) return null;
+          const box = chip.getBoundingClientRect();
+          const at = {
+            bubbles: true,
+            button: 0,
+            buttons: 1,
+            pointerId: 8,
+            pointerType: 'mouse',
+            clientX: box.left + box.width / 2,
+            clientY: box.top + box.height / 2
+          };
+          chip.dispatchEvent(new PointerEvent('pointerdown', at));
+          chip.dispatchEvent(new PointerEvent('pointerup', at));
+          return document.querySelector<HTMLElement>('[data-role="part-menu"]');
+        };
+        const typeInto = (role: string, value: string) => {
+          const input = document.querySelector<HTMLInputElement>(`[data-role="${role}"]`);
+          if (!input) return false;
+          input.value = value;
+          input.dispatchEvent(new Event('change', { bubbles: true }));
+          return true;
+        };
+
+        const menu = clickChip('imp1');
+        const menuShape = menu
+          ? {
+              open: true,
+              hasRename: !!menu.querySelector('[data-role="part-rename"]'),
+              hasNudge: !!menu.querySelector('[data-role="part-nudge"]'),
+              hasRemove: !!menu.querySelector('[data-role="part-remove"]'),
+              nudgeStart: menu.querySelector<HTMLInputElement>('[data-role="part-nudge"]')?.value ?? null
+            }
+          : { open: false };
+        const renamed = typeInto('part-rename', 'Rhythm gtr');
+        await settle(30);
+        const afterRename = shape();
+        clickChip('imp1');
+        const nudged = typeInto('part-nudge', '60');
+        await settle(30);
+        const afterNudge = shape();
+        // …and back, so what follows is the fixture the rest of the run expects.
+        clickChip('imp1');
+        typeInto('part-nudge', '0');
+        await settle(20);
+        clickChip('imp1');
+        typeInto('part-rename', 'Guitar');
+        await settle(20);
+
+        // Remove, from the menu, and then put it back — the removal is the claim, the re-add is
+        // the scenario continuing.
+        clickChip('imp1');
+        document.querySelector<HTMLElement>('[data-role="part-remove"]')?.click();
+        await settle(30);
+        const afterRemove = shape();
+        await this.addPartFromMusicXml('Guitar demo.musicxml', bytes());
+        await settle(30);
+
+        // Fill to the cap. Three more would be five, so two more is exactly four.
+        await this.addPartFromMusicXml('Second.musicxml', bytes());
+        await this.addPartFromMusicXml('Third.musicxml', bytes());
+        await settle(30);
+        const full = shape();
+        let refusedFifth = false;
+        try {
+          await this.addPartFromMusicXml('Fourth.musicxml', bytes());
+        } catch {
+          refusedFifth = true;
+        }
+        const afterFifth = shape();
+
+        // Back to the two-part state the screenshot wants: bass plus the guitar, guitar on top.
+        const keep = this.partSlots().flatMap((slot) =>
+          slot.kind === 'imported' && slot.part.id === 'imp1' ? [slot.part] : []
+        );
+        this.setParts(keep, ['imp1', LIVE_PART_ID]);
+        await settle(30);
+        const ending = shape();
+
+        const same = (a: unknown, b: unknown) => JSON.stringify(a) === JSON.stringify(b);
+        return {
+          single,
+          two,
+          dragged,
+          reordered,
+          menuShape,
+          renamed,
+          afterRename,
+          nudged,
+          afterNudge,
+          afterRemove,
+          full,
+          refusedFifth: refusedFifth || afterFifth.tracks === 4,
+          ending,
+          // THE CONTRACT. Adding a notation-only part changes nothing the synth does.
+          scheduleIdenticalWithPart: same(single.schedule, two.schedule),
+          scheduleIdenticalAfterReorder: same(single.schedule, reordered.schedule)
+        };
+      } catch (e) {
+        return { error: String((e as Error).stack ?? e) };
+      }
+    };
+
+    /** Put the take back to one part, so nothing downstream of the parts probe inherits four. */
+    (window as unknown as Record<string, unknown>).__RIFFSHEET_PARTSRESET__ = () => {
+      try {
+        this.activePartKey = LIVE_PART_ID;
+        this.setParts([], [LIVE_PART_ID]);
+        const score = this.runtime.get().score;
+        return { tracks: score?.data.tracks.length ?? 0, parts: scoreParts(score).length };
+      } catch (e) {
+        return { error: String(e) };
       }
     };
   }
@@ -6217,26 +6827,83 @@ class App {
    * through here so they cannot disagree about anything except the notes they were handed.
    */
   private buildScoreFrom(source: SourceAudio, notes: InputNote[]): RiffScore {
-    return buildRiffScore(
-      {
-        notes,
-        beats: source.detected?.beats,
-        downbeats: source.detected?.downbeats,
-        audioDurationSec: source.durationSec,
-        blankBars: source.documentBars,
-        // The pipeline anchors bar 1 / beat 1 here and KEEPS anything before it as an
-        // anacrusis, so auto-trim and the user's marker are the same knob.
-        startOffsetSec: source.barOneSec,
-        hostGrid: this.effectiveHostGrid(),
-        title: source.name.replace(/\.[^.]+$/, '')
-      },
-      {
-        ...this.settings.get(),
-        tempoBpm: source.tempoBpm,
-        timeSignature: source.timeSignature,
-        keyFifths: source.keyFifths
+    const request = {
+      notes,
+      beats: source.detected?.beats,
+      downbeats: source.detected?.downbeats,
+      audioDurationSec: source.durationSec,
+      blankBars: source.documentBars,
+      // The pipeline anchors bar 1 / beat 1 here and KEEPS anything before it as an
+      // anacrusis, so auto-trim and the user's marker are the same knob.
+      startOffsetSec: source.barOneSec,
+      hostGrid: this.effectiveHostGrid(),
+      title: source.name.replace(/\.[^.]+$/, '')
+    };
+    const settings = {
+      ...this.settings.get(),
+      tempoBpm: source.tempoBpm,
+      timeSignature: source.timeSignature,
+      keyFifths: source.keyFifths
+    };
+    // ONE PART IS NOT A SPECIAL CASE OF TWO — it is the path this app has always taken, and it
+    // is left on it. The pipeline guarantees `buildMultiPartScore([one])` is byte-identical to
+    // `buildScore`, so routing everything through the multi-part door would be defensible; not
+    // routing it there is stronger, because a take with no imported parts then executes not one
+    // line of the parts code and cannot be changed by it.
+    const slots = this.partSlots(source);
+    if (slots.length < 2) return buildRiffScore(request, settings);
+    return buildPartedRiffScore(request, settings, slots);
+  }
+
+  // =========================================================================
+  // Parts — several instruments on one sheet (score/parts.ts)
+  // =========================================================================
+
+  /** The parts of the document in printed order. Always at least the live take. */
+  private partSlots(source?: SourceAudio | null): PartSlot[] {
+    const take = source ?? this.runtime.get().source;
+    return orderedPartSlots(take?.importedParts, take?.partOrder);
+  }
+
+  /**
+   * Write a new parts list onto the take and re-engrave.
+   *
+   * `runtime.source` rather than `editedSource()`: parts are a property of the DOCUMENT, not of
+   * the cut-down view of the recording, and `editedSource` derives itself from this object.
+   */
+  private setParts(imported: ImportedPart[], order: string[]): void {
+    const source = this.runtime.get().source;
+    if (!source) return;
+    this.runtime.set({
+      source: {
+        ...source,
+        importedParts: imported.length ? imported : undefined,
+        partOrder: imported.length ? order : undefined
       }
-    );
+    });
+    // Nothing about the PERFORMANCE changed, so the player's notation edits are still about the
+    // notes they were made on: `keepEdits` defaults true and the ids are the same ids.
+    this.rebuildNotation();
+    this.renderMain();
+    this.scheduleSave();
+  }
+
+  /** Which chip is lit. The roll and playback are the live part's whatever this says. */
+  private activePartKey = LIVE_PART_ID;
+
+  /**
+   * True for a note id that belongs to an imported part.
+   *
+   * The pipeline namespaces every part after the first (`p2-`, `p3-`, …) and hands the prefix
+   * back on `PartBuild.idPrefix`, so this is read off the build rather than pattern-matched.
+   * v1 EDITS THE LIVE PART ONLY: an imported chart is somebody else's engraving, and dragging a
+   * notehead on it would write into a note list the performance has never heard of.
+   */
+  private isImportedNoteId(id: string): boolean {
+    for (const part of scoreParts(this.runtime.get().score)) {
+      if (part.role === 'imported' && part.idPrefix && id.startsWith(part.idPrefix)) return true;
+    }
+    return false;
   }
 
   /**
@@ -6821,6 +7488,35 @@ class App {
     );
   }
 
+  /**
+   * EVERY PART ON THE PAGE, not only the top one.
+   *
+   * `TriView.load()` engraves `renderScore(model, [0])` — the right answer, and the only one,
+   * for every score this app has ever built, because a single-part score has exactly one
+   * alphaTab track. A multi-part score has N, and alphaTab renders the ones it is handed.
+   *
+   * ASKED FOR FROM HERE, through `api`, which is TriView's own public handle onto alphaTab.
+   *
+   * AND ASKED FOR TWICE, which is not belt-and-braces. TriView holds renders back behind its
+   * own gate — a freshly built view defers its first render until alphaTab's facade has come up
+   * — so on a fresh screen the `renderScore(…, [0])` happens AFTER this returns and puts the
+   * selection back to one track. The call below covers the ordinary rebuild, where the gate is
+   * open and the render has already happened; the `postRenderFinished` subscription made when
+   * the view is built covers the deferred one, and stops as soon as the count agrees.
+   *
+   * A SINGLE-PART TAKE NEVER REACHES THE SECOND LINE OF THIS. It engraves exactly once, exactly
+   * as it always has.
+   */
+  private renderEveryPart(): void {
+    const view = this.triview;
+    const score = this.runtime.get().score;
+    if (!view || !score || score.data.tracks.length < 2) return;
+    const model = view.model;
+    if (!model || model.tracks.length < 2) return;
+    if ((view.api.tracks?.length ?? 0) >= model.tracks.length) return;
+    view.api.renderTracks(model.tracks);
+  }
+
   private applyScoreToViews(score: RiffScore): void {
     // See §syncViewports: the aligned window must survive this rebuild unchanged, or adding one
     // note re-spaces the picture of the performance around it.
@@ -6830,6 +7526,7 @@ class App {
     }
     this.refreshTempoBox();
     this.triview?.load(score);
+    this.renderEveryPart();
     // Bar 1 is the roll's time origin — without it a count-in slides the whole roll off
     // the waveform above it. See view/pianoroll.ts.
     this.pianoRoll?.setBarOne(this.runtime.get().source?.barOneSec ?? 0);
@@ -7186,6 +7883,375 @@ class App {
     const maxScroll = Math.max(1, v.contentWidth - v.viewportWidth);
     thumb.style.width = `${Math.max(6, frac * 100)}%`;
     thumb.style.left = `${(v.scrollLeft / maxScroll) * (100 - Math.max(6, frac * 100))}%`;
+  }
+
+  // =========================================================================
+  // The part chips — one thin row, directly above the sheet
+  // =========================================================================
+
+  /**
+   * `[● Bass] [Guitar] [+]`, and on a take that has never had a part added, `[● Bass] [+]`.
+   *
+   * IT IS DELIBERATELY ALMOST NOTHING. This app is already more chrome than music, and the row
+   * has to earn a strip of the page on a take that will never use it — so it is one line of small
+   * pills with no heading, no border and no label, and the whole of it on a single-part take is
+   * the name of the instrument and a plus.
+   *
+   * THE DOT IS THE POINT. The live part — the take this plugin recorded, the one the roll draws
+   * and the one you hear — is permanently accent-filled and carries a dot, whether or not it is
+   * the chip you last clicked and wherever in the order it has been dragged. Everything else on
+   * this screen is about that part, and a row where you cannot tell which chip that is would be
+   * worse than no row.
+   */
+  private buildPartChips(): HTMLElement {
+    const slots = this.partSlots();
+    const full = slots.length >= MAX_SCORE_PARTS;
+    const liveName = livePartName(this.settings.get());
+
+    const chips = slots.map((slot) => {
+      const live = slot.kind === 'live';
+      const key = live ? LIVE_PART_ID : slot.part.id;
+      const name = live ? liveName : slot.part.name;
+      const nudged = !live && slot.part.nudgeMs !== 0;
+      const chip = el(
+        'button',
+        {
+          class: `chip part-chip${live ? ' live on' : ''}${this.activePartKey === key ? ' selected' : ''}`,
+          'data-role': 'part-chip',
+          'data-part': key,
+          'aria-pressed': String(this.activePartKey === key),
+          title: live
+            ? 'Live — transcribed from this track'
+            : `${name} — imported notation. Click for rename, nudge and remove.`,
+          onContextMenu: (e: MouseEvent) => {
+            if (live) return;
+            e.preventDefault();
+            this.activePartKey = key;
+            this.openPartMenu(chip, slot.part);
+          },
+          onPointerDown: (e: PointerEvent) => this.beginPartDrag(e, key)
+        },
+        live ? el('span', { class: 'part-dot', 'aria-hidden': 'true', text: '●' }) : null,
+        el('span', { class: 'part-name', text: name }),
+        nudged
+          ? el('span', {
+              class: 'part-nudge',
+              text: `${slot.part.nudgeMs > 0 ? '+' : ''}${Math.round(slot.part.nudgeMs)}ms`
+            })
+          : null
+      );
+      return chip;
+    });
+
+    return el(
+      'div',
+      { class: 'part-chips', 'data-role': 'part-chips', role: 'toolbar', 'aria-label': 'Parts' },
+      ...chips,
+      el('button', {
+        class: 'chip part-add',
+        'data-role': 'part-add',
+        text: '+',
+        disabled: full,
+        'aria-label': 'Add a part',
+        title: full
+          ? `A sheet holds at most ${MAX_SCORE_PARTS} parts`
+          : 'Add a part from a MusicXML file',
+        onClick: () => void this.addPartFromPicker()
+      })
+    );
+  }
+
+  /**
+   * DRAG A CHIP, MOVE THE PART DOWN THE PAGE. Pointer events, not HTML5 drag-and-drop.
+   *
+   * The row is four pills wide at most, so there is nothing to auto-scroll and nothing to drop
+   * onto; what is wanted is "the thing under my finger goes where I let go of it", which is a
+   * pointer gesture. It also keeps the gesture drivable — the harness reorders the parts by
+   * sending the same three events a hand does, rather than through a back door that would prove
+   * only that the back door works.
+   *
+   * Under the threshold it is a CLICK: the live chip simply becomes active, an imported chip
+   * becomes active and opens its menu.
+   */
+  private partDrag: { key: string; startX: number; moved: boolean; mids: Array<{ key: string; mid: number }> } | null =
+    null;
+
+  private beginPartDrag(e: PointerEvent, key: string): void {
+    if (e.button !== 0) return;
+    const chip = e.currentTarget as HTMLElement;
+    const row = chip.parentElement;
+    if (!row) return;
+    const mids = [...row.querySelectorAll<HTMLElement>('[data-role="part-chip"]')].map((node) => {
+      const box = node.getBoundingClientRect();
+      return { key: node.getAttribute('data-part') ?? '', mid: box.left + box.width / 2 };
+    });
+    this.partDrag = { key, startX: e.clientX, moved: false, mids };
+    try {
+      // A synthetic PointerEvent carries an id no capture exists for, and the throw would abort
+      // the gesture before it started. The capture is a nicety; the listeners below are the drag.
+      chip.setPointerCapture?.(e.pointerId);
+    } catch {
+      /* nothing captured; pointermove/up are bound to the chip itself */
+    }
+
+    const move = (ev: PointerEvent) => {
+      const drag = this.partDrag;
+      if (!drag) return;
+      if (!drag.moved && Math.abs(ev.clientX - drag.startX) > 4) {
+        drag.moved = true;
+        chip.classList.add('dragging');
+      }
+    };
+    const up = (ev: PointerEvent) => {
+      chip.removeEventListener('pointermove', move);
+      chip.removeEventListener('pointerup', up);
+      chip.removeEventListener('pointercancel', up);
+      chip.classList.remove('dragging');
+      const drag = this.partDrag;
+      this.partDrag = null;
+      if (!drag) return;
+      if (!drag.moved) {
+        this.activePartKey = key;
+        // In place, not a re-render: the chip under the finger is about to be this menu's
+        // anchor, and replacing the row would detach it mid-gesture.
+        this.syncPartChipSelection();
+        const slot = this.partSlots().find((s) => s.kind === 'imported' && s.part.id === key);
+        if (slot && slot.kind === 'imported') this.openPartMenu(chip, slot.part);
+        return;
+      }
+      this.dropPartAt(drag, ev.clientX);
+    };
+    chip.addEventListener('pointermove', move);
+    chip.addEventListener('pointerup', up);
+    chip.addEventListener('pointercancel', up);
+  }
+
+  private dropPartAt(drag: { key: string; mids: Array<{ key: string; mid: number }> }, clientX: number): void {
+    const slots = this.partSlots();
+    const order = partOrderOf(slots);
+    const others = order.filter((k) => k !== drag.key);
+    let to = 0;
+    for (const entry of drag.mids) {
+      if (entry.key === drag.key) continue;
+      if (clientX > entry.mid) to++;
+    }
+    others.splice(Math.max(0, Math.min(others.length, to)), 0, drag.key);
+    if (others.length === order.length && others.every((k, i) => k === order[i])) {
+      this.renderMain();
+      return;
+    }
+    const imported = slots.flatMap((slot) => (slot.kind === 'imported' ? [slot.part] : []));
+    this.setParts(imported, others);
+  }
+
+  /** Rename, Nudge, Remove — everything an imported part can be told to do. */
+  private openPartMenu(anchor: HTMLElement, part: ImportedPart): void {
+    this.closePartMenu();
+    const commitName = (value: string) => {
+      const name = value.trim().slice(0, 40);
+      if (!name || name === part.name) return;
+      this.updatePart(part.id, (p) => ({ ...p, name }));
+    };
+    const nameBox = el('input', {
+      type: 'text',
+      'data-role': 'part-rename',
+      value: part.name,
+      'aria-label': 'Part name',
+      onKeyDown: (e: KeyboardEvent) => {
+        if (e.key !== 'Enter') return;
+        e.preventDefault();
+        commitName((e.target as HTMLInputElement).value);
+        this.closePartMenu();
+      },
+      onChange: (e: Event) => commitName((e.target as HTMLInputElement).value)
+    });
+    // THE STEP IS A 32ND, not a round number of milliseconds, and the box rounds to it. A nudge
+    // is a shift of PRINTED music, so the only shifts that exist are the ones the page can
+    // spell — see `snapNudgeMs`. Rounding here rather than only at the build is what stops the
+    // box showing a number that is not what happened.
+    const bpm = this.runtime.get().score?.tempoBpm ?? 120;
+    const step = nudgeStepMs(bpm);
+    const nudgeBox = el('input', {
+      type: 'number',
+      step: String(Math.round(step)),
+      'data-role': 'part-nudge',
+      value: String(Math.round(part.nudgeMs)),
+      'aria-label': 'Nudge in milliseconds',
+      title: `Move this part against the take. Rounded to a 32nd note — ${Math.round(step)} ms at this tempo.`,
+      onChange: (e: Event) => {
+        const ms = Number((e.target as HTMLInputElement).value);
+        const asked = Number.isFinite(ms) ? Math.max(-10_000, Math.min(10_000, ms)) : 0;
+        const next = Math.round(snapNudgeMs(asked, bpm));
+        if (next === part.nudgeMs) return;
+        this.updatePart(part.id, (p) => ({ ...p, nudgeMs: next }));
+      }
+    });
+
+    const popover = el(
+      'div',
+      { class: 'popover part-menu', 'data-role': 'part-menu', role: 'dialog', 'aria-label': `${part.name} part` },
+      el('label', { class: 'part-menu-row' }, el('span', { text: 'Name' }), nameBox),
+      el(
+        'label',
+        { class: 'part-menu-row' },
+        el('span', { text: 'Nudge' }),
+        nudgeBox,
+        el('span', { class: 'dim', text: 'ms' })
+      ),
+      el('button', {
+        class: 'part-menu-remove',
+        'data-role': 'part-remove',
+        text: 'Remove part',
+        onClick: () => {
+          this.closePartMenu();
+          const slots = this.partSlots();
+          const imported = slots.flatMap((slot) =>
+            slot.kind === 'imported' && slot.part.id !== part.id ? [slot.part] : []
+          );
+          this.activePartKey = LIVE_PART_ID;
+          this.setParts(
+            imported,
+            partOrderOf(slots).filter((key) => key !== part.id)
+          );
+        }
+      })
+    );
+    document.body.appendChild(popover);
+    this.partMenu = popover;
+
+    const box = anchor.getBoundingClientRect();
+    const own = popover.getBoundingClientRect();
+    popover.style.left = `${Math.max(8, Math.min(box.left, window.innerWidth - own.width - 8))}px`;
+    popover.style.top = `${
+      box.bottom + own.height > window.innerHeight - 8 ? Math.max(8, box.top - own.height - 6) : box.bottom + 6
+    }px`;
+    nameBox.focus();
+    nameBox.select?.();
+    this.syncPartChipSelection();
+
+    this.partMenuDismiss = (e: Event) => {
+      const target = e.target as Node;
+      if (popover.contains(target) || anchor.contains(target)) return;
+      this.closePartMenu();
+    };
+    // Deferred a frame: the pointerup that opened this menu is still on its way back up.
+    setTimeout(() => document.addEventListener('pointerdown', this.partMenuDismiss!, true), 0);
+  }
+
+  private partMenu: HTMLElement | null = null;
+  private partMenuDismiss: ((e: Event) => void) | null = null;
+
+  private closePartMenu(): void {
+    if (this.partMenuDismiss) document.removeEventListener('pointerdown', this.partMenuDismiss, true);
+    this.partMenuDismiss = null;
+    this.partMenu?.remove();
+    this.partMenu = null;
+  }
+
+  /**
+   * Move the active ring, and nothing else.
+   *
+   * `renderMain()` replaces the whole screen, which throws away the tri-view and re-engraves —
+   * far too much for "a different chip is lit", and it would detach the chip a menu is anchored
+   * to while the finger is still on it.
+   */
+  private syncPartChipSelection(): void {
+    for (const chip of this.root.querySelectorAll<HTMLElement>('[data-role="part-chip"]')) {
+      const on = chip.getAttribute('data-part') === this.activePartKey;
+      chip.classList.toggle('selected', on);
+      chip.setAttribute('aria-pressed', String(on));
+    }
+  }
+
+  private updatePart(id: string, change: (part: ImportedPart) => ImportedPart): void {
+    const slots = this.partSlots();
+    const imported = slots.flatMap((slot) =>
+      slot.kind === 'imported' ? [slot.part.id === id ? change(slot.part) : slot.part] : []
+    );
+    this.setParts(imported, partOrderOf(slots));
+  }
+
+  /**
+   * MUSICXML ONLY, and through the importer the app already opens MusicXML with.
+   *
+   * The difference between this and `ingestScoreFile` is one line of intent: the same parser
+   * produces the same `InputNote[]`, and the result becomes a NEW PART instead of replacing the
+   * document. Guitar Pro and MIDI are deliberately not offered — a part is a printed staff, and
+   * the formats that describe one are the MusicXML family (`.xml`, `.musicxml`, and the zipped
+   * `.mxl`, all of which `parseScoreFile` already reads).
+   */
+  private async addPartFromPicker(): Promise<void> {
+    if (this.partSlots().length >= MAX_SCORE_PARTS) return;
+    const file = await this.pickMusicXmlFile();
+    if (!file) return;
+    try {
+      await this.addPartFromMusicXml(file.name, file.bytes);
+    } catch (e) {
+      this.toast('danger', 'Could not add that part', (e as Error).message);
+    }
+  }
+
+  private pickMusicXmlFile(): Promise<{ name: string; bytes: Uint8Array } | null> {
+    return new Promise((resolve) => {
+      const input = document.createElement('input');
+      input.type = 'file';
+      input.accept = MUSICXML_ACCEPT;
+      Object.assign(input.style, {
+        position: 'fixed',
+        left: '-10000px',
+        top: '0',
+        width: '1px',
+        height: '1px',
+        opacity: '0'
+      });
+      document.body.appendChild(input);
+      const finish = async (picked: File | null) => {
+        input.remove();
+        if (!picked) return resolve(null);
+        resolve({ name: picked.name, bytes: new Uint8Array(await picked.arrayBuffer()) });
+      };
+      input.onchange = () => void finish(input.files?.[0] ?? null);
+      input.oncancel = () => void finish(null);
+      input.click();
+    });
+  }
+
+  private async addPartFromMusicXml(fileName: string, bytes: Uint8Array): Promise<void> {
+    const slots = this.partSlots();
+    if (slots.length >= MAX_SCORE_PARTS) return;
+    if (!MUSICXML_NAME.test(fileName)) {
+      throw new Error('A part is added from a MusicXML file (.xml, .musicxml or .mxl).');
+    }
+    const parsed = parseScoreFile(bytes);
+    const tracksWithNotes = parsed.tracks.filter((track) =>
+      parsed.notes.some((note) => note.trackIndex === track.index)
+    );
+    if (!tracksWithNotes.length) throw new Error('That MusicXML file has no notes in it.');
+    const defaultTrack = tracksWithNotes.find((track) => !track.isPercussion) ?? tracksWithNotes[0];
+    const chosen =
+      tracksWithNotes.length > 1
+        ? await this.pickScorePart(tracksWithNotes, defaultTrack.index)
+        : defaultTrack.index;
+    if (chosen === null || chosen === undefined) return;
+    const track = tracksWithNotes.find((t) => t.index === chosen);
+    const notes = parsed.notes.filter((note) => note.trackIndex === chosen);
+    if (!notes.length) throw new Error('That part has no playable notes in it.');
+
+    const existing = slots.flatMap((slot) => (slot.kind === 'imported' ? [slot.part] : []));
+    // A document-unique id, and one that never changes when the row is reordered — it is what
+    // this part's engraved note ids are namespaced with (`score/parts.ts §canonical`).
+    let n = 1;
+    while (existing.some((part) => part.id === `imp${n}`)) n++;
+    const part: ImportedPart = {
+      id: `imp${n}`,
+      name: importedPartName(track?.name, fileName),
+      nudgeMs: 0,
+      notes
+    };
+    this.activePartKey = part.id;
+    // No notice. The chip appearing beside the take's, and the staff appearing on the page, is
+    // what happened — a banner saying so as well would be a third statement of one event.
+    this.setParts([...existing, part], [...partOrderOf(slots), part.id]);
   }
 
   /** Controls that change the written page live with the written page, not in the app header. */
@@ -7650,6 +8716,28 @@ class App {
     // No waveform for a MIDI import — there is no audio, and an empty strip is a lie about
     // what the app has.
     const waveCanvas = rt.source?.peaks ? el('canvas', { class: 'waveform', title: t(TIPS.waveform) }) : null;
+    /*
+     * THE STRIP, AND THE ONE CONTROL THAT LIVES ON IT (H3).
+     *
+     * A wrapper and nothing else: the canvas keeps its class, its full width and its height, so
+     * every measurement in the app and in the harness that asks for `.waveform` still gets the
+     * canvas. What the wrapper buys is a positioning context for the Cut button.
+     *
+     * WHERE THE BUTTON GOES, and why there is room for it. The strip spans the full width and
+     * reserves its first `TIMELINE_GUTTER_PX` for the piano roll's pitch-name column below it
+     * (see ui/waveform.ts §7) — a 34px column of empty dark canvas, directly above the row of
+     * note names, that has never had anything in it. That is where Cut sits: LEFT of the
+     * recording, over the key names, at the strip's own height.
+     *
+     * It used to be a chip in the take-edit row BETWEEN the strip and the roll, which is the
+     * placement the owner rejected in as many words. The row is still there for the things that
+     * are about a SPAN — the trim offer, "Cut out 4.2s", the cut summary — and it now takes no
+     * height at all on a take that has none of them, which the always-present Cut chip was
+     * quietly preventing.
+     */
+    const waveStrip =
+      waveCanvas &&
+      el('div', { class: 'wave-strip', 'data-role': 'wave-strip' }, waveCanvas, this.buildCutArm());
     const sheet = el('div', { class: 'triview' });
 
     // The piano roll sits directly under the waveform because the two share one ruler —
@@ -7717,13 +8805,17 @@ class App {
     replace(
       this.root,
       header,
-      waveCanvas,
+      waveStrip,
       this.buildTakeEdits(),
       tunerHost,
       rollPane,
       this.buildScrollbar(),
       this.buildTransport(),
       this.buildNotationToolbar(),
+      // DIRECTLY ABOVE THE SHEET, because it is about the sheet: the chips say what is printed
+      // on the page below them and in what order, and a row that said so from the header would
+      // be a row about nothing you can see.
+      this.buildPartChips(),
       sheet,
       this.toastLayer()
     );
@@ -7982,6 +9074,20 @@ class App {
       // a zoom without ever looking wrong enough to notice.
       onViewportChange: () => this.syncViewports(),
       onRenderComplete: () => this.syncViewports(),
+      /*
+       * A PINCH OVER THE SHEET CARRIES THE ROLL'S SPAN WITH IT.
+       *
+       * The roll refuses spans that arrive from Align on purpose (`PianoRoll.holdSpan`): the
+       * sheet's derived window changes span on every scroll, because the engraving is not
+       * proportional to time, so adopting it would turn a scrollbar drag into a zoom (G16).
+       * A sheet ZOOM is the one case where the new span IS what is being asked for, and the
+       * sheet is the only thing that can tell the two apart — so it says so here, just before
+       * the re-engrave, and the roll takes the next Align window whole.
+       *
+       * Without this line the gesture is half-wired rather than broken: the sheet zooms and the
+       * roll stays where it was. See `TriViewOptions.onZoomChange` in view/triview.ts.
+       */
+      onZoomChange: () => this.pianoRoll?.adoptNextAlignSpan(),
       // Direct manipulation, in place of the old popover: drag a notehead on the STAFF to
       // change its pitch, drag a fret digit on the TAB to move it to another string. Moving a
       // note in time is deliberately not offered here — that is the piano roll's job, where a
@@ -7992,6 +9098,10 @@ class App {
       onNoteHover: (id) => this.pianoRoll?.setHover(id ? [id] : [])
     });
     this.transport.attachAlphaTab(this.triview.api);
+    // See `renderEveryPart`: a view built just now defers its first render, so the multi-part
+    // track selection has to be re-asserted once that render has actually landed. It settles
+    // after exactly one extra engrave and is a no-op on every single-part take.
+    this.triview.api.postRenderFinished.on(() => this.renderEveryPart());
     if (rt.score) this.applyScoreToViews(rt.score);
 
     if (rt.progress !== null) this.showProgressOverlay(sheet);
@@ -8395,8 +9505,12 @@ class App {
       mode === 'daw' &&
         grid &&
         el('span', { class: 'dim tempo-detail', 'data-role': 'tempo-detail', text: describeHostGrid(grid) }),
+      // "heard in your playing" was reported on screen as "heard in y…" — the row squeezed it
+      // and the CSS cut it with an ellipsis (H6). NOTHING IN THIS APP IS EVER ELLIPSIZED: the
+      // detail is not allowed to shrink any more (styles.css §.tempo-detail) and the sentence is
+      // shortened to the four words that carry it, so it fits at every width it is shown at.
       mode === 'recording' &&
-        el('span', { class: 'dim tempo-detail', 'data-role': 'tempo-detail', text: 'heard in your playing' })
+        el('span', { class: 'dim tempo-detail', 'data-role': 'tempo-detail', text: 'from your playing' })
       // "RE-DETECT" IS DELETED (G12), and nothing has been lost with it.
       //
       // It was a chip that called `setTempoSource('recording')` — the same call selecting "From
@@ -8657,6 +9771,13 @@ class App {
       return;
     }
     const noteId = hit.noteId;
+    // An imported part is notation only in v1: it can be looked at and printed, and it is not a
+    // selection the roll, the waveform or an edit action could do anything with. Clicking one
+    // seeks, exactly as clicking an empty beat does.
+    if (this.isImportedNoteId(noteId)) {
+      this.seekToTick(hit.beat.absolutePlaybackStart);
+      return;
+    }
     this.selectNoteIds([noteId]);
   }
 
@@ -8707,6 +9828,9 @@ class App {
       | { noteId: string; kind: 'pitch'; semitones: number }
       | { noteId: string; kind: 'string'; direction: 1 | -1; steps: number }
   ): void {
+    // See `onNoteClick`: an imported part is engraved, not edited. Refused here as well as at
+    // the selection, because a drag does not have to go through a selection to reach an action.
+    if (this.isImportedNoteId(p.noteId)) return;
     if (p.kind === 'pitch') {
       if (p.semitones === 0) return;
       this.perform(new ChangePitchAction(p.noteId, p.semitones), p.noteId);
@@ -9312,32 +10436,8 @@ class App {
       );
     }
 
-    /*
-     * CUT (G8). The chip that ARMS the gesture, and then the button that performs it.
-     *
-     * "The button appears with the selection rather than needing a mode" is what stood here,
-     * and it was true of a strip that could only make one kind of selection: the tuner's 0.1s
-     * probe window. So the button appeared on every click of the waveform offering to remove a
-     * tenth of a second, and there was no gesture anywhere in the app that could ask for more.
-     * That is the reported fault, and a mode is the honest fix — the strip's press has to mean
-     * either "what is at this moment" or "from here to there", and nothing about a press says
-     * which.
-     *
-     * Two clicks to a cut and no more: arm, drag, cut. Arming is free and reversible, and the
-     * chip stays lit so the changed meaning of the strip is visible rather than remembered.
-     */
-    if (this.runtime.get().source?.peaks) {
-      children.push(
-        el('button', {
-          class: `chip take-cut-arm${this.cutArmed ? ' on' : ''}`,
-          'data-role': 'cut-arm',
-          'aria-pressed': String(this.cutArmed),
-          text: this.cutArmed ? '✂ Drag on the recording' : '✂ Cut',
-          title: t(TIPS.cutArm),
-          onClick: () => this.setCutArmed(!this.cutArmed)
-        })
-      );
-    }
+    // CUT'S ARM BUTTON IS NOT IN THIS ROW ANY MORE (H3). It lives in the strip's own left
+    // gutter — see `buildCutArm()`. What is left here is what was always about a SPAN.
 
     const picked = this.cutArmed ? this.cutSelection : this.tunerSelection;
     if (picked && picked.toSec - picked.fromSec >= MIN_CUT_SEC) {
@@ -9404,12 +10504,102 @@ class App {
   }
 
   /**
+   * CUT, IN THE STRIP'S OWN LEFT GUTTER (H3, G8).
+   *
+   * WHAT IT IS. The chip that ARMS the span gesture. "The button appears with the selection
+   * rather than needing a mode" is what stood here once, and it was true of a strip that could
+   * only make one kind of selection — the tuner's 0.1s probe window — so the button appeared on
+   * every click offering to remove a tenth of a second. A mode is the honest fix: the strip's
+   * press has to mean either "what is at this moment" or "from here to there", and nothing about
+   * a press says which. Two clicks to a cut and no more: arm, drag, cut.
+   *
+   * WHERE IT IS. Absolutely placed in the `TIMELINE_GUTTER_PX` column the strip already reserves
+   * for the roll's pitch names — the empty dark square left of the recording. Its width is that
+   * constant rather than a number typed here, so the button cannot drift off the column it is
+   * sitting in. It was a chip in the take-edit row under the strip; that is the placement the
+   * owner rejected, and it also cost a whole band of chrome on every take.
+   *
+   * THE ARMED LABEL, AND WHY IT DOES NOT SWALLOW THE DRAG. Armed, the button says what to do AND
+   * how to get out of it — "Drag on the recording — click to cancel" — which means it has to be
+   * wider than the gutter and therefore has to lie over the first inch of the recording. So the
+   * BUTTON is `pointer-events: none` and only the scissors square inside it takes a press (see
+   * styles.css §.wave-cut-arm): the sentence is pointer-transparent, a drag started on top of it
+   * reaches the canvas underneath exactly as if it were not there, and "click to cancel" names
+   * the lit square it is written beside. Nothing is ever shortened to fit — the row it used to
+   * sit in is what did that.
+   */
+  private buildCutArm(): HTMLElement | null {
+    if (!this.runtime.get().source?.peaks) return null;
+    return el(
+      'button',
+      {
+        class: `wave-cut-arm${this.cutArmed ? ' on' : ''}`,
+        'data-role': 'cut-arm',
+        'aria-pressed': String(this.cutArmed),
+        // The glyph alone is not a name. Screen readers and the keyboard get the whole sentence.
+        'aria-label': this.cutArmed
+          ? 'Cut armed — drag on the recording to choose a span, or click to cancel'
+          : 'Cut a span out of the recording',
+        title: t(TIPS.cutArm),
+        onClick: () => this.setCutArmed(!this.cutArmed)
+      },
+      // The press target, and the only part of this button that has one.
+      el('span', {
+        class: 'cut-glyph',
+        'data-role': 'cut-arm-glyph',
+        'aria-hidden': 'true',
+        text: '✂',
+        style: { width: `${TIMELINE_GUTTER_PX - 6}px` }
+      }),
+      this.cutArmed &&
+        el('span', {
+          class: 'cut-hint',
+          'data-role': 'cut-arm-hint',
+          text: 'Drag on the recording — click to cancel'
+        })
+    );
+  }
+
+  /**
+   * Repaint the arm button where it stands.
+   *
+   * In place rather than through `renderMain()`: a full render rebuilds the strip, the roll and
+   * the tri-view, and arming a gesture must not cost the player their scroll position — the
+   * whole point of the mode is that you are about to drag on the picture in front of you.
+   */
+  private refreshCutArm(): void {
+    const button = this.root.querySelector<HTMLElement>('[data-role="cut-arm"]');
+    if (!button) return;
+    button.classList.toggle('on', this.cutArmed);
+    button.setAttribute('aria-pressed', String(this.cutArmed));
+    button.setAttribute(
+      'aria-label',
+      this.cutArmed
+        ? 'Cut armed — drag on the recording to choose a span, or click to cancel'
+        : 'Cut a span out of the recording'
+    );
+    const hint = button.querySelector<HTMLElement>('[data-role="cut-arm-hint"]');
+    if (this.cutArmed && !hint) {
+      button.appendChild(
+        el('span', {
+          class: 'cut-hint',
+          'data-role': 'cut-arm-hint',
+          text: 'Drag on the recording — click to cancel'
+        })
+      );
+    } else if (!this.cutArmed && hint) {
+      hint.remove();
+    }
+  }
+
+  /**
    * Arm or disarm the strip's span gesture (G8).
    *
-   * One writer, because three things have to move together: the strip's own gesture, the
-   * remembered span, and the chip that says which mode you are in. Disarming clears the span
-   * rather than leaving it — an unarmed strip cannot show you where it is or let you adjust it,
-   * so a "Cut out 8.2s" button over a span nobody can see is an offer you cannot check.
+   * One writer, because four things have to move together: the strip's own gesture, the
+   * remembered span, the button that says which mode you are in, and the row that offers the
+   * cut. Disarming clears the span rather than leaving it — an unarmed strip cannot show you
+   * where it is or let you adjust it, so a "Cut out 8.2s" button over a span nobody can see is
+   * an offer you cannot check.
    */
   private setCutArmed(on: boolean): void {
     if (this.cutArmed === on) return;
@@ -9421,6 +10611,7 @@ class App {
       this.selectNoteIds([], false);
     }
     this.waveform?.setSelectArmed(on);
+    this.refreshCutArm();
     this.refreshTakeEdits();
   }
 
@@ -10280,7 +11471,14 @@ function scoreToSynthNotes(
 
   if (live) {
     const secPerTick = 60 / score.tempoBpm / ALPHATAB_QUARTER_TICKS;
-    for (const track of live.model.tracks) {
+    for (let t = 0; t < live.model.tracks.length; t++) {
+      // AN IMPORTED PART IS ENGRAVED AND NEVER PLAYED (pipeline IR.md §Multi-part scores).
+      // The flag is the pipeline's own, carried on the data this model was built from, and the
+      // model's track order is that array's order — `fromPipeline` builds them in one pass.
+      // Without this the guitar chart somebody dropped in for reference would be added to the
+      // take, at the take's tempo, under the player's own bass.
+      if (isNotationOnlyTrack(score, t)) continue;
+      const track = live.model.tracks[t];
       for (const staff of track.staves) {
         for (const bar of staff.bars) {
           for (const voice of bar.voices) {
@@ -10311,6 +11509,8 @@ function scoreToSynthNotes(
   const barStart = new Map<number, number>();
   for (const mb of score.data.masterBars) barStart.set(mb.index, mb.startTick);
   for (const track of score.data.tracks) {
+    // Same rule on the boot path as on the live one — see above.
+    if (track.notationOnly) continue;
     for (const staff of track.staves) {
       for (const bar of staff.bars) {
         const base = barStart.get(bar.index) ?? 0;

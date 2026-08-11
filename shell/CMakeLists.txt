@@ -339,6 +339,7 @@ target_sources(Riffsheet PRIVATE
     Source/bridge/EngineLock.cpp        # one transcription at a time, machine-wide
     Source/bridge/ServerRegistry.cpp    # servers we started, so a force-quit leaves nothing behind
     Source/bridge/ModelCatalog.cpp      # which weights are on disk, and which one 'auto' means
+    Source/bridge/MuScriptorProbe.cpp    # "is a MuScriptor answering on this port?", asked over HTTP
     Source/bridge/MuScriptorServer.cpp
     Source/bridge/NativeBridge.cpp
     Source/engines/EngineCatalog.cpp    # the compiled-in engine table + its licensing invariants
@@ -495,6 +496,7 @@ if(RIFFSHEET_BUILD_TESTS)
         test/EngineRegistryTests.cpp
         test/PreprocessTests.cpp                 # wave 6, and it generates its own audio
         test/EngineInstallerTests.cpp            # wave 5, and it serves its own HTTP
+        test/MuScriptorProbeTests.cpp            # the external-server handshake, over a real socket
         # ...one file per wave, added by that wave.
 
         # The units under test, compiled in directly. NOT NativeBridge.cpp,
@@ -515,6 +517,13 @@ if(RIFFSHEET_BUILD_TESTS)
         # a copy of it.
         Source/engines/sidecar/SidecarAdapter.cpp
         Source/bridge/SystemProbe.cpp
+        # The handshake half of external-server detection. It is in here and
+        # MuScriptorServer.cpp is not for the reason the list above gives: this
+        # file speaks juce::URL and JSON and nothing else, while the server class
+        # drags WebResources - and therefore juce_gui_extra and a WebView - in
+        # behind it. Keeping the decision in a unit with no such dependency is
+        # what makes it testable at all.
+        Source/bridge/MuScriptorProbe.cpp
     )
 
     # BinaryData, unconditionally: the installer reads the pip lock files and the

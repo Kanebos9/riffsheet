@@ -121,6 +121,10 @@ export interface ReadNote {
 }
 
 export interface ReadScore {
+  /** How many `<part>` elements the document has, whichever one was read. */
+  partCount: number;
+  /** `<part-list>` in document order: the printed stack, top to bottom. */
+  partList: { id: string; name: string; abbreviation?: string; channel: number; program: number }[];
   divisions: number;
   fifths: number;
   timeSig: [number, number];
@@ -133,13 +137,32 @@ export interface ReadScore {
   hasClefOctaveChange: boolean;
 }
 
-/** Re-read an emitted MusicXML file the way an importer would. */
-export function readMusicXml(xml: string): ReadScore {
+/**
+ * Re-read an emitted MusicXML file the way an importer would.
+ *
+ * `partIndex` selects which `<part>` to walk, in printed order. It defaults to 0, so every
+ * single-part caller is unchanged; a multi-part document is read one part at a time, which is
+ * also how the measure cursor has to be checked (each part carries its own).
+ */
+export function readMusicXml(xml: string, partIndex = 0): ReadScore {
   const doc = parseXml(xml);
   const score = child(doc, 'score-partwise');
   if (!score) throw new Error('no <score-partwise>');
-  const part = child(score, 'part');
-  if (!part) throw new Error('no <part>');
+  const allParts = children(score, 'part');
+  const part = allParts[partIndex];
+  if (!part) throw new Error(`no <part> at index ${partIndex}`);
+  const partList = child(score, 'part-list');
+  const scoreParts = (partList ? children(partList, 'score-part') : []).map((sp) => {
+    const midi = child(sp, 'midi-instrument');
+    const abbreviation = child(sp, 'part-abbreviation');
+    return {
+      id: sp.attrs.id ?? '',
+      name: textOf(child(sp, 'part-name')),
+      ...(abbreviation ? { abbreviation: textOf(abbreviation) } : {}),
+      channel: midi ? numberOf(child(midi, 'midi-channel'), 0) : 0,
+      program: midi ? numberOf(child(midi, 'midi-program'), 0) : 0
+    };
+  });
 
   let divisions = 1;
   let fifths = 0;
@@ -236,6 +259,8 @@ export function readMusicXml(xml: string): ReadScore {
   }
 
   return {
+    partCount: allParts.length,
+    partList: scoreParts,
     divisions,
     fifths,
     timeSig,
@@ -243,7 +268,7 @@ export function readMusicXml(xml: string): ReadScore {
     measureLengths,
     tempo,
     staffTuning,
-    hasTranspose: findAll(score, 'transpose').length > 0,
+    hasTranspose: findAll(part, 'transpose').length > 0,
     hasClefOctaveChange: findAll(score, 'clef-octave-change').length > 0
   };
 }

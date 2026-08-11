@@ -110,7 +110,13 @@ public:
 
     /** Health-probes the reuse ports without starting anything, and updates the
         adopted/port/model reporting. Blocks for up to a couple of seconds -
-        worker threads only. */
+        worker threads only.
+
+        A server it cannot identify from the operating system - no listening pid,
+        no readable command line, which is the normal state of affairs inside a
+        sandboxed host and on Windows - is identified by an HTTP handshake with
+        the server itself instead (MuScriptorProbe), and REPORTED. It is not
+        adopted for work on that evidence: see isHandshakeIdentifiedOnly(). */
     void refreshStatus();
 
     /** Kills leftover servers from a previous force-quit and takes over healthy
@@ -125,6 +131,16 @@ public:
 
     /** True if a MuScriptor is answering on `port`. */
     bool probeHealth (int port) const;
+
+    /** The server being reported is one only its own HTTP handshake vouches for:
+        the operating system would not say which process is listening, so the pid
+        and command line this class normally requires are unknown.
+
+        It is reported (state, port, externalServer) and it is used for nothing
+        else - no audio is uploaded to it and nothing may kill it - because a
+        handshake is a good answer to "is something there?" and no answer at all
+        to "whose process is this?". Cheap: one atomic. */
+    bool isHandshakeIdentifiedOnly() const noexcept { return handshakeIdentifiedOnly.load(); }
 
     /** The port actually in use - may differ from config.port if an existing
         server was adopted. */
@@ -412,6 +428,10 @@ private:
         exactly what makes it the right half to show a "stop it anyway" button
         from. Never sufficient on its own to kill anything. */
     std::atomic<bool>   serverLooksLikeMuScriptor { false };
+    /** The server on the wire was recognised by its HTTP handshake alone,
+        because the operating system would not name the process behind the port.
+        Enough to report it; never enough to send it audio or to end it. */
+    std::atomic<bool>   handshakeIdentifiedOnly { false };
 
     // There is deliberately no timer and no watchdog thread in here any more.
     // The engine's whole life is bracketed by one transcription job on one

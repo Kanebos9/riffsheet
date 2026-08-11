@@ -170,6 +170,36 @@ function restate(n: InputNote, startSec: number, endSec: number, tempoBpm: numbe
 const CHORD_WINDOW_SEC = 0.02;
 
 /**
+ * The floor on the cascade's step, in seconds, and it is a floor about SURVIVAL rather than
+ * about taste.
+ *
+ * Two attacks closer together than `chords.ts`'s window (35 ms) are collected into one chord
+ * event by the pipeline before anything is quantized, and a chord is one notehead group. A
+ * cascade that packed two separate notes 30 ms apart would therefore hand the engraver a single
+ * event and lose one of them — the exact failure this whole function exists to prevent. 40 ms
+ * leaves a margin over that window at any tempo.
+ */
+const MIN_STEP_SEC = 0.04;
+
+/**
+ * How finely a beat may be subdivided to make room, in seconds.
+ *
+ * A SIXTEENTH OF THE BEAT, unless the ruler itself is finer. That number is not arbitrary: the
+ * quantizer's 'auto' grid offers straight-8 and straight-16 and NEVER a straight-32 (see
+ * `pipeline/src/quantize.ts` §states — "1/32 is opt-in, never offered by 'auto'"), so two
+ * attacks a 1/32 apart round onto the same tick on the page and the collision fuse eats one of
+ * them. Subdividing past what the sheet can read back would move the note loss one station
+ * downstream instead of fixing it.
+ *
+ * A ruler the player has explicitly set FINER than that is honoured — they asked for a 1/32
+ * lattice by name, and Quantize has a 1/32 setting to match — which is why this is the finer of
+ * the two rather than a flat 1/16.
+ */
+function finestStepSec(cellSec: number, beatSec: number): number {
+  return Math.min(beatSec, Math.max(Math.min(cellSec, beatSec / 4), MIN_STEP_SEC));
+}
+
+/**
  * ======================= SNAP TO BEAT (G25) =======================
  *
  * The third state of the Snap control: not "line every note up with the ruler" but "put every
@@ -187,16 +217,36 @@ const CHORD_WINDOW_SEC = 0.02;
  *    12 ms early was aiming at the beat it is early FOR, and flooring would drag it a whole beat
  *    backwards.
  *
- * 2. COLLISION CASCADE. A fast run has several notes whose nearest beat is the same beat, and
- *    stacking them there would delete the run. The EARLIEST takes the beat and every later one
- *    steps onto the next free subdivision — `subdivisionSec`, which is the roll grid's own cell
- *    so the cascade lands on lines the player can see, or a 1/16 when the ruler is Free or Off
- *    and has no cell to offer. The result is that a 1/16 run keeps its subdivisions while its
- *    first note is pulled onto the beat, which is the promise the tip makes.
+ * 2. SUBDIVIDE THE BEAT — never push the take forward. Several notes can want the same beat;
+ *    stacking them there would delete the run, so the beat is divided into as many equal parts
+ *    as the notes standing on it need. The EARLIEST takes the beat itself and the rest fill the
+ *    subdivisions after it, ALL OF THEM INSIDE THAT BEAT.
  *
- *    ORDER IS PRESERVED BY CONSTRUCTION, because each position is chosen strictly after the
- *    last one that was handed out. Two notes can never swap, and no two events can share a
- *    position — except a chord, which is one event (see `CHORD_WINDOW_SEC`).
+ *    The step starts at `subdivisionSec` — the roll grid's own cell, so the cascade lands on
+ *    lines the player can see, or a 1/16 when the ruler is Free or Off and has no cell to
+ *    offer — and is HALVED until the whole group fits between this beat and the next. That is
+ *    the whole fix for the reported bug, and it is the answer the report itself gave: if a beat
+ *    is holding more notes than the ruler has cells, use eight eighths rather than four
+ *    quarters. A coarse ruler now costs a finer cascade and nothing else.
+ *
+ *    WHAT IT REPLACED, because the failure is worth writing down. The first version stepped by
+ *    a FIXED cell — `lastPos + cell` — which is a queue, not a lattice: with the ruler on 1/4
+ *    the cell IS the beat, so the second note of any crowded beat was thrown a whole beat
+ *    forward, the third inherited that debt, and every later note in the take inherited it
+ *    again. A bar of six notes emptied its last two into the next bar (the reported symptom:
+ *    "bar 2 is missing a G2 and an F2 that Grid mode shows"), the drift grew without bound —
+ *    measured at 5.4 seconds by the end of an eight-bar take — and the notes that ran off the
+ *    end of the last bar were dropped outright by `buildScore`'s past-the-end filter. Notes
+ *    disappeared from the SHEET because the snap had pushed them off it.
+ *
+ *    SPILLING IS THE LAST RESORT, not the mechanism. A beat only hands notes to the next one
+ *    when it is full at the finest step allowed (`finestStepSec`), which takes more attacks on
+ *    one beat than a 4/4 bar has 1/16s. Even then the spill is one beat, not a growing debt.
+ *
+ *    ORDER IS PRESERVED BY CONSTRUCTION: beats are filled in ascending order, a group never
+ *    leaves its own beat, and within a beat the notes keep the order they were played in. Two
+ *    notes can never swap, and no two events can share a position — except a chord, which is
+ *    one event (see `CHORD_WINDOW_SEC`).
  *
  * 3. CLEAN ENDS. The release goes to the nearest subdivision line with a floor of one cell, so
  *    nothing rings a ragged 40 ms across the next beat. It is then capped at the next attack —
@@ -216,10 +266,14 @@ export function snapPerformanceToBeat(
 ): InputNote[] {
   if (!(beatSec > 0) || notes.length === 0) return notes as InputNote[];
   const quarterSec = 60 / (tempoBpm || 100);
-  // The cascade's step. Never coarser than the beat itself: with Grid on 1/4 in a 6/8 take the
-  // ruler's cell is longer than a beat, and stepping by it would throw the second note of a
-  // collision a whole beat away rather than onto the next position after the first.
+  // Where the subdivision STARTS — the ruler's own cell, so a beat that is not crowded puts its
+  // notes on lines the player can already see. Never coarser than the beat itself: with Grid on
+  // 1/4 in a 6/8 take the ruler's cell is longer than a beat, and a "subdivision" longer than
+  // the thing it subdivides is not one. Where it starts is not where it ends: the loop below
+  // halves it as often as the notes standing on a beat require.
   const cell = Math.min(subdivisionSec > 0 ? subdivisionSec : quarterSec / 4, beatSec);
+  // …and where the halving stops.
+  const finest = finestStepSec(cell, beatSec);
   const chordWindow = Math.min(CHORD_WINDOW_SEC, cell / 2);
   const EPS = 1e-9;
 
@@ -229,22 +283,63 @@ export function snapPerformanceToBeat(
     .map((n, i) => ({ n, i }))
     .sort((a, b) => a.n.startSec - b.n.startSec || a.n.midi - b.n.midi || a.i - b.i);
 
-  // --- 1 and 2: where each attack lands ------------------------------------------------
-  const positions = new Array<number>(notes.length);
-  let lastPos = -Infinity;
-  let groupRawStart = Number.NaN;
-  let groupPos = 0;
+  // --- events: a chord is ONE event ------------------------------------------------------
+  // Everything below counts EVENTS, not noteheads, because "how many notes want this beat" is
+  // a question about attacks: a strummed triad needs one position, not three.
+  const events: { members: number[]; rawStart: number }[] = [];
   for (const { n, i } of order) {
-    if (Number.isFinite(groupRawStart) && n.startSec - groupRawStart <= chordWindow) {
-      positions[i] = groupPos;
+    const open = events[events.length - 1];
+    if (open && n.startSec - open.rawStart <= chordWindow) {
+      open.members.push(i);
       continue;
     }
-    const nearest = Math.max(0, originSec + Math.round((n.startSec - originSec) / beatSec) * beatSec);
-    const pos = nearest > lastPos + EPS ? nearest : lastPos + cell;
-    positions[i] = pos;
-    lastPos = pos;
-    groupRawStart = n.startSec;
-    groupPos = pos;
+    events.push({ members: [i], rawStart: n.startSec });
+  }
+
+  // --- 1: every event goes to its NEAREST beat -------------------------------------------
+  // Beats are addressed by INDEX rather than by time so that two of them can never collapse
+  // onto the same second at the head of the take, which is what a bare `Math.max(0, …)` on the
+  // position would do to a note played before written second 0.
+  const minIdx = Math.ceil((0 - originSec) / beatSec - EPS);
+  const buckets = new Map<number, number[]>();
+  for (let e = 0; e < events.length; e++) {
+    const idx = Math.max(minIdx, Math.round((events[e].rawStart - originSec) / beatSec));
+    const at = buckets.get(idx);
+    if (at) at.push(e);
+    else buckets.set(idx, [e]);
+  }
+
+  // --- 2: each beat subdivides itself until its own notes fit ----------------------------
+  const positions = new Array<number>(notes.length);
+  const stepOf = new Array<number>(notes.length);
+  const anchorOf = new Array<number>(notes.length);
+  const indices = [...buckets.keys()].sort((a, b) => a - b);
+  const lastIdx = indices[indices.length - 1];
+  let spilled: number[] = [];
+  // EVERY beat from the first occupied one onward, not only the occupied ones: a spill goes to
+  // the beat AFTER the one that was full, and an empty beat is exactly where it should land.
+  for (let idx = indices[0]; idx <= lastIdx || spilled.length; idx++) {
+    const own = buckets.get(idx);
+    const here = spilled.length ? [...spilled, ...(own ?? [])] : (own ?? []);
+    spilled = [];
+    if (!here.length) continue;
+    const beatStart = originSec + idx * beatSec;
+    // HALVE THE RULER'S CELL UNTIL THEY FIT. The last note of the group has to stand strictly
+    // inside this beat, so `(count - 1) * step` must be shorter than the beat itself.
+    let step = cell;
+    while ((here.length - 1) * step >= beatSec - EPS && step / 2 >= finest - EPS) step /= 2;
+    // How many the beat can hold at the step it settled on. Anything past that is handed to the
+    // next beat, which will subdivide for them in turn.
+    const capacity = Math.max(1, Math.floor((beatSec - EPS) / step) + 1);
+    if (here.length > capacity) spilled = here.slice(capacity);
+    for (let j = 0; j < Math.min(here.length, capacity); j++) {
+      const pos = beatStart + j * step;
+      for (const m of events[here[j]].members) {
+        positions[m] = pos;
+        stepOf[m] = step;
+        anchorOf[m] = beatStart;
+      }
+    }
   }
 
   // --- 3: where each release lands ------------------------------------------------------
@@ -252,9 +347,14 @@ export function snapPerformanceToBeat(
   for (let k = 0; k < order.length; k++) {
     const { n, i } = order[k];
     const startSec = positions[i];
+    const step = stepOf[i];
+    // Rounded onto THIS BEAT's lattice rather than the origin's. They are the same lattice
+    // whenever the beat divides into the step a whole number of times, which is every straight
+    // ruler; where they differ — a triplet cell under a compound beat — the beat's own lines are
+    // the ones the note is standing on, and an end may not land between them.
     let endSec = Math.max(
-      startSec + cell,
-      originSec + Math.round((n.endSec - originSec) / cell) * cell
+      startSec + step,
+      anchorOf[i] + Math.round((n.endSec - anchorOf[i]) / step) * step
     );
     // `positions` is non-decreasing along `order`, so the first later note standing anywhere
     // past this one is the next attack — chords included, since they share this position.
@@ -262,7 +362,7 @@ export function snapPerformanceToBeat(
       const next = order[j];
       if (positions[next.i] <= startSec + EPS) continue;
       // Only where the take itself did not hold them together.
-      if (n.endSec <= next.n.startSec + EPS) endSec = Math.max(startSec + cell, Math.min(endSec, positions[next.i]));
+      if (n.endSec <= next.n.startSec + EPS) endSec = Math.max(startSec + step, Math.min(endSec, positions[next.i]));
       break;
     }
     out[k] = restate(n, startSec, endSec, tempoBpm);

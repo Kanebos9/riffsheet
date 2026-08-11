@@ -2386,6 +2386,48 @@ juce::var NativeBridge::makeEngineStatusVar (const juce::String& id)
         adapter = nativeResolution.adapter;
         manifest = adapter != nullptr ? &adapter->manifest()
                                       : EngineCatalog::find (nativeResolution.resolved);
+
+        // ...AND IF THERE IS A LISTENER PROCESS ON THIS MACHINE, IT IS THE ONE
+        // THIS PAYLOAD IS ABOUT. The paragraph above is why this call answers
+        // for the native engine rather than the in-page one: every field here
+        // describes a server, and answering for an engine that has none hides
+        // the one that does. That argument does not stop at the in-page engine,
+        // and stopping it there is a REPORTED BUG rather than a hypothetical.
+        //
+        // What the machine it was reported from actually looked like:
+        // engine.json said `"selectedEngine": "bass-v2"`, bass-v2 was installed,
+        // and a MuScriptor the user had started by hand was answering on port
+        // 8222 holding a gigabyte and a half. So resolution picked bass-v2 -
+        // correctly; it is what the user chose - and bass-v2 is a per-job CLI
+        // with no server, so this payload went out with `port: 0`,
+        // `memoryMb: null` and `externalServer: false`. The page's chip needs
+        // evidence of a PROCESS to appear (webcore app.ts, engineProcessAlive),
+        // there was none in the payload, and the user was told nothing about the
+        // 1.5 GB on their machine. The same hole swallows a MuScriptor whose
+        // venv lives somewhere discovery does not look.
+        //
+        // A running server outranks a resolution here. It is what the user can
+        // see in their memory monitor, it is what stopEngine() and
+        // stopExternalEngine() already act on whatever engine is resolved, and
+        // `id` in this payload says which engine it is describing.
+        if (adapter == nullptr || manifest == nullptr || juce::String (manifest->id) != "muscriptor")
+        {
+            // Two atomics, which is what `running` means in IdleState anyway -
+            // this runs on the message thread on every poll, so it does not
+            // reach for the fuller snapshot (a file read) to ask a question the
+            // cached facts already answer.
+            const auto& muscriptorServer = proc.getMuScriptor();
+
+            if (muscriptorServer.getActivePort() > 0
+                && muscriptorServer.getState() == MuScriptorServer::State::ready)
+            {
+                if (auto* muscriptor = registry.find ("muscriptor"))
+                {
+                    adapter = muscriptor;
+                    manifest = &adapter->manifest();
+                }
+            }
+        }
     }
     else
     {

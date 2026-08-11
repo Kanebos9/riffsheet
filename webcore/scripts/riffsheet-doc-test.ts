@@ -35,7 +35,17 @@ import {
   type PersistedSource,
   type RiffsheetDocument
 } from '../src/app/persist';
-import type { SourceAudio } from '../src/app/state';
+import {
+  DEFAULT_SETTINGS,
+  SETTINGS_VERSION,
+  TAKE_SCOPED_SETTING_KEYS,
+  applyDocumentSettings,
+  isTakeScopedSetting,
+  mergeStoredSettings,
+  takeScopedDefaults,
+  type AppSettings,
+  type SourceAudio
+} from '../src/app/state';
 
 function assert(condition: unknown, message: string): asserts condition {
   if (!condition) throw new Error(message);
@@ -158,8 +168,11 @@ const document: RiffsheetDocument = {
 const written = writeRiffsheetDocument(document);
 const reopened = readRiffsheetDocument(written);
 
-assert(reopened.version === 3, 'a document written by this build reports version 3');
-assert(!!reopened.audioData, 'a v3 document comes back with its recording');
+assert(
+  reopened.version === RIFFSHEET_DOCUMENT_VERSION && RIFFSHEET_DOCUMENT_VERSION === 4,
+  'a document written by this build reports version 4'
+);
+assert(!!reopened.audioData, 'a v4 document comes back with its recording');
 
 // THE CONTAINER: a real zip, recognisable to anything that reads them.
 assert(
@@ -351,12 +364,91 @@ assert(
 );
 
 // ---------------------------------------------------------------------------
+// 4b. PARTS travel inside the document (v4)
+// ---------------------------------------------------------------------------
+//
+// A part is STORED, never referenced: the guitar chart somebody dropped in goes into the file, so
+// the document opens on another machine as the document they were looking at. That is the whole
+// reason the version moved — a v3 reader would have shown the take alone and then written the
+// parts back out of existence.
+const withParts = readRiffsheetDocument(
+  writeRiffsheetDocument({
+    ...document,
+    source: {
+      ...source,
+      importedParts: [
+        {
+          id: 'imp1',
+          name: 'Guitar',
+          nudgeMs: -40,
+          notes: [
+            { id: 'g0', startSec: 0, endSec: 0.5, midi: 64, sourceTiming: { startTick: 0, endTick: 960, ppq: 960 } },
+            { id: 'g1', startSec: 0.5, endSec: 1, midi: 67, sourceTiming: { startTick: 960, endTick: 1920, ppq: 960 } }
+          ]
+        }
+      ],
+      partOrder: ['imp1', 'live']
+    }
+  })
+);
+assert(withParts.source.importedParts?.length === 1, 'an imported part survives the round trip');
+assert(withParts.source.importedParts![0].name === 'Guitar', 'the part keeps its name');
+assert(withParts.source.importedParts![0].nudgeMs === -40, 'the part keeps its nudge');
+assert(
+  withParts.source.importedParts![0].notes.length === 2 &&
+    withParts.source.importedParts![0].notes[0].sourceTiming?.ppq === 960,
+  'the part keeps its symbolic notes, written ticks and all'
+);
+assert(
+  JSON.stringify(withParts.source.partOrder) === JSON.stringify(['imp1', 'live']),
+  'the printed order survives — a part dragged above the take stays above it'
+);
+
+// A v3 file IS a single-part document, and reads as exactly that rather than as a broken v4.
+const v3SinglePart = readRiffsheetDocument(
+  utf8(
+    JSON.stringify({
+      app: 'riffsheet-document',
+      version: 3,
+      savedAt: 3,
+      name: 'older',
+      source,
+      settings: {},
+      edits: [],
+      editCursor: -1,
+      audioData: null
+    })
+  )
+);
+assert(v3SinglePart.version === 3, 'a v3 document reports the version it actually is');
+assert(v3SinglePart.source.importedParts === undefined, 'a v3 document has no parts, and says so by absence');
+
+// A document with a part list that has lost its order, or an order naming a part that is gone,
+// must still open. Reconciling the two is `orderedPartSlots`; the reader's job is only to not
+// invent either half.
+const halfParts = readRiffsheetDocument(
+  writeRiffsheetDocument({
+    ...document,
+    source: {
+      ...source,
+      importedParts: [{ id: 'imp1', name: '  ', nudgeMs: Number.NaN, notes: [{ startSec: 0, endSec: 1, midi: 60 }] }],
+      partOrder: ['live', 'imp1', 'ghost']
+    }
+  })
+);
+assert(halfParts.source.importedParts?.[0].name === 'Part', 'a nameless part is named rather than dropped');
+assert(halfParts.source.importedParts?.[0].nudgeMs === 0, 'a nonsense nudge reads as no nudge');
+
+// ---------------------------------------------------------------------------
 // 5. Magic-byte detection
 // ---------------------------------------------------------------------------
 //
 // Three containers, told apart by their first bytes and nothing else. The extension is the same
 // for all of them, so sniffing is the only honest route.
-assert(readRiffsheetDocument(written).version === 3, 'PK\\x03\\x04 is read as a zip');
+assert(
+  readRiffsheetDocument(written).version === RIFFSHEET_DOCUMENT_VERSION,
+  'PK\\x03\\x04 is read as a zip'
+);
 assert(readRiffsheetDocument(v1).version === 1, '{ is read as legacy JSON');
 assert(readRiffsheetDocument(v2).version === 2, '{ with base64 audio is read as legacy JSON');
 // Leading whitespace is legal JSON and must not defeat the sniff.
@@ -589,5 +681,84 @@ assert(
 // Not an array at all is "no cuts", never a throw: a bad blob costs the restore, not the app.
 assert(decodeSource({ ...uncut!, cuts: 'nope' as unknown as PersistedSource['cuts'] })!.cuts === undefined,
   'a non-array cut list is ignored rather than thrown over');
+
+// ---------------------------------------------------------------------------
+// H4 — settings must not leak from one project into the next
+// ---------------------------------------------------------------------------
+/*
+ * THE REPORT: "I set the fret count to 22 once, and every project I have opened since starts
+ * at 22." Every setting was persisted in one global blob, so a number typed about ONE
+ * instrument became a standing claim about every recording afterwards.
+ *
+ * The three claims, in the order they have to hold:
+ *
+ *  1. the take-scoped keys have FIXED defaults a new take starts from;
+ *  2. a profile already carrying 22 is corrected once, by a migration, rather than forever;
+ *  3. a SAVED DOCUMENT still wins — its own 22 is honoured when it is reopened, and does not
+ *     write itself into the player's preferences on the way.
+ *
+ * `resetTakeScopedSettings()` in ui/app.ts is the third piece and lives in the DOM; verify.mjs
+ * drives it through the blank-score path and reads the numbers back (§ take-scope).
+ */
+const takeDefaults = takeScopedDefaults();
+assert(takeDefaults.maxFret === DEFAULT_SETTINGS.maxFret, 'the fret default is the take default');
+assert(DEFAULT_SETTINGS.maxFret === 17, 'the shipped fret default is 17');
+for (const key of TAKE_SCOPED_SETTING_KEYS) {
+  assert(key in takeDefaults, `${key} is take-scoped and must be in the reset patch`);
+}
+// A FRESH ARRAY EVERY TIME. Two takes sharing one `customTuningMidi` would let a custom tuning
+// typed on the second reach back into the first.
+assert(
+  takeScopedDefaults().customTuningMidi !== takeScopedDefaults().customTuningMidi,
+  'the reset patch must not hand two takes the same tuning array'
+);
+// …and the genuine app preferences are NOT reset. Resetting a guitarist to the bass sound, or
+// re-opening the piano roll they closed, on every new take is the same complaint pointed the
+// other way.
+for (const pref of ['playbackVoice', 'showNoteNames', 'showPianoRoll', 'pianoRollHeight',
+  'midiExportMode', 'engineId', 'engineModel', 'autoSplitAtAttacks', 'useHostGrid'] as const) {
+  assert(!isTakeScopedSetting(pref), `${pref} is an app preference and must survive a new take`);
+}
+
+// 2. THE PROFILE ALREADY CARRYING 22. A v12 blob is migrated once (`migrationFloor()` is 0 in
+//    Node, where there is no localStorage), and the leaked values go back to the defaults.
+const leaked = mergeStoredSettings({
+  settingsVersion: 12,
+  maxFret: 22,
+  capo: 4,
+  tabMode: 'guitar',
+  clefMode: 'treble',
+  grid: 'quarter',
+  rollGrid: 'quarter',
+  rollSnap: 'grid',
+  // one genuine preference, which must SURVIVE the same migration
+  showNoteNames: false,
+  playbackVoice: 'marimba'
+} as Partial<AppSettings>);
+assert(leaked.maxFret === 17, `a leaked fret count is re-defaulted (got ${leaked.maxFret})`);
+assert(leaked.capo === 0, `a leaked capo is re-defaulted (got ${leaked.capo})`);
+assert(leaked.tabMode === DEFAULT_SETTINGS.tabMode, 'a leaked tab mode is re-defaulted');
+assert(leaked.clefMode === DEFAULT_SETTINGS.clefMode, 'a leaked clef is re-defaulted');
+assert(leaked.grid === DEFAULT_SETTINGS.grid, 'a leaked quantize grid is re-defaulted');
+assert(leaked.rollGrid === DEFAULT_SETTINGS.rollGrid, 'a leaked roll grid is re-defaulted');
+assert(leaked.rollSnap === 'off', `a leaked snap mode is re-defaulted (got ${leaked.rollSnap})`);
+assert(leaked.showNoteNames === false, 'an app preference survives the take-scope migration');
+assert(leaked.playbackVoice === 'marimba', 'the chosen sound survives the take-scope migration');
+// A CURRENT blob is left alone: the case is one-time, not a rule that re-defaults every boot.
+const current = mergeStoredSettings({ settingsVersion: SETTINGS_VERSION, maxFret: 22 } as Partial<AppSettings>);
+assert(current.maxFret === 22, 'a v13 blob keeps its own fret count — the case is one-time');
+
+// 3. A SAVED DOCUMENT STILL WINS. Reopening one restores that document's own values, and the
+//    floor pinned at SETTINGS_VERSION is what stops the migration above firing over them.
+const openedDoc = applyDocumentSettings(
+  { ...DEFAULT_SETTINGS },
+  { settingsVersion: 3, maxFret: 22, capo: 2, tabMode: 'guitar' } as Partial<AppSettings>
+);
+assert(openedDoc.effective.maxFret === 22, 'a document is shown with the fret count it was saved with');
+assert(openedDoc.effective.capo === 2, 'a document is shown with the capo it was saved with');
+assert(
+  openedDoc.overridden.includes('maxFret') && openedDoc.overridden.includes('capo'),
+  'the document keys are reported as on loan, so they are never written to the preferences'
+);
 
 console.log('riffsheet-doc-test: all assertions passed');

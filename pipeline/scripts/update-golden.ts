@@ -6,20 +6,28 @@
  */
 
 import { buildScore } from '../src/buildScore.js';
-import { GOLDEN_CASES } from '../test/goldenCases.js';
+import { buildMultiPartScore } from '../src/multipart.js';
+import { GOLDEN_CASES, MULTI_PART_GOLDEN_CASES } from '../test/goldenCases.js';
 
 declare function print(s: string): void;
 declare const GOLDEN_CASE_NAME: string | undefined;
 
 const name = typeof GOLDEN_CASE_NAME === 'string' ? GOLDEN_CASE_NAME : '';
 const testCase = GOLDEN_CASES.find((c) => c.name === name);
-if (!testCase) throw new Error(`unknown golden case ${JSON.stringify(name)}`);
+const multiCase = MULTI_PART_GOLDEN_CASES.find((c) => c.name === name);
+if (!testCase && !multiCase) throw new Error(`unknown golden case ${JSON.stringify(name)}`);
 
-const xml = buildScore(testCase.input, testCase.settings).toMusicXML();
-const escaped = xml.replace(/\\/g, '\\\\').replace(/`/g, '\\`').replace(/\$\{/g, '\\${');
+// The alphaTab hand-off is JSON, not text, so its fixture is the JSON — indented one space so a
+// diff points at the field that moved rather than at one 40 KB line.
+const body = testCase
+  ? buildScore(testCase.input, testCase.settings).toMusicXML()
+  : multiCase!.emit === 'alphatab'
+    ? JSON.stringify(buildMultiPartScore(multiCase!.parts, multiCase!.input, multiCase!.settings).toAlphaTabModelData(), null, 1)
+    : buildMultiPartScore(multiCase!.parts, multiCase!.input, multiCase!.settings).toMusicXML();
+const escaped = body.replace(/\\/g, '\\\\').replace(/`/g, '\\`').replace(/\$\{/g, '\\${');
 
-print(`/** GENERATED golden fixture for the "${testCase.name}" case — regenerate with`);
-print(` *  scripts/update-golden.sh ${testCase.name}`);
+print(`/** GENERATED golden fixture for the "${name}" case — regenerate with`);
+print(` *  scripts/update-golden.sh ${name}`);
 print(' *  Do not edit by hand: a diff here is a real behaviour change and wants review. */');
 print('');
 print('export default `' + escaped + '`;');

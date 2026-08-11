@@ -1039,6 +1039,47 @@ async function main() {
           [...document.querySelectorAll('.transport > *')]
             .map((e) => { const b = e.getBoundingClientRect(); return Math.round((b.top + b.height / 2) / 4); })
         ).size,
+        /*
+         * NOTHING IN THE TRANSPORT IS CUT SHORT (H6).
+         *
+         * transportRows counts bands of chrome and says nothing about whether the things in
+         * them can be read, and the two came apart: the row held its single line at 390px by
+         * giving the clock 29px for "0:00.00 / 0:22.77" and the fader 13px, both cut off inside
+         * overflow:hidden, with 132px of content past the row's own edge. A row that fits by
+         * clipping has not fitted.
+         *
+         * Leaf elements only — a container is allowed to be narrower than its children's
+         * combined natural width, that is what shrinking IS — and an ellipsis is reported by the
+         * same measure, since text-overflow only ever draws one where the text is overflowing.
+         */
+        transportOverflow: Math.max(0, document.querySelector('.transport').scrollWidth -
+          document.querySelector('.transport').clientWidth),
+        /*
+         * The reported sentence itself (H6). It read "heard in y…" — 109px of text in a 63px
+         * box — and the rule is that it is either on screen whole or not on screen at all.
+         * hidden is the honest second state: it is a corroboration of the numbers beside it,
+         * so dropping it costs nothing and cutting it in half cost trust.
+         */
+        detailFit: (() => {
+          const d = document.querySelector('[data-role="tempo-detail"]');
+          if (!d) return { hidden: true, text: null, scrollW: 0, clientW: 0 };
+          const cs = getComputedStyle(d);
+          return {
+            hidden: cs.display === 'none' || cs.visibility === 'hidden',
+            text: d.textContent,
+            scrollW: d.scrollWidth,
+            clientW: d.clientWidth
+          };
+        })(),
+        transportClipped: [...document.querySelectorAll('.transport *')]
+          .filter((e) => e.children.length === 0 && e.scrollWidth > e.clientWidth + 1)
+          .map((e) => ({
+            role: e.getAttribute('data-role'),
+            cls: e.className,
+            text: (e.textContent || '').slice(0, 24),
+            scrollW: e.scrollWidth,
+            clientW: e.clientWidth
+          })),
         bodyScrollW: document.body.scrollWidth, innerW: window.innerWidth,
         docScrollW: document.documentElement.scrollWidth,
         header: r('.app-header'), transport: r('.transport'), triview: r('.triview'),
@@ -2969,6 +3010,224 @@ async function main() {
       110_000
     );
 
+    /*
+     * ------------------------------------------------------------------------------------
+     * H3 — CUT LIVES IN THE STRIP'S LEFT GUTTER, NOT IN A ROW UNDER IT
+     * ------------------------------------------------------------------------------------
+     *
+     * The owner's report was about PLACEMENT, in as many words: the button belongs in the empty
+     * dark column left of the recording and over the roll's key names, and not in the band
+     * between the strip and the piano roll where it had been put. So this is measured in
+     * coordinates rather than asserted from the DOM: the button's box against the waveform
+     * canvas's box, and the take-edit row's height.
+     *
+     * The armed state is driven too, because that is where the old chip changed its label and
+     * where the new one has a sentence to fit. Nothing is cut, and nothing is committed — the
+     * arm is switched straight off again, so every check after this reads a take of full length.
+     */
+    phase('checking where Cut sits on the waveform strip', 30_000);
+    /*
+     * The tempo detail at the FULL window, which is the only width it is ever shown at (H6). The
+     * per-viewport probe above measures 1100, 900 and 360, and at all three the sentence is
+     * dropped rather than squeezed — so without this the check would be satisfied by absence and
+     * would never look at the case that was reported.
+     */
+    result.detailFit = await evalJson(`(() => {
+      const d = document.querySelector('[data-role="tempo-detail"]');
+      if (!d) return JSON.stringify({ hidden: true, text: null, scrollW: 0, clientW: 0, innerW: window.innerWidth });
+      const cs = getComputedStyle(d);
+      return JSON.stringify({
+        hidden: cs.display === 'none' || cs.visibility === 'hidden',
+        text: d.textContent,
+        scrollW: d.scrollWidth,
+        clientW: d.clientWidth,
+        innerW: window.innerWidth
+      });
+    })()`);
+    const CUT_ARM_PLACE = `(() => {
+      const b = document.querySelector('[data-role="cut-arm"]');
+      const c = document.querySelector('.waveform');
+      const row = document.querySelector('[data-role="take-edits"]');
+      if (!b || !c) return JSON.stringify({ present: false });
+      const r = b.getBoundingClientRect();
+      const w = c.getBoundingClientRect();
+      const hint = b.querySelector('[data-role="cut-arm-hint"]');
+      const glyph = b.querySelector('.cut-glyph');
+      return JSON.stringify({
+        present: true,
+        armed: b.getAttribute('aria-pressed') === 'true',
+        // The strip's own left gutter is 34px (TIMELINE_GUTTER_PX). "In it" means the button
+        // starts at the very left of the strip and its PRESS TARGET does not reach past the
+        // gutter into the recording.
+        left: Math.round(r.left - w.left),
+        glyphRight: glyph ? Math.round(glyph.getBoundingClientRect().right - w.left) : null,
+        // Vertically inside the strip: this is what "at waveform height" means, and it is what
+        // fails if the button ever drifts back into a row of its own.
+        insideStrip: r.top >= w.top - 1 && r.bottom <= w.bottom + 1,
+        // The row that used to hold it. On a take with no trim offer and nothing selected it
+        // now has nothing to say and takes no height at all.
+        rowHidden: !!row && (row.hidden || row.getBoundingClientRect().height === 0),
+        rowHasCutArm: !!(row && row.querySelector('[data-role="cut-arm"]')),
+        // The armed sentence, whole. scrollWidth > clientWidth is how an ellipsis shows up.
+        hint: hint
+          ? { text: hint.textContent, scrollW: hint.scrollWidth, clientW: hint.clientWidth }
+          : null,
+        // The sentence lies over the recording, so it must not swallow a drag: only the glyph
+        // takes presses. Read off the computed styles rather than assumed.
+        buttonPointerEvents: getComputedStyle(b).pointerEvents,
+        glyphPointerEvents: glyph ? getComputedStyle(glyph).pointerEvents : null
+      });
+    })()`;
+    result.cutArmPlace = await evalJson(CUT_ARM_PLACE);
+    await evalJson(clickRole('cut-arm'));
+    await settle(350);
+    result.cutArmPlaceArmed = await evalJson(CUT_ARM_PLACE);
+    await evalJson(clickRole('cut-arm'));
+    await settle(300);
+
+    /*
+     * ------------------------------------------------------------------------------------
+     * H12 — THE MAIN MENU: NO RECENT LIST, A RECENT DROP-DOWN, AND A CENTRED PAGE
+     * ------------------------------------------------------------------------------------
+     *
+     * The recent entries are seeded straight into `localStorage` because there is no other way
+     * to have any: the browser mock cannot open a real file, and `pushRecent` only writes after
+     * one has been opened. Everything downstream of the seed is the app's own code — the menu is
+     * re-rendered by pressing Main menu, exactly as a person would.
+     */
+    phase('checking the main menu after the Recent list was removed', 40_000);
+    await evalJson(`(() => {
+      const now = Date.now();
+      const names = [
+        'Bass take 3 — bridge idea (final, actually final).wav',
+        'riff-sketch.wav',
+        'Guitar loop C minor.mp3',
+        'Session 14 chorus doubles.wav',
+        'piano-idea.mid',
+        'quick hum.wav'
+      ];
+      localStorage.setItem('riffsheet.recent', JSON.stringify(names.map((n, i) => ({
+        name: n, path: '/tmp/riffsheet-verify/' + n, at: now - (i + 1) * 3600000
+      }))));
+      return JSON.stringify({ seeded: names.length });
+    })()`);
+    result.menuRecentClick = await evalJson(clickRole('main-menu'));
+    await settle(800);
+    const MENU_SHAPE = `(() => {
+      const select = document.querySelector('[data-role="recent-select"]');
+      const actions = document.querySelector('[data-role="menu-actions"]');
+      const button = [...document.querySelectorAll('.dropzone button')]
+        .find((b) => /Choose a file/.test(b.textContent || ''));
+      const box = (e) => { if (!e) return null; const r = e.getBoundingClientRect();
+        return { left: Math.round(r.left), right: Math.round(r.right), top: Math.round(r.top),
+                 bottom: Math.round(r.bottom), width: Math.round(r.width) }; };
+      const screen = document.querySelector('.dropzone-screen');
+      return JSON.stringify({
+        innerW: window.innerWidth,
+        // THE LIST IS GONE. All three of its old hooks, so a partial removal cannot pass.
+        listGone: !document.querySelector('[data-role="recent-list"]') &&
+          !document.querySelector('.recent-item') && !document.querySelector('.recent'),
+        // …AND THE DROP-DOWN IS THERE, with a label row rather than a file selected.
+        select: select
+          ? {
+              options: select.options.length,
+              placeholder: select.options[0] ? select.options[0].textContent : null,
+              value: select.value,
+              // Full names live in the option titles — the visible text is allowed to be
+              // shortened, and it is shortened in the MIDDLE so both ends of a name survive.
+              secondText: select.options[1] ? select.options[1].textContent : null,
+              secondTitle: select.options[1] ? select.options[1].getAttribute('title') : null,
+              box: box(select)
+            }
+          : null,
+        chooseButton: box(button),
+        // CENTRED: the column's own centre against the window's.
+        actionsCentre: actions ? Math.round(box(actions).left + box(actions).width / 2) : null,
+        windowCentre: Math.round(window.innerWidth / 2),
+        // NO PAGE SCROLL, which is what F12 was reported for and what the old two-column layout
+        // existed to fix. Both axes: the menu must not scroll the document at all.
+        docScrollW: document.documentElement.scrollWidth,
+        docScrollH: document.documentElement.scrollHeight,
+        docClientW: document.documentElement.clientWidth,
+        docClientH: document.documentElement.clientHeight,
+        screenScrollH: screen ? screen.scrollHeight : null,
+        screenClientH: screen ? screen.clientHeight : null
+      });
+    })()`;
+    result.menuShape = await evalJson(MENU_SHAPE);
+    await cdp.send('Emulation.setDeviceMetricsOverride', { width: 900, height: 600, deviceScaleFactor: 1, mobile: false });
+    await settle(600);
+    result.menuShape900 = await evalJson(MENU_SHAPE);
+    const menuShot = await cdp.send('Page.captureScreenshot', { format: 'png' });
+    await writeFile(join(ROOT, 'spike-results', 'app-main-menu.png'), Buffer.from(menuShot.data, 'base64'));
+    await cdp.send('Emulation.clearDeviceMetricsOverride');
+    await settle(600);
+    // Back to the sheet, because the engine chip only exists on the main screen.
+    result.menuResume = await evalJson(clickRole('resume-current'));
+    await settle(900);
+
+    /*
+     * ------------------------------------------------------------------------------------
+     * H8 — THE ENGINE CHIP NOTICES A SERVER RIFFSHEET DID NOT START
+     * ------------------------------------------------------------------------------------
+     *
+     * Slow on purpose: the claim is about a TIMER, and the only honest way to check a timer is
+     * to wait for it. The hook stubs `engineStatus`, answers "nothing running" for one idle
+     * period — a poll that stopped re-arming after a negative answer is asked exactly once —
+     * then starts answering with somebody else's MuScriptor and waits again WITHOUT prompting
+     * the app. See `installTestHooks` in ui/app.ts.
+     */
+    phase('checking that the engine chip notices an external server', 60_000);
+    result.enginePoll = await evalJson(
+      `window.__RIFFSHEET_ENGINEPOLL__
+        ? window.__RIFFSHEET_ENGINEPOLL__().then(r => JSON.stringify(r), e => JSON.stringify({ error: String(e) }))
+        : Promise.resolve('null')`,
+      50_000
+    );
+
+    /*
+     * ------------------------------------------------------------------------------------
+     * H4 — SETTINGS DO NOT LEAK FROM ONE PROJECT INTO THE NEXT
+     * ------------------------------------------------------------------------------------
+     *
+     * LAST, and that is not an accident: the probe makes a real new take, which is what it is
+     * for, and there is no way to do that without replacing the one on screen. It reloads the
+     * demo fixture on the way out, but nothing after this point reads the page.
+     */
+    phase('checking that a new take starts from the fixed defaults', 60_000);
+    result.takeScope = await evalJson(
+      `window.__RIFFSHEET_TAKESCOPE__
+        ? window.__RIFFSHEET_TAKESCOPE__().then(r => JSON.stringify(r), e => JSON.stringify({ error: String(e) }))
+        : Promise.resolve('null')`,
+      50_000
+    );
+
+    // --- PARTS: several instruments on one sheet --------------------------------------
+    //
+    // The whole feature is driven inside the page by `__RIFFSHEET_PARTS__` — one part to two
+    // to a reorder to the cap — because every claim is about a transition. What is left here
+    // is the part a probe cannot do for itself: LOOK at the two-part state.
+    phase('checking parts — several instruments on one sheet', 90_000);
+    result.parts = await evalJson(
+      `window.__RIFFSHEET_PARTS__
+        ? window.__RIFFSHEET_PARTS__().then(r => JSON.stringify(r), e => JSON.stringify({ error: String(e) }))
+        : Promise.resolve('null')`,
+      70_000
+    );
+    await settle(700);
+    {
+      const partsShot = await cdp.send('Page.captureScreenshot', { format: 'png' });
+      await mkdir(join(ROOT, 'spike-results'), { recursive: true });
+      await writeFile(join(ROOT, 'spike-results', 'app-parts.png'), Buffer.from(partsShot.data, 'base64'));
+    }
+    // Back to one part. Everything after this expects the take it has had all along, and a
+    // probe that left four staves on the page would fail checks that have nothing to do with it.
+    result.partsReset = await evalJson(
+      `JSON.stringify(window.__RIFFSHEET_PARTSRESET__ ? window.__RIFFSHEET_PARTSRESET__() : null)`,
+      30_000
+    );
+    await settle(500);
+
     const layouts = [
       ['wide', result.namesLayout],
       ['1100x700', result.mid?.layout],
@@ -3075,6 +3334,8 @@ async function main() {
     const preOnSeen = result.transcribeSeenOn?.lastTranscribeOptions;
     const preEngine = result.transcribeProbeEngine;
     const preEngineSeen = result.transcribeSeenEngine?.lastTranscribeOptions;
+    /** The parts scenario, in one letter because every parts check reaches for it. */
+    const P = result.parts;
 
     const checks = [
       ['main screen rendered', result.screen === 'main'],
@@ -4215,8 +4476,48 @@ async function main() {
         // to wrap out of it into a band of its own at every plugin width. Asserted at 900x600
         // and at REAPER's 360x280 floor, because the failure was a width-dependent wrap and a
         // check at one width would have missed it exactly where it happened.
-        'transport: one row at 900x600 and at the 360x280 floor',
-        result.narrow?.transportRows === 1 && result.floor?.transportRows === 1
+        // ONE ROW AT THE PRODUCT'S FLOOR (900x600). Unchanged, and it is the half of G4 that
+        // was ever about a width anybody works at.
+        'transport: one row at 900x600',
+        result.narrow?.transportRows === 1
+      ],
+      [
+        /*
+         * …AND AT REAPER'S 360x280 IT IS ALLOWED A SECOND LINE, BUT NOTHING IN IT MAY BE CUT (H6).
+         *
+         * CHANGED, deliberately, and this is the justification. The old check asserted exactly
+         * one row at the floor as well — and it passed while the row was holding that line by
+         * CLIPPING: at 390px the clock had 29px for "0:00.00 / 0:22.77" and the blend fader 13px,
+         * both inside `overflow: hidden`, 132px of content past the row's edge. So the check was
+         * true and the screen was broken, which is the worst combination a check can have.
+         *
+         * The owner's rule is that nothing is ever cut short, and 360x280 cannot hold a clock, a
+         * fader, a sound picker and a three-part tempo control on one legible line at any scale.
+         * The bars above already take exactly this fallback at their own floor ("a second row is
+         * the honest answer down there"), so the transport now does too.
+         *
+         * THREE, and the number is measured rather than chosen. Those four items come to 989px
+         * of natural width in a 450px row at that window, so two lines is arithmetically out of
+         * reach without deleting a control — and deleting one to save a row is a worse answer
+         * than a row. Everything G4 was actually reported for is still asserted: exactly ONE row
+         * at 900x600, which is the product's stated floor and the width people work at, and
+         * nothing clipped or overflowing at any size.
+         */
+        'transport: at the 360x280 floor nothing is clipped and the row count is bounded',
+        !!result.floor &&
+          result.floor.transportRows <= 3 &&
+          (result.floor.transportClipped ?? []).length === 0 &&
+          (result.floor.transportOverflow ?? 0) <= 1
+      ],
+      [
+        // The same claim at every viewport this run visits, because a clipped readout is a
+        // width-dependent fault and one measurement would miss it exactly where it happens.
+        'transport: no readout is ever cut short, at any viewport',
+        [
+          ['900x600', result.narrow],
+          ['1100x700', result.mid],
+          ['360x280', result.floor]
+        ].every(([, v]) => !!v && (v.transportClipped ?? []).length === 0 && (v.transportOverflow ?? 0) <= 1)
       ],
       ['900x600: no horizontal overflow', !!result.narrow && result.narrow.docScrollW <= result.narrow.innerW + 1],
       ['900x600: header buttons on screen', !!result.narrow && result.narrow.maxHeaderButtonRight <= 900],
@@ -5008,8 +5309,10 @@ async function main() {
         // truth; the reader still accepts v1 and v2 documents by their magic bytes, which is
         // the property that actually protects people and is checked by
         // `scripts/riffsheet-doc-test.ts`.
+        // v4 since PARTS: `importedParts` / `partOrder` are additive, but a v3 reader handed one
+        // would drop them on the next save, so the number moved. The READER still takes v1..v4.
         'document: the current writer stamps the current version',
-        !!result.document && result.document.version === 3
+        !!result.document && result.document.version === 4
       ],
       [
         // The container is the point of v3, so it is asserted rather than assumed, together
@@ -5578,6 +5881,264 @@ async function main() {
           result.crossHighlight.rollSelected === result.crossHighlight.askedFor &&
           result.crossHighlight.sheetKnowsIds === result.crossHighlight.askedFor &&
           result.crossHighlight.runtimeSelected === result.crossHighlight.askedFor
+      ],
+
+      // --- H3: Cut sits in the strip's own left gutter -----------------------------------
+      [
+        // LEFT OF THE RECORDING AND OVER THE KEY NAMES, which is a coordinate claim: the button
+        // starts at the strip's left edge and its press target stays inside the 34px gutter the
+        // roll's pitch names occupy below it.
+        'cut: the button is in the waveform strip’s left gutter, not in a row under it',
+        !!result.cutArmPlace && result.cutArmPlace.present === true &&
+          result.cutArmPlace.left >= 0 && result.cutArmPlace.left <= 6 &&
+          result.cutArmPlace.glyphRight !== null && result.cutArmPlace.glyphRight <= 34 &&
+          result.cutArmPlace.insideStrip === true
+      ],
+      [
+        // …and the row it used to live in is empty, and therefore takes no height, on a take
+        // with nothing selected. That row is the placement the owner rejected.
+        'cut: the take-edit row no longer carries the arm button and costs no height',
+        !!result.cutArmPlace && result.cutArmPlace.rowHasCutArm === false &&
+          result.cutArmPlace.rowHidden === true
+      ],
+      [
+        // ARMED, the label says what to do AND how to get out — whole, with no ellipsis.
+        'cut: the armed label reads in full and mentions cancelling',
+        !!result.cutArmPlaceArmed && result.cutArmPlaceArmed.armed === true &&
+          !!result.cutArmPlaceArmed.hint &&
+          /cancel/i.test(result.cutArmPlaceArmed.hint.text ?? '') &&
+          /drag/i.test(result.cutArmPlaceArmed.hint.text ?? '') &&
+          result.cutArmPlaceArmed.hint.scrollW <= result.cutArmPlaceArmed.hint.clientW + 1
+      ],
+      [
+        // The armed sentence lies over the recording. Only the glyph may take a press, or a drag
+        // begun on the sentence would hit a button instead of the strip it is telling you to use.
+        'cut: the armed sentence is pointer-transparent; only the scissors takes the press',
+        !!result.cutArmPlaceArmed && result.cutArmPlaceArmed.buttonPointerEvents === 'none' &&
+          result.cutArmPlaceArmed.glyphPointerEvents === 'auto'
+      ],
+      [
+        'cut: pressing the button again disarms it',
+        !!result.cutArmPlace && result.cutArmPlace.armed === false
+      ],
+
+      // --- H6: the tempo detail is never cut short --------------------------------------
+      [
+        // The reported string, at the width it was reported at. Either it is on screen whole or
+        // it is not on screen — never "heard in y…".
+        'tempo detail: shown whole or not at all, never truncated',
+        [
+          ['wide', result.detailFit],
+          ['1100x700', result.mid?.detailFit],
+          ['900x600', result.narrow?.detailFit],
+          ['360x280', result.floor?.detailFit]
+        ].every(([, d]) => !!d && (d.hidden === true || d.scrollW <= d.clientW + 1))
+      ],
+      [
+        // …and at the full window it IS shown, whole. Without this the check above passes on a
+        // build that simply deleted the sentence.
+        'tempo detail: at a full-size window it is on screen and complete',
+        !!result.detailFit && result.detailFit.hidden === false &&
+          (result.detailFit.text ?? '').length > 8 &&
+          result.detailFit.scrollW <= result.detailFit.clientW + 1
+      ],
+
+      // --- H12: the main menu ------------------------------------------------------------
+      ['menu: the Recent list is gone', !!result.menuShape && result.menuShape.listGone === true],
+      [
+        'menu: a Recent files drop-down sits directly below “Choose a file”',
+        !!result.menuShape?.select && result.menuShape.select.options === 7 &&
+          /recent file/i.test(result.menuShape.select.placeholder ?? '') &&
+          // Nothing is selected: it is an action, not a state.
+          result.menuShape.select.value === '' &&
+          !!result.menuShape.chooseButton &&
+          result.menuShape.select.box.top >= result.menuShape.chooseButton.bottom - 1 &&
+          result.menuShape.select.box.top - result.menuShape.chooseButton.bottom <= 40
+      ],
+      [
+        // Shortened in the MIDDLE, with the whole name one hover away. A tail-truncated
+        // filename is two different files with one name.
+        'menu: recent names keep both ends and carry the full name in a tooltip',
+        !!result.menuShape?.select &&
+          (result.menuShape.select.secondTitle ?? '').length >
+            (result.menuShape.select.secondText ?? '').length - 20 &&
+          /^Bass take 3/.test(result.menuShape.select.secondText ?? '') &&
+          /\.wav/.test(result.menuShape.select.secondText ?? '')
+      ],
+      [
+        'menu: the remaining content is centred, at both viewports',
+        [result.menuShape, result.menuShape900].every(
+          (m) => !!m && typeof m.actionsCentre === 'number' && Math.abs(m.actionsCentre - m.windowCentre) <= 2
+        )
+      ],
+      [
+        // F12's original complaint, still answered: the first screen of the app must not open
+        // with a scrollbar. Both axes, at both viewports.
+        'menu: the page does not scroll, at either viewport',
+        [result.menuShape, result.menuShape900].every(
+          (m) => !!m && m.docScrollW <= m.docClientW + 1 && m.docScrollH <= m.docClientH + 1
+        )
+      ],
+
+      // --- H8: the engine chip notices somebody else's server ---------------------------
+      [
+        // A poll that stopped re-arming after a negative answer is asked exactly once. Two or
+        // more asks over one idle period is the whole claim.
+        'engine chip: the poll keeps asking after “nothing is running”',
+        !!result.enginePoll && !result.enginePoll.error && result.enginePoll.askedWhileDown >= 2
+      ],
+      [
+        'engine chip: it is hidden while nothing is running',
+        !!result.enginePoll && result.enginePoll.hiddenWhileDown === true
+      ],
+      [
+        // Nobody told the app. The timer noticed, inside about ten seconds.
+        'engine chip: an externally-started server appears without being announced',
+        !!result.enginePoll && result.enginePoll.chipShown === true &&
+          result.enginePoll.noticedMs <= result.enginePoll.idlePollMs + 4000
+      ],
+      [
+        // …and it names the engine that is RUNNING, not the one the player has selected.
+        'engine chip: it names the running engine, not the selected one',
+        !!result.enginePoll && /MuScriptor/i.test(result.enginePoll.chipText ?? '') &&
+          !/^muscriptor$/i.test(result.enginePoll.selectedEngine ?? '')
+      ],
+
+      // --- H4: a new take starts from the fixed defaults ---------------------------------
+      [
+        // The reported number, driven through the real blank-score path: set 22, make a new
+        // take, and it is 17 again.
+        'settings: the fret count does not follow you into the next project',
+        !!result.takeScope && !result.takeScope.error &&
+          result.takeScope.maxFretChosen === 22 &&
+          result.takeScope.maxFretAfter === result.takeScope.maxFretDefault
+      ],
+      [
+        // …and so does every other take-scoped key. Named individually in the payload so a
+        // failure says WHICH one leaked rather than "some setting".
+        'settings: no take-scoped setting survives into a new take',
+        !!result.takeScope && Array.isArray(result.takeScope.leaked) &&
+          result.takeScope.leaked.length === 0
+      ],
+      [
+        // The other half, and the one a blanket reset would break: a genuine app preference is
+        // NOT reset. Resetting the sound on every new take is the same complaint reversed.
+        'settings: app preferences survive a new take',
+        !!result.takeScope &&
+          result.takeScope.prefAfter?.playbackVoice === result.takeScope.prefChosen?.playbackVoice &&
+          result.takeScope.prefAfter?.showNoteNames === result.takeScope.prefChosen?.showNoteNames
+      ],
+
+      // --- PARTS ------------------------------------------------------------------------
+      [
+        // The row exists on a take that has never had a part added, and it is the two pills
+        // the design asks for: the live chip and the plus. Nothing else.
+        'parts: a single-part take shows [● Live] [+] and nothing else',
+        !!P && !P.error && P.single?.row?.chips.length === 1 &&
+          P.single.row.chips[0].key === 'live' && P.single.row.chips[0].dot === true &&
+          P.single.row.addPresent === true && P.single.row.addDisabled === false
+      ],
+      [
+        // The mark, and the sentence beside it. Both are what tell you which staff on the page
+        // is the one the roll below is drawing.
+        'parts: the live chip is accent-filled, dotted and says so',
+        !!P && P.single?.row?.chips[0]?.live === true &&
+          /^Live — transcribed from this track$/.test(P.single.row.chips[0].title ?? '')
+      ],
+      [
+        'parts: the row sits directly above the sheet, on one line, nothing overlapping',
+        !!P && !!P.two?.row && P.two.row.aboveSheet === true && P.two.row.overlapping === false &&
+          P.two.row.height > 0 && P.two.row.height <= 34
+      ],
+      [
+        // NO ELLIPSIS ANYWHERE IN THE ROW, at one part or at four. A truncated part name is a
+        // part you cannot tell from another part.
+        'parts: no ellipsis in the row',
+        !!P && [P.single?.row, P.two?.row, P.full?.row].every((r) => !!r && r.ellipsis === false)
+      ],
+      [
+        // A MusicXML file became a PART: a second chip, named from the file's own <part-name>.
+        'parts: [+] adds a MusicXML file as a second part, named from the XML',
+        !!P && P.two?.row?.chips.length === 2 &&
+          P.two.row.chips.some((chip) => chip.key === 'imp1' && /Guitar/.test(chip.text ?? ''))
+      ],
+      [
+        // The SHEET. Two alphaTab tracks built, and two tracks actually engraved — the second
+        // number is the one that was wrong when the view rendered `[0]` alone.
+        'parts: a two-part score renders 2 track systems',
+        !!P && P.two?.tracks === 2 && P.two?.renderedTracks === 2
+      ],
+      [
+        'parts: the imported track is flagged notation-only and the live one is not',
+        !!P && JSON.stringify(P.two?.notationOnly ?? []) === JSON.stringify([false, true])
+      ],
+      [
+        // MusicXML exports the document, not the live part.
+        'parts: MusicXML export carries both parts',
+        !!P && (P.two?.partNames ?? []).length === 2 && (P.two.partNames ?? []).some((n) => /Guitar/.test(n))
+      ],
+      [
+        // THE CONTRACT. An imported part is engraved and never played: the synth schedule with
+        // the guitar on the page is the one-part schedule, to the microsecond.
+        'parts: playback is identical with a part present',
+        !!P && P.scheduleIdenticalWithPart === true
+      ],
+      [
+        'parts: playback is identical after a reorder',
+        !!P && P.scheduleIdenticalAfterReorder === true
+      ],
+      [
+        // Dragged with real pointer events, and the EMITTED order changed — the part list the
+        // file is written from, not merely the chips.
+        'parts: dragging a chip changes the emitted part order',
+        !!P && P.dragged === true &&
+          JSON.stringify(P.two?.partNames ?? []) !== JSON.stringify(P.reordered?.partNames ?? []) &&
+          /Guitar/.test((P.reordered?.partNames ?? [])[0] ?? '')
+      ],
+      [
+        'parts: the chips follow the same order',
+        !!P && (P.reordered?.row?.chips ?? [])[0]?.key === 'imp1' &&
+          (P.reordered?.row?.chips ?? [])[1]?.key === 'live'
+      ],
+      [
+        // Clicking an imported chip opens its menu, and the menu is the three things the spec
+        // asks for and nothing else.
+        'parts: an imported chip opens a menu with rename, nudge and remove',
+        !!P && P.menuShape?.open === true && P.menuShape.hasRename === true &&
+          P.menuShape.hasNudge === true && P.menuShape.hasRemove === true &&
+          P.menuShape.nudgeStart === '0'
+      ],
+      [
+        // Renaming reaches the CHIP and the PAGE, not just the box it was typed into.
+        'parts: renaming a part renames it on the chip and in the export',
+        !!P && P.renamed === true &&
+          (P.afterRename?.row?.chips ?? []).some((chip) => /Rhythm gtr/.test(chip.text ?? '')) &&
+          (P.afterRename?.partNames ?? []).some((n) => /Rhythm gtr/.test(n))
+      ],
+      [
+        // A nudge is a number the player can see afterwards, and it really moves the part.
+        // 60 ms is typed; 78 comes back, because a nudge is rounded to a whole 32nd — the
+        // finest shift the printed page can spell (score/parts.ts §snapNudgeMs).
+        'parts: a nudge is applied, rounded to a printable unit, and shown on the chip',
+        !!P && P.nudged === true &&
+          (P.afterNudge?.row?.chips ?? []).some((chip) => /\+78ms/.test(chip.text ?? '')) &&
+          P.afterNudge?.tracks === 2
+      ],
+      [
+        'parts: Remove takes the part off the sheet',
+        !!P && P.afterRemove?.tracks === 1 && (P.afterRemove?.row?.chips ?? []).length === 1
+      ],
+      [
+        // Four staves is the cap. The plus goes dim and says why rather than disappearing.
+        'parts: [+] is limited to 4 parts and says why',
+        !!P && P.full?.tracks === 4 && P.full?.row?.addDisabled === true &&
+          /at most 4 parts/i.test(P.full?.row?.addTitle ?? '') && P.refusedFifth === true
+      ],
+      [
+        // …and the take is put back afterwards, or every check after this one is about a
+        // four-part document nobody asked for.
+        'parts: the harness leaves the take on one part',
+        !!result.partsReset && result.partsReset.tracks === 1
       ],
 
       // --- octave-folded tab positions ------------------------------------------------

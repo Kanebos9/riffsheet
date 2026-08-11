@@ -1,6 +1,7 @@
 #include "MuScriptorServer.h"
 #include "WebResources.h"
 #include "ModelCatalog.h"
+#include "MuScriptorProbe.h"
 #include "ServerRegistry.h"
 #include "SystemProbe.h"
 #include "EngineLock.h"
@@ -482,6 +483,10 @@ bool MuScriptorServer::haveLiveChild() const
 
 void MuScriptorServer::refreshStatus()
 {
+    // Blocks on two ports' worth of HTTP and shells out to lsof/ps. The header
+    // says worker threads only; this is that promise, checked.
+    jassert (! juce::MessageManager::existsAndIsCurrentThread());
+
     const auto c = getConfig();
 
     for (const auto port : c.reusePorts)
@@ -494,8 +499,38 @@ void MuScriptorServer::refreshStatus()
         // /health alone is not identity: any localhost process can return
         // {status:"ok"}. Never upload a user's recording unless this is our
         // live child or the listening command line is recognisably MuScriptor.
-        if (! ours && ! isRecognisableMuScriptorOnPort (port))
+        auto recognised = ours || isRecognisableMuScriptorOnPort (port);
+        auto byHandshake = false;
+
+        if (! recognised)
+        {
+            // THE SERVER THE OPERATING SYSTEM WOULD NOT TELL US ABOUT.
+            //
+            // isRecognisableMuScriptorOnPort() reads the listening pid out of
+            // lsof and its command line out of ps, and there are ordinary
+            // machines where both come back empty for a server that is plainly
+            // there: a sandboxed plugin host cannot spawn either tool, lsof
+            // hides other users' processes, and the Windows implementation of
+            // listeningProcessId() returns 0 by definition. A user who starts
+            // MuScriptor themselves on those machines got "stopped" from a
+            // Riffsheet that was, at that moment, three lines away from the
+            // running server - which is the bug this branch closes.
+            //
+            // So ask the SERVER. A /health that says ok plus an /instruments
+            // that lists MuScriptor's own group names is identity enough to
+            // REPORT a server with, and it is deliberately not enough to do
+            // anything to one: `handshakeIdentifiedOnly` below is what keeps
+            // the kill path and the upload path on the old, stricter proof.
+            byHandshake = MuScriptorProbe::answersLikeMuScriptor (c.host, port);
+            recognised = byHandshake;
+        }
+
+        if (! recognised)
             continue;
+
+        // Before state goes to ready, never after: transcribe() reads the two
+        // together to decide whether it may send audio straight to this port.
+        handshakeIdentifiedOnly = byHandshake;
 
         activePort = port;
         adopted = ! ours;
@@ -525,6 +560,7 @@ void MuScriptorServer::clearServerFacts()
     serverMemoryMb = -1;
     registryOwned = false;
     serverLooksLikeMuScriptor = false;
+    handshakeIdentifiedOnly = false;
     ourServerSinceMs = 0.0;
 }
 
@@ -714,6 +750,9 @@ bool MuScriptorServer::ensureRunning (std::function<void (const juce::String&)> 
                            SystemProbe::processCommandLine (listener))))
                 continue;
 
+            // Adopted the strict way - lsof and ps agreed - so this server is a
+            // full citizen: audio may go to it and stopIfAllowed() may end it.
+            handshakeIdentifiedOnly = false;
             activePort = port;
             adopted = ! ours;
             state = State::ready;
@@ -762,6 +801,7 @@ bool MuScriptorServer::ensureRunning (std::function<void (const juce::String&)> 
 
         if (probeHealth (c.port))
         {
+            handshakeIdentifiedOnly = false;   // we started it; nothing to identify
             activePort = c.port;
             adopted = false;
             state = State::ready;
@@ -833,7 +873,14 @@ juce::var MuScriptorServer::transcribe (const juce::File& audioFile,
         return {};
     }
 
-    if (state.load() != State::ready && ! ensureRunning())
+    // THE UPLOAD RULE IS UNCHANGED BY THE HANDSHAKE PROBE. `ready` on its own no
+    // longer means "identified well enough to be sent a user's recording": since
+    // refreshStatus() can also reach ready on the strength of an HTTP handshake,
+    // a server that got there that way is pushed through ensureRunning(), whose
+    // test is still the pid and its command line. It will either adopt the
+    // server on the old, stricter evidence or start one of its own - which is
+    // exactly what happened before this state existed.
+    if ((state.load() != State::ready || handshakeIdentifiedOnly.load()) && ! ensureRunning())
     {
         error = getLastError();
         return {};

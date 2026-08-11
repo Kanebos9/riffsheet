@@ -12,11 +12,25 @@
  */
 
 import type { BuildInput, BuildSettings } from '../src/types.js';
+import type { ScorePart, SharedBuildInput } from '../src/multipart.js';
 import { grid, playedNotes, settings } from './helpers.js';
 
 export interface GoldenCase {
   name: string;
   input: BuildInput;
+  settings: BuildSettings;
+}
+
+/**
+ * A multi-part golden. Two fixtures come off one case — the MusicXML document and the alphaTab
+ * hand-off — because "both emitters agree about the same two parts" is the claim being pinned,
+ * and pinning only one of them would let the other drift.
+ */
+export interface MultiPartGoldenCase {
+  name: string;
+  emit: 'musicxml' | 'alphatab';
+  parts: ScorePart[];
+  input: SharedBuildInput;
   settings: BuildSettings;
 }
 
@@ -78,5 +92,66 @@ export const GOLDEN_CASES: GoldenCase[] = [
       ]
     },
     settings: settings({ title: 'Pickup' })
+  }
+];
+
+/**
+ * THE TWO-PART SHAPE THE FEATURE EXISTS FOR: a live guitar take on top, an imported bass part
+ * below, both on one clock.
+ *
+ * The guitar is the live part and keeps everything a single-part score has — notation over its
+ * own tablature staff, its tuning printed in its name. The bass arrives as a symbolic import and
+ * is engraved notation-only, on its own clef, chosen from its own pitches. The two never meet:
+ * the bass plays quarters where the guitar plays eighths, and each part's beams, rests and
+ * measure cursor are its own.
+ *
+ * The guitar runs two bars and the bass only one, so the fixture also pins what a part does with
+ * a bar it did not play in: a whole-bar rest, at the same measure number, on the same barline.
+ */
+const TWO_PART_INPUT: SharedBuildInput = grid(2, 4, 120);
+
+const TWO_PART_PARTS: ScorePart[] = [
+  {
+    name: 'Guitar',
+    abbreviation: 'Gtr.',
+    role: 'live',
+    instrument: 'guitar6',
+    notes: playedNotes(
+      // sixteen eighths over two bars: a bar of the riff and a bar answering it
+      Array.from({ length: 16 }, (_, i) => ({
+        beat: i * 0.5,
+        midi: [55, 59, 62, 64, 62, 59, 57, 55, 55, 57, 59, 62, 64, 62, 59, 55][i]
+      })),
+      0.9,
+      120
+    ).map((note, i) => ({ ...note, id: `g${i}` }))
+  },
+  {
+    name: 'Bass',
+    abbreviation: 'Bs.',
+    role: 'imported',
+    notes: [
+      { id: 'b0', startSec: 0.0, endSec: 0.48, midi: 40, velocity: 90 },
+      { id: 'b1', startSec: 0.5, endSec: 0.98, midi: 43, velocity: 88 },
+      { id: 'b2', startSec: 1.0, endSec: 1.48, midi: 45, velocity: 90 },
+      { id: 'b3', startSec: 1.5, endSec: 1.98, midi: 40, velocity: 88 }
+    ]
+  }
+];
+
+export const MULTI_PART_GOLDEN_CASES: MultiPartGoldenCase[] = [
+  {
+    name: 'two-part',
+    emit: 'musicxml',
+    parts: TWO_PART_PARTS,
+    input: TWO_PART_INPUT,
+    settings: settings({ title: 'Two Parts', instrument: 'guitar6', tuningMidi: [40, 45, 50, 55, 59, 64] })
+  },
+  {
+    name: 'two-part-alphatab',
+    emit: 'alphatab',
+    parts: TWO_PART_PARTS,
+    input: TWO_PART_INPUT,
+    settings: settings({ title: 'Two Parts', instrument: 'guitar6', tuningMidi: [40, 45, 50, 55, 59, 64] })
   }
 ];

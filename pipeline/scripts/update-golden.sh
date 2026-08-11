@@ -27,7 +27,7 @@ if [ ! -x "${JSC:-}" ]; then echo "jsc not found (set JSC=)" >&2; exit 127; fi
 OUT="${TMPDIR:-/tmp}/riffsheet-golden"
 mkdir -p "$OUT" test/golden
 
-CASES=("straight-eighths" "external-grid" "pickup")
+CASES=("straight-eighths" "external-grid" "pickup" "two-part" "two-part-alphatab")
 if [ $# -gt 0 ]; then CASES=("$@"); fi
 
 for name in "${CASES[@]}"; do

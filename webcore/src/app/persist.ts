@@ -33,6 +33,7 @@ import type { EditSpec } from '../edit/actions';
 import type { NativeBridge } from '../bridge';
 import type { TrimResult } from '../audio/trim';
 import type { AppSettings, HostGrid, SourceAudio } from './state';
+import { MAX_SCORE_PARTS, type ImportedPart } from '../score/parts';
 import { normalizeCuts, type CutSpan } from '../edit/cuts';
 
 /** Raise this AND add a case in `readSession()` when the shape has to change under people. */
@@ -91,6 +92,15 @@ export interface PersistedSource {
    * serialises to exactly the bytes it did before this field existed.
    */
   cuts?: CutSpan[];
+  /**
+   * The imported parts printed on this sheet, and the order they print in (`score/parts.ts`).
+   *
+   * NEW IN DOCUMENT v4, and the reason for the bump: a v3 reader handed one of these would show
+   * the live take alone and then write the file back without them. The pair is written only when
+   * there is at least one part, so a single-part document is unchanged.
+   */
+  importedParts?: ImportedPart[];
+  partOrder?: string[];
 }
 
 export interface PersistedSession {
@@ -191,7 +201,20 @@ export function encodeSource(source: SourceAudio | null): PersistedSource | null
     // Copied, not aliased: the blob is handed to `JSON.stringify` asynchronously (SessionStore
     // debounces), and a list that keeps changing underneath the writer is a race nobody would
     // find. Empty stays undefined — see the field's note.
-    cuts: source.cuts?.length ? source.cuts.map((c) => ({ fromSec: c.fromSec, toSec: c.toSec })) : undefined
+    cuts: source.cuts?.length ? source.cuts.map((c) => ({ fromSec: c.fromSec, toSec: c.toSec })) : undefined,
+    // PARTS. Symbolic notes and a name — a part is stored, never referenced, so a document that
+    // travels takes the guitar chart with it. Omitted rather than written as `[]` for the same
+    // reason `cuts` is: a take that has never had a part added must serialise to the bytes it
+    // always did.
+    importedParts: source.importedParts?.length
+      ? source.importedParts.map((part) => ({
+          id: part.id,
+          name: part.name,
+          nudgeMs: part.nudgeMs || 0,
+          notes: part.notes
+        }))
+      : undefined,
+    partOrder: source.importedParts?.length ? source.partOrder?.slice() : undefined
   };
 }
 
@@ -219,8 +242,34 @@ export function decodeSource(source: PersistedSource | null | undefined): Source
     // hand-edited or truncated blob carrying overlapping spans would silently break the
     // audio<->edited clocks being inverses of each other. Normalizing on the way in costs a
     // sort of a handful of pairs and makes the restored list indistinguishable from a live one.
-    cuts: decodeCuts(source.cuts, Number(source.durationSec) || 0)
+    cuts: decodeCuts(source.cuts, Number(source.durationSec) || 0),
+    // Through the same gate the live app uses: at most MAX_SCORE_PARTS - 1 imported parts, each
+    // with a name and a note list, and an order that names them. A blob that has lost one of the
+    // two must not produce a document with a chip for a part that is not there — `orderedPartSlots`
+    // is the one that reconciles them, and it is fed the pair exactly as it is stored.
+    importedParts: decodeImportedParts(source.importedParts),
+    partOrder: Array.isArray(source.partOrder)
+      ? source.partOrder.filter((key): key is string => typeof key === 'string')
+      : undefined
   };
+}
+
+function decodeImportedParts(value: unknown): ImportedPart[] | undefined {
+  if (!Array.isArray(value)) return undefined;
+  const parts: ImportedPart[] = [];
+  for (const raw of value.slice(0, MAX_SCORE_PARTS - 1)) {
+    if (!raw || typeof raw !== 'object') continue;
+    const part = raw as Partial<ImportedPart>;
+    if (typeof part.id !== 'string' || !part.id) continue;
+    if (!Array.isArray(part.notes) || part.notes.length === 0) continue;
+    parts.push({
+      id: part.id,
+      name: typeof part.name === 'string' && part.name.trim() ? part.name.trim() : 'Part',
+      nudgeMs: Number.isFinite(Number(part.nudgeMs)) ? Number(part.nudgeMs) : 0,
+      notes: part.notes as ImportedPart['notes']
+    });
+  }
+  return parts.length ? parts : undefined;
 }
 
 function decodeCuts(value: unknown, durationSec: number): CutSpan[] | undefined {
@@ -250,8 +299,11 @@ function validTimeSignature(value: unknown): { numerator: number; denominator: n
 /**
  * What this build WRITES. Readers accept anything from v1 up to this — see
  * `readRiffsheetDocument` — so a document made before the audio moved inside still opens.
+ *
+ * v4 is v3 plus PARTS (`PersistedSource.importedParts` / `partOrder`). Nothing about the
+ * container changed, and a v3 document is read as exactly what it is: a score with one part.
  */
-export const RIFFSHEET_DOCUMENT_VERSION = 3;
+export const RIFFSHEET_DOCUMENT_VERSION = 4;
 
 /**
  * THE CONTAINER, and why it changed twice.

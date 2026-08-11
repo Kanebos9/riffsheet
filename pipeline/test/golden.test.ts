@@ -1,36 +1,56 @@
 import { describe, it, expect } from 'vitest';
 import { buildScore } from '../src/buildScore.js';
-import { GOLDEN_CASES } from './goldenCases.js';
+import { buildMultiPartScore } from '../src/multipart.js';
+import { GOLDEN_CASES, MULTI_PART_GOLDEN_CASES } from './goldenCases.js';
 import { readMusicXml } from './xmlReader.js';
 import straightEighths from './golden/straight-eighths.js';
 import externalGrid from './golden/external-grid.js';
 import pickup from './golden/pickup.js';
+import twoPart from './golden/two-part.js';
+import twoPartAlphaTab from './golden/two-part-alphatab.js';
 
 const EXPECTED: Record<string, string> = {
   'straight-eighths': straightEighths,
   'external-grid': externalGrid,
-  pickup
+  pickup,
+  'two-part': twoPart,
+  'two-part-alphatab': twoPartAlphaTab
 };
+
+/** Point at the first differing line rather than dumping the whole fixture. */
+function assertMatches(name: string, actual: string, expected: string): void {
+  if (actual !== expected) {
+    const a = actual.split('\n');
+    const b = expected.split('\n');
+    let i = 0;
+    while (i < a.length && i < b.length && a[i] === b[i]) i++;
+    throw new Error(
+      `golden "${name}" diverges at line ${i + 1}\n` +
+        `  expected: ${b[i] ?? '<eof>'}\n` +
+        `  actual:   ${a[i] ?? '<eof>'}\n` +
+        `  (regenerate deliberately with scripts/update-golden.sh ${name})`
+    );
+  }
+  expect(actual).toBe(expected);
+}
 
 describe('GOLDEN FILES — notes + beats in, MusicXML out', () => {
   for (const testCase of GOLDEN_CASES) {
     it(`${testCase.name} matches its committed fixture`, () => {
-      const actual = buildScore(testCase.input, testCase.settings).toMusicXML();
-      const expected = EXPECTED[testCase.name];
-      if (actual !== expected) {
-        // Point at the first differing line rather than dumping 300 lines of XML.
-        const a = actual.split('\n');
-        const b = expected.split('\n');
-        let i = 0;
-        while (i < a.length && i < b.length && a[i] === b[i]) i++;
-        throw new Error(
-          `golden "${testCase.name}" diverges at line ${i + 1}\n` +
-            `  expected: ${b[i] ?? '<eof>'}\n` +
-            `  actual:   ${a[i] ?? '<eof>'}\n` +
-            `  (regenerate deliberately with scripts/update-golden.sh ${testCase.name})`
-        );
-      }
-      expect(actual).toBe(expected);
+      assertMatches(testCase.name, buildScore(testCase.input, testCase.settings).toMusicXML(), EXPECTED[testCase.name]);
+    });
+  }
+});
+
+describe('GOLDEN FILES — two parts in, one document out', () => {
+  for (const testCase of MULTI_PART_GOLDEN_CASES) {
+    it(`${testCase.name} matches its committed fixture`, () => {
+      const built = buildMultiPartScore(testCase.parts, testCase.input, testCase.settings);
+      const actual =
+        testCase.emit === 'alphatab'
+          ? JSON.stringify(built.toAlphaTabModelData(), null, 1)
+          : built.toMusicXML();
+      assertMatches(testCase.name, actual, EXPECTED[testCase.name]);
     });
   }
 });
@@ -76,8 +96,58 @@ describe('GOLDEN FILES — what each one pins', () => {
     expect(inPickup[0].midi).toBe(47);
   });
 
-  it('all three round-trip through the reader with balanced measures', () => {
+  it('two-part: a guitar over a bass, one clock, one key, two independent engravings', () => {
+    const read = readMusicXml(twoPart);
+    expect(read.partCount).toBe(2);
+    expect(read.partList.map((p) => p.name)).toEqual(['Guitar', 'Bass']);
+    expect(read.partList.map((p) => p.channel)).toEqual([1, 2]);
+
+    // TOP PART: the live take. Two staves — notation over its own tablature — and its own beams.
+    const top = readMusicXml(twoPart, 0);
+    expect(top.measureLengths.map((m) => m.length)).toEqual([96, 96]);
+    expect(top.notes.filter((n) => n.staff === 1 && !n.isRest)).toHaveLength(16);
+    expect(top.staffTuning).toHaveLength(6);
+
+    // BOTTOM PART: imported, notation only. One staff, its own bass clef, no tablature.
+    const bottom = readMusicXml(twoPart, 1);
+    expect(bottom.measureLengths.map((m) => m.length)).toEqual([96, 96]);
+    expect(bottom.staffTuning).toHaveLength(0);
+    expect(bottom.notes.filter((n) => !n.isRest)).toHaveLength(4);
+    // The bar it did not play in is a whole-bar rest at the same measure number, not a short bar.
+    const secondBar = bottom.notes.filter((n) => n.measure === 2);
+    expect(secondBar).toHaveLength(1);
+    expect(secondBar[0].isRest).toBe(true);
+    expect(secondBar[0].duration).toBe(96);
+    // ONE CLOCK, ONE KEY: the two parts agree bar for bar.
+    expect(bottom.measureLengths).toEqual(top.measureLengths);
+    expect(bottom.fifths).toBe(top.fifths);
+  });
+
+  it('two-part-alphatab: two tracks against one master-bar list, the imported one flagged', () => {
+    const data = JSON.parse(twoPartAlphaTab) as ReturnType<
+      ReturnType<typeof buildMultiPartScore>['toAlphaTabModelData']
+    >;
+    expect(data.tracks).toHaveLength(2);
+    expect(data.masterBars).toHaveLength(2);
+    expect(data.tracks[0].staves[0].showTablature).toBe(true);
+    expect(data.tracks[0].notationOnly).toBeUndefined();
+    expect(data.tracks[1].staves).toHaveLength(1);
+    expect(data.tracks[1].staves[0].showTablature).toBe(false);
+    expect(data.tracks[1].notationOnly).toBe(true);
+    for (const track of data.tracks) {
+      for (const staff of track.staves) expect(staff.bars).toHaveLength(data.masterBars.length);
+    }
+    // The two emitters were fed the same build, so they must agree about the same notes.
+    const xmlNotes = readMusicXml(twoPart, 1).notes.filter((n) => !n.isRest).map((n) => n.midi);
+    const atNotes = data.tracks[1].staves[0].bars.flatMap((bar) =>
+      bar.voices.flatMap((v) => v.beats.flatMap((b) => b.notes.map((n) => n.midi)))
+    );
+    expect(atNotes).toEqual(xmlNotes);
+  });
+
+  it('every MusicXML golden round-trips through the reader with balanced measures', () => {
     for (const [name, xml] of Object.entries(EXPECTED)) {
+      if (name === 'two-part-alphatab') continue;
       const read = readMusicXml(xml);
       expect(read.hasTranspose, name).toBe(false);
       expect(read.hasClefOctaveChange, name).toBe(false);

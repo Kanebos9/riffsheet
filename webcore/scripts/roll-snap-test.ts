@@ -206,10 +206,18 @@ assert(new Set(sheets.values()).size > 1, 'changing Quantize must change what th
 assert(fingerprint(raw) === rawBefore, 'building at four grids must leave the performance layer alone');
 
 // ---------------------------------------------------------------------------
-// 7. Settings v10 … v12
+// 7. Settings v10 … v13
 // ---------------------------------------------------------------------------
+//
+// V13 SITS ON TOP OF EVERYTHING BELOW IT, and it is worth stating once here rather than at each
+// assertion. H4 made `grid`, `rollGrid` and `rollSnap` TAKE-SCOPED — answers about the recording
+// in front of you rather than preferences that follow you between projects — so v13 stamps their
+// defaults over any blob older than itself. Several claims below were written when those three
+// were global preferences and read the other way round ("a deliberate '1/4' is never touched");
+// they are restated, not deleted, because the thing they were guarding — a migration that fires
+// once, on a blob it can identify, and never re-fires — is unchanged and still worth pinning.
 
-assert(SETTINGS_VERSION === 12, 'this test is written against settings v12');
+assert(SETTINGS_VERSION === 13, 'this test is written against settings v13');
 assert(DEFAULT_SETTINGS.grid === 'auto', "a new user's Quantize default is Auto again");
 assert(DEFAULT_SETTINGS.rollSnap === 'off', 'Snap is off until asked for');
 assert(DEFAULT_SETTINGS.alignViews === true, 'alignment is on and is not a choice');
@@ -230,7 +238,7 @@ assert(fromV8.rollAllNoteNames === true && fromV8.rollEditing === true, 'v9 stil
 assert(fromV8.preciseBeats === false, 'v9 still forces the drifting-tempo pass off');
 assert(fromV8.rollSnap === 'off', 'a migrated blob does not arrive with notes already snapped');
 assert(fromV8.alignViews === true, 'v11 forces alignment on — the chip is gone (G11)');
-assert(fromV8.settingsVersion === 12, 'the migrated blob is stamped v12');
+assert(fromV8.settingsVersion === 13, 'the migrated blob is stamped v13');
 
 // A v9 blob that had explicitly chosen 'sixteenth' is still carried across v10 — which forced
 // everything to 'free' — and v11 then reads that 'free' as v10's doing rather than as a choice,
@@ -239,50 +247,61 @@ assert(fromV8.settingsVersion === 12, 'the migrated blob is stamped v12');
 const fromV9 = mergeStoredSettings({ settingsVersion: 9, grid: 'sixteenth' } as Partial<AppSettings>);
 assert(fromV9.grid === 'auto', 'a pre-v10 blob ends on Auto');
 
-// THE HALF THAT MATTERS MOST. A v10 profile sitting on any value except 'free' chose it — no
-// v10 default could have produced it — so v11 leaves it exactly alone.
-for (const kept of ['auto', 'quarter', 'eighth', 'sixteenth', 'thirtysecond', 'triplet'] as const) {
-  const blob = mergeStoredSettings({ settingsVersion: 10, grid: kept } as Partial<AppSettings>);
-  assert(blob.grid === kept, `v11 must not touch a deliberate '${kept}'`);
+// THE HALF THAT MATTERED MOST, AND WHAT BECAME OF IT. A v10 profile sitting on any value except
+// 'free' chose it — no v10 default could have produced it — so v11 left it exactly alone. v13
+// then takes all three of these keys away from the profile entirely (H4: they describe the take,
+// not the player), so an OLD blob now arrives on the take default whatever it was carrying. The
+// claim is therefore about the reset being total rather than partial: no v10 or v11 value of
+// Quantize survives into a new take, including the ones v11 was careful to preserve.
+for (const kept of ['auto', 'quarter', 'eighth', 'sixteenth', 'thirtysecond', 'triplet', 'free'] as const) {
+  for (const version of [10, 11, 12] as const) {
+    const blob = mergeStoredSettings({ settingsVersion: version, grid: kept } as Partial<AppSettings>);
+    assert(
+      blob.grid === DEFAULT_SETTINGS.grid,
+      `v13 takes Quantize away from the profile: a v${version} '${kept}' must arrive as '${DEFAULT_SETTINGS.grid}', got '${blob.grid}'`
+    );
+  }
 }
 
-// …and the one that is NOT distinguishable. A v10 'free' may be the migration's or the
-// player's; the two are written identically, so everybody on it lands on Auto once.
-const wasFree = mergeStoredSettings({ settingsVersion: 10, grid: 'free' } as Partial<AppSettings>);
-assert(wasFree.grid === 'auto', "v11 moves every v10 'free' to Auto exactly once");
-
-// …and once they are on v11, their choice is theirs, INCLUDING 'free'. This is the half that
-// would make the feature obnoxious if it were wrong: a migration that re-fires would overwrite
-// the menu every time the app started.
-const chosen = mergeStoredSettings({ settingsVersion: 11, grid: 'free', rollSnapToGrid: true } as Partial<AppSettings>);
-assert(chosen.grid === 'free', "after v11 the player's own Quantize choice is never re-flipped");
+// …and once a profile IS on v13, the value in the blob is the take's own and is never re-flipped.
+// This is the half that would make the feature obnoxious if it were wrong: a migration that
+// re-fires would overwrite the menu every time a document was opened.
+for (const kept of ['auto', 'quarter', 'eighth', 'sixteenth', 'thirtysecond', 'triplet', 'free'] as const) {
+  const blob = mergeStoredSettings({ settingsVersion: 13, grid: kept } as Partial<AppSettings>);
+  assert(blob.grid === kept, `after v13 a stored '${kept}' is the take's own and stands`);
+}
 
 // v11 -> v12: the switch becomes a mode, by TRANSLATION rather than by reset. The boolean said
-// exactly one thing and 'grid' means exactly that, so somebody who had switched it on stays on.
-assert(chosen.rollSnap === 'grid', "a stored `true` carries over as the player's own Grid choice");
+// exactly one thing and 'grid' means exactly that — and v13 then resets the MODE while leaving
+// the translation itself intact, which is the distinction worth pinning: the old boolean is
+// still read correctly, it simply no longer decides what a new take starts on.
+const chosen = mergeStoredSettings({ settingsVersion: 11, grid: 'free', rollSnapToGrid: true } as Partial<AppSettings>);
 assert(chosen.rollSnapToGrid === true, 'the dead boolean survives so an old blob still round-trips');
+assert(chosen.rollSnap === DEFAULT_SETTINGS.rollSnap, 'v13 hands a new take the default snap mode');
 const wasOff = mergeStoredSettings({ settingsVersion: 11, rollSnapToGrid: false } as Partial<AppSettings>);
 assert(wasOff.rollSnap === 'off', 'a stored `false` carries over as Off');
 // NOBODY IS MIGRATED ONTO BEAT. It moves notes to places the old switch never would have, and a
-// mode nobody chose must not arrive already on.
+// mode nobody chose must not arrive already on — which is now true twice over, since v13 stamps
+// the default on top of whatever v12 decided.
 assert(
   mergeStoredSettings({ settingsVersion: 9, rollSnapToGrid: true } as Partial<AppSettings>).rollSnap !== 'beat',
   'no migration may land a profile on Beat'
 );
-// …and once on v12, the chosen mode is theirs, including the new one.
-const onBeat = mergeStoredSettings({ settingsVersion: 12, rollSnap: 'beat' } as Partial<AppSettings>);
-assert(onBeat.rollSnap === 'beat', 'after v12 a chosen Beat is never re-flipped');
+// …and once on v13, the chosen mode is the take's, including the new one.
+const onBeat = mergeStoredSettings({ settingsVersion: 13, rollSnap: 'beat' } as Partial<AppSettings>);
+assert(onBeat.rollSnap === 'beat', 'after v13 a chosen Beat is never re-flipped');
 
 // Stored JSON is untrusted: a garbage snap value must normalise rather than reach the feed.
-const junk = mergeStoredSettings({ settingsVersion: 11, rollSnapToGrid: 'yes' } as unknown as Partial<AppSettings>);
+const junk = mergeStoredSettings({ settingsVersion: 13, rollSnapToGrid: 'yes' } as unknown as Partial<AppSettings>);
 assert(junk.rollSnap === 'off', 'a non-boolean legacy snap setting falls back to Off');
-const junkMode = mergeStoredSettings({ settingsVersion: 12, rollSnap: 'sort-of' } as unknown as Partial<AppSettings>);
+const junkMode = mergeStoredSettings({ settingsVersion: 13, rollSnap: 'sort-of' } as unknown as Partial<AppSettings>);
 assert(junkMode.rollSnap === 'off', 'a snap mode nothing recognises falls back to Off, not to "some kind of on"');
 // And a garbage roll grid falls back rather than reaching the ruler — the vocabulary grew by two
-// words in G14, so the guard has to know both of them.
-const goodGrid = mergeStoredSettings({ settingsVersion: 11, rollGrid: 'off' } as Partial<AppSettings>);
+// words in G14, so the guard has to know both of them. Read at v13, where the take's own value is
+// the one under test rather than one the migration would have overwritten anyway.
+const goodGrid = mergeStoredSettings({ settingsVersion: 13, rollGrid: 'off' } as Partial<AppSettings>);
 assert(goodGrid.rollGrid === 'off', "'off' is a real roll grid now");
-const badGrid = mergeStoredSettings({ settingsVersion: 11, rollGrid: 'auto' } as unknown as Partial<AppSettings>);
+const badGrid = mergeStoredSettings({ settingsVersion: 13, rollGrid: 'auto' } as unknown as Partial<AppSettings>);
 assert(badGrid.rollGrid === DEFAULT_SETTINGS.rollGrid, "'auto' is still meaningless as a roll grid");
 
 // ---------------------------------------------------------------------------
@@ -492,9 +511,195 @@ assert(
   'every note the gesture did not name comes back from the recording'
 );
 
+// ---------------------------------------------------------------------------
+// 9e. THE REPORTED BUG: a crowded bar SUBDIVIDES, it does not push the take forward
+// ---------------------------------------------------------------------------
+//
+// From a screenshot, and it is worth restating exactly because the shape of the failure is the
+// whole point. A bass take, Snap on Beat, the ruler on 1/4: the SHEET's bar 2 was missing a G2
+// and an F2 that Grid mode showed in the same bar, while an A1 of the same length beside them
+// survived. The notes had not been merged or filtered — they had been PUSHED. The cascade
+// stepped by a fixed cell, the 1/4 ruler's cell IS the beat, so the second note of every crowded
+// beat was thrown a whole beat forward and every note after it inherited that debt: bar 2's last
+// two notes were sitting in bar 3, bar 3's in bar 4, and by the end of an eight-bar take the
+// drift was 5.4 seconds and the overflow was falling off the end of the last bar, where
+// `buildScore`'s past-the-end filter deleted it outright.
+//
+// The owner's own words are the fix: "beat snap must never lose a note — can't you use 8 eighths
+// instead of 4 quarters?" A beat holding more notes than the ruler has cells halves the cell
+// until they fit, and they all stay in the beat they were aiming at.
+const riff: InputNote[] = [
+  // bar 1, four on the pulse
+  { id: 'b0', startSec: 0.01, endSec: 0.23, midi: 33 },
+  { id: 'b1', startSec: 0.52, endSec: 0.72, midi: 33 },
+  { id: 'b2', startSec: 0.99, endSec: 1.24, midi: 40 },
+  { id: 'b3', startSec: 1.51, endSec: 1.7, midi: 33 },
+  // bar 2, SIX notes of similar length over four beats — the bar from the screenshot
+  { id: 'b4', startSec: 2.0, endSec: 2.19, midi: 33 }, // A1
+  { id: 'b5', startSec: 2.19, endSec: 2.39, midi: 43 }, // G2
+  { id: 'b6', startSec: 2.41, endSec: 2.6, midi: 41 }, // F2
+  { id: 'b7', startSec: 2.62, endSec: 2.83, midi: 33 }, // A1
+  { id: 'b8', startSec: 2.98, endSec: 3.19, midi: 43 }, // G2
+  { id: 'b9', startSec: 3.44, endSec: 3.65, midi: 41 }, // F2
+  // bar 3
+  { id: 'b10', startSec: 4.0, endSec: 4.22, midi: 33 },
+  { id: 'b11', startSec: 4.5, endSec: 4.7, midi: 40 },
+  { id: 'b12', startSec: 5.0, endSec: 5.2, midi: 33 },
+  { id: 'b13', startSec: 5.5, endSec: 5.72, midi: 43 }
+];
+const riffBeats: number[] = [];
+for (let i = 0; i <= 4 * 4; i++) riffBeats.push(i * BEAT);
+
+/** Every input note that reached the page, by id, and which bar it reached. */
+const engraved = (notes: ReadonlyArray<InputNote>, grid: BuildSettings['grid'] = 'auto') => {
+  const built = buildScore(
+    { notes: [...notes], beats: riffBeats, startOffsetSec: 0, audioDurationSec: 4 * 4 * BEAT + 1 },
+    { grid, instrument: 'staff', tuningMidi: [], fingeringStyle: 'low', clefMode: 'auto' }
+  );
+  const barOf = new Map<string, number>();
+  for (const bar of built.ir.bars) {
+    for (const voice of bar.voices) {
+      for (const beat of voice.beats) {
+        for (const note of beat.notes) if (!barOf.has(note.id)) barOf.set(note.id, bar.index);
+      }
+    }
+  }
+  return barOf;
+};
+
+// THE RULER IS ON 1/4, which is the setting that produced the screenshot: its cell is exactly a
+// beat, so under the old cascade every collision cost a whole beat.
+const riffSnapped = snapPerformanceToBeat(riff, BEAT, rollSnapUnitSec('quarter', 120), 0, 120);
+assert(riffSnapped.length === riff.length, 'the snap itself may not drop a note');
+// SIX NOTES, FOUR BEATS, ONE BAR. Bar 2 is written seconds 2.0 to 4.0; every note that was
+// played in it must still be in it. Under the old cascade b8 landed at 4.0 and b9 at 4.5 —
+// squarely in bar 3, which is precisely "bar 2 is missing a G2 and an F2".
+for (const id of ['b4', 'b5', 'b6', 'b7', 'b8', 'b9']) {
+  const note = riffSnapped.find((n) => n.id === id)!;
+  assert(
+    note.startSec >= 2 - 1e-9 && note.startSec < 4 - 1e-9,
+    `${id} was played in bar 2 and must be snapped inside bar 2, not to ${note.startSec}`
+  );
+}
+// …and they subdivide rather than stack: six distinct positions, and the two that shared a beat
+// with a neighbour are an EIGHTH apart, which is the answer the report asked for by name.
+assert(
+  riffSnapped.map((n) => `${n.id}@${n.startSec}`).join(' ').includes('b4@2 b5@2.25 b6@2.5 b7@2.75 b8@3 b9@3.5'),
+  `bar 2 must subdivide onto eighths: ${riffSnapped.map((n) => `${n.id}@${n.startSec}`).join(' ')}`
+);
+// THE SHEET, which is where the notes were actually going missing. Every played note reaches the
+// page, and it reaches the bar it was played in.
+const riffPage = engraved(riffSnapped);
+for (const note of riff) {
+  assert(riffPage.has(note.id!), `${note.id} must reach the sheet — beat snap may never lose a note`);
+}
+for (const id of ['b4', 'b5', 'b6', 'b7', 'b8', 'b9']) {
+  assert(riffPage.get(id) === 1, `${id} must be engraved in bar 2 (index 1), not bar ${riffPage.get(id)}`);
+}
+// GRID MODE IS THE CONTROL. The screenshot compared the two, so the test does too: whatever Beat
+// does, it may not write fewer notes than Grid does on the same take.
+const riffGridPage = engraved(snapPerformanceToGrid(riff, rollSnapUnitSec('eighth', 120), 0, 120));
+assert(
+  riffPage.size >= riffGridPage.size,
+  `Beat wrote ${riffPage.size} of ${riff.length} notes where Grid wrote ${riffGridPage.size}`
+);
+
+// ---------------------------------------------------------------------------
+// 9f. THE INVARIANT, AS A PROPERTY: every input note survives to the sheet
+// ---------------------------------------------------------------------------
+//
+// One scenario proves the reported bug is gone; it does not prove the class is. These are
+// randomised dense takes — three to eight notes a bar, human timing, every roll grid the ruler
+// offers — checked on three claims at once:
+//
+//   1. the snap is a bijection: as many events out as in, at strictly increasing positions at
+//      least one subdivision apart, so no two attacks can ever occupy one slot;
+//   2. no note moves further than a beat, which is what stops the drift that caused the bug;
+//   3. and the number that actually matters — every one of them is still on the SHEET.
+//
+// `'auto'` is the Quantize setting because it is the default and because it is the one with an
+// opinion: it offers straight-8 and straight-16 and never a 1/32, so a cascade that subdivided
+// past a 1/16 of the beat would have its extra notes fused onto one tick by the quantizer's
+// collision rule. That is why `finestStepSec` stops where it does, and this is the check that
+// would catch it moving.
+const TRIALS = 240;
+const TRIAL_BARS = 8;
+const trialBeats: number[] = [];
+for (let i = 0; i <= TRIAL_BARS * 4; i++) trialBeats.push(i * BEAT);
+
+let seed = 20260812;
+const rnd = (): number => ((seed = (seed * 1103515245 + 12345) & 0x7fffffff) / 0x7fffffff);
+
+const RULERS = ['quarter', 'eighth', 'sixteenth', 'thirtysecond', 'triplet', 'off'] as const;
+let checkedNotes = 0;
+let widestMove = 0;
+
+for (let trial = 0; trial < TRIALS; trial++) {
+  const played: InputNote[] = [];
+  let id = 0;
+  for (let bar = 0; bar < TRIAL_BARS; bar++) {
+    const count = 3 + Math.floor(rnd() * 6);
+    const offsets: number[] = [];
+    for (let i = 0; i < count; i++) offsets.push(rnd() * 4 * BEAT);
+    offsets.sort((a, b) => a - b);
+    for (const offset of offsets) {
+      const startSec = bar * 4 * BEAT + offset;
+      played.push({ id: `t${id++}`, startSec, endSec: startSec + 0.12 + rnd() * 0.3, midi: 33 + Math.floor(rnd() * 12) });
+    }
+  }
+  // Two attacks inside the pipeline's own chord window are ONE event on any page, so they are
+  // not what this property is about; thinned out here rather than special-cased below.
+  const events = played.filter((n, i) => i === 0 || n.startSec - played[i - 1].startSec > 0.06);
+  const ruler = RULERS[trial % RULERS.length];
+  const cell = rollSnapUnitSec(ruler, 120);
+  const beatSnapped = snapPerformanceToBeat(events, BEAT, cell, 0, 120);
+
+  assert(beatSnapped.length === events.length, `trial ${trial}: the snap changed the note count`);
+  const minStep = Math.min(cell > 0 ? cell : 0.125, BEAT / 4);
+  for (let i = 1; i < beatSnapped.length; i++) {
+    assert(
+      beatSnapped[i].startSec - beatSnapped[i - 1].startSec >= minStep - 1e-9,
+      `trial ${trial} (${ruler}): two attacks landed less than a subdivision apart`
+    );
+  }
+  for (const note of beatSnapped) {
+    const move = Math.abs(note.startSec - events.find((e) => e.id === note.id)!.startSec);
+    widestMove = Math.max(widestMove, move);
+    assert(move < BEAT + 1e-9, `trial ${trial} (${ruler}): ${note.id} moved ${move}s — further than a beat`);
+  }
+
+  // THE SHEET. Quantize on 'auto', because that is what the player is looking at.
+  const built = buildScore(
+    { notes: beatSnapped, beats: trialBeats, startOffsetSec: 0, audioDurationSec: TRIAL_BARS * 4 * BEAT + 1 },
+    {
+      // A 1/32 ruler is an explicit request for a 1/32 lattice, and 'auto' has no word for one
+      // (pipeline/src/quantize.ts §states). The player who asks the roll for 32nds is the player
+      // who asks Quantize for them, so that is the pairing under test.
+      grid: ruler === 'thirtysecond' ? 'thirtysecond' : 'auto',
+      instrument: 'staff',
+      tuningMidi: [],
+      fingeringStyle: 'low',
+      clefMode: 'auto'
+    }
+  );
+  const onPage = new Set<string>();
+  for (const bar of built.ir.bars) {
+    for (const voice of bar.voices) {
+      for (const beat of voice.beats) for (const note of beat.notes) onPage.add(note.id);
+    }
+  }
+  assert(
+    onPage.size === events.length,
+    `trial ${trial} (${ruler}): ${events.length} played, ${onPage.size} engraved — ` +
+      `lost ${events.filter((e) => !onPage.has(e.id!)).map((e) => e.id).join(',')}`
+  );
+  checkedNotes += events.length;
+}
+
 console.log(
   `roll-snap-test: free/straight ${freeStraight.glyphs}g ${freeStraight.rests}r ${freeStraight.ties}t · ` +
     `free/triplet ${freeTriplet.glyphs}g ${freeTriplet.rests}r ${freeTriplet.ties}t · ` +
-    `beat/cascade ${cascaded.map((n) => n.startSec).join('/')}`
+    `beat/cascade ${cascaded.map((n) => n.startSec).join('/')} · ` +
+    `beat/preserved ${checkedNotes} notes over ${TRIALS} dense takes, widest move ${widestMove.toFixed(3)}s`
 );
 console.log('roll-snap-test: all assertions passed');

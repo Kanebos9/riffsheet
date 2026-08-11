@@ -114,6 +114,12 @@ export interface AlphaTabScoreData {
     /** General MIDI program. */
     program: number;
     /**
+     * An IMPORTED part: engraved, never played. Set only on tracks that are not the take the
+     * plugin itself produced, so a single-part score (which is always the live take) carries no
+     * such flag and its hand-off is unchanged. The consumer must not route these to playback.
+     */
+    notationOnly?: boolean;
+    /**
      * ONE alphaTab Track, one to three Staves, in printed order top to bottom:
      *
      *   plain            [ notation (+ tab on the same staff when the part has strings) ]
@@ -163,22 +169,69 @@ function pitchName(midi: number): string {
   return `${names[((midi % 12) + 12) % 12]}${Math.floor(midi / 12) - 1}`;
 }
 
-export function toAlphaTabModelData(ir: RiffsheetIR): AlphaTabScoreData {
-  const tuningsHighToLow = [...ir.instrument.tuningMidi].sort((a, b) => b - a);
-  const isBass = ir.instrument.kind.startsWith('bass');
-  const isStaffOnly = ir.instrument.stringCount === 0;
+/** One part of a multi-track hand-off, in printed order: index 0 is the TOP track. */
+export interface AlphaTabPart {
+  ir: RiffsheetIR;
+  /** Track name. Omitted, the instrument/tuning summary is used, as on a single-part score. */
+  name?: string;
+  /** General MIDI program. Omitted, it follows the instrument. */
+  program?: number;
+  /** True for an imported part: it is engraved but never played. See `notationOnly` above. */
+  notationOnly?: boolean;
+}
 
-  const masterBars: AlphaTabMasterBarData[] = ir.bars.map((bar) => ({
+export function toAlphaTabModelData(ir: RiffsheetIR): AlphaTabScoreData {
+  return toMultiPartAlphaTabModelData([{ ir }]);
+}
+
+/**
+ * ONE alphaTab score, N TRACKS, printed top to bottom in array order.
+ *
+ * alphaTab renders multiple tracks natively and webcore's `fromPipeline` already loops
+ * `data.tracks`, so a multi-part score needs nothing new on the screen side beyond more entries
+ * in that array. Each track is built exactly as it would be on its own — one to three staves,
+ * its own clefs, its own tuning, its own grand-staff split.
+ *
+ * THE MASTER BARS BELONG TO THE SCORE, not to a track: alphaTab keys every track's bars against
+ * one master-bar list, so they are taken from the first part and every other part must already
+ * have been aligned to it (`multipart.ts alignPartBars`). A track with a different bar count
+ * would silently render past the end of the timeline.
+ */
+export function toMultiPartAlphaTabModelData(parts: AlphaTabPart[]): AlphaTabScoreData {
+  if (!parts.length) throw new Error('alphaTab: a score needs at least one part');
+  const lead = parts[0].ir;
+  const masterBars: AlphaTabMasterBarData[] = lead.bars.map((bar) => ({
     index: bar.index,
     number: bar.number,
     isAnacrusis: bar.implicit,
     timeSignatureNumerator: bar.timeSig[0],
     timeSignatureDenominator: bar.timeSig[1],
     keySignature: bar.keyFifths,
-    keySignatureType: ir.key.mode === 'minor' ? 'Minor' : 'Major',
+    keySignatureType: lead.key.mode === 'minor' ? 'Minor' : 'Major',
     startTick: bar.startTick,
     durTicks: bar.durTicks
   }));
+
+  return {
+    schema: 1,
+    title: lead.title,
+    ...(lead.composer ? { artist: lead.composer } : {}),
+    tempo: lead.tempo.displayBpm,
+    tempoChanges: lead.tempo.changes?.length
+      ? lead.tempo.changes.map((change) => ({ ...change }))
+      : [{ tick: 0, bpm: lead.tempo.displayBpm }],
+    divisions: lead.divisions,
+    masterBars,
+    tracks: parts.map((part) => buildTrack(part)),
+    grandStaff: parts.some((part) => part.ir.grandStaff)
+  };
+}
+
+function buildTrack(part: AlphaTabPart): AlphaTabScoreData['tracks'][number] {
+  const ir = part.ir;
+  const tuningsHighToLow = [...ir.instrument.tuningMidi].sort((a, b) => b - a);
+  const isBass = ir.instrument.kind.startsWith('bass');
+  const isStaffOnly = ir.instrument.stringCount === 0;
 
   /**
    * @param clefOverride the fixed clef of a grand-staff staff; omitted, the bar's own clef wins.
@@ -300,22 +353,13 @@ export function toAlphaTabModelData(ir: RiffsheetIR): AlphaTabScoreData {
       ];
 
   return {
-    schema: 1,
-    title: ir.title,
-    ...(ir.composer ? { artist: ir.composer } : {}),
-    tempo: ir.tempo.displayBpm,
-    tempoChanges: ir.tempo.changes?.length ? ir.tempo.changes.map((change) => ({ ...change })) : [{ tick: 0, bpm: ir.tempo.displayBpm }],
-    divisions: ir.divisions,
-    masterBars,
-    tracks: [
-      {
-        name: isStaffOnly
-          ? 'Music'
-          : `${isBass ? 'Bass' : 'Guitar'} — Tuning low → high: ${ir.instrument.tuningMidi.map(pitchName).join(' ')}`,
-        program: isStaffOnly ? 0 : isBass ? 33 : 27,
-        staves
-      }
-    ],
-    grandStaff: ir.grandStaff
+    name:
+      part.name ??
+      (isStaffOnly
+        ? 'Music'
+        : `${isBass ? 'Bass' : 'Guitar'} — Tuning low → high: ${ir.instrument.tuningMidi.map(pitchName).join(' ')}`),
+    program: part.program ?? (isStaffOnly ? 0 : isBass ? 33 : 27),
+    ...(part.notationOnly ? { notationOnly: true } : {}),
+    staves
   };
 }

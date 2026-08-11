@@ -21,7 +21,12 @@
 
 import * as alphaTab from '@coderline/alphatab';
 import { createPrintSettings, FONT_DIRECTORY } from '../view/atSettings';
-import { stringLettersFromBounds, tuningLowToHighFromScore, type StringLetter } from '../view/stringLetters';
+import {
+  STRING_LETTER_GAP_PX,
+  stringLettersFromBounds,
+  tuningLowToHighFromScore,
+  type StringLetter
+} from '../view/stringLetters';
 import { stripRendererCredit, stripRendererCreditFromMarkup } from '../view/watermark';
 import { buildAlphaTabScore } from '../score/fromPipeline';
 import { A4_HEIGHT_PT, A4_WIDTH_PT, PX_PER_PT, canvasesToPdf, mmToPx } from './pdfWriter';
@@ -71,6 +76,14 @@ export interface PrintOptions {
 interface PrintGeometry {
   /** Top-left of each SVG inside the hidden host, index-parallel with the svgs array. */
   offsets: Array<{ x: number; y: number }>;
+  /**
+   * THE LEFTMOST ENGRAVED INK in each picture, in that picture's own coordinates.
+   *
+   * Measured with `getBBox()` — the union of the SVG's children — because it is the only honest
+   * answer to "is there anything at this x". It is what the open-string letters are placed
+   * against: see `renderScorePdf`, where the brace was printing straight through them.
+   */
+  inkLefts: number[];
   letters: StringLetter[];
 }
 
@@ -93,7 +106,14 @@ async function withPrintRender<T>(
         clearTimeout(timer);
         resolve(result);
       });
-      api.renderScore(result.score, [0]);
+      // EVERY PART, because the PDF is a picture of the document and the document may hold
+      // several instruments (score/parts.ts). `[0]` was the same number for every score this
+      // app could build until parts existed, and it still is for a single-part one — this
+      // expression is `[0]` whenever there is one track, so a one-part PDF is unchanged.
+      api.renderScore(
+        result.score,
+        result.score.tracks.map((_, index) => index)
+      );
     });
 
     // #40: alphaTab's "rendered by alphaTab" credit, out of the PRINTED sheet as well as the
@@ -113,12 +133,20 @@ async function withPrintRender<T>(
       const r = svg.getBoundingClientRect();
       return { x: r.left - hostRect.left, y: r.top - hostRect.top };
     });
+    const inkLefts = svgs.map((svg) => {
+      try {
+        const box = (svg as SVGGraphicsElement).getBBox();
+        return Number.isFinite(box.x) ? box.x : 0;
+      } catch {
+        return 0;
+      }
+    });
     const letters = stringLettersFromBounds(
       api.renderer.boundsLookup,
       tuningLowToHighFromScore(built.score)
     );
 
-    return await use(svgs, { offsets, letters });
+    return await use(svgs, { offsets, inkLefts, letters });
   } finally {
     api.destroy();
     host.remove();
@@ -316,12 +344,33 @@ export async function renderScorePdf(score: RiffScore, options: PrintOptions = {
       const offset = geometry.offsets[i] ?? { x: 0, y: 0 };
       const rect = svg.getBoundingClientRect();
       const scale = rect.width > 0 ? image.width / rect.width : 1;
+      /*
+       * THE LEGEND GOES LEFT OF EVERY MARK ON THE PAGE (H9), and this line is the whole fix.
+       *
+       * `StringLetter.x` is the tab staff's own left edge less a hair — which is right on screen,
+       * where the row is pinned into the viewport's own gutter, and wrong on paper. A printed
+       * system is BRACED: the accolade, the system bracket and the sideways track name are all
+       * drawn to the LEFT of the staff line, in the page padding. Right-aligning the letters at
+       * the staff edge therefore ran them straight through the brace, and the rasterised page
+       * showed four letters with a thick black bar printed down the middle of them. Photographed
+       * out of the actual PDF bytes at 200 dpi, not reasoned about.
+       *
+       * `inkLeft` is the leftmost thing the engraver drew in this picture, measured. Ending the
+       * text a gap before it cannot collide with anything, because there is nothing further left
+       * to collide with; and the A4 margin (14 mm = 110 px at this raster) has room to spare for
+       * the few px the text spills into it.
+       */
+      const inkLeft = geometry.inkLefts[i] ?? 0;
       // A letter belongs to this picture when its LINE falls inside it. Compared on y alone
       // because the letters sit in the page padding, a little to the LEFT of the staff, and a
       // strict x containment would drop every one of them.
       const letters = geometry.letters
         .filter((l) => l.y >= offset.y - 1 && l.y <= offset.y + rect.height + 1)
-        .map((l) => ({ ...l, x: l.x - offset.x, y: l.y - offset.y }));
+        .map((l) => ({
+          ...l,
+          x: Math.min(l.x - offset.x, inkLeft) - STRING_LETTER_GAP_PX,
+          y: l.y - offset.y
+        }));
       out.push({ image, scale, letters });
     }
     return out;

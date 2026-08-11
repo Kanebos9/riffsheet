@@ -279,76 +279,53 @@ input[type="number"], input[type="text"], select {
 /* ------------------------------------------------------------------ drop zone */
 
 /*
- * THE MAIN MENU: TWO COLUMNS, NO PAGE SCROLL (F12).
+ * THE MAIN MENU: ONE CENTRED COLUMN, NO PAGE SCROLL (H12).
  *
- * It was one centred column of `width: min(640px, 92vw)` blocks, which failed twice on the same
- * window: at 1440px the screen was 640px of content between two 400px voids, and the stack —
- * engine picker, current work, drop zone, blank score, capture, Recent, footer — was taller than
- * the pane, so the very first screen of the app opened with a scrollbar.
+ * THIRD LAYOUT, and the two before it are why this one is the shape it is.
  *
- * `grid`, not flex, and the columns are `minmax(0, …)` on both sides: a grid track's default
- * `min-width: auto` is the widest thing inside it, and the drop zone's headline is long enough
- * to have blown the left track wide and pushed Recent off the edge.
+ * (F12) It was one centred column of `min(640px, 92vw)` blocks — engine picker, current work,
+ * drop zone, blank score, capture, Recent, footer — which was taller than the pane, so the first
+ * screen of the app arrived with a scrollbar and its footer below the fold.
  *
- * `align-items: start` rather than centring. The two columns are different heights by nature
- * (one has a 240px drop zone in it), and centring them independently would leave the Recent
- * heading floating at some arbitrary height with nothing to line up with.
- */
-/*
- * G1: BALANCED, NOT 1fr-AND-A-SLIVER. The right track was `minmax(0, 300px)` against an
- * unbounded left one, so on a 1600px window the actions column was ~1200px wide holding a
- * 640px drop zone — 560px of dead space inside the column, which is the same void the
- * single-centred-column layout had, moved one level in. Both tracks are fractions now and the
- * left one is capped by its own contents (the drop zone's `width` below), so the gap between
- * them grows instead of the emptiness inside them.
+ * (G1) It became two grid columns, `3fr` and `2fr`: what you DO on the left, what you had done
+ * BEFORE on the right. That fixed the scrollbar, and it fixed it by giving the Recent LIST a
+ * column of its own — a third of the first screen of the app spent on work already finished.
  *
- * `stretch`, not `start`: the side column has to be as tall as the row for its footer to be
- * able to sit at the bottom of it. The columns' own contents still start at the top, because
- * each of them is a `flex-direction: column` box that packs from the top.
+ * (H12) The list is gone; recent files are a drop-down under "Choose a file" (ui/app.ts
+ * §buildRecentPicker). With nothing in the right-hand track, a two-track grid is not a balanced
+ * layout, it is a page pushed to the left with a void beside it — which is exactly how it read.
+ * So: ONE column, centred in the pane both ways, with the footer under it. The height that F12
+ * was fighting is not back, because the tallest thing that caused it is not either.
+ *
+ * `justify-content: safe center` rather than plain centring: when the content IS taller than the
+ * pane — a very short plugin window with the blank-score form open — plain centring puts the top
+ * of the column above the scroll origin and makes it unreachable. `safe` falls back to `start`
+ * in exactly that case.
  */
 .dropzone-screen {
   flex: 1;
   min-height: 0;
-  display: grid;
-  grid-template-columns: minmax(0, 3fr) minmax(0, 2fr);
-  align-items: stretch;
-  gap: clamp(14px, 2.5vw, 32px);
-  /* The margins were `clamp(12px, 3vw, 32px)` of padding on top of a 640px cap — nearly the
-     whole width on a wide window. The cap is gone (the columns share the room) and the padding
-     is what is left, which is a margin rather than a void. */
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: safe center;
+  gap: clamp(10px, 2vh, 18px);
   padding: clamp(12px, 2vw, 24px);
   /* A safety net, not the layout. At the sizes this app promises, nothing here overflows. */
   overflow-y: auto;
 }
 /*
- * Each column is its own column. `min-width: 0` on both for the same reason the tracks are
- * `minmax(0, …)`: without it a long filename in Recent makes the whole grid wider than the pane.
+ * The column itself. `min-width: 0` so a long name in a control inside it can never make the
+ * whole screen wider than the pane.
  */
-.menu-actions, .menu-side {
+.menu-actions {
   display: flex;
   flex-direction: column;
+  align-items: center;
   gap: clamp(10px, 2vh, 18px);
+  width: 100%;
+  max-width: min(640px, 92vw);
   min-width: 0;
-}
-/* Centred inside a track that is now only as wide as it needs to be, so "centred" is a nudge
-   rather than a 500px indent. */
-.menu-actions { align-items: center; justify-self: end; width: 100%; max-width: 640px; }
-.menu-side { align-items: stretch; justify-self: start; width: 100%; max-width: 420px; }
-
-/*
- * BELOW 900px THERE IS ONE COLUMN AGAIN, and Recent goes back under the actions.
- *
- * Two columns in a 360px-wide docked FX window would be two columns of about 160px, which is
- * narrower than the drop zone's own headline. The breakpoint is the product's stated floor
- * (900x600) because that is the width the two-column layout was measured to work at.
- */
-@media (max-width: 900px) {
-  .dropzone-screen { grid-template-columns: minmax(0, 1fr); justify-content: safe center; }
-  /* One column means there is no "its own column" left for anything to be anchored to the
-     right of, so the caps and the justification go back to centred (G1). */
-  .menu-actions, .menu-side { justify-self: center; max-width: min(640px, 92vw); }
-  .menu-side { align-items: center; }
-  .opening-footer { justify-content: center; }
 }
 
 .dropzone {
@@ -371,35 +348,37 @@ input[type="number"], input[type="text"], select {
 .dropzone .headline { font-size: clamp(16px, 2.4vw, 21px); font-weight: 600; }
 .dropzone .explainer { font-size: 13.5px; color: var(--text-dim); max-width: 46ch; line-height: 1.5; }
 
-/* Its column decides its width now. The old `min(640px, 92vw)` was a whole column of its own
-   and is exactly the rule that made the menu a single centred stack. */
-.recent { width: 100%; max-width: min(640px, 92vw); min-width: 0; }
-.recent h2 { font-size: 12px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--text-dim); margin: 0 0 6px; }
 /*
- * SIX ROWS, THEN IT SCROLLS ITSELF.
+ * RECENT FILES, AS ONE LINE UNDER THE BUTTON (H12).
  *
- * Eight entries are remembered and all eight are still reachable — what is capped is how much
- * of the screen the list may take from the things above it. A row is 12.5px text in 6px of
- * padding plus its radius: ~30px, so six of them is 180px, and the `+ 4px` is the scroller's
- * own breathing room so a seventh row is visibly cut rather than perfectly hidden (a list that
- * ends flush at its cap does not look scrollable).
+ * What replaced the list, the heading and the 184px scroller that used to be a column of their
+ * own. It sits inside the drop zone, directly under "Choose a file", because opening something
+ * you had open before is the same act as opening something new.
+ *
+ * `max-width: 100%` and `min-width: 0` on the select: option text is middle-truncated in JS
+ * (ui/app.ts §buildRecentPicker) so both ends of a filename survive, and this is what keeps a
+ * long one from widening the drop zone rather than being scrolled inside its own menu.
  */
-.recent-list { max-height: 184px; overflow-y: auto; overscroll-behavior: contain; }
-.recent-item {
-  display: flex; align-items: center; gap: 8px;
-  padding: 6px 9px; border-radius: 6px; cursor: pointer; font-size: 12.5px;
+.recent-pick {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  max-width: 100%;
   min-width: 0;
 }
-/* The name is middle-truncated in JS (ui/app.ts §middleTruncate) so both ends survive. This is
-   the belt to that braces: a name that still overflows a very narrow column is cut rather than
-   allowed to push the age off the row, and the age is what dates the entry. */
-.recent-item .recent-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
-.recent-item:hover { background: var(--bg-panel); }
-.recent-item .when { margin-left: auto; flex: 0 0 auto; color: var(--text-dim); font-size: 11.5px; }
-/* BOTTOM-RIGHT OF ITS OWN COLUMN (G1). `margin-top: auto` puts it at the bottom of the side
-   column — which is why `.dropzone-screen` stretches its tracks — and `flex-end` puts it at the
-   right of it. It is the least urgent thing on the screen and it now reads that way. */
-.opening-footer { width: 100%; display: flex; justify-content: flex-end; margin-top: auto; }
+.recent-pick-label { font-size: 11.5px; color: var(--text-dim); flex: 0 0 auto; }
+.recent-select {
+  min-width: 0;
+  max-width: min(340px, 60vw);
+  font-size: 12px;
+  color: var(--text);
+  cursor: pointer;
+}
+/* UNDER THE COLUMN, CENTRED (H12). It was bottom-right of a side column that no longer exists.
+   `margin-top: auto` is gone with it: in a centred flex column that rule pushed the footer to
+   the bottom of the pane and dragged the whole menu up off centre with it. */
+.opening-footer { display: flex; justify-content: center; }
 .legal-link { color: var(--text-dim); text-decoration: underline; text-underline-offset: 2px; }
 
 .current-work {
@@ -493,6 +472,82 @@ input[type="number"], input[type="text"], select {
   cursor: pointer;
   display: block;
   width: 100%;
+}
+
+/*
+ * THE STRIP'S WRAPPER, and it exists for exactly one thing (H3).
+ *
+ * A positioning context, nothing more: no padding, no background, no height of its own. The
+ * canvas inside it keeps its class, its full width and its height, so `.waveform` still measures
+ * the canvas everywhere in the app and in scripts/verify.mjs — and the roll below it is still
+ * exactly as wide, which is the check that keeps a note over the sound that made it.
+ */
+.wave-strip { position: relative; flex: 0 0 auto; }
+
+/*
+ * CUT, IN THE EMPTY COLUMN LEFT OF THE RECORDING (H3).
+ *
+ * The strip spends its first `TIMELINE_GUTTER_PX` on nothing at all — it is reserved so the
+ * roll's pitch-name column below can line up with it — and that dark square, left of the
+ * waveform and directly above the key names, is where this sits. Its width comes from that same
+ * constant, set inline in ui/app.ts §buildCutArm, so the two cannot drift apart.
+ *
+ * THE BUTTON TAKES NO PRESSES; THE SQUARE INSIDE IT DOES. Armed, the label has to say what to do
+ * and how to stop — a sentence far wider than the gutter, lying over the first inch of the
+ * recording. `pointer-events: none` here and `auto` on the glyph is what keeps that honest: a
+ * drag begun on top of the sentence reaches the canvas underneath as if the text were not there,
+ * while a click on the lit square still bubbles up to this button's handler. Nothing is ever
+ * abbreviated to fit; the sentence is allowed its full width because it costs nothing.
+ */
+.wave-cut-arm {
+  position: absolute;
+  left: 3px;
+  top: 50%;
+  transform: translateY(-50%);
+  z-index: 2;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  margin: 0;
+  padding: 0;
+  border: none;
+  background: none;
+  white-space: nowrap;
+  pointer-events: none;
+}
+.wave-cut-arm .cut-glyph {
+  pointer-events: auto;
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  /* `width` is set inline from TIMELINE_GUTTER_PX; the height matches so it is a square. */
+  height: 28px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--bg-panel);
+  color: var(--text);
+  font-size: 13px;
+  line-height: 1;
+}
+.wave-cut-arm:hover .cut-glyph { border-color: var(--accent-hover); }
+/* ARMED IS THE ACCENT, because while it is on the strip above has a different gesture, and a
+   mode you cannot see is a mode you get stuck in. */
+.wave-cut-arm.on .cut-glyph {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: var(--accent-ink);
+}
+.wave-cut-arm .cut-hint {
+  font-size: 11px;
+  line-height: 1;
+  padding: 5px 9px;
+  border-radius: 999px;
+  color: var(--text);
+  /* Sat on the recording, so it needs a ground of its own to stay readable over the silhouette
+     — dark enough to read against, transparent enough that the waveform is still visible. */
+  background: #0b0f16e0;
+  border: 1px solid var(--accent);
 }
 
 /* ------------------------------------------------------------------ piano roll */
@@ -610,14 +665,8 @@ input[type="number"], input[type="text"], select {
   opacity: 0.75;
 }
 .take-chip-dismiss:hover { opacity: 1; }
-/*
- * THE CUT ARM CHIP (G8). Ordinary until it is armed, and then it is the accent — because while
- * it is on, the strip above it has a different gesture, and a mode you cannot see is a mode you
- * get stuck in. `.chip.on` supplies the fill; this only widens the target, since the label
- * changes length when it lights and a chip that resizes under the cursor is a chip you
- * double-press by accident.
- */
-.take-cut-arm { min-width: 9.5em; text-align: center; }
+/* THE CUT ARM CHIP IS NOT IN THIS ROW ANY MORE (H3) — it is `.wave-cut-arm`, in the strip's own
+   left gutter. What is left here is the offers, which are all about a SPAN. */
 .take-cut { border-color: var(--danger, #e2725b); color: var(--danger, #e2725b); }
 .take-cut:hover:not(:disabled) { background: var(--danger, #e2725b); color: #06131f; }
 .take-cut-note { font-size: 11px; opacity: 0.7; cursor: help; }
@@ -809,14 +858,25 @@ input[type="number"], input[type="text"], select {
 .transport > button,
 .transport .undo-redo,
 .transport [data-role="loop"] { flex: 0 0 auto; }
-/* The clock gives up its slack last and its digits never reflow — `11ch` was a floor, and a
-   floor in a nowrap row is a reason to overflow. It is a maximum now, and tabular digits mean
-   the text does not jitter as it counts. */
+/*
+ * THE CLOCK, AND IT IS NEVER CUT (H6).
+ *
+ * It was `flex: 0 1 auto` inside `overflow: hidden`, on the reasoning that it gives up its slack
+ * last. Measured, "last" was still far too early: 133px of digits in 85–129px of box at every
+ * width from 1300px down, so "0:00.00 / 0:22.77" was on screen as "0:00.00 / 0:22." — a clipped
+ * readout, which is the same fault as an ellipsized sentence and harder to notice because the
+ * digits that go are the ones at the end.
+ *
+ * It does not shrink. `tabular-nums` is what makes that affordable: the width is the same 133px
+ * whatever the numbers are, so reserving it costs nothing and the digits do not jitter as they
+ * count. The row's slack comes from the fader and the tempo detail instead, both of which are
+ * things you look at rather than read.
+ */
 .transport .position {
   font-variant-numeric: tabular-nums;
   white-space: nowrap;
-  flex: 0 1 auto;
-  overflow: hidden;
+  flex: 0 0 auto;
+  overflow: visible;
 }
 
 /* Undo / redo. Tight against each other and loose from everything else, so they read as one
@@ -855,18 +915,27 @@ input[type="number"], input[type="text"], select {
   cursor: default;
 }
 .tempo-source select:disabled { opacity: 0.75; cursor: default; }
-/* The one item in this row that is a SENTENCE, so it is the one allowed to be cut short. It
-   said "bar lines · 222 BPM · 3/6" in `white-space: nowrap` with no give, which in a nowrap
-   transport is a guarantee of horizontal overflow rather than of legibility (measured: 12px
-   past the window edge at 1100px). Its full text stays in the DOM and in the tooltip. */
+/*
+ * WHAT THE TEMPO SOURCE IS SUPPLYING, AND IT IS NEVER CUT SHORT (H6).
+ *
+ * It used to be `flex: 0 1 auto` with `text-overflow: ellipsis`, on the reasoning that it is the
+ * one item in the row that is a sentence and so the one that can afford to be shortened. That
+ * shipped as "heard in y…" — 109px of text in 63px of box at a 1100px window — which is not a
+ * shortened sentence, it is a broken one. Half a word is worth less than no word: the reader
+ * cannot tell whether the app is telling them something they need.
+ *
+ * So it does not shrink at all. `flex: 0 0 auto` and `max-content` mean the box is always as
+ * wide as the words in it, and when the row genuinely runs out of room the detail is DROPPED
+ * whole, at the breakpoint below — it is a corroboration of the numbers beside it, not a control
+ * anybody has to reach, so its absence costs nothing and its truncation cost trust.
+ */
 .tempo-source .tempo-detail {
   font-size: 11px;
   font-variant-numeric: tabular-nums;
   white-space: nowrap;
-  flex: 0 1 auto;
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
+  flex: 0 0 auto;
+  min-width: max-content;
+  overflow: visible;
 }
 
 /* The first thing to give. A blend fader is still usable at 60px and the row is not usable at
@@ -907,6 +976,55 @@ button[data-drag="midi"] .drag-grip {
   pointer-events: none;
 }
 button[data-drag="midi"]:hover .drag-grip { opacity: 0.9; }
+
+/* --------------------------------------------------------------- part chips */
+
+/*
+ * ONE THIN LINE ABOVE THE SHEET, and on a single-part take it holds two pills.
+ *
+ * The height is the whole design constraint: this row appears on every take, including the very
+ * many that will only ever have one part, so it must cost the page almost nothing. No border, no
+ * heading, no background — just small pills sitting on the app's own surface.
+ */
+.part-chips {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  padding: 3px 10px;
+  flex-wrap: nowrap;
+  overflow-x: auto;
+  scrollbar-width: none;
+}
+.part-chips::-webkit-scrollbar { display: none; }
+
+.part-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 2px 10px;
+  font-size: 11px;
+  white-space: nowrap;
+  touch-action: none;
+  user-select: none;
+}
+/* The live part is accent-filled by `.chip.on`; the dot is the mark that survives a reorder. */
+.part-chip .part-dot { font-size: 8px; line-height: 1; opacity: 0.95; }
+.part-chip .part-nudge { font-size: 10px; opacity: 0.7; font-variant-numeric: tabular-nums; }
+/*
+ * ACTIVE IS A RING, NOT A FILL. The fill already means "this is the live part", and reusing it
+ * for "this is the chip you last clicked" would leave the two indistinguishable the moment an
+ * imported part is selected.
+ */
+.part-chip.selected { box-shadow: 0 0 0 2px var(--accent-hover); }
+.part-chip.dragging { opacity: 0.7; cursor: grabbing; }
+.part-add { padding: 2px 9px; font-size: 12px; line-height: 1.1; }
+
+.part-menu { min-width: 210px; }
+.part-menu .part-menu-row { display: flex; align-items: center; gap: 6px; font-size: 11.5px; }
+.part-menu .part-menu-row > span:first-child { width: 46px; color: var(--text-dim); }
+.part-menu .part-menu-row input { flex: 1 1 auto; min-width: 0; }
+.part-menu .part-menu-row input[type="number"] { flex: 0 0 76px; }
+.part-menu .part-menu-remove { font-size: 11.5px; }
 
 /* ------------------------------------------------------------------ tri-view */
 
@@ -1507,13 +1625,20 @@ button[data-drag="midi"]:hover .drag-grip { opacity: 0.9; }
 }
 /* The chips are grid items now, so they fill their cell rather than hugging their text — which
    is the whole point of the change. Centred, because a left-aligned label in a cell wider than
-   itself re-introduces the ragged edge on the inside. */
+   itself re-introduces the ragged edge on the inside.
+
+   THEY WRAP; THEY ARE NOT CUT (H6's rule, applied here because the main menu is where it shows).
+   This was `nowrap` inside `overflow: hidden` with an ellipsis, and engine names come from the
+   shell rather than from a list written here — so the menu shipped with "Instrument-Agn…" and
+   "Transkun v2 · in…" on it, which name no engine anybody can look up. A chip that is two lines
+   tall is a chip you can read; the row simply grows, which is what `align-items: stretch` above
+   is for. */
 .engine-pick .chip-group > .chip {
   width: 100%;
   text-align: center;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
+  white-space: normal;
+  overflow-wrap: anywhere;
+  line-height: 1.25;
 }
 .engine-pick [data-role="engine-pick-more"] { align-self: flex-start; }
 
@@ -1532,16 +1657,30 @@ button[data-drag="midi"]:hover .drag-grip { opacity: 0.9; }
 
 /* ------------------------------------------------------------------ tooltips */
 
+/*
+ * THE TOOLTIP BUBBLE (H11).
+ *
+ * It was 270px wide with 1.45 line-height, and every tip in ui/tips.ts was an essay — the
+ * capo's ran to sixty words, the auto-split one to a hundred and thirty. A hundred and thirty
+ * words in a 270px column is twenty lines of grey text, which is a thing people close rather
+ * than read. Both halves are fixed together and neither works alone: the texts are now one to
+ * three short sentences (see ui/tips.ts), and the bubble is shaped to read like a note rather
+ * than a paragraph — wider, so a sentence is two lines instead of four, and looser, so the lines
+ * are separable at a glance.
+ *
+ * `min(340px, calc(100vw - 24px))`: the clamping in `show()` keeps the bubble on screen at any
+ * position, but only this keeps it narrower than a 360px plugin window in the first place.
+ */
 .riff-tooltip {
   position: fixed;
   z-index: 100;
-  max-width: 270px;
+  max-width: min(340px, calc(100vw - 24px));
   background: var(--bg-panel);
   border: 1px solid var(--border);
-  border-radius: 6px;
-  padding: 7px 9px;
-  font-size: 12px;
-  line-height: 1.45;
+  border-radius: 8px;
+  padding: 9px 12px;
+  font-size: 12.5px;
+  line-height: 1.55;
   color: var(--text);
   box-shadow: 0 8px 28px #000a;
   pointer-events: none;
@@ -1583,12 +1722,27 @@ button[data-drag="midi"]:hover .drag-grip { opacity: 0.9; }
  * Nothing above uses a fixed pixel width that cannot shrink; these rules buy the last
  * bit of room by trimming chrome rather than by clipping content.
  */
+/*
+ * THE TEMPO DETAIL IS DROPPED WHOLE, AND EARLY (H6).
+ *
+ * It used to go at 1000px, and between 1000 and about 1090 it was still on screen being squeezed
+ * — which, with the old `text-overflow: ellipsis`, is where "heard in y…" came from. It does not
+ * squeeze any more (§.tempo-detail), so the width it needs is the width it has, and the
+ * breakpoint has to be where the rest of the row stops leaving room for it.
+ *
+ * MEASURED, not guessed: the transport's other contents come to 954px at their natural sizes,
+ * and the longest sentence this element can hold is the DAW one — "222 · 13/16 · tempo only",
+ * about 135px. 954 + 135 = 1089, so anything at 1151px and above fits with room to spare, and
+ * below that the sentence goes rather than shrinks. It is a corroboration of the numbers beside
+ * it, never a control anybody has to reach, which is what makes dropping it the cheap answer and
+ * cutting it in half the expensive one.
+ */
+@media (max-width: 1150px) {
+  .transport .tempo-detail { display: none; }
+}
+
 @media (max-width: 1000px) {
   .transport { gap: 9px; padding: 7px 10px; }
-  /* What the chosen tempo source is supplying, said in words. It is a corroboration of the
-     numbers beside it rather than a control, so it is the first thing the one-row transport
-     drops when there is not room for everything (G4). */
-  .transport .tempo-detail { display: none; }
   .fader .end { display: none; }
   .app-header { padding: 7px 10px; }
   button { padding: 5px 8px; }
@@ -1706,6 +1860,31 @@ button[data-drag="midi"]:hover .drag-grip { opacity: 0.9; }
  */
 @media (min-width: 700px) {
   .app-header, .notation-toolbar { flex-wrap: nowrap; }
+}
+
+/*
+ * …AND THE TRANSPORT TAKES THE SAME FLOOR FALLBACK (H6).
+ *
+ * Above 700px it is one row and shrinks, which is the whole of §.transport and is not being
+ * undone here. Below it, the same argument that already applies to the two bars applies to this
+ * one: at REAPER's 360x280 there is no legible way to fit nine controls on a line, and holding
+ * `nowrap` there does not fit them either — it CLIPS them. Measured at 390px: the clock was
+ * given 29px for "0:00.00 / 0:22.77" and the blend fader 13px, both cut off inside
+ * `overflow: hidden`, with the row's contents 132px past its own edge.
+ *
+ * A clipped clock is the same fault as an ellipsized sentence: half a readout is worth less than
+ * a second row. So at the floor the row wraps, and the clock is allowed to be as wide as its own
+ * digits again — there is no longer any slack for it to be giving up.
+ *
+ * 800px RATHER THAN THE BARS' 700, and the number is measured rather than matched: this row
+ * holds a clock, a fader, a sound picker and a three-part tempo control, and its contents stop
+ * fitting one line at about 810px (821px of content in a 779px row at a 701px window). Sharing
+ * the bars' breakpoint would have left an 80px band where the row overflowed its own edge again.
+ */
+@media (max-width: 800px) {
+  .transport { flex-wrap: wrap; row-gap: 8px; }
+  .transport .position { overflow: visible; flex: 0 0 auto; }
+  .fader { flex: 1 1 120px; }
 }
 
 @media (max-width: 720px) {

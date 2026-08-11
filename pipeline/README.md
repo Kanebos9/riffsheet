@@ -11,6 +11,26 @@ const { ir, toMusicXML, toMidi, toAlphaTabModelData } = buildScore(
 );
 ```
 
+Several instruments print as one document — a guitar part over a bass part — through
+`buildMultiPartScore`, which is N of the above sharing one clock and one key, merged into one
+MusicXML document, one N-track alphaTab hand-off and one format-1 MIDI file:
+
+```ts
+import { buildMultiPartScore } from '@riffsheet/pipeline';
+
+const score = buildMultiPartScore(
+  [
+    { name: 'Guitar', role: 'live', instrument: 'guitar6', notes: takeNotes },
+    { name: 'Bass', role: 'imported', notes: importedNotes, nudgeSec: 0 }
+  ],
+  { beats, downbeats, audioDurationSec },
+  { grid: 'auto', instrument: 'guitar6', tuningMidi: [40, 45, 50, 55, 59, 64], fingeringStyle: 'low' }
+);
+```
+
+A one-part score comes out of it byte-for-byte identical to `buildScore`, so a caller can route
+every build through it and never branch on part count.
+
 The output contract is [IR.md](IR.md). Start there if you are consuming this package.
 
 ---
@@ -62,6 +82,7 @@ note value that hides the middle of the bar. Those are engraving rules, and they
 | 7 | `guards.ts` | past-end filter, repeat-loop suspects |
 | — | `rational.ts` | exact rational arithmetic; no float ever enters a metric decision |
 | — | `buildScore.ts` | the orchestration, and the only place the ordering constraints live |
+| — | `multipart.ts` | N parts, one clock, one key; merged at the emitters, not in the IR |
 
 Six orderings are load-bearing and each one is a bug if violated. They are enforced in
 `buildScore.ts` and listed in its header comment.
@@ -95,10 +116,12 @@ Override `ESBUILD=` and `JSC=` if the binaries live elsewhere.
 
 ### Golden files
 
-`test/golden/*.ts` hold committed MusicXML for three cases. Regenerate deliberately:
+`test/golden/*.ts` hold committed MusicXML for three single-part cases, plus a two-part
+guitar-over-bass case pinned on BOTH emitters — the MusicXML document and the alphaTab hand-off,
+so neither can drift from the other. Regenerate deliberately:
 
 ```bash
-scripts/update-golden.sh            # all three
+scripts/update-golden.sh            # all five
 scripts/update-golden.sh pickup     # one
 ```
 

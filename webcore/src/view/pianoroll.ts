@@ -709,7 +709,7 @@ const WHEEL_ZOOM_PER_PX = 0.0015;
  * `deltaMode` 1 — where a trackpad sends twenty small ones. A gain low enough to make those
  * bearable would make a trackpad feel dead. 6% is a step you can see and cannot be thrown by.
  */
-const WHEEL_ZOOM_MAX_STEP = 1.06;
+export const WHEEL_ZOOM_MAX_STEP = 1.06;
 
 /**
  * How long a zoom made HERE owns the span, in ms. See `PianoRoll.holdSpan`.
@@ -1246,6 +1246,9 @@ export class PianoRoll {
     // Not passive: a ctrl-wheel is a pinch on a trackpad and the browser will zoom the whole
     // page with it unless we say we handled it.
     this.canvas.addEventListener('wheel', this.onWheel, { passive: false });
+    // Safari/WKWebView's own pinch. Harmless everywhere else — no other engine fires them.
+    this.canvas.addEventListener('gesturestart', this.onGestureStart, { passive: false });
+    this.canvas.addEventListener('gesturechange', this.onGestureChange, { passive: false });
     // The drag listeners live for the object's whole life rather than per gesture, so there
     // is exactly one place that adds them and exactly one that removes them. They return
     // immediately when nothing is being dragged.
@@ -1486,6 +1489,22 @@ export class PianoRoll {
     const span = current.toSec - current.fromSec;
     if (!(span > 0)) return next;
     return { fromSec: next.fromSec, toSec: next.fromSec + span };
+  }
+
+  /**
+   * THE OTHER PANE JUST RE-SCALED: take the next Align window's SPAN, not just its position.
+   *
+   * `holdSpan` above refuses spans that arrive from Align, and it has to — the sheet's derived
+   * span moves on every scroll, because the engraving is not proportional to time, so adopting
+   * it would turn a scrollbar drag into a zoom (G16). A pinch over the SHEET is the one gesture
+   * where the new span is exactly what is being asked for, and the sheet is the only thing that
+   * can tell the two apart, so it says so. Same clock and same duration as a zoom made here,
+   * because it is the same round trip in the other direction.
+   *
+   * Wired as `TriViewOptions.onZoomChange`.
+   */
+  adoptNextAlignSpan(): void {
+    this.ownZoomUntilMs = now() + OWN_ZOOM_ECHO_MS;
   }
 
   /**
@@ -3372,16 +3391,45 @@ export class PianoRoll {
    * roll's own and is applied here.
    */
   private onWheel = (e: WheelEvent): void => {
-    /*
-     * THE TIME RULER, which is new (#29).
-     *
-     * A wheel over the band along the top zooms TIME, about the pointer. It is the exact mirror
-     * of the rule the gutter already had — a wheel over a ruler zooms that ruler's axis — and it
-     * is why the ruler is drawn at all. No modifier, because the whole point of the convention is
-     * that there is nothing to know.
-     */
     const zoom = (delta: number) => wheelZoomFactor(delta, e.deltaMode);
+    /*
+     * A PINCH IS THE ONLY THING THAT ZOOMS FROM THE FINGERS (H1).
+     *
+     * macOS delivers a trackpad pinch to a web view as a wheel event with `ctrlKey` forced on,
+     * whether or not anybody is touching ctrl; Safari/WKWebView ALSO emits the older
+     * `gesturestart`/`gesturechange` pair, which is why `onGestureChange` below exists. Both
+     * roads end here, at the same two rules:
+     *
+     *     pinch                -> HORIZONTAL zoom, the TIME axis, about the pointer
+     *     Option (alt) + pinch -> VERTICAL zoom, the PITCH axis, about the pointer
+     *
+     * WHAT THIS REPLACES, and why it is a straight deletion rather than a tuning. The previous
+     * model was "the axis you move is the axis you zoom": a bare two-finger swipe up/down zoomed
+     * pitch and left/right zoomed time, with no modifier at all. It was reported as wrong and
+     * hated, and the reason is not taste — a two-finger swipe is SCROLLING on every other surface
+     * of every machine this runs on, so the one gesture a hand makes without thinking about it
+     * was the one gesture that threw the picture away. Nothing about a swipe zooms now, at any
+     * angle, over any part of this pane.
+     */
+    const pinch = e.ctrlKey || e.metaKey;
 
+    if (pinch || e.altKey) {
+      const d = e.deltaY || e.deltaX;
+      if (d === 0) return;
+      e.preventDefault();
+      // Option picks the other axis. Alt on its own (no pinch) is kept as the pitch zoom a
+      // plain MOUSE has always had here — a mouse cannot pinch, and it was shipped.
+      if (e.altKey) this.zoomVerticalAt(zoom(d), this.localPoint(e).y);
+      else this.zoomTimeAt(zoom(d), this.canvasPoint(e).x);
+      return;
+    }
+
+    /*
+     * THE TIME RULER (#29). A wheel over the band along the top zooms TIME, about the pointer.
+     * The exact mirror of the rule the gutter already had — a wheel over a RULER zooms that
+     * ruler's axis — and it is why the ruler is drawn at all. Unchanged by H1: a ruler is a
+     * control, not the picture, so a scroll there has nothing else it could mean.
+     */
     if (this.overTimeRuler(e)) {
       const d = e.deltaY || e.deltaX;
       if (d === 0) return;
@@ -3390,11 +3438,9 @@ export class PianoRoll {
       return;
     }
 
-    // A pinch, or a wheel over the pitch ruler. Both are "zoom this axis" and neither asks the
-    // player to know anything. A pinch arrives as a wheel with `ctrlKey` set whether or not
-    // anybody is holding ctrl, and it arrives in a stream — hence the damped factor.
+    // The same rule on the other ruler: the pitch gutter down the left zooms pitch.
     const overGutter = this.gutterPx > 0 && this.localPoint(e).x < this.gutterPx;
-    if (e.ctrlKey || e.metaKey || e.altKey || (overGutter && !e.shiftKey)) {
+    if (overGutter && !e.shiftKey) {
       const d = e.deltaY || e.deltaX;
       if (d === 0) return;
       e.preventDefault();
@@ -3403,44 +3449,68 @@ export class PianoRoll {
     }
 
     /*
-     * SHIFT still PANS TIME, and it is the only thing left that pans from the wheel.
+     * EVERYTHING ELSE PANS, in whichever direction the fingers went.
      *
-     * It used to be "Shift, or a wheel that is genuinely mostly sideways", and the sideways half
-     * has moved to the zoom below (G15). Shift is kept because it is the contract on a mouse,
-     * where there is no second axis to move.
+     *   two fingers left/right   -> pan TIME
+     *   two fingers up/down      -> pan PITCH
+     *   Shift + wheel            -> pan TIME (the mouse's way to the second axis; kept)
+     *
+     * Both axes at once, because a trackpad sends both components of one diagonal flick and
+     * throwing one away makes the picture crab sideways under a hand that moved diagonally.
      */
-    if (e.shiftKey) {
-      // Shift+wheel arrives as deltaX on some platforms and deltaY on others, so take whichever
-      // is bigger rather than guessing the platform.
-      const delta = Math.abs(e.deltaX) > Math.abs(e.deltaY) ? e.deltaX : e.deltaY;
-      if (delta === 0) return;
-      e.preventDefault();
-      const win = this.getTimeWindow();
-      this.panTimeBy((delta / Math.max(1, this.plotWidth)) * (win.toSec - win.fromSec));
-      return;
+    const lines = e.deltaMode === 1 ? 16 : e.deltaMode === 2 ? 400 : 1;
+    let dx = e.deltaX * lines;
+    let dy = e.deltaY * lines;
+    if (e.shiftKey && dx === 0) {
+      // Shift+wheel arrives as deltaX on some platforms and deltaY on others; a mouse with one
+      // axis gets its only delta treated as sideways rather than losing the gesture.
+      dx = dy;
+      dy = 0;
     }
-
-    /*
-     * THE AXIS YOU MOVE IS THE AXIS YOU ZOOM (G15).
-     *
-     *   two fingers up/down     -> the PITCH axis zooms, about the pointer
-     *   two fingers left/right  -> the TIME axis zooms, about the pointer
-     *
-     * No modifier, because a trackpad already has two axes and asking somebody to hold a key to
-     * reach the second one wastes the hardware. It replaces "a plain wheel scrolls pitch": with
-     * both zooms on the wheel, panning is the drag (space, or any drag once zoomed in) and the
-     * two scrollbars, which is where a DAW puts it anyway.
-     *
-     * DEGRADES GRACEFULLY. A device with only `deltaY` — a plain mouse, and a Windows precision
-     * touchpad in its scroll-emulation mode — never satisfies the `deltaX` test, so it gets the
-     * pitch zoom and keeps Shift for time. Nothing needs to detect the hardware.
-     */
-    const dx = e.deltaX;
-    const dy = e.deltaY;
     if (dx === 0 && dy === 0) return;
     e.preventDefault();
-    if (Math.abs(dx) > Math.abs(dy)) this.zoomTimeAt(zoom(dx), this.canvasPoint(e).x);
-    else this.zoomVerticalAt(zoom(dy), this.localPoint(e).y);
+    if (dx !== 0) {
+      const win = this.getTimeWindow();
+      this.panTimeBy((dx / Math.max(1, this.plotWidth)) * (win.toSec - win.fromSec));
+    }
+    if (dy !== 0) this.scrollVerticalBy(dy);
+  };
+
+  /**
+   * Safari's own pinch, for the JUCE WebView.
+   *
+   * WKWebView reports a trackpad pinch as `gesturestart`/`gesturechange`/`gestureend` with a
+   * CUMULATIVE `scale` since the gesture began, and — depending on the build — may not synthesise
+   * the ctrl-wheel `onWheel` reads. Taking the RATIO against the previous event turns the
+   * cumulative number into the same per-event multiplier a wheel produces, so both roads reach
+   * `zoomTimeAt`/`zoomVerticalAt` with the same units and a pinch feels identical either way.
+   *
+   * Typed structurally rather than against `GestureEvent`, which is not in the standard DOM lib.
+   */
+  private gestureScale = 1;
+
+  private onGestureStart = (e: Event): void => {
+    e.preventDefault();
+    this.gestureScale = (e as Event & { scale?: number }).scale ?? 1;
+  };
+
+  private onGestureChange = (e: Event): void => {
+    const g = e as Event & { scale?: number; altKey?: boolean; clientX?: number; clientY?: number };
+    const scale = g.scale;
+    if (!scale || !Number.isFinite(scale) || scale <= 0) return;
+    e.preventDefault();
+    const ratio = scale / (this.gestureScale > 0 ? this.gestureScale : 1);
+    this.gestureScale = scale;
+    if (!Number.isFinite(ratio) || ratio <= 0 || Math.abs(ratio - 1) < 1e-4) return;
+    // Clamped by the same anti-jump step a wheel gets, so one violent pinch cannot throw the view.
+    const factor = Math.min(WHEEL_ZOOM_MAX_STEP, Math.max(1 / WHEEL_ZOOM_MAX_STEP, ratio));
+    const rect = this.canvas.getBoundingClientRect();
+    const at = {
+      clientX: g.clientX ?? rect.left + rect.width / 2,
+      clientY: g.clientY ?? rect.top + rect.height / 2
+    };
+    if (g.altKey) this.zoomVerticalAt(factor, this.localPoint(at).y);
+    else this.zoomTimeAt(factor, this.canvasPoint(at).x);
   };
 
   /**
@@ -4662,6 +4732,8 @@ export class PianoRoll {
     this.canvas.removeEventListener('pointerleave', this.onPointerLeave);
     this.canvas.removeEventListener('dblclick', this.onDoubleClick);
     this.canvas.removeEventListener('wheel', this.onWheel);
+    this.canvas.removeEventListener('gesturestart', this.onGestureStart);
+    this.canvas.removeEventListener('gesturechange', this.onGestureChange);
     window.removeEventListener('pointermove', this.onWindowPointerMove);
     window.removeEventListener('pointerup', this.onWindowPointerUp);
     window.removeEventListener('pointercancel', this.onWindowPointerUp);

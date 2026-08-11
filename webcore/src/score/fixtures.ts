@@ -161,3 +161,59 @@ export function dropTunedRiff(bars: number, bpm = 88): Performance {
 
   return { notes, beats, bpm, durationSec: bars * 4 * beatSec };
 }
+
+/**
+ * A four-bar guitar part, as MusicXML — the fixture the PARTS feature is checked against.
+ *
+ * Deliberately the smallest file that is a real MusicXML document: one `score-part` with a
+ * `<part-name>` (which is where the chip's label has to come from), a treble clef, 4/4, and
+ * quarter notes at written ticks. It sits an octave and a bit above the bass demo, so a
+ * screenshot of the two of them together shows two clearly separate systems.
+ *
+ * It is a string rather than a file under `public/` because the harness drives the REAL import
+ * path — `parseScoreFile` on bytes — and a fixture that has to be fetched would only add a
+ * server round trip to a test about parts.
+ */
+export const GUITAR_PART_MUSICXML = `<?xml version="1.0" encoding="UTF-8"?>
+<score-partwise version="3.1">
+  <part-list>
+    <score-part id="P1">
+      <part-name>Guitar</part-name>
+      <part-abbreviation>Gtr.</part-abbreviation>
+    </score-part>
+  </part-list>
+  <part id="P1">
+${[
+  ['E', 4, 'G', 4, 'B', 4, 'E', 5],
+  ['D', 4, 'A', 4, 'D', 5, 'A', 4],
+  ['C', 4, 'G', 4, 'E', 5, 'G', 4],
+  ['G', 3, 'D', 4, 'B', 4, 'D', 5]
+]
+  .map((bar, index) => {
+    const attributes =
+      index === 0
+        ? `      <attributes>
+        <divisions>1</divisions>
+        <key><fifths>0</fifths></key>
+        <time><beats>4</beats><beat-type>4</beat-type></time>
+        <clef><sign>G</sign><line>2</line></clef>
+      </attributes>
+`
+        : '';
+    const notes: string[] = [];
+    for (let i = 0; i < bar.length; i += 2) {
+      notes.push(`      <note>
+        <pitch><step>${bar[i]}</step><octave>${bar[i + 1]}</octave></pitch>
+        <duration>1</duration>
+        <voice>1</voice>
+        <type>quarter</type>
+      </note>`);
+    }
+    return `    <measure number="${index + 1}">
+${attributes}${notes.join('\n')}
+    </measure>`;
+  })
+  .join('\n')}
+  </part>
+</score-partwise>
+`;

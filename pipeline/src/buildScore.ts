@@ -45,9 +45,38 @@ export interface BuildDiagnostics {
 export interface BuildResult {
   ir: RiffsheetIR;
   diagnostics: BuildDiagnostics;
+  /** The shared clock this part was engraved against. Multi-part MIDI needs it per part. */
+  skeleton: TimeSkeleton;
+  /** The guarded notes this part was engraved from — the as-played MIDI export is made of them. */
+  notes: InputNote[];
   toMusicXML(): string;
   toMidi(quantized: boolean): Uint8Array;
   toAlphaTabModelData(): AlphaTabScoreData;
+}
+
+/**
+ * THE MULTI-PART HOOK, and the only one. See multipart.ts.
+ *
+ * A score with N parts is N ordinary builds sharing one clock; everything else about a part —
+ * its clefs, its staff split, its tuning, its tab, its rests — is decided from its own notes,
+ * exactly as a single-part build decides them. Two decisions are NOT a part's own, because a
+ * score has one of each and not N:
+ *
+ *   the TIME SKELETON  (origin, anacrusis, meter, bar count) — otherwise a bass part that comes
+ *                      in on bar 3 would number its first bar 1 and no two parts would line up;
+ *   the KEY SIGNATURE  — otherwise the guitar prints two sharps and the bass one.
+ *
+ * Both are derived from `sharedNotes` when it is present: every note in the SCORE, across every
+ * part, pre-guard (this function applies the same guards to them that it applies to its own).
+ * Absent — the ordinary single-part call — the part's own notes are the score's notes and
+ * nothing changes, which is what keeps single-part output byte-identical.
+ */
+export interface BuildOptions {
+  sharedNotes?: InputNote[];
+}
+
+function spanSec(notes: InputNote[]): number {
+  return notes.length ? Math.max(...notes.map((n) => n.endSec)) - Math.min(...notes.map((n) => n.startSec)) : 0;
 }
 
 interface PlacedEvent {
@@ -150,7 +179,7 @@ function applySymbolicBars(skel: TimeSkeleton, source: NonNullable<InputNote['so
   return true;
 }
 
-export function buildScore(input: BuildInput, settings: BuildSettings): BuildResult {
+export function buildScore(input: BuildInput, settings: BuildSettings, options: BuildOptions = {}): BuildResult {
   const s = resolveSettings(settings);
 
   // ---- station 7 (input half): guards ------------------------------------------------------
@@ -164,8 +193,11 @@ export function buildScore(input: BuildInput, settings: BuildSettings): BuildRes
   const notes: InputNote[] = guard.notes;
 
   // ---- station 1: time skeleton -------------------------------------------------------------
-  const skel = buildTimeSkeleton({ ...input, notes }, s);
-  const sourceCarrier = identified.find((note) => note.sourceBars?.length);
+  // The SCORE's notes, not this part's: identical to `notes` on an ordinary single-part build,
+  // the union of every part on a multi-part one. See BuildOptions.
+  const scoreNotes = options.sharedNotes ? applyGuards(options.sharedNotes, input.audioDurationSec).notes : notes;
+  const skel = buildTimeSkeleton({ ...input, notes: scoreNotes }, s);
+  const sourceCarrier = (options.sharedNotes ?? identified).find((note) => note.sourceBars?.length);
   const sourceBarsApplied = sourceCarrier?.sourceBars ? applySymbolicBars(skel, sourceCarrier.sourceBars) : false;
   const ibis: number[] = [];
   for (let i = 1; i < skel.beatTimesSec.length; i++) {
@@ -263,12 +295,14 @@ export function buildScore(input: BuildInput, settings: BuildSettings): BuildRes
   const legatoById = new Map(surviving.map((p) => [p.fromId, p]));
 
   // ---- station 3a: key -----------------------------------------------------------------------
-  const durationSec = notes.length ? Math.max(...notes.map((n) => n.endSec)) - Math.min(...notes.map((n) => n.startSec)) : 0;
+  const durationSec = spanSec(notes);
+  // ONE KEY SIGNATURE PER SCORE, so it is read off the score's notes, not this part's. On a
+  // single-part build the two lists are the same object and this is the call it always made.
   const key = s.keyFifths !== undefined
     ? authoritativeKey(s.keyFifths)
     : detectKey(
-        notes.map((n) => ({ midi: n.midi, weight: Math.max(0, n.endSec - n.startSec) })),
-        { bars: skel.bars.filter((b) => !b.implicit).length, durationSec }
+        scoreNotes.map((n) => ({ midi: n.midi, weight: Math.max(0, n.endSec - n.startSec) })),
+        { bars: skel.bars.filter((b) => !b.implicit).length, durationSec: options.sharedNotes ? spanSec(scoreNotes) : durationSec }
       );
 
   // ---- bars: rests are constructed here, and only here ---------------------------------------
@@ -467,6 +501,8 @@ export function buildScore(input: BuildInput, settings: BuildSettings): BuildRes
   return {
     ir,
     diagnostics,
+    skeleton: skel,
+    notes,
     toMusicXML: () => toMusicXML(ir),
     toMidi: (quantized: boolean) => toMidi(ir, skel, notes, quantized),
     toAlphaTabModelData: () => toAlphaTabModelData(ir)

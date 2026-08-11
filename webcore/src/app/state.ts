@@ -12,6 +12,7 @@ import { DEFAULT_ROLL_HEIGHT_PX } from '../view/pianoroll';
 import type { SynthVoice } from '../audio/synth';
 import type { TrimResult } from '../audio/trim';
 import type { CutSpan } from '../edit/cuts';
+import type { ImportedPart } from '../score/parts';
 import type { HostInfo } from '../bridge';
 
 /**
@@ -330,7 +331,7 @@ export interface AppSettings {
 }
 
 /** Raise this AND add a case in `migrate()` when a default has to change under people. */
-export const SETTINGS_VERSION = 12;
+export const SETTINGS_VERSION = 13;
 
 export const DEFAULT_SETTINGS: AppSettings = {
   // 'auto', NOT 'bass'. This is sent to the model as a HARD CONSTRAINT on what it is allowed to
@@ -432,6 +433,86 @@ export const DEFAULT_SETTINGS: AppSettings = {
 };
 
 /**
+ * SETTINGS THAT BELONG TO A TAKE, NOT TO THE PLAYER (H4).
+ *
+ * THE BUG, in the owner's words: "I set the fret count to 22 once, and every project I have
+ * opened since starts at 22." Every setting in this file was persisted the same way — one
+ * global blob, written on change, merged back on boot — so a number typed to describe ONE
+ * instrument silently became a claim about every recording that would ever be opened
+ * afterwards. The same was true of the tuning, the capo, the clef, the key and the quantizer:
+ * open a drop-C bass take, then a piano sketch, and the piano sketch arrives on a four-string
+ * bass tab in D.
+ *
+ * THE AUDIT. A setting is take-scoped when it is an answer about THE MUSIC IN FRONT OF YOU —
+ * what instrument played it, how it is tuned, how it should be spelled, how finely it should
+ * be rounded. It is a genuine app preference when it is an answer about HOW YOU LIKE TO WORK,
+ * which is the same answer on every take you will ever open.
+ *
+ *   take-scoped, reset on every new take       app preference, persisted for good
+ *   ---------------------------------------    -----------------------------------------
+ *   instrument, tabMode, tuningId,             showNoteNames, showPianoRoll,
+ *   customTuningMidi   — which instrument      pianoRollHeight  — how you like the window
+ *   maxFret, capo, fingering, anchorFret       midiExportMode   — how you file things
+ *      — the shape of that instrument          engineId, engineModel, normalize…,
+ *   clefMode, keyFifths — how it is spelled    correctTuning…, autoSplitAtAttacks
+ *   grid, rollGrid, rollSnap — how it is          — how you want the app to listen
+ *      rounded and drawn                      useHostGrid      — whether your DAW leads
+ *   tempoBpm, timeSignature (legacy) — how     playbackVoice    — the sound you like to
+ *      fast, in what metre                       hear, see below
+ *
+ * `playbackVoice` was on the owner's candidate list and is deliberately NOT here. It changes
+ * nothing on the page and nothing in any export — it is the timbre of the MIDI monitor — so it
+ * is "the sound I like to hear", and resetting a guitarist to `finger-bass` on every new take
+ * would be the same complaint this list exists to answer, pointed the other way. It is one
+ * click from the transport row on any take that wants something else.
+ *
+ * `useHostGrid` is likewise a preference ("follow my DAW"), and the three ingest paths that
+ * must contradict it — a MIDI file, a score file, a blank score, none of which have any
+ * relationship to the DAW's transport — already set it false explicitly, after the reset.
+ *
+ * Reopening a saved .riffsheet is UNAFFECTED: `applyDocumentSettings()` puts the document's own
+ * values over whatever these are, and `App.documentOverrides` keeps them from leaking back into
+ * the player's blob. A reset is for a NEW take, which has no values of its own to honour.
+ */
+export const TAKE_SCOPED_SETTING_KEYS = [
+  'instrument',
+  'tabMode',
+  'tuningId',
+  'customTuningMidi',
+  'clefMode',
+  'grid',
+  'rollGrid',
+  'rollSnap',
+  'fingering',
+  'anchorFret',
+  'maxFret',
+  'capo',
+  'keyFifths',
+  'tempoBpm',
+  'timeSignature'
+] as const satisfies ReadonlyArray<keyof AppSettings>;
+
+/**
+ * The fixed defaults a NEW take starts from, as a patch.
+ *
+ * A fresh object every call — `customTuningMidi` is an array, and handing the same one to two
+ * takes would let an edit on the second reach back into the first.
+ */
+export function takeScopedDefaults(): Partial<AppSettings> {
+  const patch: Record<string, unknown> = {};
+  for (const key of TAKE_SCOPED_SETTING_KEYS) {
+    const value = DEFAULT_SETTINGS[key];
+    patch[key] = Array.isArray(value) ? [...value] : value;
+  }
+  return patch as Partial<AppSettings>;
+}
+
+/** True when `key` is the take's to answer rather than the player's. */
+export function isTakeScopedSetting(key: keyof AppSettings): boolean {
+  return (TAKE_SCOPED_SETTING_KEYS as ReadonlyArray<keyof AppSettings>).includes(key);
+}
+
+/**
  * The DAW's own grid, when a capture supplied one.
  * Preferred over detected beats because it cannot be wrong — it is the project's truth.
  */
@@ -485,6 +566,19 @@ export interface SourceAudio {
    * feature be inert — the app's `editedSource()` hands back this very object unchanged.
    */
   cuts?: CutSpan[];
+  /**
+   * PARTS — the other instruments printed on this sheet (`score/parts.ts`).
+   *
+   * Notation only, and symbolic only: each entry is the `InputNote[]` a MusicXML import produced,
+   * so a document carries the parts themselves rather than a path to somebody else's file. The
+   * live take is NOT in this list — it is the take, and `partOrder` names it with `LIVE_PART_ID`.
+   *
+   * Absent (not `[]`) on every take that has never had a part added, so a single-part document
+   * serialises to exactly the bytes it did before this field existed.
+   */
+  importedParts?: ImportedPart[];
+  /** Printed order, top to bottom: `LIVE_PART_ID` and imported part ids. */
+  partOrder?: string[];
 }
 
 export type Screen = 'opening' | 'main';
@@ -872,6 +966,21 @@ function migrate(settings: AppSettings, stored: Partial<AppSettings>, floor = 0)
   // The boolean itself survives (see its field comment) so an older blob round-trips; this is
   // the only line that ever reads it.
   if (from < 12) settings.rollSnap = settings.rollSnapToGrid === true ? 'grid' : 'off';
+
+  /*
+   * v12 -> v13: the take-scoped keys stop being global preferences (H4).
+   *
+   * Every one of them had been persisted in the player's blob since v1, so an existing profile
+   * is carrying a fret count, a tuning, a capo and a key that were typed about ONE recording and
+   * have been applied to every recording opened since. `takeScopedDefaults()` is now stamped
+   * over a new take, which fixes it from the next take onwards — this case fixes the value
+   * sitting in the blob right now, so the very first take after the update starts clean too.
+   *
+   * ONE-TIME AND PER-PROFILE, like every case above it: `migrationFloor()` is stamped at boot,
+   * so this cannot fire twice, and `applyDocumentSettings()` pins the floor at SETTINGS_VERSION,
+   * so opening a saved document never re-runs it over the document's own values.
+   */
+  if (from < 13) Object.assign(settings, takeScopedDefaults());
 
   const sampled = new Set([
     'finger-bass',

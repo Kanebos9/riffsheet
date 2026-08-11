@@ -41,6 +41,10 @@ import {
   type StaveKind
 } from './staveKinds';
 import type { EngravedExtent } from './timeAxis';
+// The one wheel-to-zoom law, borrowed rather than restated: a pinch over the SHEET and a pinch
+// over the ROLL have to be worth exactly the same amount, or the coupled pair pulls apart in the
+// hand. See `wheelZoomFactor`'s note on why it is exponential and clamped.
+import { wheelZoomFactor, WHEEL_ZOOM_MAX_STEP } from './pianoroll';
 import { countRendererCredits, stripRendererCredit } from './watermark';
 import { t, TIPS } from '../ui/tips';
 import type { RiffScore } from '../pipeline';
@@ -134,6 +138,24 @@ export interface TriViewOptions {
    * each other's `setHover`. Never echo one into the other's report or the pair will loop.
    */
   onNoteHover?: (noteId: string | null) => void;
+  /**
+   * THE SHEET'S SCALE CHANGED, and the coupling has to be told which direction it came from.
+   *
+   * Fired by `setZoom` — so by a pinch over the sheet (`onSheetWheel`) and by nothing else that
+   * a player can do — BEFORE the re-engrave. It exists because the roll deliberately refuses to
+   * take a span from Align (`PianoRoll.holdSpan`): a window derived from the sheet's viewport
+   * changes span on every scroll, because the engraving is not proportional to time, so adopting
+   * it would make dragging the scrollbar re-zoom the roll. A sheet ZOOM is the one case where
+   * the new span IS the point, and only the sheet knows the difference.
+   *
+   * ONE LINE at the integrator, and the roll already has the method:
+   *
+   *     onZoomChange: () => this.pianoRoll?.adoptNextAlignSpan(),
+   *
+   * Without it a sheet pinch still zooms the sheet — it simply does not carry the roll's span
+   * with it, which is a partial coupling rather than a broken one.
+   */
+  onZoomChange?: (scale: number) => void;
 }
 
 export interface NoteHit {
@@ -169,6 +191,17 @@ interface NameLabel {
  * silent disagreement between the two is exactly how the row ended up on top of the tab.
  */
 const NAME_HEIGHT = 13;
+/**
+ * Half the on-screen width of a label, in px, without measuring it.
+ *
+ * `.note-name` is `600 10.5px ui-monospace` with 2px of padding either side (ui/styles.css), and
+ * a monospace advance is 0.6em — so a name's width is arithmetic rather than a layout question.
+ * Measuring instead would mean a `getBoundingClientRect` per label per render, on a row that can
+ * hold four hundred of them, to learn a number that only ever depends on the character count.
+ */
+function nameHalfWidth(text: string): number {
+  return (text.length * 6.3 + 4) / 2;
+}
 /** Chord names stack upward from the anchor by this much per extra note. */
 const NAME_STACK_STEP = 12;
 /**
@@ -239,14 +272,29 @@ const BRACED_LEFT_OVERHANG_PER_SCALE = 22;
 const INSET_TUNE_PASSES = 2;
 
 /**
- * alphaTab display scale limits. 1.0 is the default; below 0.4 the tab digits stop being readable.
+ * alphaTab display scale limits. 1.0 is the default.
  *
  * Exported because Align's coupled zoom is computed OUTSIDE this class — `coupledSheetScale`
  * needs the clamps to work against, and a caller that guessed them would either fight `setZoom`'s
  * own clamp (asking for 6 and getting 3 every notch, so the roll and the sheet drift apart) or
  * stop short of a zoom the sheet would have allowed.
+ *
+ * THE FLOOR IS 0.6, UP FROM 0.4, AND IT IS A MEASUREMENT (H2).
+ *
+ * 0.4 was justified as "below this the tab digits stop being readable", which had it backwards:
+ * 0.4 IS below it. alphaTab draws fret digits at 14px and the music font at 36px, so at 0.4 a
+ * digit is 5.6px tall and a notehead is 5px wide. Rendered live on the triplet fixture at 8 bars
+ * — the picture the report is of — the whole take came out 954px wide: about 119px a bar, 12px
+ * an eighth-note triplet, which is a grey smear rather than an engraving, and it is where the
+ * coupling used to park itself (see pianoroll.ts §reportTimeWindow). At 0.6 a digit is 8.4px and
+ * a triplet gets 18px, which is the point at which the same render is readable in a screenshot.
+ *
+ * THE ROLL ADAPTS AND THE SHEET DOES NOT. Past this floor the coupling simply stops magnifying
+ * the sheet while the roll goes on zooming out — the two panes then show different spans, which
+ * is visibly a limit rather than a fault. The alternative is a sheet that is present but cannot
+ * be read, which is worse than one that has stopped following.
  */
-export const MIN_ZOOM = 0.4;
+export const MIN_ZOOM = 0.6;
 export const MAX_ZOOM = 3.0;
 
 /** We only ever render track 0. Hoisted so a per-note query does not allocate a Set. */
@@ -350,6 +398,11 @@ export class TriView {
   /** ALIGN's pending anchor: the tick that must be at the music column's left edge (#30). */
   private alignAnchorTick: number | null = null;
   private scrollAnchorAtStart = false;
+  /**
+   * How far from the LEFT EDGE the anchor tick has to land, in px. 0 for every zoom that came
+   * from a button or the coupling; the pointer's own offset for a pinch (see `zoomAt`).
+   */
+  private scrollAnchorOffsetPx = 0;
   /**
    * THE RENDER GATE. Nothing may ask alphaTab to render while alphaTab is rendering.
    *
@@ -541,6 +594,11 @@ export class TriView {
 
     this.scroller.addEventListener('pointerdown', this.onPointerDown);
     this.scroller.addEventListener('scroll', this.onScroll, { passive: true });
+    // Not passive: a pinch arrives as a ctrl-wheel and the browser would zoom the whole plugin
+    // window with it unless this says it was handled. See `onSheetWheel`.
+    this.scroller.addEventListener('wheel', this.onSheetWheel, { passive: false });
+    this.scroller.addEventListener('gesturestart', this.onGestureStart, { passive: false });
+    this.scroller.addEventListener('gesturechange', this.onGestureChange, { passive: false });
     // Hover only: the cursor has to say "this note can be moved up and down" before
     // anybody tries it. The drag itself listens on window, so it survives the pointer
     // leaving the element mid-gesture.
@@ -869,8 +927,16 @@ export class TriView {
               const shift = id ? this.tabShifts.get(id) : undefined;
               if (!shift) continue;
               const r = nb.noteHeadBounds;
+              // CENTRED OVER ITS OWN DIGIT, not hung off the digit's right edge (H10).
+              //
+              // Hung to the right, an "8va" is ~14px of ink starting 1px after a fret digit —
+              // so on any tab tight enough to matter (a capo makes most positions fold, which is
+              // the configuration this was reported in) it lands on the NEXT digit and the row
+              // reads "1 8va 1" with the marker between two numbers it does not belong to.
+              // Above the digit it can only ever cover the digit it is about, and the row above
+              // the tab is empty by construction — `TAB_DIGIT_RISE` is already reserved there.
               wantedMarks.push({
-                x: r.x + r.w + 1,
+                x: r.x + r.w / 2,
                 y: r.y - TAB_MARK_RISE,
                 text: octaveMarkText(shift)
               });
@@ -933,7 +999,7 @@ export class TriView {
       }
     }
 
-    this.syncLabels(wanted);
+    this.syncLabels(this.pruneNames(wanted));
     this.syncTabMarks(wantedMarks);
     // The tab's own legend. Derived from the SAME bounds as everything else above, so it
     // re-places itself on every render — a zoom, an edit or a re-flow cannot leave it behind.
@@ -1103,6 +1169,25 @@ export class TriView {
      * off `BeatBounds.onNotesX`, the notehead's own geometry.
      */
     noteXs: Array<{ noteId: string; contentX: number; screenX: number }>;
+    /**
+     * THE NUMBERS ALIGN'S WINDOW IS DERIVED FROM, read from the pane that owns them.
+     *
+     * `ui/app.ts §syncViewports` turns the sheet's two viewport edges into the seconds every
+     * other pane draws. When that derivation goes wrong the symptom is a mile away from the
+     * cause — the sheet re-scales, the roll re-spans — so the inputs are published here rather
+     * than reconstructed by a harness that would only be guessing at them. `leftEdgeTick` and
+     * `rightEdgeTick` are `contentXToTick` at exactly the two x's app.ts asks about.
+     */
+    axis: {
+      scale: number;
+      scrollLeft: number;
+      viewportWidth: number;
+      contentWidth: number;
+      firstX: number | null;
+      lastX: number | null;
+      leftEdgeTick: number | null;
+      rightEdgeTick: number | null;
+    };
   } | null {
     const lookup = this.api.renderer.boundsLookup;
     if (!lookup) return null;
@@ -1133,6 +1218,18 @@ export class TriView {
       }
       if (band) break;
     }
+    const extent = this.engravedExtent();
+    const vp = this.viewport();
+    const axis = {
+      scale: this.api.settings.display.scale,
+      scrollLeft: Math.round(vp?.scrollLeft ?? 0),
+      viewportWidth: Math.round(vp?.viewportWidth ?? 0),
+      contentWidth: Math.round(vp?.contentWidth ?? 0),
+      firstX: extent ? Math.round(extent.firstX) : null,
+      lastX: extent ? Math.round(extent.lastX) : null,
+      leftEdgeTick: vp ? this.contentXToTick(vp.scrollLeft + LEFT_INSET_PX) : null,
+      rightEdgeTick: vp ? this.contentXToTick(vp.scrollLeft + vp.viewportWidth) : null
+    };
     const hostRect = this.host.getBoundingClientRect();
     const markTexts = this.tabMarks.map((m) => m.el.textContent ?? '');
     let marksOnTab = 0;
@@ -1169,7 +1266,8 @@ export class TriView {
         surfaceSvgs,
         partialsThisRender: this.partialsThisRender,
         ghostsTrimmed: this.ghostsTrimmed,
-        noteXs
+        noteXs,
+        axis
       };
     }
 
@@ -1246,7 +1344,8 @@ export class TriView {
       surfaceSvgs,
       partialsThisRender: this.partialsThisRender,
       ghostsTrimmed: this.ghostsTrimmed,
-      noteXs
+      noteXs,
+      axis
     };
   }
 
@@ -1345,39 +1444,55 @@ export class TriView {
   /**
    * The inverse: which tick is under this x. O(log n), by bisecting the same axis.
    *
-   * HELD INSIDE THE ENGRAVING, which is a change of behaviour and the fix for the pane drift.
+   * IT EXTRAPOLATES PAST BOTH ENDS, and the right-hand one is the fix for H1b — the sheet
+   * collapsing to MIN_ZOOM the moment you scrolled it to its right edge.
    *
-   * The bisection itself still extrapolates past both ends — `axisTickAt` is the exact mirror
-   * of `axisXAt` and has to stay that way — but every CALLER of this method is asking a
-   * question about the viewport ("which second is at my left/right edge?"), and past the last
-   * engraved bar there is no answer to give but "the last engraved moment". Extrapolating there
-   * produced a time beyond the end of the recording whenever the pane was wider than the
-   * engraving, which is the ordinary state of a short riff; the align window then overran the
-   * take, `clampWindow` slid it back keeping its span, and the sheet and the roll ended up at
-   * different scales showing different music. Measured at ~578 px of drift.
+   * THE FAULT, root-caused live rather than described. Align is a closed loop: `syncViewports`
+   * asks this method which second sits at each edge of the sheet's viewport, hands the pair to
+   * the roll, the roll reports back the window it applied, and ui/app.ts answers any difference
+   * by re-scaling the sheet through `coupledSheetScale`. That loop is a controller whose job is
+   * to make the sheet's visible span equal the roll's, and it is stable only while shrinking the
+   * sheet INCREASES the span the sheet is showing — which is obvious, and was false here.
    *
-   * `exact: true` opts back out, for anything that genuinely wants the extrapolated inverse.
+   * This method used to hold x inside the engraving at the right end (`Math.min(lastX, x)`), so
+   * once the viewport reached past the last engraved bar the right edge's answer FROZE at the
+   * final tick while the left edge went on moving. Shrinking the sheet then made its derived
+   * span smaller, not larger, and the controller's sign flipped from negative to positive.
+   * Worse, it accelerates: at half the scale the engraving is half as wide, so the pane hangs
+   * twice as far past the end. Measured on `?demo=triplet&bars=8&tab=bass`, scrolling right in
+   * 220px steps with the right edge pinned at tick 30720 throughout, `display.scale` went
+   * 1 -> 0.978 -> 0.955 -> 0.887 -> 0.777 -> 0.570 -> 0.40 in six steps and the whole take was
+   * a 430px smudge. With the pin gone it stays at 0.978 all the way to the last bar.
+   *
+   * WHAT THE PIN WAS FOR, and why losing it costs nothing measurable. It was added because
+   * extrapolating produced a time beyond the end of the recording whenever the pane was wider
+   * than the engraving — a short riff — after which `clampWindow` slid the window back keeping
+   * its span and the panes ended up showing different music (~578 px of drift). That reading is
+   * still available and still bounded, because `axisTickAt` extrapolates on the axis's OWN
+   * average slope: blank page to the right of the last bar is worth what a page of this music is
+   * worth, which is exactly what the roll needs in order to leave the same proportion of its own
+   * plot empty. Re-measured after this change on the harness's own three-pane check
+   * (scripts/ghost-probe.mjs): worst sheet-vs-roll disagreement 66 px, unchanged from the pinned
+   * build, and the first engraved note still pinned to 8 px.
+   *
+   * The short riff — the very case the pin was added for — was re-measured too, on
+   * `?demo=triplet&bars=2`, whose whole engraving is 855 px inside a 1440 px pane: worst
+   * sheet-vs-roll 768 px WITH the pin and 258 px without it. The pin was not paying for itself
+   * even on its own fixture, which is what a clamp does when the thing it clamps is a ruler.
+   *
+   * The LEFT end was never clamped here (G2), for the same reason now stated once for both:
+   * left of the first beat is the clef, key and meter prefix — real page width standing for the
+   * lead-in the roll and the strip are quite right to go on drawing. Clamping it pinned the
+   * window's start to the first ATTACK while the sheet still showed the whole prefix, measured
+   * at 114-177 px of disagreement, the worst on the page.
+   *
+   * The `exact` opt-out this used to carry is gone with the clamp it opted out of: there is one
+   * answer now, and it is `axisTickAt`'s.
    */
-  contentXToTick(x: number, exact = false): number | null {
+  contentXToTick(x: number): number | null {
     const axis = this.ensureAxis();
     if (!axis) return null;
-    if (exact) return axisTickAt(axis, x);
-    // THE RIGHT END ONLY. Past the last engraved bar there is genuinely no more music, so the
-    // last engraved moment is what that edge is showing — see `clampXToEngraving`, which is the
-    // pure statement of the same rule and is what everything else in the app uses.
-    //
-    // The LEFT end is deliberately not clamped here (G2). Left of the first beat is the clef,
-    // key and meter prefix: real page width at the very start of the take, and the roll and the
-    // strip are quite right to go on drawing the lead-in that stands under it. Clamping it
-    // pinned the derived window's start to the FIRST ATTACK while the sheet was still showing
-    // the whole prefix, so at scroll 0 the roll drew the first note hard against its gutter and
-    // the sheet drew it up to `firstX - ALIGN_GUTTER_PX` further right — measured at 114-177 px,
-    // the single worst disagreement on the page. `axisTickAt` extrapolates there on the axis's
-    // OWN average slope, which is the one number that makes the prefix worth about what the roll
-    // thinks it is worth.
-    const extent = this.engravedExtent();
-    const held = extent && Number.isFinite(extent.lastX) ? Math.min(extent.lastX, x) : x;
-    return axisTickAt(axis, held);
+    return axisTickAt(axis, x);
   }
 
   /**
@@ -1555,8 +1670,13 @@ export class TriView {
     const left = this.scroller.scrollLeft;
     this.scrollAnchorAtStart = left <= 0;
     this.scrollAnchorTick = this.scrollAnchorAtStart ? null : this.contentXToTick(left);
+    // The default anchor is the left edge. `zoomAt` overwrites this immediately afterwards.
+    this.scrollAnchorOffsetPx = 0;
 
     this.api.settings.display.scale = next;
+    // Announced BEFORE the render, so the coupling is armed by the time the new viewport is
+    // published and the aligned window derived from it. See `TriViewOptions.onZoomChange`.
+    this.opts.onZoomChange?.(next);
     // The overhang scales with the engraving, so the padding has to be recomputed for the
     // new scale or the reserved column would come out wider or narrower than the roll's.
     setLeftPadding(this.api.settings, LEFT_INSET_PX + leftInkOverhangPerScale * next);
@@ -1576,6 +1696,101 @@ export class TriView {
     // there is nothing worth reusing.
     this.startRender(() => this.api.render({ reuseViewport: false }));
   }
+
+  /**
+   * Zoom about a point in the viewport, given in CLIENT x. The pinch's entry point.
+   *
+   * `setZoom` on its own keeps the music under the LEFT EDGE where it was, which is right for a
+   * zoom that came from a button and wrong for one that came from two fingers: a pinch is a
+   * statement about the thing under them. So the tick under the pointer is taken first and put
+   * back at the same distance from the left edge once the new engraving exists —
+   * `scrollAnchorOffsetPx` is that distance, and `restoreScrollAnchor` spends it.
+   *
+   * The pointer can legitimately be over the page padding past the last bar; `contentXToTick`
+   * extrapolates there on the engraving's own slope rather than pretending the last beat is
+   * under the fingers, which is what makes a pinch at the end of the take zoom about the end of
+   * the take. See its note.
+   */
+  zoomAt(factor: number, clientX: number): void {
+    if (!Number.isFinite(factor) || factor <= 0) return;
+    const rect = this.scroller.getBoundingClientRect();
+    const px = Math.max(0, Math.min(rect.width, clientX - rect.left));
+    const tick = this.contentXToTick(this.scroller.scrollLeft + px);
+    this.setZoom(this.getZoom() * factor);
+    if (tick === null || !this.renderPending()) return;
+    this.scrollAnchorAtStart = false;
+    this.scrollAnchorTick = tick;
+    this.scrollAnchorOffsetPx = px;
+  }
+
+  /**
+   * THE SHEET'S HALF OF THE TRACKPAD CONTRACT (H1/H2).
+   *
+   *   pinch                  -> HORIZONTAL zoom: re-engrave at a new `display.scale`
+   *   Option (alt) + pinch   -> the PITCH axis, which only the roll has — swallowed here
+   *   two fingers, any way   -> SCROLL, and nothing else, ever
+   *
+   * Zooming from HERE and not through the integrator is the point: a new scale changes the
+   * viewport, `onViewportChange` fires, and ui/app.ts derives the shared window from it and hands
+   * it to the roll and the strip, so the coupling that already exists is what carries a sheet
+   * pinch to the other two panes.
+   *
+   * IT NEEDS ONE LINE AT THE INTEGRATOR TO BITE, and this is measured rather than assumed. The
+   * roll refuses spans that arrive from Align (`PianoRoll.holdSpan`), so it answers a pinched
+   * window with its OWN span; ui/app.ts reads the difference as a zoom notch and puts the sheet
+   * back where it was. Live, six pinch events over the sheet move `display.scale` 1.269 -> 1.274
+   * — the gesture is inert, not wrong. Wiring `onZoomChange` (see `TriViewOptions`) to
+   * `PianoRoll.adoptNextAlignSpan` tells the roll that THIS span is the point, after which the
+   * echo guard matches and the pinch stands.
+   *
+   * A plain two-finger swipe is left to the browser, which is already correct — except on the
+   * one axis the browser cannot guess: this pane is a horizontal strip, so fingers moving UP and
+   * DOWN over it have nowhere vertical to go and must move the music sideways instead. Without
+   * that the sheet is the only pane in the app a trackpad cannot scroll.
+   */
+  private onSheetWheel = (e: WheelEvent): void => {
+    if (e.ctrlKey || e.metaKey) {
+      // Always swallowed, both branches: an unhandled ctrl-wheel is the browser's page zoom,
+      // which inside a plugin window resizes the entire UI and cannot be got back from.
+      e.preventDefault();
+      if (e.altKey) return;
+      const d = e.deltaY || e.deltaX;
+      if (d === 0) return;
+      this.zoomAt(wheelZoomFactor(d, e.deltaMode), e.clientX);
+      return;
+    }
+    const lines = e.deltaMode === 1 ? 16 : e.deltaMode === 2 ? 400 : 1;
+    const dx = e.deltaX * lines;
+    const dy = e.deltaY * lines;
+    if (dy === 0 || Math.abs(dy) <= Math.abs(dx)) return;
+    if (this.scroller.scrollHeight > this.scroller.clientHeight + 1) return;
+    if (this.scroller.scrollWidth <= this.scroller.clientWidth + 1) return;
+    e.preventDefault();
+    this.setScrollLeft(this.scroller.scrollLeft + dy);
+  };
+
+  /** Safari/WKWebView's pinch. Same two rules; see `PianoRoll.onGestureChange` for the units. */
+  private gestureScale = 1;
+
+  private onGestureStart = (e: Event): void => {
+    e.preventDefault();
+    this.gestureScale = (e as Event & { scale?: number }).scale ?? 1;
+  };
+
+  private onGestureChange = (e: Event): void => {
+    const g = e as Event & { scale?: number; altKey?: boolean; clientX?: number };
+    const scale = g.scale;
+    if (!scale || !Number.isFinite(scale) || scale <= 0) return;
+    e.preventDefault();
+    const ratio = scale / (this.gestureScale > 0 ? this.gestureScale : 1);
+    this.gestureScale = scale;
+    if (g.altKey || !Number.isFinite(ratio) || ratio <= 0 || Math.abs(ratio - 1) < 1e-4) return;
+    const rect = this.scroller.getBoundingClientRect();
+    this.zoomAt(
+      Math.min(WHEEL_ZOOM_MAX_STEP, Math.max(1 / WHEEL_ZOOM_MAX_STEP, ratio)),
+      g.clientX ?? rect.left + rect.width / 2
+    );
+  };
 
   /**
    * "Reset view": back to the default size, back to the beginning, in one call.
@@ -1638,6 +1853,8 @@ export class TriView {
   }
 
   private restoreScrollAnchor(): void {
+    const offset = this.scrollAnchorOffsetPx;
+    this.scrollAnchorOffsetPx = 0;
     // Align outranks the zoom anchor: when both are set, the caller has asked for a specific
     // moment at the left edge and `setZoom` only ever asked for "wherever we were".
     const aligned = this.alignAnchorTick;
@@ -1649,17 +1866,20 @@ export class TriView {
       if (alignedX !== null) this.setScrollLeft(alignedX - LEFT_INSET_PX);
       return;
     }
-    if (this.scrollAnchorAtStart) {
+    if (this.scrollAnchorAtStart && offset === 0) {
       this.scrollAnchorAtStart = false;
       this.scrollAnchorTick = null;
       this.setScrollLeft(0);
       return;
     }
+    this.scrollAnchorAtStart = false;
     const tick = this.scrollAnchorTick;
     if (tick === null) return;
     this.scrollAnchorTick = null;
     const x = this.tickToContentX(tick);
-    if (x !== null) this.setScrollLeft(x);
+    // `offset` is the pinch's own anchor: put the tick back where the fingers were, not at the
+    // left edge. It is 0 for every other zoom, so this line is the identity for them.
+    if (x !== null) this.setScrollLeft(x - offset);
   }
 
   // -------------------------------------------------------------------------
@@ -1727,6 +1947,94 @@ export class TriView {
       if (left < min) min = left;
     }
     return Number.isFinite(min) ? min : null;
+  }
+
+  /**
+   * A NOTE NAME IS NEVER DRAWN ON TOP OF SOMETHING ELSE (H2/H10).
+   *
+   * Two collisions, one pass, and both were photographed:
+   *
+   *   1. ENGRAVED LETTERING. alphaTab writes the capo annotation ("Capo. fret 1") as an effect
+   *      band in exactly the gap this row lives in, so with a capo set the first two names came
+   *      out reading "E(Capo. fret)1". The tempo mark and the bar numbers are the same shape of
+   *      problem at the same y. Rather than special-case the capo, ANY engraved text made of
+   *      ordinary letters is treated as occupied ground — the music font is skipped, because
+   *      Bravura's em box is about four times its ink (a 36px notehead reports a 144px box that
+   *      spans the staff, the gap and the tab) and intersecting against it would delete the whole
+   *      row. Cheap to tell apart without `getComputedStyle`: every music glyph is a private-use
+   *      codepoint, and lettering is not.
+   *
+   *   2. EACH OTHER. The row is one label per attack, so at a zoomed-out scale a dense bar asks
+   *      for more labels than there are pixels: at 0.6 the triplet fixture wants "G1 A#1 C2" in
+   *      the width of one of them and prints them as a smudge. Where two would collide the LATER
+   *      one is dropped, which is the same thing the piano roll does to its own pitch names when
+   *      the pane gets short (§labelMode). A missing label reads as "no room"; two labels on top
+   *      of each other read as a bug, and neither can be read anyway.
+   *
+   * Chord stacks share an anchor x, so they survive or fall together — which is right: half a
+   * chord's names is a wrong chord, not a thinner one.
+   */
+  private pruneNames(
+    wanted: Array<{ x: number; y: number; text: string; uncertain: boolean }>
+  ): Array<{ x: number; y: number; text: string; uncertain: boolean }> {
+    if (wanted.length === 0) return wanted;
+    const stackLeft = this.stack.getBoundingClientRect().left;
+    const stackTop = this.stack.getBoundingClientRect().top;
+    // The band the row occupies, with the tallest chord stack allowed for, so only the handful
+    // of engraved texts that could possibly be in the way are measured.
+    let bandTop = Number.POSITIVE_INFINITY;
+    let bandBottom = Number.NEGATIVE_INFINITY;
+    for (const w of wanted) {
+      bandTop = Math.min(bandTop, w.y);
+      bandBottom = Math.max(bandBottom, w.y + NAME_HEIGHT);
+    }
+    const blockers: Array<{ left: number; right: number; top: number; bottom: number }> = [];
+    for (const glyph of this.host.querySelectorAll('svg text')) {
+      const text = glyph.textContent ?? '';
+      // Music font = private use area. Anything with a plain letter or digit in it is lettering.
+      if (text.length === 0 || ![...text].some((c) => c.charCodeAt(0) < 0xe000)) continue;
+      const r = glyph.getBoundingClientRect();
+      if (r.width === 0 || r.height === 0) continue;
+      const top = r.top - stackTop;
+      const bottom = r.bottom - stackTop;
+      if (bottom < bandTop || top > bandBottom) continue;
+      blockers.push({ left: r.left - stackLeft, right: r.right - stackLeft, top, bottom });
+    }
+
+    const kept: Array<{ x: number; y: number; text: string; uncertain: boolean }> = [];
+    const keptBoxes: Array<{ left: number; right: number; top: number; bottom: number }> = [];
+    let droppedAnchorX: number | null = null;
+    let keptAnchorX: number | null = null;
+    for (const w of wanted) {
+      // One decision per anchor, reused by every name stacked on it.
+      if (droppedAnchorX !== null && w.x === droppedAnchorX) continue;
+      const box = {
+        left: w.x - nameHalfWidth(w.text),
+        right: w.x + nameHalfWidth(w.text),
+        top: w.y,
+        bottom: w.y + NAME_HEIGHT
+      };
+      const sameAnchor = keptAnchorX !== null && w.x === keptAnchorX;
+      const hits =
+        blockers.some((b) => box.left < b.right && box.right > b.left && box.top < b.bottom && box.bottom > b.top) ||
+        // Only the last few: `wanted` is built in engraving order, so a label can only ever
+        // collide with its immediate neighbours, and comparing every pair is quadratic on a row
+        // that can hold four hundred of them.
+        (!sameAnchor &&
+          keptBoxes
+            .slice(-6)
+            .some(
+              (b) => box.left < b.right && box.right > b.left && box.top < b.bottom && box.bottom > b.top
+            ));
+      if (hits) {
+        droppedAnchorX = w.x;
+        continue;
+      }
+      keptAnchorX = w.x;
+      kept.push(w);
+      keptBoxes.push(box);
+    }
+    return kept;
   }
 
   /** Reuse label elements across renders; creating 400 divs per keystroke is not free. */
@@ -1811,7 +2119,26 @@ export class TriView {
   /** Write the pinned transform for every letter. Cheap enough to call on every scroll frame. */
   private placeStringLetters(): void {
     const left = this.scroller.scrollLeft;
+    /*
+     * THE LINE SPACING IS THE SIZE (H10), the same law the printed page uses
+     * (export/pdf.ts §stringLetterSize) and for the same reason: the letters are stacked one per
+     * tab line, and a tab line on a six-string staff at a zoomed-out scale is a few pixels from
+     * the next. A fixed 9px is therefore sometimes taller than the gap it has to sit in, and four
+     * letters become one grey column with no white between them — which is what "vertical
+     * crowding on grand + tab" was a photograph of.
+     *
+     * 68% of the smallest measured gap, capped at the stylesheet's own 9px and floored at 6px so
+     * a very tight staff shrinks them rather than making them illegible. Measured off the letters
+     * that are actually there, so nothing here has to know how many strings the instrument has.
+     */
+    let minGap = Number.POSITIVE_INFINITY;
+    for (let i = 1; i < this.stringLetters.length; i++) {
+      const gap = Math.abs(this.stringLetters[i].y - this.stringLetters[i - 1].y);
+      if (gap > 0) minGap = Math.min(minGap, gap);
+    }
+    const size = Number.isFinite(minGap) ? Math.max(6, Math.min(9, minGap * 0.68)) : 9;
     for (const m of this.stringLetters) {
+      m.el.style.fontSize = `${size.toFixed(2)}px`;
       m.el.style.transform = `translate(${m.x + left}px, ${m.y}px) translate(-100%, -50%)`;
     }
   }
@@ -1842,7 +2169,8 @@ export class TriView {
       const w = wanted[i];
       const m = this.tabMarks[i];
       if (m.el.textContent !== w.text) m.el.textContent = w.text;
-      m.el.style.transform = `translate(${w.x}px, ${w.y}px)`;
+      // `x` is the CENTRE of the digit the marker is about; see the note where they are built.
+      m.el.style.transform = `translate(${w.x}px, ${w.y}px) translateX(-50%)`;
       m.x = w.x;
     }
   }
@@ -2603,6 +2931,9 @@ export class TriView {
     this.drag = null;
     this.scroller.removeEventListener('pointerdown', this.onPointerDown);
     this.scroller.removeEventListener('scroll', this.onScroll);
+    this.scroller.removeEventListener('wheel', this.onSheetWheel);
+    this.scroller.removeEventListener('gesturestart', this.onGestureStart);
+    this.scroller.removeEventListener('gesturechange', this.onGestureChange);
     this.scroller.removeEventListener('pointermove', this.onHoverMove);
     this.scroller.removeEventListener('pointerleave', this.onHoverLeave);
     this.api.destroy();

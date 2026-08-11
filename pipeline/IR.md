@@ -6,6 +6,10 @@ MIDI**: middle C is MIDI 60, MusicXML C4, and alphaTab `{ octave: 5, tone: 0 }`.
 number is deliberately one greater than scientific pitch notation, so its invariant is
 `octave * 12 + tone === midi`.
 
+Several instruments print as one document through `buildMultiPartScore` — N of these builds
+sharing one clock, merged at the output layer. See **Multi-part scores** below; a single-part
+build is byte-for-byte unaffected by any of it.
+
 ## Input
 
 ```ts
@@ -153,6 +157,118 @@ summary in the part/track name so printed and exported sheets are self-describin
 Quantized MIDI follows IR tempo and meter changes. As-played MIDI uses the original note seconds and
 a constant tick clock, preserving wall-clock performance timing. A symbolic MIDI import retains its
 original bytes for exact re-export at the webcore boundary.
+
+## Multi-part scores (Parts)
+
+Several instruments print as ONE document — a guitar part over a bass part — through a second
+entry point beside `buildScore`. Nothing about the IR changes: `RiffsheetIR` is, as it has always
+been, ONE part's engraving. A multi-part score is N ordinary builds merged at the OUTPUT layer,
+because every invariant the IR carries (ties, tuplet balance, type-vs-duration, the measure
+cursor, the grand-staff split) is a statement about one part's staves and means nothing across
+parts.
+
+```ts
+buildMultiPartScore(
+  parts: ScorePart[],                 // PRINTED ORDER, top to bottom. 1..MAX_PARTS (4).
+  sharedInput: SharedBuildInput,      // = Omit<BuildInput, 'notes'>
+  sharedSettings: BuildSettings       // the ordinary settings; timing/key/title half is score-wide
+): MultiPartBuildResult;
+
+interface ScorePart {
+  notes: InputNote[];         // the part's content, in the form the app already produces it
+  name?: string;              // printed part name; omitted, the part names itself as today
+  abbreviation?: string;      // <part-abbreviation>
+  role?: 'live' | 'imported'; // default: 'live' for index 0, 'imported' for the rest
+  nudgeSec?: number;          // move this part against the shared clock, before quantize. Default 0
+  // engraving-only overrides; anything absent falls back as described below
+  instrument?: Instrument;
+  tuningMidi?: number[];
+  fingeringStyle?: FingeringStyle;
+  anchorFret?: number;
+  capo?: number;
+  maxFret?: number;
+  clefMode?: ClefMode;
+  tab?: 'two-staves' | 'omit';
+  octaveTransposition?: 'none' | 'conventional';
+  midiProgram?: number;       // General MIDI program - 1
+}
+
+interface MultiPartBuildResult {
+  parts: PartBuild[];
+  liveIndex: number;          // index of the live take; -1 if the caller declared none
+  toMusicXML(): string;
+  toMidi(quantized: boolean): Uint8Array;
+  toAlphaTabModelData(): AlphaTabScoreData;
+}
+
+interface PartBuild {
+  index: number;              // 0-based printed order
+  id: string;                 // 'P1', 'P2', ... — the MusicXML part id AND the tracks[] index
+  name: string;               // the resolved display name, as the file actually contains it
+  abbreviation?: string;
+  role: 'live' | 'imported';
+  idPrefix: string;           // what was prepended to this part's note ids ('' for part 0)
+  nudgeSec: number;
+  ir: RiffsheetIR;
+  diagnostics: BuildDiagnostics;
+}
+```
+
+**What parts share, and it is exactly two things.** THE CLOCK — same tempo, same meter, same bars,
+bar 1 aligned — and THE KEY SIGNATURE. Both are derived once from every note in the score, so a
+bass entering on bar 3 does not number that bar 1 and two parts of one piece never print different
+accidentals. An imported part's `sourceBars` / `sourceTempoChanges` become the whole score's bar
+and tempo map, not just its own. Everything else — clefs, grand staff, tuning, tab, string
+assignment, rests, beams, stats, diagnostics — is decided from that part's notes alone, exactly as
+on a single-part build, and no code path exists by which one part's content could reach another's
+engraving.
+
+**Defaults per role.** The live part inherits `sharedSettings` verbatim, so it keeps the full
+grand-staff/TAB options it has today. An imported part defaults to `instrument: 'staff'` — a plain
+notation staff with no invented fretboard — and its tuning follows its instrument rather than the
+shared settings, so a bass tuning left in the shared settings cannot give a `'staff'` part a
+tablature staff nobody asked for. TAB is not hard-blocked: name an instrument on an imported part
+and it gets tab like any other.
+
+**The nudge** is a translation, in seconds, applied before quantization; positive is later. A part
+carrying its own written ticks (`sourceTiming`) is shifted in ticks too, by `nudgeSec` at the
+score's display tempo — ONE constant shift for the whole part, so its internal rhythm survives
+exactly. `sourceBars` / `sourceTempoChanges` are never nudged: they ARE the shared clock.
+
+**Note ids are unique across the SCORE.** Part 0 keeps its ids untouched; every later part is
+namespaced `p2-`, `p3-`, ... Read `PartBuild.idPrefix` and strip it to recover the id you passed in.
+
+**Bar alignment.** Both output formats stack parts by measure, so every part must cover the same
+bars. The shared clock does almost all of this; a part whose last note rings past the final barline
+can still come out one bar longer, and shorter parts are then padded with whole-bar rests
+(`alignPartBars`, also exported). A disagreement about a bar two parts BOTH have is a broken clock
+and throws rather than being papered over.
+
+**Outputs.**
+
+- MusicXML: one `score-partwise` with a real `<part-list>` — `P1..PN`, part names and
+  abbreviations from the labels, one MIDI channel each. Metronome marks are written on the top
+  part only (N stacked tempo marks is not a score).
+- alphaTab: one `AlphaTabScoreData` with N `tracks`, against ONE `masterBars` list. `webcore`'s
+  `fromPipeline` already loops `data.tracks`, so nothing new is needed on the screen side.
+  An imported track carries `notationOnly: true`; **do not route those to playback**.
+- MIDI: format 1 — a conductor track carrying tempo/meter/key, then one track per part on its own
+  channel. ALL parts are written, including imported ones the app never plays: the file format
+  should describe the document the user is looking at, and every DAW expects the parts to be
+  there. (A deliberate asymmetry between what the app plays and what the file contains.)
+
+**A single-part score is unchanged, byte for byte, on all three emitters.**
+`buildMultiPartScore([{ notes }], input, settings)` produces exactly what `buildScore(input,
+settings)` produces — the same MusicXML string, the same MIDI bytes (format 0, one track), the
+same alphaTab JSON including key order, and the same IR. Callers can therefore route every build
+through the multi-part entry point and never branch on part count. `multipart.test.ts` proves this
+against every golden case.
+
+The emit-level primitives are exported too, for a caller that already holds built parts:
+`toMultiPartMusicXML(parts)`, `toMultiPartAlphaTabModelData(parts)`, `toMultiPartMidi(parts,
+quantized)`, plus `defaultPartName(ir)` and `alignPartBars(irs)`. `buildScore` gained an optional
+third argument, `BuildOptions`, whose only field is `sharedNotes` — the score's notes, from which
+the clock and the key are derived. It is the one hook multi-part needed inside the pipeline.
 
 ## Safety limits
 

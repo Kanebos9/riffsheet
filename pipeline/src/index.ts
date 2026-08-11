@@ -10,7 +10,17 @@
 
 export { buildScore } from './buildScore.js';
 export { applyBeams, markTupletEdges, projectStaffBeats } from './beaming.js';
-export type { BuildResult, BuildDiagnostics } from './buildScore.js';
+export type { BuildResult, BuildDiagnostics, BuildOptions } from './buildScore.js';
+
+// ---- multi-part: N instruments, one document (see multipart.ts and IR.md) -------------------
+export { buildMultiPartScore, alignPartBars, MAX_PARTS } from './multipart.js';
+export type {
+  ScorePart,
+  PartRole,
+  PartBuild,
+  SharedBuildInput,
+  MultiPartBuildResult
+} from './multipart.js';
 
 export type {
   BuildInput,
@@ -112,13 +122,15 @@ export type { TabNoteInput, TabAssignment, TabPosition, LegatoPair } from './tab
 export { applyGuards, detectRepeatLoops, MIN_NOTE_SEC, REPEAT_MIN_RUN, REPEAT_IOI_STDDEV_SEC } from './guards.js';
 export type { GuardResult } from './guards.js';
 
-export { toMusicXML } from './musicxml.js';
-export type { MusicXmlOptions } from './musicxml.js';
+export { toMusicXML, toMultiPartMusicXML, defaultPartName } from './musicxml.js';
+export type { MusicXmlOptions, MusicXmlPart } from './musicxml.js';
 
-export { toMidi, MIDI_PPQ } from './midi.js';
+export { toMidi, toMultiPartMidi, MIDI_PPQ } from './midi.js';
+export type { MidiPart } from './midi.js';
 
-export { toAlphaTabModelData } from './alphatab.js';
+export { toAlphaTabModelData, toMultiPartAlphaTabModelData } from './alphatab.js';
 export type {
+  AlphaTabPart,
   AlphaTabScoreData,
   AlphaTabBarData,
   AlphaTabBeatData,

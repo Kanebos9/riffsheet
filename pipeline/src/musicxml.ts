@@ -70,6 +70,26 @@ export interface MusicXmlOptions {
    * If the screen and the exported file must agree octave-for-octave, use 'conventional'.
    */
   octaveTransposition?: 'none' | 'conventional';
+  /** `<part-abbreviation>`, printed beside every system after the first. Omitted when absent. */
+  partAbbreviation?: string;
+}
+
+/** One part of a multi-part document, in printed order: index 0 is the TOP staff group. */
+export interface MusicXmlPart {
+  ir: RiffsheetIR;
+  options?: MusicXmlOptions;
+}
+
+/**
+ * The name this part prints when the caller does not supply one. Exported because the multi-part
+ * builder reports the resolved display name back to its caller, and it must be the same string
+ * the file actually contains rather than a second guess at it.
+ */
+export function defaultPartName(ir: RiffsheetIR): string {
+  const isStaffOnly = ir.instrument.stringCount === 0;
+  const base = isStaffOnly ? 'Music' : ir.instrument.kind.startsWith('bass') ? 'Bass' : 'Guitar';
+  if (isStaffOnly) return base;
+  return `${base} — Tuning low → high: ${ir.instrument.tuningMidi.map(pitchName).join(' ')}`;
 }
 
 function pitchName(midi: number): string {
@@ -102,14 +122,35 @@ function assertNoOctaveTrap(xml: string, transposed: boolean): void {
   }
 }
 
-export function toMusicXML(ir: RiffsheetIR, options: MusicXmlOptions = {}): string {
+/**
+ * A part with every derived decision already made: what it is called, how many staves it has,
+ * which of them is the TAB staff, whether it writes written or sounding pitch. Computed once per
+ * part so `<part-list>` and the `<part>` body can never disagree about the same part, and so a
+ * multi-part document is exactly N of these rather than a second copy of the logic.
+ */
+interface ResolvedPart {
+  ir: RiffsheetIR;
+  options: MusicXmlOptions;
+  /** 0-based printed order; 0 is the TOP part. */
+  index: number;
+  /** `P1`, `P2`, ... — the id shared by `<score-part>` and `<part>`. */
+  id: string;
+  name: string;
+  abbreviation?: string;
+  program: number;
+  midiChannel: number;
+  useTab: boolean;
+  useGrand: boolean;
+  writtenShift: number;
+  notationStaves: number;
+  tabStaff: number;
+  staffCount: number;
+}
+
+function resolvePart(ir: RiffsheetIR, options: MusicXmlOptions, index: number): ResolvedPart {
   const useTab = (options.tab ?? 'two-staves') === 'two-staves' && ir.instrument.stringCount > 0;
-  const isBass = ir.instrument.kind.startsWith('bass');
   const isStaffOnly = ir.instrument.stringCount === 0;
-  const basePartName = isStaffOnly ? 'Music' : isBass ? 'Bass' : 'Guitar';
-  const tuningSummary = ir.instrument.tuningMidi.map(pitchName).join(' ');
-  const partName = options.partName ?? (isStaffOnly ? basePartName : `${basePartName} — Tuning low → high: ${tuningSummary}`);
-  const program = options.midiProgram ?? (isStaffOnly ? 0 : isBass ? 33 : 27);
+  const program = options.midiProgram ?? (isStaffOnly ? 0 : ir.instrument.kind.startsWith('bass') ? 33 : 27);
   const writtenShift = options.octaveTransposition === 'conventional'
     ? 12
     : options.octaveTransposition === 'none'
@@ -118,11 +159,89 @@ export function toMusicXML(ir: RiffsheetIR, options: MusicXmlOptions = {}): stri
   // A grand staff no longer cancels itself when the part has strings: the notation is two staves
   // and the tab, when asked for, is a THIRD. `<staves>` counts them; nothing below assumes 2.
   const useGrand = ir.grandStaff;
-  const grandClefs = ir.grandStaffClefs ?? grandClefPair();
   /** Staff numbers are 1-based and printed top to bottom: notation staves first, TAB last. */
   const notationStaves = useGrand ? 2 : 1;
-  const tabStaff = notationStaves + 1;
-  const staffCount = notationStaves + (useTab ? 1 : 0);
+  return {
+    ir,
+    options,
+    index,
+    id: `P${index + 1}`,
+    name: options.partName ?? defaultPartName(ir),
+    ...(options.partAbbreviation ? { abbreviation: options.partAbbreviation } : {}),
+    program,
+    // Channel 10 is percussion by GM convention; step over it rather than land a pitched part on
+    // it. A four-part cap means this never fires today, and it costs one comparison if it ever does.
+    midiChannel: index + 1 >= 10 ? index + 2 : index + 1,
+    useTab,
+    useGrand,
+    writtenShift,
+    notationStaves,
+    tabStaff: notationStaves + 1,
+    staffCount: notationStaves + (useTab ? 1 : 0)
+  };
+}
+
+export function toMusicXML(ir: RiffsheetIR, options: MusicXmlOptions = {}): string {
+  return toMultiPartMusicXML([{ ir, options }]);
+}
+
+/**
+ * ONE `score-partwise` DOCUMENT, N PARTS, printed top to bottom in array order.
+ *
+ * A part is engraved exactly as it would be on its own — same staves, same tab, same clefs, same
+ * assertions — and the only thing the document does is stack them. Three things belong to the
+ * SCORE rather than to a part and are therefore taken from the first one: the work title, the
+ * composer, and the metronome marks (a tempo direction repeated in every part is N tempo marks
+ * stacked on the page, and readers honour the first anyway).
+ *
+ * Every part must already agree on bar count, bar numbering and bar lengths — the caller's job,
+ * and `multipart.ts alignPartBars` is what does it. Nothing is checked here beyond the per-part
+ * cursor and tuplet assertions, which are the same ones a single-part emit runs.
+ */
+export function toMultiPartMusicXML(parts: MusicXmlPart[]): string {
+  if (!parts.length) throw new Error('MusicXML: a score needs at least one part');
+  const resolved = parts.map((part, index) => resolvePart(part.ir, part.options ?? {}, index));
+  const lead = resolved[0].ir;
+
+  const L: string[] = [];
+  L.push('<?xml version="1.0" encoding="UTF-8" standalone="no"?>');
+  L.push(
+    '<!DOCTYPE score-partwise PUBLIC "-//Recordare//DTD MusicXML 4.0 Partwise//EN" "http://www.musicxml.org/dtds/partwise.dtd">'
+  );
+  L.push('<score-partwise version="4.0">');
+  L.push(`  <work><work-title>${esc(lead.title)}</work-title></work>`);
+  L.push('  <identification>');
+  if (lead.composer) L.push(`    <creator type="composer">${esc(lead.composer)}</creator>`);
+  L.push('    <encoding><software>Riffsheet pipeline</software></encoding>');
+  L.push('  </identification>');
+  L.push('  <part-list>');
+  for (const part of resolved) {
+    L.push(`    <score-part id="${part.id}">`);
+    L.push(`      <part-name>${esc(part.name)}</part-name>`);
+    if (part.abbreviation) L.push(`      <part-abbreviation>${esc(part.abbreviation)}</part-abbreviation>`);
+    L.push(`      <score-instrument id="${part.id}-I1"><instrument-name>${esc(part.name)}</instrument-name></score-instrument>`);
+    L.push(
+      `      <midi-instrument id="${part.id}-I1"><midi-channel>${part.midiChannel}</midi-channel><midi-program>${part.program + 1}</midi-program></midi-instrument>`
+    );
+    L.push('    </score-part>');
+  }
+  L.push('  </part-list>');
+  for (const part of resolved) {
+    const body: string[] = [];
+    emitPart(body, part, part.index === 0);
+    // §8.3 is a PER-PART rule: one part may write conventional pitch while another writes
+    // sounding pitch, so the guard runs against that part's own fragment. Checking the whole
+    // document instead would read a neighbour's <transpose> as this part's.
+    assertNoOctaveTrap(body.join('\n'), part.writtenShift !== 0);
+    L.push(...body);
+  }
+  L.push('</score-partwise>');
+  return L.join('\n');
+}
+
+function emitPart(L: string[], part: ResolvedPart, withTempoDirections: boolean): void {
+  const { ir, useTab, useGrand, writtenShift, tabStaff, staffCount } = part;
+  const grandClefs = ir.grandStaffClefs ?? grandClefPair();
   // The split lives in the IR (clef.ts `grandStaffSplitter`) so this emitter and alphatab.ts can
   // no longer disagree about which staff a note belongs to.
   const onStaff = (index: 0 | 1) => (note: IRNote): boolean => (note.staffIndex ?? 0) === index;
@@ -141,25 +260,7 @@ export function toMusicXML(ir: RiffsheetIR, options: MusicXmlOptions = {}): stri
     stringCount: ir.instrument.stringCount
   });
 
-  const L: string[] = [];
-  L.push('<?xml version="1.0" encoding="UTF-8" standalone="no"?>');
-  L.push(
-    '<!DOCTYPE score-partwise PUBLIC "-//Recordare//DTD MusicXML 4.0 Partwise//EN" "http://www.musicxml.org/dtds/partwise.dtd">'
-  );
-  L.push('<score-partwise version="4.0">');
-  L.push(`  <work><work-title>${esc(ir.title)}</work-title></work>`);
-  L.push('  <identification>');
-  if (ir.composer) L.push(`    <creator type="composer">${esc(ir.composer)}</creator>`);
-  L.push('    <encoding><software>Riffsheet pipeline</software></encoding>');
-  L.push('  </identification>');
-  L.push('  <part-list>');
-  L.push('    <score-part id="P1">');
-  L.push(`      <part-name>${esc(partName)}</part-name>`);
-  L.push(`      <score-instrument id="P1-I1"><instrument-name>${esc(partName)}</instrument-name></score-instrument>`);
-  L.push(`      <midi-instrument id="P1-I1"><midi-channel>1</midi-channel><midi-program>${program + 1}</midi-program></midi-instrument>`);
-  L.push('    </score-part>');
-  L.push('  </part-list>');
-  L.push('  <part id="P1">');
+  L.push(`  <part id="${part.id}">`);
 
   let lastTimeSig: string | null = null;
   let lastClef: string | null = null;
@@ -233,9 +334,11 @@ export function toMusicXML(ir: RiffsheetIR, options: MusicXmlOptions = {}): stri
       L.push('      </attributes>');
     }
 
-    const tempoChanges = ir.tempo.changes?.length
-      ? ir.tempo.changes
-      : [{ tick: 0, bpm: ir.tempo.displayBpm }];
+    const tempoChanges = !withTempoDirections
+      ? []
+      : ir.tempo.changes?.length
+        ? ir.tempo.changes
+        : [{ tick: 0, bpm: ir.tempo.displayBpm }];
     for (const change of tempoChanges.filter((candidate) =>
       candidate.tick >= bar.startTick && candidate.tick < bar.startTick + bar.durTicks
     )) {
@@ -307,10 +410,6 @@ export function toMusicXML(ir: RiffsheetIR, options: MusicXmlOptions = {}): stri
   });
 
   L.push('  </part>');
-  L.push('</score-partwise>');
-  const xml = L.join('\n');
-  assertNoOctaveTrap(xml, writtenShift !== 0);
-  return xml;
 }
 
 interface EmitOptions {

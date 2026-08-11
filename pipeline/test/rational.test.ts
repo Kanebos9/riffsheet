@@ -34,13 +34,14 @@ describe('Rational — exact metric arithmetic', () => {
   });
 
   it('converts to ticks exactly, and refuses what it cannot represent', () => {
-    expect(R(1, 4).toTicksExact(DIVISIONS)).toBe(12); // quarter
-    expect(R(1, 8).toTicksExact(DIVISIONS)).toBe(6); // eighth
-    expect(R(1, 16).toTicksExact(DIVISIONS)).toBe(3); // sixteenth
-    expect(R(3, 8).toTicksExact(DIVISIONS)).toBe(18); // dotted quarter / compound beat
-    expect(R(1, 12).toTicksExact(DIVISIONS)).toBe(4); // eighth-note triplet
-    expect(R(1, 24).toTicksExact(DIVISIONS)).toBe(2); // sixteenth-note triplet
-    expect(() => R(1, 32).toTicksExact(DIVISIONS)).toThrow('not representable');
+    expect(R(1, 4).toTicksExact(DIVISIONS)).toBe(24); // quarter
+    expect(R(1, 8).toTicksExact(DIVISIONS)).toBe(12); // eighth
+    expect(R(1, 16).toTicksExact(DIVISIONS)).toBe(6); // sixteenth
+    expect(R(1, 32).toTicksExact(DIVISIONS)).toBe(3); // thirty-second
+    expect(R(3, 8).toTicksExact(DIVISIONS)).toBe(36); // dotted quarter / compound beat
+    expect(R(1, 12).toTicksExact(DIVISIONS)).toBe(8); // eighth-note triplet
+    expect(R(1, 24).toTicksExact(DIVISIONS)).toBe(4); // sixteenth-note triplet
+    expect(() => R(1, 64).toTicksExact(DIVISIONS)).toThrow('not representable');
   });
 
   it('names the documented constants', () => {
@@ -49,10 +50,12 @@ describe('Rational — exact metric arithmetic', () => {
   });
 });
 
-describe('divisions = 12 covers the v1 inventory exactly', () => {
-  // The dossier flagged a possible need for divisions=24. This test settles it: everything v1
-  // emits is an exact integer at 12 per quarter, and the two things that are NOT representable
-  // are both outside the v1 vocabulary.
+describe('divisions = 24 covers the inventory exactly', () => {
+  // This block used to assert divisions=12 and record that 32nds and dotted 16ths were the two
+  // values it could not say ("raising DIVISIONS to 24 is the single-constant change that unlocks
+  // them"). Issue #35 took that change, so both are now first-class — and the whole triplet
+  // ladder had to survive it, which is the real content of the test: 24 = 12 x 2 is still
+  // divisible by 3.
   const REPRESENTABLE: [string, Rational][] = [
     ['whole', R(1, 1)],
     ['dotted half', R(3, 4)],
@@ -61,22 +64,36 @@ describe('divisions = 12 covers the v1 inventory exactly', () => {
     ['quarter', R(1, 4)],
     ['dotted eighth', R(3, 16)],
     ['eighth', R(1, 8)],
+    ['dotted 16th', R(3, 32)],
     ['16th', R(1, 16)],
+    ['32nd', R(1, 32)],
     ['quarter-note triplet unit', R(1, 6)],
     ['eighth-note triplet unit', R(1, 12)],
     ['16th-note triplet unit', R(1, 24)]
   ];
   for (const [name, len] of REPRESENTABLE) {
-    it(`${name} is exact at divisions=12`, () => {
+    it(`${name} is exact at divisions=24`, () => {
       expect(Number.isInteger(len.toTicksExact(DIVISIONS))).toBe(true);
     });
   }
 
-  it('32nds and dotted 16ths are NOT representable — and are outside the v1 vocabulary', () => {
-    expect(() => R(1, 32).toTicksExact(DIVISIONS)).toThrow();
-    expect(() => R(3, 32).toTicksExact(DIVISIONS)).toThrow();
-    // Raising DIVISIONS to 24 is the single-constant change that unlocks them.
-    expect(R(1, 32).toTicksExact(24)).toBe(3);
-    expect(R(3, 32).toTicksExact(24)).toBe(9);
+  it('32nds and dotted 16ths are representable at 24, and were not at 12', () => {
+    expect(DIVISIONS).toBe(24);
+    expect(R(1, 32).toTicksExact(DIVISIONS)).toBe(3);
+    expect(R(3, 32).toTicksExact(DIVISIONS)).toBe(9);
+    // The resolution this replaced could not say either value at all.
+    expect(() => R(1, 32).toTicksExact(12)).toThrow();
+    expect(() => R(3, 32).toTicksExact(12)).toThrow();
+  });
+
+  it('doubling the resolution did not cost the triplets — every unit is still an integer', () => {
+    expect(R(1, 12).toTicksExact(DIVISIONS)).toBe(8); // eighth-note triplet
+    expect(R(1, 24).toTicksExact(DIVISIONS)).toBe(4); // 16th-note triplet
+    expect(R(1, 6).toTicksExact(DIVISIONS)).toBe(16); // quarter-note triplet
+    expect(DIVISIONS % 3).toBe(0);
+  });
+
+  it('a 64th is still out of reach — the vocabulary stops where the research does', () => {
+    expect(() => R(1, 64).toTicksExact(DIVISIONS)).toThrow();
   });
 });

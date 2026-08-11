@@ -29,6 +29,7 @@
 
 import type * as alphaTab from '@coderline/alphatab';
 import { midiNoteName } from '../score/tuning';
+import { staveKindsFromBars, tabStaveIndex } from './staveKinds';
 
 /** Air between the right edge of a letter and the left edge of the staff, in px. */
 export const STRING_LETTER_GAP_PX = 3;
@@ -68,10 +69,14 @@ export function stringLettersFromBounds(
     let tab: { x: number; y: number; h: number } | null = null;
     for (const masterBar of staffSystem.bars) {
       const bars = masterBar.bars ?? [];
-      // One alphaTab Staff showing both notation and tab produces one BarBounds per rendered
-      // stave; the second is the tab. One entry means notation only — nothing to label.
-      if (bars.length < 2) continue;
-      const v = bars[1].visualBounds;
+      // One BarBounds per RENDERED stave, and which of them is the tablature is asked of the
+      // staves themselves. It used to be index 1, which is the tab only when a single alphaTab
+      // Staff shows notation and tab together. On a grand staff plus tab the tab is index 2 and
+      // index 1 is the bass clef — so the letters were drawn as a legend down the side of a
+      // staff that has no strings.
+      const index = tabStaveIndex(staveKindsFromBars(bars));
+      if (index < 0) continue;
+      const v = bars[index].visualBounds;
       if (!(v.h > 0)) continue;
       tab = { x: v.x, y: v.y, h: v.h };
       break;
@@ -108,7 +113,16 @@ export function stringLettersFromBounds(
 export function tuningLowToHighFromScore(
   score: alphaTab.model.Score | null | undefined
 ): number[] {
-  const staff = score?.tracks?.[0]?.staves?.[0];
+  const staves = score?.tracks?.[0]?.staves ?? [];
+  // The TAB staff's tuning, not `staves[0]`'s. On a grand staff plus tab, staves[0] is the
+  // treble clef and carries no tuning at all, so the letters silently disappeared — which
+  // reads exactly like "this score has no tab" rather than like a bug. A notation staff that
+  // happens to carry a leftover tuning must not answer for the tab either, so the tab staff is
+  // preferred outright and only then does anything with strings get a look in.
+  const staff =
+    staves.find((s) => s.showTablature && (s.stringTuning?.tunings?.length ?? 0) > 0) ??
+    staves.find((s) => (s.stringTuning?.tunings?.length ?? 0) > 0) ??
+    staves[0];
   const tunings = staff?.stringTuning?.tunings ?? [];
   // alphaTab stores index 0 = the HIGHEST string (score/fromPipeline.ts §13). Ours is the
   // other way round, everywhere, so it is reversed exactly once — here.

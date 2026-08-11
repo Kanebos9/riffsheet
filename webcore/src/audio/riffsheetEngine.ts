@@ -15,7 +15,7 @@
  *   - `audio/pitch.ts` answers *what note is this?* — 62 of 65 real notes across six instruments,
  *     with the three failures written down rather than rounded off.
  *
- * `edit/autoEdits.ts` already fused them once, for a narrower job: cluster the attacks, tell an
+ * `edit/editBrain.ts` already fused them once, for a narrower job: cluster the attacks, tell an
  * attack from a hand landing on the strings, and measure how long a missed note actually lasted.
  * Everything below is the SAME machinery asked a bigger question — not a second implementation
  * of it. `clusterOnsetsDetailed`, `classifyOnsetEnergy` and `readNoteEvidence` are imported, not
@@ -53,6 +53,23 @@
  *
  * 4. THE TWO GUARDS — octaves and chords. Both have their own sections below, because both are
  *    about the one thing this engine could get confidently, plausibly wrong.
+ *
+ * 5. SETTLE — the last step, and the reason the app stops contradicting itself.
+ *    The auto-split / gap-fill pass runs after every transcription and is the app's most
+ *    trusted output: the green edits are the ones the player believes. It used to find work to
+ *    do on THIS engine's output — three edits on a take the app itself had just written down —
+ *    because the two asked the same questions with different code. Now the last thing this file
+ *    does is run that pass's own decision procedure over its own notes (`settle`, in
+ *    `edit/editBrain.ts`), so anything the pass would have proposed is already done. The pass in
+ *    the UI is then the same call on the same audio and comes back with nothing:
+ *
+ *        THIS ENGINE'S OUTPUT IS A FIXED POINT OF THE AUTO-EDIT PASS.
+ *
+ *    It is asserted in `edit/editBrain.test.ts`, not assumed. What it costs is that a gap this
+ *    engine's own read declined (60 ms floor, 100 ms voting lead) gets a second look at the
+ *    FILL profile (150 ms and 150 ms) before the take leaves — and if the stricter profile says
+ *    there is a note there, the note is written. That is the brain's verdict beating the
+ *    engine's, which is the correct way round: the pass is what the player trusts.
  *
  * ===========================================================================================
  * THE OCTAVE GUARD. The tuner's one documented weakness, handled without repeating its mistakes.
@@ -142,34 +159,27 @@
 
 import { detectOnsets, type Onset } from './onsets';
 import {
+  ENGINE_MIN_NOTE_SEC,
+  ENGINE_PROFILE,
   classifyOnsetEnergy,
   clusterOnsetsDetailed,
   readNoteEvidence,
+  settle,
   takePeakOf,
+  type EditNote,
   type NoteEvidence
-} from '../edit/autoEdits';
+} from '../edit/editBrain';
 import { tuningRange } from '../score/tuning';
 
 // ---------------------------------------------------------------------------
 // Constants. Every one of them is either inherited from the file it came from or explained.
+//
+// The lengths this engine reads evidence with — its 60 ms floor and its 100 ms voting lead —
+// are NOT here. They are `ENGINE_PROFILE` in `edit/editBrain.ts`, next to the gap-fill profile
+// they have to stay honest against, because a transcription floor kept in one file and an edit
+// floor kept in another is exactly how the two ended up disagreeing about the same take.
 // ---------------------------------------------------------------------------
 
-/**
- * Shortest note this engine will write down: 60 ms.
- *
- * The gap-fill pass uses 150 ms, and that is right for an automatic EDIT — a fill that short is
- * not worth proposing. A transcriber cannot use it: a sixteenth at 200 BPM is 75 ms and a
- * thirty-second at 120 is 62 ms. 60 ms is one hop under that and comfortably above the 30 ms
- * `MIN_SPACING_SEC` at which the attack detector stops resolving two events at all, so the floor
- * that actually binds is the detector's, which is the honest place for it to bind.
- */
-const MIN_NOTE_SEC = 0.06;
-/**
- * How much of a segment's opening decides which note it is: 100 ms, or the segment, whichever is
- * shorter. Long enough for five 20 ms frames to vote, short enough to fit inside a fast note
- * rather than voting across the next one.
- */
-const LEAD_SEC = 0.1;
 /**
  * An octave rival holding this share of a segment's pitched frames makes the segment AMBIGUOUS.
  *
@@ -275,7 +285,9 @@ export interface RiffsheetNote {
    * tracker's own clarity floor, so what is left to be unsure about is exactly the disagreement
    * between frames, which is this number. A note the octave guard moved carries the agreement
    * of the reading it was moved FROM, scaled by `MOVED_CONFIDENCE`, because a note that argued
-   * with itself is genuinely less certain than one that did not.
+   * with itself is genuinely less certain than one that did not. A note the settle step added
+   * (step 5) carries the agreement its own gap-fill evidence measured — the same quantity, read
+   * by the same walk, at the stricter profile.
    */
   confidence: number;
 }
@@ -295,12 +307,25 @@ export interface RiffsheetStats {
   clusters: number;
   mutes: number;
   segments: number;
-  /** Segments that produced a note. The rest had no stable pitch and were left silent. */
+  /**
+   * Notes that came out. Usually the segments that held a steady pitch — the rest were left
+   * silent — plus anything the settle step below added.
+   */
   voiced: number;
   contested: number;
   octaveMoves: number;
   rangeMoves: number;
   contourMoves: number;
+  /**
+   * What the settle step had to change — see step 5 in the header.
+   *
+   * These are the edits the auto-edit pass would otherwise have proposed on this take, made
+   * here instead. ON A HEALTHY TAKE THEY ARE USUALLY ZERO and they are never a fault: a fill
+   * here means the gap-fill profile heard a note in a stretch this engine's own read declined,
+   * which is the pass doing the job it exists to do, one step earlier than it used to.
+   */
+  settledSplits: number;
+  settledFills: number;
   elapsedMs: number;
 }
 
@@ -319,6 +344,15 @@ export interface RiffsheetOptions {
   maxFret?: number;
   /** Take length. Defaults to the buffer's own length, which is nearly always right. */
   durationSec?: number;
+  /**
+   * Skip step 5. THE TEST SEAM, and the only caller that may pass it is the fixed-point test.
+   *
+   * With this set, the engine returns what it read and nothing else — which is precisely the
+   * behaviour that let the auto-edit pass find three edits on our own take. The test needs to
+   * be able to produce that, because "the pass now finds zero" is only evidence if the same
+   * fixture can be shown to have produced more than zero before. The app never sets it.
+   */
+  unsettled?: boolean;
 }
 
 /** How much confidence a note keeps after the octave guard moved it. See `RiffsheetNote`. */
@@ -327,6 +361,20 @@ const MOVED_CONFIDENCE = 0.75;
 // ---------------------------------------------------------------------------
 // The pass
 // ---------------------------------------------------------------------------
+
+/**
+ * A note on its way through the settle step: what this engine writes, plus the id the brain
+ * needs to talk about it. The id never leaves this file.
+ */
+interface SettlingNote extends EditNote {
+  id: string;
+  confidence: number;
+}
+
+/** Seconds, to a tenth of a millisecond. Below that is not a claim this engine is making. */
+function round4(sec: number): number {
+  return Number(sec.toFixed(4));
+}
 
 /** One segment between two attacks, with everything the frames said about it. */
 interface Segment {
@@ -369,6 +417,8 @@ export function transcribeRiffsheet(
     octaveMoves: 0,
     rangeMoves: 0,
     contourMoves: 0,
+    settledSplits: 0,
+    settledFills: 0,
     elapsedMs: Date.now() - startedAt
   });
 
@@ -402,7 +452,14 @@ export function transcribeRiffsheet(
       mutes++;
       if (starts.length > 0) {
         const last = starts[starts.length - 1];
-        if (winner.timeSec > last.atSec) muteEnds.set(last.atSec, winner.timeSec);
+        // THE FIRST HAND WINS. This used to overwrite, so a note followed by two mutes was
+        // limited by the SECOND one and ran straight through the first — and a cluster winner
+        // sitting inside a note is precisely what the auto-edit pass calls a split, which is
+        // where one of the three edits on our own take came from. A note ends the first time
+        // somebody stops it; a later damp is the hand settling on a string already silenced.
+        if (winner.timeSec > last.atSec && !muteEnds.has(last.atSec)) {
+          muteEnds.set(last.atSec, winner.timeSec);
+        }
       }
       continue;
     }
@@ -428,10 +485,7 @@ export function transcribeRiffsheet(
     if (standaloneMute !== undefined) limit = Math.min(limit, standaloneMute);
     if (!(limit > from)) continue;
 
-    const evidence = readNoteEvidence(pcm, sampleRate, takePeak, from, limit, {
-      minSec: MIN_NOTE_SEC,
-      leadSec: LEAD_SEC
-    });
+    const evidence = readNoteEvidence(pcm, sampleRate, takePeak, from, limit, ENGINE_PROFILE);
     const segment = describeSegment(from, limit, evidence);
     // The second chord test, asked only of segments that produced a confident reading — a
     // segment with no steady pitch is already producing no note, and there is nothing there to
@@ -452,6 +506,8 @@ export function transcribeRiffsheet(
     octaveMoves: 0,
     rangeMoves: 0,
     contourMoves: 0,
+    settledSplits: 0,
+    settledFills: 0,
     elapsedMs: 0
   };
 
@@ -481,18 +537,54 @@ export function transcribeRiffsheet(
   // --- 4a. the octave guard: range, then contour ---------------------------
   applyOctaveGuard(segments, opts, stats);
 
-  // --- what came out ------------------------------------------------------
-  const notes: RiffsheetNote[] = [];
+  // --- what the frames said ------------------------------------------------
+  let ids = 0;
+  const read: SettlingNote[] = [];
   for (const s of segments) {
     if (s.midi === null) continue;
-    if (!(s.endSec - s.startSec >= MIN_NOTE_SEC)) continue;
-    notes.push({
-      startSec: Number(s.startSec.toFixed(4)),
-      endSec: Number(s.endSec.toFixed(4)),
+    if (!(s.endSec - s.startSec >= ENGINE_MIN_NOTE_SEC)) continue;
+    read.push({
+      id: `r${ids++}`,
+      startSec: round4(s.startSec),
+      endSec: round4(s.endSec),
       midi: s.midi,
       confidence: Number((s.moved ? s.agreement * MOVED_CONFIDENCE : s.agreement).toFixed(3))
     });
   }
+
+  // --- 5. settle: the auto-edit pass's own verdict, taken here --------------
+  // See step 5 in the header. This is the same `planEdits` the pass runs, on the same audio and
+  // the same attacks, so once it has nothing left to say the pass has nothing left to say
+  // either. The ids are throwaway — `ui/app.ts` renumbers every note it receives — but they
+  // have to exist, because a split is a decision ABOUT a note and the brain identifies notes
+  // by id. Without them the engine would settle against a question the pass answers differently.
+  const settled = opts.unsettled
+    ? { notes: read, splits: 0, fills: 0 }
+    : settle(read, {
+        onsets: detected.onsets,
+        pcm,
+        sampleRate,
+        durationSec,
+        newId: () => `r${ids++}`,
+        fillNote: (fill, id) => ({
+          id,
+          startSec: fill.fromSec,
+          endSec: fill.toSec,
+          midi: fill.midi,
+          // The measurement, not a constant, and not 1: a filled note is exactly as certain as
+          // the frames that voted for it. See `RiffsheetNote.confidence`.
+          confidence: Number(fill.agreement.toFixed(3))
+        })
+      });
+  stats.settledSplits = settled.splits;
+  stats.settledFills = settled.fills;
+
+  const notes: RiffsheetNote[] = settled.notes.map((n) => ({
+    startSec: round4(n.startSec),
+    endSec: round4(n.endSec),
+    midi: n.midi,
+    confidence: n.confidence
+  }));
   stats.voiced = notes.length;
   stats.elapsedMs = Date.now() - startedAt;
 
@@ -562,10 +654,10 @@ function describeSegment(startSec: number, limitSec: number, evidence: NoteEvide
 
   base.midi = evidence.midi;
   base.endSec = evidence.toSec;
-  const kept = evidence.readings.slice(0, evidence.keptFrames);
-  const keptPitched = kept.filter((r) => r.midi !== null);
-  const agreeing = keptPitched.filter((r) => r.midi === evidence.midi).length;
-  base.agreement = keptPitched.length > 0 ? agreeing / keptPitched.length : 0;
+  // The reader already counted this while applying its own agreement gate — see
+  // `NoteEvidence.pitchAgreement`. Counting it again here is how the same word ends up meaning
+  // two things in two files.
+  base.agreement = evidence.pitchAgreement;
   base.octaveCandidates = octaveCandidates(pitched, evidence.midi);
   return base;
 }

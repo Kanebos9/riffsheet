@@ -9,10 +9,16 @@
  * This file is the normative shape; IR.md explains it.
  *
  * TICKS. Every tick in the IR is an integer at `divisions` per QUARTER note.
- * `divisions` is 12 — the smallest value that keeps eighth-triplets (4), sixteenth-triplets
- * (2), sixteenths (3), eighths (6) and dotted eighths (9) all exact integers. A compound
- * beat (dotted quarter) is 18 ticks, which is why the docs say "12 ticks/beat, 18 for
+ * `divisions` is 24 — the smallest value that keeps the whole straight ladder AND the triplet
+ * ladder exact at once: 32nds (3), sixteenth-triplets (4), sixteenths (6), eighth-triplets (8),
+ * dotted sixteenths (9), eighths (12) and dotted eighths (18) are all integers. A compound
+ * beat (dotted quarter) is 36 ticks, which is why the docs say "24 ticks/beat, 36 for
  * compound": divisions-per-quarter never changes, the beat length does.
+ *
+ * IT USED TO BE 12, and the doubling is what bought honest 1/32 support (issue #35). At 12 a
+ * 32nd was 1.5 ticks and a dotted 16th 4.5 — neither representable, so both were absent from
+ * the printable vocabulary and any span that wanted one got a glyph whose <type> did not match
+ * its <duration>. 24 = 12 x 2 keeps every triplet divisor (24 / 3 = 8) intact.
  */
 
 export type StepName = 'C' | 'D' | 'E' | 'F' | 'G' | 'A' | 'B';
@@ -20,7 +26,14 @@ export type DurationType = 'whole' | 'half' | 'quarter' | 'eighth' | '16th' | '3
 export type AccidentalName = 'sharp' | 'flat' | 'natural' | 'double-sharp' | 'double-flat';
 export type ClefSign = 'F' | 'G' | 'TAB';
 
-export const DIVISIONS = 12;
+export const DIVISIONS = 24;
+
+/**
+ * The finest straight lattice the printed vocabulary can express: a 1/32 note.
+ * `grid: 'thirtysecond'` snaps to it, and `grid: 'free'` uses it as its honest resolution
+ * limit — below this a glyph would have to lie about its own duration.
+ */
+export const THIRTYSECOND_TICKS = DIVISIONS / 8;
 
 export interface IRClef {
   sign: ClefSign;
@@ -94,6 +107,19 @@ export interface IRNote {
   endSec?: number;
   /** Symbolic source staff identity, used to retain real grand-staff placement. */
   sourceStaffIndex?: number;
+  /**
+   * WHICH NOTATION STAFF PRINTS THIS NOTE — 0 is the upper (treble) staff, 1 the lower (bass).
+   *
+   * This is the OUTPUT side of the decision, the counterpart of `sourceStaffIndex`, which is the
+   * INPUT side (what an importer said). It is set once, in buildScore, and both emitters consume
+   * it verbatim: the split rule used to live duplicated in alphatab.ts and musicxml.ts, where the
+   * two copies could disagree about the same note.
+   *
+   * Absent means "the single notation staff", which is every note of a non-grand score. A TAB
+   * staff is not a notation staff and is never named here: tab shows the whole part regardless of
+   * how the notation above it is split.
+   */
+  staffIndex?: 0 | 1;
 }
 
 /** One rhythmic slot: a chord, a single note, or a rest. alphaTab calls this a Beat. */
@@ -179,7 +205,7 @@ export interface IRStats {
 
 export interface RiffsheetIR {
   version: 1;
-  /** Ticks per QUARTER note. Always 12 (see file header). */
+  /** Ticks per QUARTER note. Always 24 (see file header). */
   divisions: number;
   /** Alias of `divisions`, under the name webcore/IR.md uses. Always equal to it. */
   ppq: number;
@@ -217,6 +243,12 @@ export interface RiffsheetIR {
   };
   /** The range/policy requests a stable grand staff; it never means alternating bar clefs. */
   grandStaff: boolean;
+  /**
+   * The clef of each notation staff when `grandStaff` is true, upper first: [G2, F4]. Decided in
+   * clef.ts so the pair is chosen in one place instead of being hard-coded in each emitter.
+   * Absent when `grandStaff` is false — then `IRBar.clef` is the whole story.
+   */
+  grandStaffClefs?: [IRClef, IRClef];
   bars: IRBar[];
   suspects: {
     /** Runs the webcore must resolve with audio evidence; the pipeline only marks them. */

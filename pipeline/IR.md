@@ -49,7 +49,7 @@ written octave, the caller may reinterpret once at ingest: canonical MIDI moves 
 
 ```ts
 interface BuildSettings {
-  grid?: 'auto' | '1/4' | '1/8' | '1/16' | '1/8T' | 'free';
+  grid?: 'auto' | '1/4' | '1/8' | '1/16' | '1/8T' | 'thirtysecond' | 'free';
   timeSignature?: 'auto' | [number, number];
   fillGaps?: boolean;                 // DEPRECATED, ignored — see below
   showStaccato?: boolean;             // DEPRECATED, ignored — see below
@@ -73,13 +73,32 @@ webcore setting. Enabling TAB or changing tuning must never alter staff pitches 
 
 ## Canonical IR invariants
 
-- All ticks use `DIVISIONS = 960` per quarter note.
+- All ticks use `DIVISIONS = 24` per quarter note, exported from the package. A 1/32 is 3 ticks,
+  a 1/16 is 6, an eighth-note triplet unit is 8, a quarter is 24, a 4/4 bar is 96, and a compound
+  (dotted-quarter) beat is 36. Read it from `DIVISIONS`; never hard-code the number.
+- A GRID IS A CEILING ON WHAT THE PAGE MAY PRINT, binding durations exactly as tightly as onsets.
+  Under `grid: '1/4'` no glyph is finer than a quarter, under `'1/8'` none finer than an eighth,
+  and so on. A coarse grid may MERGE two events onto one slot — keeping the pitch with the most
+  duration-weighted evidence — but it never fabricates an extra attack.
+- `grid: 'thirtysecond'` is the only setting that offers a 1/32 lattice; `'auto'` never volunteers
+  one. The literal is spelled out, not `'1/32'`, and is shared verbatim with the webcore union.
+- `grid: 'free'` is a read-only view of the input, not a looser quantizer: one attack group per
+  played event, in play order, nothing merged or dropped, positions and durations on the 1/32
+  lattice (the finest the printable vocabulary can express), engraved as the fewest glyphs that
+  add up rather than as a maximal-precision tie chain.
+- A printed `<type>` always equals the `<duration>` it is printed against. A tied chain is ONE
+  attack: only the head of a chain has `tieStop: false`.
 - All pitches are sounding MIDI integers. Note spelling is stored separately.
 - Bars cover the score contiguously; beats cover every bar without gaps or overlaps.
 - A note split at a barline has matching tie start/stop flags.
 - Generated single-staff scores choose one stable clef for the whole part.
 - Authoritative imported treble/bass changes are preserved.
-- A grand part has two simultaneous standard-notation staves, not alternating clefs.
+- A grand part has two simultaneous standard-notation staves, not alternating clefs. `grandStaff`
+  does not depend on the instrument: a fretted part gets the pair too, with its TAB staff beneath.
+- `RiffsheetIR.grandStaffClefs` is the pair itself, upper first, and is present exactly when
+  `grandStaff` is true. `IRNote.staffIndex` (0 upper, 1 lower) says which of the two prints each
+  note, and is absent on a non-grand score. Both are decided once, during the build; an emitter
+  reads them and never re-derives the split.
 - TAB assignment uses the exact low-to-high tuning and never octave-folds a canonical note.
 - Metric decisions use integer ticks or exact rationals, never floating-point equality.
 - Stable source note IDs survive settings-only rebuilds.
@@ -99,9 +118,19 @@ webcore setting. Enabling TAB or changing tuning must never alter staff pitches 
 
 ## Output behavior
 
-MusicXML and alphaTab both emit two real staves for grand staff. Imported staff identity controls
-which staff receives a note; generated grand staff uses middle C as the split. Each projected staff
-retains full measure rhythm by replacing notes belonging to the other staff with rests.
+MusicXML and alphaTab both emit real stacked staves for a grand staff, and a fretted grand part
+gets THREE: treble, bass, then TAB. Imported staff identity controls which staff receives a note;
+otherwise the split is middle C on sounding pitch. Each projected notation staff retains the full
+measure rhythm by replacing the other staff's notes with rests, while the TAB staff always shows
+the whole part — a fretboard is not split by a notation boundary.
+
+Staff numbering is 1-based, top to bottom, notation first and TAB last, so MusicXML `<staves>` is
+1, 2 or 3 and the TAB clef/`<staff-details>` carry whichever number is last. The measure body is a
+stack of layers: emit a layer, assert its cursor reached the barline, back up by exactly what it
+advanced, emit the next. The alphaTab hand-off is plain JSON, never alphaTex, so a three-staff
+track is expressed directly as three `Track.staves` entries; the notation staves of a fretted
+grand part deliberately omit string/fret, because their tuning is empty and alphaTab resolves a
+stringed note's pitch through its own staff's tuning.
 
 The alphaTab adapter uses its native octave convention while preserving the MIDI invariant above.
 MusicXML uses scientific pitch numbering. Stringed output includes an explicit low-to-high tuning

@@ -1875,71 +1875,16 @@ export class SettingsPanel {
           }),
           el('span', { text: 'Show note names' })
         ),
-        el(
-          'label',
-          { class: 'switch settings-row', title: t(TIPS.preciseBeats) },
-          el('input', {
-            type: 'checkbox',
-            'data-setting': 'preciseBeats',
-            checked: s.preciseBeats,
-            // Not a rebuild: it changes how the NEXT transcription listens, and the sheet
-            // on screen was built from beats that already exist.
-            onChange: (e: Event) => this.set('preciseBeats', (e.target as HTMLInputElement).checked, false)
-          }),
-          el('span', { text: 'Follow a drifting tempo' })
-        ),
-        source?.hostGrid &&
-          el(
-            'label',
-            { class: 'switch settings-row', title: t(TIPS.hostSync) },
-            el('input', {
-              type: 'checkbox',
-              'data-setting': 'useHostGrid',
-              checked: s.useHostGrid,
-              onChange: (e: Event) => this.set('useHostGrid', (e.target as HTMLInputElement).checked, true)
-            }),
-            el('span', { text: 'Use the DAW’s bars and tempo' })
-          )
-      ),
-
-      // --- piano roll -------------------------------------------------------
-      // Its own group now, because it has four switches rather than one. The pane carries
-      // chips for the first two of these; the chips and these boxes write the same settings,
-      // so whichever the player reaches for, the other follows.
-      el(
-        'div',
-        { class: 'settings-group' },
-        el('h3', { text: 'Piano roll' }),
-        // "Show the piano roll" was here as well as on the chip row above the roll. The chip
-        // is the one that stays: it is beside the pane it opens and closes.
-        el(
-          'label',
-          { class: 'switch settings-row', title: t(TIPS.rollAllNoteNames) },
-          el('input', {
-            type: 'checkbox',
-            'data-setting': 'rollAllNoteNames',
-            checked: s.rollAllNoteNames,
-            onChange: (e: Event) => this.set('rollAllNoteNames', (e.target as HTMLInputElement).checked, false)
-          }),
-          el('span', { text: 'Name every row of the piano roll, not just the C’s' })
-        ),
-        el(
-          'label',
-          { class: 'switch settings-row', title: t(TIPS.rollEditing) },
-          el('input', {
-            type: 'checkbox',
-            'data-setting': 'rollEditing',
-            checked: s.rollEditing,
-            onChange: (e: Event) => this.set('rollEditing', (e.target as HTMLInputElement).checked, false)
-          }),
-          // "drag" was only a third of it — the roll also adds on a double-click and deletes
-          // on the Delete key, and all three rewrite the sheet.
-          el('span', { text: 'Let me edit notes on the piano roll' })
-        ),
-        // Beside the editing switch, because that is what it is: an edit, made by the app
-        // instead of by hand. The highlights it leaves live on this pane and on the waveform,
-        // so the setting belongs with them rather than under transcription — the transcription
-        // is finished by the time this runs.
+        // "FOLLOW A DRIFTING TEMPO" STOOD HERE, and it is gone rather than moved. It bought a
+        // whole second listening pass — minutes on a long take — for a beat grid that followed
+        // the drift so closely the bar lines stopped meaning anything. `AppSettings.preciseBeats`
+        // survives as a field so an old blob still reads, forced false in `migrate()` v9.
+        //
+        // The auto-split switch, moved up out of the "Piano roll" group with the rest of that
+        // group deleted. It reads as a transcription setting rather than a view one anyway:
+        // what it changes is which notes end up on the page, and the highlights it leaves are
+        // only how it shows its working. The dim line under it is the half people miss — that
+        // switching it off stops it TOUCHING notes.
         el(
           'label',
           { class: 'switch settings-row', title: t(TIPS.autoSplitAtAttacks) },
@@ -1955,13 +1900,33 @@ export class SettingsPanel {
           class: 'status-row dim',
           text: 'Off, it still shows you where it heard one — it just does not touch your notes.'
         }),
-        // The roll's OWN grid used to be repeated here too. It lives on the chip row beside
-        // the roll, where the columns it draws are.
-        el('div', {
-          class: 'status-row',
-          text: 'The roll’s grid and its show/hide switch are on the chip row above the roll itself.'
-        })
+        source?.hostGrid &&
+          el(
+            'label',
+            { class: 'switch settings-row', title: t(TIPS.hostSync) },
+            el('input', {
+              type: 'checkbox',
+              'data-setting': 'useHostGrid',
+              checked: s.useHostGrid,
+              onChange: (e: Event) => this.set('useHostGrid', (e.target as HTMLInputElement).checked, true)
+            }),
+            el('span', { text: 'Use the DAW’s bars and tempo' })
+          )
       ),
+
+      // --- THE "PIANO ROLL" GROUP IS GONE, and this is the whole of what happened to it.
+      //
+      // It held four boxes. Three of them were questions nobody wants to be asked — may the
+      // roll name its own rows, may the roll be edited, and where the roll's grid and its
+      // show/hide chip are — and the player said so directly. Naming every row and editing on
+      // the roll are simply what the roll DOES now: the settings survive as fields for the
+      // sake of old blobs, `migrate()` v9 forces both true, and `ui/app.ts` §renderMain hands
+      // the roll the literals. The signpost row went with them, because the two controls it
+      // pointed at are on screen beside the roll and a panel that explains where its own
+      // controls went is a panel with too many rows.
+      //
+      // The fourth, the auto-split switch, moved up into Notation above rather than being
+      // deleted: it decides which notes reach the page, which is a transcription question.
 
       // The whole Playback group is gone with its two rows: the sound picker is on the
       // transport beside the fader, which is where somebody choosing a playback sound is

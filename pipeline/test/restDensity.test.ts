@@ -87,8 +87,9 @@ describe('DURATION FIDELITY — the criterion that replaced rest density', () =>
         if (playedSec === undefined) continue;
         // One grid step of slack: the off-time is snapped, so it may round up by less than the
         // finest straight subdivision on offer. Anything beyond that is invented sustain.
+        // One 1/16 is 6 ticks at divisions=24, which is the finest straight step `auto` offers.
         expect(ticks * secondsPerTick, `note ${id} of ${SYNTHETIC_FIXTURES[i].id}`).toBeLessThan(
-          playedSec + 3 * secondsPerTick
+          playedSec + 6 * secondsPerTick
         );
         checked++;
       }

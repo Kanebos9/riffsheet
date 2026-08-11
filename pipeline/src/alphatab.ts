@@ -21,6 +21,7 @@
  */
 
 import type { DurationType, RiffsheetIR } from './ir.js';
+import { grandClefPair } from './clef.js';
 
 /** alphaTab `Duration` enum names. */
 export type AlphaTabDuration =
@@ -111,6 +112,18 @@ export interface AlphaTabScoreData {
     name: string;
     /** General MIDI program. */
     program: number;
+    /**
+     * ONE alphaTab Track, one to three Staves, in printed order top to bottom:
+     *
+     *   plain            [ notation (+ tab on the same staff when the part has strings) ]
+     *   grand            [ treble, bass ]
+     *   grand + strings  [ treble, bass, TAB ]
+     *
+     * A three-staff track is a real alphaTab arrangement (`Track.staves` is a list and webcore
+     * loops it), NOT an alphaTex string — this hand-off has never been alphaTex, so alphaTex's
+     * one-staff-pair limit does not apply. The TAB staff is deliberately LAST so a consumer that
+     * remembers "the last staff's tuning" (webcore's ScoreIndex does) still reads the real one.
+     */
     staves: {
       showStandardNotation: boolean;
       showTablature: boolean;
@@ -148,15 +161,19 @@ export function toAlphaTabModelData(ir: RiffsheetIR): AlphaTabScoreData {
     durTicks: bar.durTicks
   }));
 
-  const sourceStaffIndexes = [...new Set(ir.bars.flatMap((bar) =>
-    bar.voices.flatMap((voice) => voice.beats.flatMap((beat) => beat.notes
-      .map((note) => note.sourceStaffIndex)
-      .filter((index): index is number => index !== undefined)))
-  ))].sort((a, b) => a - b);
-  const sourceGrandStaff = sourceStaffIndexes.length === 2;
+  /**
+   * @param clefOverride the fixed clef of a grand-staff staff; omitted, the bar's own clef wins.
+   * @param include which notes this staff prints. A beat whose notes all belong to the other
+   *   staff becomes a rest, so both staves keep the full rhythm of the bar.
+   * @param withPositions whether the notes carry string/fret. FALSE on the notation staves of a
+   *   grand staff: those staves have an empty tuning, and alphaTab reads a stringed note's pitch
+   *   out of its staff's tuning array, so a string number there would resolve against nothing.
+   *   The frets belong to the TAB staff, which has the tuning.
+   */
   const makeBars = (
     clefOverride?: 'F4' | 'G2',
-    include?: (note: IRNoteForAlphaTab) => boolean
+    include?: (note: IRNoteForAlphaTab) => boolean,
+    withPositions = true
   ): AlphaTabBarData[] => ir.bars.map((bar) => ({
     index: bar.index,
     clef: clefOverride ?? (bar.clef.sign === 'G' ? 'G2' : 'F4'),
@@ -178,8 +195,8 @@ export function toAlphaTabModelData(ir: RiffsheetIR): AlphaTabScoreData {
           // notation. MIDI 60 is therefore octave 5/tone 0; fromPipeline must receive C4.
           octave: Math.floor(n.midi / 12),
           tone: ((n.midi % 12) + 12) % 12,
-          ...(n.string !== undefined ? { string: n.string } : {}),
-          ...(n.fret !== undefined ? { fret: n.fret } : {}),
+          ...(withPositions && n.string !== undefined ? { string: n.string } : {}),
+          ...(withPositions && n.fret !== undefined ? { fret: n.fret } : {}),
           isTieOrigin: n.tieStart,
           isTieDestination: n.tieStop,
           isStaccato: !!n.staccato,
@@ -193,17 +210,21 @@ export function toAlphaTabModelData(ir: RiffsheetIR): AlphaTabScoreData {
   }));
 
   const bars = makeBars();
-  const trueGrandStaff = ir.grandStaff && isStaffOnly;
   const displayTranspositionPitch = ir.displayPitchOffset !== undefined
     ? -ir.displayPitchOffset
     : ir.instrument.stringCount > 0
       ? -12
       : 0;
-  const upper = (note: IRNoteForAlphaTab): boolean => sourceGrandStaff
-    ? note.sourceStaffIndex === sourceStaffIndexes[0]
-    : note.midi >= 60;
-  const lower = (note: IRNoteForAlphaTab): boolean => !upper(note);
-  const staves = trueGrandStaff
+  // THE FLAG IS NO LONGER CONDITIONAL ON THE PART HAVING NO STRINGS. It used to be
+  // (`ir.grandStaff && isStaffOnly`), so a fretted instrument asked for a grand staff got one
+  // silently-discarded flag and a single bass clef full of ledger lines. Strings now add a THIRD
+  // staff instead of cancelling the first two.
+  const hasStrings = ir.instrument.stringCount > 0;
+  const [upperClef, lowerClef] = ir.grandStaffClefs ?? grandClefPair();
+  const signOf = (sign: string): 'F4' | 'G2' => (sign === 'G' ? 'G2' : 'F4');
+  // The split itself was decided in the IR (clef.ts `grandStaffSplitter`); this only reads it.
+  const onStaff = (index: 0 | 1) => (note: IRNoteForAlphaTab): boolean => (note.staffIndex ?? 0) === index;
+  const staves = ir.grandStaff
     ? [
         {
           showStandardNotation: true,
@@ -211,7 +232,7 @@ export function toAlphaTabModelData(ir: RiffsheetIR): AlphaTabScoreData {
           tuningsHighToLow: [],
           capo: 0,
           displayTranspositionPitch,
-          bars: makeBars('G2', upper)
+          bars: makeBars(signOf(upperClef.sign), onStaff(0), false)
         },
         {
           showStandardNotation: true,
@@ -219,13 +240,27 @@ export function toAlphaTabModelData(ir: RiffsheetIR): AlphaTabScoreData {
           tuningsHighToLow: [],
           capo: 0,
           displayTranspositionPitch,
-          bars: makeBars('F4', lower)
-        }
+          bars: makeBars(signOf(lowerClef.sign), onStaff(1), false)
+        },
+        // The tab staff shows the WHOLE part: tablature is one fretboard, and it is not split by
+        // the notation's middle-C boundary.
+        ...(hasStrings
+          ? [
+              {
+                showStandardNotation: false,
+                showTablature: true,
+                tuningsHighToLow,
+                capo: ir.instrument.capo,
+                displayTranspositionPitch,
+                bars
+              }
+            ]
+          : [])
       ]
     : [
         {
           showStandardNotation: true,
-          showTablature: ir.instrument.stringCount > 0,
+          showTablature: hasStrings,
           tuningsHighToLow,
           capo: ir.instrument.capo,
           displayTranspositionPitch,

@@ -5649,19 +5649,25 @@ class App {
             el('option', { value: String(fifths), text: `Key: ${label}`, selected: source.keyFifths === fifths })
           )
         ),
-      // THE NOTATION GRID, and nothing else. It is the quantizer's brief: what the pipeline
-      // may write when it turns the performance into a page. The piano roll's ruler is a
-      // separate control (see `viewToolChips`) and deliberately does not rebuild anything.
+      // QUANTIZE. It is the quantizer's brief: how much the sheet rounds what was played. The
+      // menu used to be called "Notation", which named the bar it sits on rather than the thing
+      // it does, and "Notation: 1/8" reads as a fact about the page instead of an instruction
+      // to round to eighths — the player could not tell from the words that choosing a size
+      // FORBIDS everything finer. The `data-role` and the stored values are untouched: this is
+      // a change of vocabulary, not of wiring.
+      //
+      // The piano roll's ruler is a separate control (see `viewToolChips`) and deliberately
+      // does not rebuild anything.
       el(
         'select',
         {
-          'aria-label': 'Notation grid',
+          'aria-label': 'Quantize',
           'data-role': 'notation-grid',
           'data-setting': 'grid',
           title: t(TIPS.grid),
           onChange: (e: Event) => rebuild({ grid: (e.target as HTMLSelectElement).value as AppSettings['grid'] })
         },
-        ...(['auto', 'quarter', 'eighth', 'sixteenth', 'triplet', 'free'] as const)
+        ...(['auto', 'quarter', 'eighth', 'sixteenth', 'thirtysecond', 'triplet', 'free'] as const)
           // FREE IS FOR IMPORTS, NOT FOR AUDIO — and this is a measurement, not a preference.
           //
           // 'free' means "write exactly what was played, snapped to nothing". For a MIDI,
@@ -5686,7 +5692,7 @@ class App {
           // had thrown the choice away.
           .filter((value) => value !== 'free' || freeGridUsable || s.grid === 'free')
           .map((value) =>
-            el('option', { value, text: `Notation: ${GRID_LABELS[value]}`, selected: s.grid === value })
+            el('option', { value, text: `Quantize: ${GRID_LABELS[value]}`, selected: s.grid === value })
           )
       ),
       this.coarseGridWarning(),
@@ -6154,8 +6160,16 @@ class App {
         // --- editing ---------------------------------------------------------------------
         onEdit: (edit) => this.applyRollEdit(edit)
       });
-      this.pianoRoll.setShowAllNames(s.rollAllNoteNames);
-      this.pianoRoll.setEditable(s.rollEditing);
+      // LITERALS, NOT SETTINGS. Naming every row and being editable are what the roll IS —
+      // both switches were taken out of the settings panel (#39) because neither was a question
+      // anybody wanted to be asked, and a roll that quietly refuses to be dragged, with no
+      // control left anywhere to explain why, is the failure mode of reading a dead field.
+      // `AppSettings.rollAllNoteNames` and `.rollEditing` survive for old blobs only and
+      // `migrate()` v9 pins both true; nothing reads them now. The roll thins the names out by
+      // itself when it is too short for them (view/pianoroll.ts §labelMode), so "all" is a
+      // request rather than a promise and a 46px pane is still legible.
+      this.pianoRoll.setShowAllNames(true);
+      this.pianoRoll.setEditable(true);
       this.pianoRoll.setDuration(rt.source?.durationSec ?? rt.score?.durationSec ?? 0);
       this.pianoRoll.setBarOne(rt.source?.barOneSec ?? 0);
       if (rt.score) this.pianoRoll.setScore(rt.score);
@@ -6253,10 +6267,15 @@ class App {
     return el('span', {
       class: 'status-row warn-row',
       'data-role': 'grid-too-coarse',
+      // The sentence names the SIZE, not the control: "1/4 would merge 12 notes" is the fact,
+      // and it stays word for word what it has always been. The tooltip is where the control
+      // is named, and it is Quantize now — a warning that sends somebody looking for a "grid"
+      // beside a menu labelled Quantize is a warning about a control they cannot find.
       text: `${GRID_LABELS[s.grid]} would merge ${lost} notes — too coarse for this riff`,
       title: t(
-        `The engine heard ${detected.length} notes and this grid can only write ${engraved} of them, ` +
-          'because the rest fall between its lines. Try a finer grid, or Auto, which picks one that fits.'
+        `The engine heard ${detected.length} notes and this Quantize setting can only write ${engraved} ` +
+          'of them, because the rest fall between its lines. Try a finer size, or Auto, which picks one ' +
+          'that fits.'
       )
     });
   }
@@ -7914,12 +7933,22 @@ function liveHostGrid(host: HostInfo | null): SourceAudio['hostGrid'] {
   };
 }
 
+/**
+ * The QUANTIZE menu's words. The control is named for what it does to the page — round it —
+ * rather than for the part of the app it lives on, which is what "Notation" was naming.
+ *
+ * 'Triplet (1/12)' rather than 'Triplet': a triplet is a division, not a note value, and the
+ * one thing somebody comparing it against 1/8 and 1/16 needs to know is how FINE it is. An
+ * eighth-note triplet divides the beat in three, so its cell is a twelfth of a bar in 4/4 —
+ * finer than 1/8 and coarser than 1/16, which is exactly where the number puts it in the list.
+ */
 const GRID_LABELS: Record<AppSettings['grid'], string> = {
   auto: 'Auto',
   quarter: '1/4',
   eighth: '1/8',
   sixteenth: '1/16',
-  triplet: 'Triplet',
+  thirtysecond: '1/32',
+  triplet: 'Triplet (1/12)',
   free: 'Free'
 };
 

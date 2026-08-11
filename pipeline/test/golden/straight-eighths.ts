@@ -19,7 +19,7 @@ export default `<?xml version="1.0" encoding="UTF-8" standalone="no"?>
   <part id="P1">
     <measure number="1">
       <attributes>
-        <divisions>12</divisions>
+        <divisions>24</divisions>
         <key><fifths>0</fifths></key>
         <time><beats>4</beats><beat-type>4</beat-type></time>
         <staves>2</staves>
@@ -41,120 +41,120 @@ export default `<?xml version="1.0" encoding="UTF-8" standalone="no"?>
       </direction>
       <note>
         <pitch><step>E</step><octave>2</octave></pitch>
-        <duration>3</duration>
+        <duration>6</duration>
         <voice>1</voice>
         <type>16th</type>
         <staff>1</staff>
       </note>
       <note>
         <rest/>
-        <duration>3</duration>
+        <duration>6</duration>
         <voice>1</voice>
         <type>16th</type>
         <staff>1</staff>
       </note>
       <note>
         <pitch><step>E</step><octave>2</octave></pitch>
-        <duration>3</duration>
+        <duration>6</duration>
         <voice>1</voice>
         <type>16th</type>
         <staff>1</staff>
       </note>
       <note>
         <rest/>
-        <duration>3</duration>
+        <duration>6</duration>
         <voice>1</voice>
         <type>16th</type>
         <staff>1</staff>
       </note>
       <note>
         <pitch><step>G</step><octave>2</octave></pitch>
-        <duration>3</duration>
+        <duration>6</duration>
         <voice>1</voice>
         <type>16th</type>
         <staff>1</staff>
       </note>
       <note>
         <rest/>
-        <duration>3</duration>
+        <duration>6</duration>
         <voice>1</voice>
         <type>16th</type>
         <staff>1</staff>
       </note>
       <note>
         <pitch><step>A</step><octave>2</octave></pitch>
-        <duration>3</duration>
+        <duration>6</duration>
         <voice>1</voice>
         <type>16th</type>
         <staff>1</staff>
       </note>
       <note>
         <rest/>
-        <duration>3</duration>
+        <duration>6</duration>
         <voice>1</voice>
         <type>16th</type>
         <staff>1</staff>
       </note>
       <note>
         <pitch><step>B</step><octave>2</octave></pitch>
-        <duration>3</duration>
+        <duration>6</duration>
         <voice>1</voice>
         <type>16th</type>
         <staff>1</staff>
       </note>
       <note>
         <rest/>
-        <duration>3</duration>
+        <duration>6</duration>
         <voice>1</voice>
         <type>16th</type>
         <staff>1</staff>
       </note>
       <note>
         <pitch><step>A</step><octave>2</octave></pitch>
-        <duration>3</duration>
+        <duration>6</duration>
         <voice>1</voice>
         <type>16th</type>
         <staff>1</staff>
       </note>
       <note>
         <rest/>
-        <duration>3</duration>
+        <duration>6</duration>
         <voice>1</voice>
         <type>16th</type>
         <staff>1</staff>
       </note>
       <note>
         <pitch><step>G</step><octave>2</octave></pitch>
-        <duration>3</duration>
+        <duration>6</duration>
         <voice>1</voice>
         <type>16th</type>
         <staff>1</staff>
       </note>
       <note>
         <rest/>
-        <duration>3</duration>
+        <duration>6</duration>
         <voice>1</voice>
         <type>16th</type>
         <staff>1</staff>
       </note>
       <note>
         <pitch><step>E</step><octave>2</octave></pitch>
-        <duration>3</duration>
+        <duration>6</duration>
         <voice>1</voice>
         <type>16th</type>
         <staff>1</staff>
       </note>
       <note>
         <rest/>
-        <duration>3</duration>
+        <duration>6</duration>
         <voice>1</voice>
         <type>16th</type>
         <staff>1</staff>
       </note>
-      <backup><duration>48</duration></backup>
+      <backup><duration>96</duration></backup>
       <note>
         <pitch><step>E</step><octave>2</octave></pitch>
-        <duration>3</duration>
+        <duration>6</duration>
         <voice>5</voice>
         <type>16th</type>
         <staff>2</staff>
@@ -162,14 +162,14 @@ export default `<?xml version="1.0" encoding="UTF-8" standalone="no"?>
       </note>
       <note>
         <rest/>
-        <duration>3</duration>
+        <duration>6</duration>
         <voice>5</voice>
         <type>16th</type>
         <staff>2</staff>
       </note>
       <note>
         <pitch><step>E</step><octave>2</octave></pitch>
-        <duration>3</duration>
+        <duration>6</duration>
         <voice>5</voice>
         <type>16th</type>
         <staff>2</staff>
@@ -177,14 +177,14 @@ export default `<?xml version="1.0" encoding="UTF-8" standalone="no"?>
       </note>
       <note>
         <rest/>
-        <duration>3</duration>
+        <duration>6</duration>
         <voice>5</voice>
         <type>16th</type>
         <staff>2</staff>
       </note>
       <note>
         <pitch><step>G</step><octave>2</octave></pitch>
-        <duration>3</duration>
+        <duration>6</duration>
         <voice>5</voice>
         <type>16th</type>
         <staff>2</staff>
@@ -192,14 +192,14 @@ export default `<?xml version="1.0" encoding="UTF-8" standalone="no"?>
       </note>
       <note>
         <rest/>
-        <duration>3</duration>
+        <duration>6</duration>
         <voice>5</voice>
         <type>16th</type>
         <staff>2</staff>
       </note>
       <note>
         <pitch><step>A</step><octave>2</octave></pitch>
-        <duration>3</duration>
+        <duration>6</duration>
         <voice>5</voice>
         <type>16th</type>
         <staff>2</staff>
@@ -207,14 +207,14 @@ export default `<?xml version="1.0" encoding="UTF-8" standalone="no"?>
       </note>
       <note>
         <rest/>
-        <duration>3</duration>
+        <duration>6</duration>
         <voice>5</voice>
         <type>16th</type>
         <staff>2</staff>
       </note>
       <note>
         <pitch><step>B</step><octave>2</octave></pitch>
-        <duration>3</duration>
+        <duration>6</duration>
         <voice>5</voice>
         <type>16th</type>
         <staff>2</staff>
@@ -222,14 +222,14 @@ export default `<?xml version="1.0" encoding="UTF-8" standalone="no"?>
       </note>
       <note>
         <rest/>
-        <duration>3</duration>
+        <duration>6</duration>
         <voice>5</voice>
         <type>16th</type>
         <staff>2</staff>
       </note>
       <note>
         <pitch><step>A</step><octave>2</octave></pitch>
-        <duration>3</duration>
+        <duration>6</duration>
         <voice>5</voice>
         <type>16th</type>
         <staff>2</staff>
@@ -237,14 +237,14 @@ export default `<?xml version="1.0" encoding="UTF-8" standalone="no"?>
       </note>
       <note>
         <rest/>
-        <duration>3</duration>
+        <duration>6</duration>
         <voice>5</voice>
         <type>16th</type>
         <staff>2</staff>
       </note>
       <note>
         <pitch><step>G</step><octave>2</octave></pitch>
-        <duration>3</duration>
+        <duration>6</duration>
         <voice>5</voice>
         <type>16th</type>
         <staff>2</staff>
@@ -252,14 +252,14 @@ export default `<?xml version="1.0" encoding="UTF-8" standalone="no"?>
       </note>
       <note>
         <rest/>
-        <duration>3</duration>
+        <duration>6</duration>
         <voice>5</voice>
         <type>16th</type>
         <staff>2</staff>
       </note>
       <note>
         <pitch><step>E</step><octave>2</octave></pitch>
-        <duration>3</duration>
+        <duration>6</duration>
         <voice>5</voice>
         <type>16th</type>
         <staff>2</staff>
@@ -267,7 +267,7 @@ export default `<?xml version="1.0" encoding="UTF-8" standalone="no"?>
       </note>
       <note>
         <rest/>
-        <duration>3</duration>
+        <duration>6</duration>
         <voice>5</voice>
         <type>16th</type>
         <staff>2</staff>
@@ -276,98 +276,14 @@ export default `<?xml version="1.0" encoding="UTF-8" standalone="no"?>
     <measure number="2">
       <note>
         <pitch><step>E</step><octave>2</octave></pitch>
-        <duration>3</duration>
+        <duration>6</duration>
         <voice>1</voice>
         <type>16th</type>
         <staff>1</staff>
       </note>
       <note>
         <rest/>
-        <duration>3</duration>
-        <voice>1</voice>
-        <type>16th</type>
-        <staff>1</staff>
-      </note>
-      <note>
-        <pitch><step>E</step><octave>2</octave></pitch>
-        <duration>3</duration>
-        <voice>1</voice>
-        <type>16th</type>
-        <staff>1</staff>
-      </note>
-      <note>
-        <rest/>
-        <duration>3</duration>
-        <voice>1</voice>
-        <type>16th</type>
-        <staff>1</staff>
-      </note>
-      <note>
-        <pitch><step>G</step><octave>2</octave></pitch>
-        <duration>3</duration>
-        <voice>1</voice>
-        <type>16th</type>
-        <staff>1</staff>
-      </note>
-      <note>
-        <rest/>
-        <duration>3</duration>
-        <voice>1</voice>
-        <type>16th</type>
-        <staff>1</staff>
-      </note>
-      <note>
-        <pitch><step>A</step><octave>2</octave></pitch>
-        <duration>3</duration>
-        <voice>1</voice>
-        <type>16th</type>
-        <staff>1</staff>
-      </note>
-      <note>
-        <rest/>
-        <duration>3</duration>
-        <voice>1</voice>
-        <type>16th</type>
-        <staff>1</staff>
-      </note>
-      <note>
-        <pitch><step>B</step><octave>2</octave></pitch>
-        <duration>3</duration>
-        <voice>1</voice>
-        <type>16th</type>
-        <staff>1</staff>
-      </note>
-      <note>
-        <rest/>
-        <duration>3</duration>
-        <voice>1</voice>
-        <type>16th</type>
-        <staff>1</staff>
-      </note>
-      <note>
-        <pitch><step>A</step><octave>2</octave></pitch>
-        <duration>3</duration>
-        <voice>1</voice>
-        <type>16th</type>
-        <staff>1</staff>
-      </note>
-      <note>
-        <rest/>
-        <duration>3</duration>
-        <voice>1</voice>
-        <type>16th</type>
-        <staff>1</staff>
-      </note>
-      <note>
-        <pitch><step>G</step><octave>2</octave></pitch>
-        <duration>3</duration>
-        <voice>1</voice>
-        <type>16th</type>
-        <staff>1</staff>
-      </note>
-      <note>
-        <rest/>
-        <duration>3</duration>
+        <duration>6</duration>
         <voice>1</voice>
         <type>16th</type>
         <staff>1</staff>
@@ -376,13 +292,97 @@ export default `<?xml version="1.0" encoding="UTF-8" standalone="no"?>
         <pitch><step>E</step><octave>2</octave></pitch>
         <duration>6</duration>
         <voice>1</voice>
+        <type>16th</type>
+        <staff>1</staff>
+      </note>
+      <note>
+        <rest/>
+        <duration>6</duration>
+        <voice>1</voice>
+        <type>16th</type>
+        <staff>1</staff>
+      </note>
+      <note>
+        <pitch><step>G</step><octave>2</octave></pitch>
+        <duration>6</duration>
+        <voice>1</voice>
+        <type>16th</type>
+        <staff>1</staff>
+      </note>
+      <note>
+        <rest/>
+        <duration>6</duration>
+        <voice>1</voice>
+        <type>16th</type>
+        <staff>1</staff>
+      </note>
+      <note>
+        <pitch><step>A</step><octave>2</octave></pitch>
+        <duration>6</duration>
+        <voice>1</voice>
+        <type>16th</type>
+        <staff>1</staff>
+      </note>
+      <note>
+        <rest/>
+        <duration>6</duration>
+        <voice>1</voice>
+        <type>16th</type>
+        <staff>1</staff>
+      </note>
+      <note>
+        <pitch><step>B</step><octave>2</octave></pitch>
+        <duration>6</duration>
+        <voice>1</voice>
+        <type>16th</type>
+        <staff>1</staff>
+      </note>
+      <note>
+        <rest/>
+        <duration>6</duration>
+        <voice>1</voice>
+        <type>16th</type>
+        <staff>1</staff>
+      </note>
+      <note>
+        <pitch><step>A</step><octave>2</octave></pitch>
+        <duration>6</duration>
+        <voice>1</voice>
+        <type>16th</type>
+        <staff>1</staff>
+      </note>
+      <note>
+        <rest/>
+        <duration>6</duration>
+        <voice>1</voice>
+        <type>16th</type>
+        <staff>1</staff>
+      </note>
+      <note>
+        <pitch><step>G</step><octave>2</octave></pitch>
+        <duration>6</duration>
+        <voice>1</voice>
+        <type>16th</type>
+        <staff>1</staff>
+      </note>
+      <note>
+        <rest/>
+        <duration>6</duration>
+        <voice>1</voice>
+        <type>16th</type>
+        <staff>1</staff>
+      </note>
+      <note>
+        <pitch><step>E</step><octave>2</octave></pitch>
+        <duration>12</duration>
+        <voice>1</voice>
         <type>eighth</type>
         <staff>1</staff>
       </note>
-      <backup><duration>48</duration></backup>
+      <backup><duration>96</duration></backup>
       <note>
         <pitch><step>E</step><octave>2</octave></pitch>
-        <duration>3</duration>
+        <duration>6</duration>
         <voice>5</voice>
         <type>16th</type>
         <staff>2</staff>
@@ -390,14 +390,14 @@ export default `<?xml version="1.0" encoding="UTF-8" standalone="no"?>
       </note>
       <note>
         <rest/>
-        <duration>3</duration>
+        <duration>6</duration>
         <voice>5</voice>
         <type>16th</type>
         <staff>2</staff>
       </note>
       <note>
         <pitch><step>E</step><octave>2</octave></pitch>
-        <duration>3</duration>
+        <duration>6</duration>
         <voice>5</voice>
         <type>16th</type>
         <staff>2</staff>
@@ -405,14 +405,14 @@ export default `<?xml version="1.0" encoding="UTF-8" standalone="no"?>
       </note>
       <note>
         <rest/>
-        <duration>3</duration>
+        <duration>6</duration>
         <voice>5</voice>
         <type>16th</type>
         <staff>2</staff>
       </note>
       <note>
         <pitch><step>G</step><octave>2</octave></pitch>
-        <duration>3</duration>
+        <duration>6</duration>
         <voice>5</voice>
         <type>16th</type>
         <staff>2</staff>
@@ -420,14 +420,14 @@ export default `<?xml version="1.0" encoding="UTF-8" standalone="no"?>
       </note>
       <note>
         <rest/>
-        <duration>3</duration>
+        <duration>6</duration>
         <voice>5</voice>
         <type>16th</type>
         <staff>2</staff>
       </note>
       <note>
         <pitch><step>A</step><octave>2</octave></pitch>
-        <duration>3</duration>
+        <duration>6</duration>
         <voice>5</voice>
         <type>16th</type>
         <staff>2</staff>
@@ -435,14 +435,14 @@ export default `<?xml version="1.0" encoding="UTF-8" standalone="no"?>
       </note>
       <note>
         <rest/>
-        <duration>3</duration>
+        <duration>6</duration>
         <voice>5</voice>
         <type>16th</type>
         <staff>2</staff>
       </note>
       <note>
         <pitch><step>B</step><octave>2</octave></pitch>
-        <duration>3</duration>
+        <duration>6</duration>
         <voice>5</voice>
         <type>16th</type>
         <staff>2</staff>
@@ -450,14 +450,14 @@ export default `<?xml version="1.0" encoding="UTF-8" standalone="no"?>
       </note>
       <note>
         <rest/>
-        <duration>3</duration>
+        <duration>6</duration>
         <voice>5</voice>
         <type>16th</type>
         <staff>2</staff>
       </note>
       <note>
         <pitch><step>A</step><octave>2</octave></pitch>
-        <duration>3</duration>
+        <duration>6</duration>
         <voice>5</voice>
         <type>16th</type>
         <staff>2</staff>
@@ -465,14 +465,14 @@ export default `<?xml version="1.0" encoding="UTF-8" standalone="no"?>
       </note>
       <note>
         <rest/>
-        <duration>3</duration>
+        <duration>6</duration>
         <voice>5</voice>
         <type>16th</type>
         <staff>2</staff>
       </note>
       <note>
         <pitch><step>G</step><octave>2</octave></pitch>
-        <duration>3</duration>
+        <duration>6</duration>
         <voice>5</voice>
         <type>16th</type>
         <staff>2</staff>
@@ -480,14 +480,14 @@ export default `<?xml version="1.0" encoding="UTF-8" standalone="no"?>
       </note>
       <note>
         <rest/>
-        <duration>3</duration>
+        <duration>6</duration>
         <voice>5</voice>
         <type>16th</type>
         <staff>2</staff>
       </note>
       <note>
         <pitch><step>E</step><octave>2</octave></pitch>
-        <duration>6</duration>
+        <duration>12</duration>
         <voice>5</voice>
         <type>eighth</type>
         <staff>2</staff>

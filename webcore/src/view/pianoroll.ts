@@ -183,6 +183,29 @@
 import type * as alphaTab from '@coderline/alphatab';
 import { scoreOriginSec, type RiffScore } from '../pipeline';
 import { soundingMidi, type ScoreIndex } from '../score/fromPipeline';
+import {
+  barGrid,
+  clampWindow,
+  fracToSec,
+  fullWindow,
+  gridDetail,
+  gridMarks,
+  isFullWindow,
+  medianBeatSec,
+  secToFrac,
+  MIN_WINDOW_SEC,
+  TIME_ZOOM_IN_FACTOR,
+  TIME_ZOOM_OUT_FACTOR,
+  panWindow,
+  secPerPx,
+  windowShowing,
+  zoomWindowAt,
+  zoomWindowCentred,
+  type BarSpan,
+  type GridMark,
+  type TimeLimits,
+  type TimeWindow
+} from './timeAxis';
 
 export interface PianoRollNote {
   startSec: number;
@@ -228,6 +251,47 @@ export interface PianoRollLiveModel {
 export interface TimeAnchor {
   sec: number;
   frac: number;
+}
+
+/**
+ * A time window written as the pair of anchors the WAVEFORM already understands.
+ *
+ * The waveform strip (`ui/waveform.ts`) has taken `setTimeAnchors` since Align was built and it
+ * draws linearly between them, which is precisely a window. So the roll and the strip share a
+ * time axis by the integrator forwarding ONE value through this one function — no second
+ * implementation of the mapping, and nothing for the two files to disagree about.
+ *
+ *     roll.onTimeWindowChange = (win) => waveform.setTimeAnchors(timeWindowAnchors(win));
+ */
+export function timeWindowAnchors(win: TimeWindow | null): TimeAnchor[] | null {
+  if (!win || !(win.toSec > win.fromSec)) return null;
+  return [
+    { sec: win.fromSec, frac: 0 },
+    { sec: win.toSec, frac: 1 }
+  ];
+}
+
+/**
+ * The inverse: the window an anchor list describes, read off its two ends.
+ *
+ * Any monotone anchor list has a first and a last, and what the plot SHOWS is whatever lands at
+ * fraction 0 and fraction 1 — so a list of any length collapses to the window it implies. For
+ * the two-anchor lists `ui/app.ts` has always sent, this is the identity.
+ */
+export function windowFromAnchors(anchors: ReadonlyArray<TimeAnchor> | null | undefined): TimeWindow | null {
+  const clean = (anchors ?? [])
+    .filter((a) => Number.isFinite(a.sec) && Number.isFinite(a.frac))
+    .sort((a, b) => a.frac - b.frac);
+  if (clean.length < 2) return null;
+  const first = clean[0];
+  const last = clean[clean.length - 1];
+  const fracSpan = last.frac - first.frac;
+  if (!(fracSpan > 0)) return null;
+  const perFrac = (last.sec - first.sec) / fracSpan;
+  if (!(perFrac > 0)) return null;
+  const fromSec = first.sec + (0 - first.frac) * perFrac;
+  const toSec = first.sec + (1 - first.frac) * perFrac;
+  return toSec > fromSec ? { fromSec, toSec } : null;
 }
 
 /** The visible DAW-style edit grid. It controls drawing and every time edit. */
@@ -349,6 +413,31 @@ export interface PianoRollOptions {
   /** "Back to normal size" — the roll has no zoom of its own, the sheet does. */
   onResetView?: () => void;
 
+  // --- the time axis (#29 / #30) ---------------------------------------------
+  /**
+   * The stretch of recording on screen changed — a time zoom, a time pan, or Align.
+   *
+   * WIRE THIS OR THE WAVEFORM GOES OUT OF STEP. The strip above the roll draws the same
+   * seconds and has no way of knowing the roll zoomed; forward the window to it with
+   * `waveform.setTimeAnchors(timeWindowAnchors(win))` and the two share an axis by construction.
+   * With Align on, this is also where the sheet is scrolled and scaled to match.
+   *
+   * `commit` marks the end of a gesture, exactly like `onHeightChange` and
+   * `onVerticalViewChange`: a wheel has no release, so it is a trailing pause. Do the cheap
+   * thing (redraw the strip) on every call and the expensive one (re-engrave the sheet at a new
+   * scale) on `commit` only.
+   */
+  onTimeWindowChange?: (win: TimeWindow, commit: boolean) => void;
+
+  /**
+   * The pointer moved onto a note, or off one (`null`).
+   *
+   * Cross-highlight (#30d): the integrator forwards this to `TriView.setHover`, so pointing at a
+   * rectangle rings the notehead that made it. Coalesced to one report per changed note, not one
+   * per pointermove.
+   */
+  onNoteHover?: (noteId: string | null) => void;
+
   // --- selection (invariant 4) ----------------------------------------------
   /**
    * A note was clicked, or empty space was (`null`).
@@ -427,6 +516,30 @@ const CRAMPED_ROLL_HEIGHT_PX = 46;
  * there is a thing the player can see and cannot click. See invariant 7.
  */
 const HANDLE_RESERVE_PX = 4;
+
+/**
+ * The TIME RULER along the top of the plot, in px. The horizontal twin of the gutter.
+ *
+ * It exists for two reasons and both are about the gesture, not the decoration. A wheel over a
+ * RULER meaning "zoom that axis" is the convention every DAW already taught the player, and the
+ * roll had only one ruler — the gutter — so only one axis could be zoomed that way. And the bar
+ * numbers have to live somewhere that is not on top of the notes: printed into the plot they
+ * are either behind a rectangle or in front of one, and both look like a mistake.
+ *
+ * The plot is offset down by exactly this much and everything below `draw()` still works in
+ * plot coordinates, so the pitch axis, the hit test and the harness's `firstNoteY` are all
+ * unchanged in their own frame of reference. See the `ctx.translate` in `draw()`.
+ */
+const RULER_H_PX = 15;
+/**
+ * A pane shorter than this gives the ruler back to the music.
+ *
+ * At REAPER's floor the roll is 46px tall (`CRAMPED_ROLL_HEIGHT_PX`); spending a third of that
+ * on bar numbers would leave three rows of notes. The grid lines still run the full height, so
+ * the bars are still visible — what goes is the numbered band and, with it, the wheel-to-zoom
+ * target, which is why the buttons exist and are not merely a convenience.
+ */
+const RULER_MIN_PANE_PX = 96;
 
 /** Semitones of headroom kept above and below the notes actually present. */
 const PITCH_PADDING = 1;
@@ -692,6 +805,10 @@ type Gesture =
       startX: number;
       startY: number;
       startScroll: number;
+      /** The first second on screen when the drag began — what a time pan moves relative to. */
+      startFromSec: number;
+      /** Seconds per pixel when the drag began, frozen so a redraw cannot change the gearing. */
+      startSecPerPx: number;
       /** The pitch at the top of the plot when the drag began. */
       startTopMidi: number;
       /**
@@ -774,7 +891,15 @@ export class PianoRoll {
   private handle: HTMLElement | null;
 
   private notes: PianoRollNote[] = [];
-  private barLinesSec: number[] = [];
+  /**
+   * The bars, on the RECORDING clock, with their beats. The grid and the ruler's only source.
+   *
+   * Was `barLinesSec`, a list of written seconds. It carries the beats and the printed bar
+   * number as well now, because the ruler has to name a bar and the grid has to draw inside one,
+   * and rebuilding either from a bare list of line positions means re-deriving a bar length that
+   * `barGrid()` already knows exactly. Rebuilt whenever the score or the origin changes.
+   */
+  private bars: BarSpan[] = [];
   private durationSec = 0;
   private positionSec = 0;
 
@@ -846,11 +971,26 @@ export class PianoRoll {
   /** How many of those got their halo painted this frame. `probe()` reports it. */
   private autoMarksDrawn = 0;
   private gesture: Gesture | null = null;
-  /** ALIGN: the sheet's own ruler, in time. Null = the whole take, evenly. `setTimeAnchors`. */
-  private anchors: TimeAnchor[] | null = null;
-  /** Anchors that arrived mid-gesture, waiting for the pointer to come up. Boxed so that a
-   *  deferred `null` (Align switched off during a drag) is distinguishable from "nothing". */
-  private deferredAnchors: { value: TimeAnchor[] | null } | null = null;
+  /**
+   * THE TIME AXIS. The stretch of RECORDING on screen; null = the whole take, evenly.
+   *
+   * Was `anchors`, a list of (second, fraction) pairs Align lent the roll. It is a plain window
+   * now, for two reasons. The roll has a time ZOOM of its own (#29) and the thing a zoom moves
+   * has to be the roll's own state, not something borrowed. And a window of two edges with a
+   * straight line between them is what an anchor list of two entries already WAS — app.ts has
+   * only ever sent two — so nothing about the picture changes and one whole interpolation
+   * disappears. See `setTimeWindow` and view/timeAxis.ts.
+   */
+  private timeWindow: TimeWindow | null = null;
+  /** A window that arrived from ALIGN mid-gesture, waiting for the pointer to come up. Boxed so
+   *  that a deferred `null` (Align switched off during a drag) differs from "nothing arrived". */
+  private deferredWindow: { value: TimeWindow | null } | null = null;
+  /** Trailing "the gesture has stopped" timer for `onTimeWindowChange`. */
+  private timeCommitTimer: number | null = null;
+  /** The note the pointer is over, for the sheet to ring. Null when it is over nothing. */
+  private hoverNoteId: string | null = null;
+  /** Notes the SHEET says the pointer is over. Drawn like a light selection — see `setHover`. */
+  private hovered = new Set<string>();
   /**
    * The edit just emitted, still drawn where the gesture left it.
    *
@@ -995,6 +1135,8 @@ export class PianoRoll {
    */
   setBarOne(sec: number): void {
     this.barOneSec = sec;
+    // The bar grid is expressed on the recording's clock, so moving bar 1 moves every line.
+    this.rebuildBars();
     this.draw();
   }
 
@@ -1012,10 +1154,40 @@ export class PianoRoll {
 
   setScore(score: RiffScore): void {
     this.score = score;
-    this.barLinesSec = barLines(score);
+    this.rebuildBars();
     if (this.durationSec <= 0) this.durationSec = score.durationSec;
     this.rebuildNotes();
     this.draw();
+  }
+
+  /**
+   * The bar grid, on the recording's clock.
+   *
+   * Depends on the ORIGIN as well as on the score, so it is rebuilt by `setBarOne` too — moving
+   * the bar-1 marker moves every bar line, and a grid that only refreshed on a new score would
+   * go on drawing the old downbeats under the new notes.
+   */
+  private rebuildBars(): void {
+    const score = this.score;
+    if (!score) {
+      this.bars = [];
+      return;
+    }
+    this.bars = barGrid(
+      {
+        tempoBpm: score.tempoBpm,
+        divisions: score.ir.divisions,
+        bars: score.ir.bars.map((b) => ({
+          index: b.index,
+          number: b.number,
+          implicit: b.implicit,
+          startTick: b.startTick,
+          durTicks: b.durTicks,
+          timeSig: b.timeSig
+        }))
+      },
+      this.originSec
+    );
   }
 
   /**
@@ -1043,96 +1215,167 @@ export class PianoRoll {
    * gesture is remembered and applied when the gesture ends. Re-sync on commit, never live.
    */
   setTimeAnchors(anchors: ReadonlyArray<TimeAnchor> | null): void {
-    const clean =
-      anchors && anchors.length >= 2
-        ? anchors
-            .filter((a) => Number.isFinite(a.sec) && Number.isFinite(a.frac))
-            .sort((a, b) => a.sec - b.sec)
-            .filter((a, i, all) => i === 0 || a.sec - all[i - 1].sec > 1e-6)
-        : null;
-    const next = clean && clean.length >= 2 ? clean : null;
-    if (this.gesture) {
-      this.deferredAnchors = { value: next };
-      return;
-    }
-    this.deferredAnchors = null;
-    this.applyTimeAnchors(next);
+    this.applyWindowRequest(windowFromAnchors(anchors), 'align');
   }
 
-  private applyTimeAnchors(next: TimeAnchor[] | null): void {
-    const a = this.anchors;
+  /**
+   * THE TIME AXIS, set directly. `null` = the whole take.
+   *
+   * The window is now the roll's OWN state rather than something Align lends it: the time zoom
+   * (#29) is a window the player drives with the wheel and the buttons, and Align (#30) is the
+   * same window being kept in step with the sheet's viewport. One piece of state, two ways of
+   * moving it, so the two features cannot disagree about what is on screen.
+   *
+   * `source` says who is asking, and it only matters for one thing — see `applyWindowRequest`.
+   */
+  setTimeWindow(win: TimeWindow | null): void {
+    this.applyWindowRequest(win, 'align');
+  }
+
+  /** The stretch of RECORDING on screen. Never null: with no window set, it is the whole take. */
+  getTimeWindow(): TimeWindow {
+    return this.timeWindow ?? fullWindow(this.timeLimits());
+  }
+
+  /** True while the roll is showing the whole take — i.e. the time zoom is all the way out. */
+  isTimeZoomedOut(): boolean {
+    return this.timeWindow === null || isFullWindow(this.timeWindow, this.timeLimits());
+  }
+
+  private timeLimits(): TimeLimits {
+    return {
+      durationSec: Math.max(this.durationSec, this.minTakeSec()),
+      minSpanSec: MIN_WINDOW_SEC
+    };
+  }
+
+  /** A take with no measured duration still has to be a window onto SOMETHING. */
+  private minTakeSec(): number {
+    return this.score?.durationSec && this.score.durationSec > 0 ? this.score.durationSec : 1;
+  }
+
+  /**
+   * Every route into the window goes through here, and there is exactly one reason for that:
+   *
+   * FROZEN DURING A GESTURE. A drag or a double-click ends in a re-engrave, which can change the
+   * sheet's content width and therefore the window Align derives from it. Applying that while
+   * the player still has the pointer down would move every rectangle out from under their hand
+   * mid-edit — the exact failure the old linked mode was deleted for. So a window arriving from
+   * ALIGN during a gesture is remembered and applied when the gesture ends.
+   *
+   * A window the player is asking for HERE ('user' — a wheel over the ruler, a zoom button) is
+   * applied immediately even mid-gesture, because it is their own hand doing it and a zoom that
+   * waited for them to let go would simply look broken.
+   */
+  private applyWindowRequest(next: TimeWindow | null, source: 'align' | 'user'): void {
+    if (source === 'align' && this.gesture) {
+      this.deferredWindow = { value: next };
+      return;
+    }
+    this.deferredWindow = null;
+    this.applyTimeWindow(next);
+  }
+
+  private applyTimeWindow(next: TimeWindow | null): void {
+    const clamped = next ? clampWindow(next, this.timeLimits()) : null;
+    const now = this.timeWindow;
     const same =
-      (next === null && a === null) ||
-      (next !== null &&
-        a !== null &&
-        next.length === a.length &&
-        next.every((n, i) => Math.abs(n.sec - a[i].sec) < 1e-4 && Math.abs(n.frac - a[i].frac) < 1e-4));
+      (clamped === null && now === null) ||
+      (clamped !== null &&
+        now !== null &&
+        Math.abs(clamped.fromSec - now.fromSec) < 1e-4 &&
+        Math.abs(clamped.toSec - now.toSec) < 1e-4);
     if (same) return;
-    this.anchors = next;
+    this.timeWindow = clamped;
     this.draw();
+    this.reportTimeWindow(false);
   }
 
   /** Whatever arrived while the pointer was down. Called from the one place a gesture ends. */
   private flushDeferredWindow(): void {
-    const deferred = this.deferredAnchors;
+    const deferred = this.deferredWindow;
     if (!deferred) return;
-    this.deferredAnchors = null;
-    this.applyTimeAnchors(deferred.value);
+    this.deferredWindow = null;
+    this.applyTimeWindow(deferred.value);
   }
 
   /**
-   * A RECORDING second -> a fraction of the plot, on the sheet's ruler. Null when there is none.
+   * Tell the integrator the time axis moved, so it can carry it to the WAVEFORM and (with Align
+   * on) to the sheet.
    *
-   * Linear inside each pair of anchors and along the slope of the end pair outside them, so a
-   * second before the first beat or after the last still has an answer and the answer is
-   * monotonic. Monotonic matters: a click has to invert this, and a ruler that doubles back is
-   * a ruler where two places on screen mean the same moment.
+   * The waveform is not optional and not a nicety: it sits directly above the roll drawing the
+   * same seconds, and a zoom that moved one and not the other would put a rectangle over the
+   * wrong sound — which is the single most misleading thing either strip can do. It is a
+   * callback rather than a direct call because this file does not know the waveform exists;
+   * `timeWindowAnchors()` exists so the hand-off is one line and cannot be got wrong.
+   */
+  private reportTimeWindow(commit: boolean): void {
+    this.opts.onTimeWindowChange?.(this.getTimeWindow(), commit);
+    if (commit) {
+      this.clearTimeCommitTimer();
+      return;
+    }
+    // A wheel has no "end", so the end is a pause — the same trick the pitch axis uses.
+    this.clearTimeCommitTimer();
+    this.timeCommitTimer = setTimeout(() => {
+      this.timeCommitTimer = null;
+      this.opts.onTimeWindowChange?.(this.getTimeWindow(), true);
+    }, VIEW_COMMIT_MS) as unknown as number;
+  }
+
+  private clearTimeCommitTimer(): void {
+    if (this.timeCommitTimer === null) return;
+    clearTimeout(this.timeCommitTimer);
+    this.timeCommitTimer = null;
+  }
+
+  // --- the public time-zoom API (#29) ----------------------------------------
+
+  /**
+   * Zoom the time axis about a point on the plot, given in canvas x.
+   *
+   * The gutter is not part of the time axis, so an x inside it anchors on the plot's left edge
+   * rather than extrapolating backwards into a column that means nothing in seconds.
+   */
+  zoomTimeAt(factor: number, x: number): void {
+    const frac = Math.max(0, Math.min(1, (x - this.gutterPx) / this.plotWidth));
+    this.applyWindowRequest(zoomWindowAt(this.getTimeWindow(), factor, frac, this.timeLimits()), 'user');
+  }
+
+  /** Zoom about the middle of the view — what the buttons do. */
+  zoomTime(factor: number): void {
+    this.applyWindowRequest(zoomWindowCentred(this.getTimeWindow(), factor, this.timeLimits()), 'user');
+  }
+
+  zoomTimeIn(): void {
+    this.zoomTime(TIME_ZOOM_IN_FACTOR);
+  }
+
+  zoomTimeOut(): void {
+    this.zoomTime(TIME_ZOOM_OUT_FACTOR);
+  }
+
+  /** Back to the whole take. */
+  fitTime(): void {
+    this.applyWindowRequest(null, 'user');
+  }
+
+  /** Slide the window without changing how much of the take is on screen. */
+  panTimeBy(deltaSec: number): void {
+    this.applyWindowRequest(panWindow(this.getTimeWindow(), deltaSec, this.timeLimits()), 'user');
+  }
+
+  /**
+   * A RECORDING second -> a fraction of the plot. Null only when there is no window at all,
+   * which is the "whole take, evenly" case the caller handles itself.
    */
   private anchorFrac(sec: number): number | null {
-    const a = this.anchors;
-    if (!a) return null;
-    if (sec <= a[0].sec) {
-      const span = a[1].sec - a[0].sec;
-      return a[0].frac + (span > 0 ? ((sec - a[0].sec) / span) * (a[1].frac - a[0].frac) : 0);
-    }
-    const last = a.length - 1;
-    if (sec >= a[last].sec) {
-      const span = a[last].sec - a[last - 1].sec;
-      return a[last].frac + (span > 0 ? ((sec - a[last].sec) / span) * (a[last].frac - a[last - 1].frac) : 0);
-    }
-    let lo = 0;
-    let hi = last;
-    while (hi - lo > 1) {
-      const mid = (lo + hi) >> 1;
-      if (a[mid].sec <= sec) lo = mid;
-      else hi = mid;
-    }
-    const span = a[hi].sec - a[lo].sec;
-    return span > 0 ? a[lo].frac + ((sec - a[lo].sec) / span) * (a[hi].frac - a[lo].frac) : a[lo].frac;
+    return this.timeWindow ? secToFrac(this.timeWindow, sec) : null;
   }
 
   /** The exact inverse of `anchorFrac`. */
   private anchorSec(frac: number): number | null {
-    const a = this.anchors;
-    if (!a) return null;
-    if (frac <= a[0].frac) {
-      const span = a[1].frac - a[0].frac;
-      return a[0].sec + (span > 0 ? ((frac - a[0].frac) / span) * (a[1].sec - a[0].sec) : 0);
-    }
-    const last = a.length - 1;
-    if (frac >= a[last].frac) {
-      const span = a[last].frac - a[last - 1].frac;
-      return a[last].sec + (span > 0 ? ((frac - a[last].frac) / span) * (a[last].sec - a[last - 1].sec) : 0);
-    }
-    let lo = 0;
-    let hi = last;
-    while (hi - lo > 1) {
-      const mid = (lo + hi) >> 1;
-      if (a[mid].frac <= frac) lo = mid;
-      else hi = mid;
-    }
-    const span = a[hi].frac - a[lo].frac;
-    return span > 0 ? a[lo].sec + ((frac - a[lo].frac) / span) * (a[hi].sec - a[lo].sec) : a[lo].sec;
+    return this.timeWindow ? fracToSec(this.timeWindow, frac) : null;
   }
 
   /**
@@ -1160,7 +1403,7 @@ export class PianoRoll {
     this.score = null;
     this.live = null;
     this.notes = [];
-    this.barLinesSec = [];
+    this.bars = [];
     this.source = 'ir';
     this.irDeltaSec = null;
     this.irNotes = 0;
@@ -1560,10 +1803,20 @@ export class PianoRoll {
     return Math.max(1, this.canvas.clientWidth - this.gutterPx);
   }
 
-  /** The rows' height. The bottom strip belongs to the resize handle — invariant 7. */
+  /**
+   * The time ruler's height, or 0 when the pane cannot spare it. The top strip.
+   *
+   * The one number that says where the pitch plot begins; `draw()` translates by it and
+   * `localPoint()` subtracts it, so nothing else in the file has to know it exists.
+   */
+  private get rulerH(): number {
+    return this.canvas.clientHeight >= RULER_MIN_PANE_PX ? RULER_H_PX : 0;
+  }
+
+  /** The rows' height. The top strip is the ruler, the bottom one the resize handle — invariant 7. */
   private get plotHeight(): number {
     const h = this.canvas.clientHeight;
-    return Math.max(1, h - (this.handle ? HANDLE_RESERVE_PX : 0));
+    return Math.max(1, h - this.rulerH - (this.handle ? HANDLE_RESERVE_PX : 0));
   }
 
   /**
@@ -2057,9 +2310,34 @@ export class PianoRoll {
     return this.editableOn && !!this.opts.onEdit;
   }
 
-  private localPoint(e: { clientX: number; clientY: number }): { x: number; y: number } {
+  /**
+   * CANVAS coordinates: y = 0 is the top of the element, which is the top of the time ruler.
+   * Only the ruler's own hit test wants this.
+   */
+  private canvasPoint(e: { clientX: number; clientY: number }): { x: number; y: number } {
     const r = this.canvas.getBoundingClientRect();
     return { x: e.clientX - r.left, y: e.clientY - r.top };
+  }
+
+  /**
+   * PLOT coordinates: y = 0 is the first pitch row.
+   *
+   * The matching half of the `ctx.translate` in `draw()`. Everything that hit-tests a rectangle,
+   * a row or the pitch scrollbar goes through here, so the ruler's height is accounted for
+   * exactly once on the way in and exactly once on the way out. A y below zero means the pointer
+   * is on the ruler.
+   */
+  private localPoint(e: { clientX: number; clientY: number }): { x: number; y: number } {
+    const p = this.canvasPoint(e);
+    return { x: p.x, y: p.y - this.rulerH };
+  }
+
+  /** Is the pointer on the TIME ruler — the horizontal axis's own zoom target? */
+  private overTimeRuler(e: { clientX: number; clientY: number }): boolean {
+    const rh = this.rulerH;
+    if (rh <= 0) return false;
+    const p = this.canvasPoint(e);
+    return p.y >= 0 && p.y < rh && p.x >= this.gutterPx;
   }
 
   /** The rect under a point, from what was last PAINTED. Null over the gutter or empty space. */
@@ -2243,19 +2521,25 @@ export class PianoRoll {
     this.changeSelection(new Set());
     this.opts.onNoteSelect?.(null, this.viewportRect(null, x, y));
     // Horizontal only, and only when there is a sheet to scroll. See the `vertical` field on
-    // the pan gesture for why this one does not touch the pitch axis.
-    if (this.map() && this.opts.onScrollRequest) this.beginPan(e.pointerId, x, y, false);
+    // the pan gesture for why this one does not touch the pitch axis. Armed whenever there is
+    // anywhere to pan TO — i.e. whenever the time axis is zoomed in at all.
+    if (!this.isTimeZoomedOut()) this.beginPan(e.pointerId, x, y, false);
     this.draw();
   };
 
   /** One place a pan starts, so the middle button, Space and the bare drag cannot diverge. */
   private beginPan(pointerId: number, x: number, y: number, vertical: boolean): void {
+    const win = this.getTimeWindow();
     this.gesture = {
       kind: 'pan',
       pointerId,
       startX: x,
       startY: y,
       startScroll: this.map()?.scrollLeft ?? 0,
+      startFromSec: win.fromSec,
+      // Frozen at the press: the gearing must not change while the hand is moving, and the
+      // window's span is what the sheet may be re-scaling underneath us with Align on.
+      startSecPerPx: (win.toSec - win.fromSec) / Math.max(1, this.plotWidth),
       startTopMidi: this.scrollTopMidi,
       vertical,
       moved: false
@@ -2366,11 +2650,42 @@ export class PianoRoll {
     this.bandModifier = e.shiftKey;
     if (this.gesture) return;
     this.refreshCursor();
+    this.reportHover(this.hitTest(x, y)?.note.noteId ?? null);
   };
 
   private onPointerLeave = (): void => {
     this.hovering = false;
+    this.reportHover(null);
   };
+
+  /**
+   * Cross-highlight (#30d), outward: point at a rectangle and the SHEET rings the notehead.
+   *
+   * Coalesced to one report per CHANGED note. A pointermove fires dozens of times a second and
+   * the other end of this is an SVG rebuild on the sheet; sending the same id sixty times would
+   * make hovering the most expensive thing the app does. Never fired while a gesture is running
+   * — during a drag the interesting note is the one being dragged, and it is already selected.
+   */
+  private reportHover(noteId: string | null): void {
+    if (noteId === this.hoverNoteId) return;
+    this.hoverNoteId = noteId;
+    this.opts.onNoteHover?.(noteId);
+  }
+
+  /**
+   * Cross-highlight, inward: the SHEET says the pointer is over these notes, so ring them here.
+   *
+   * Deliberately NOT the selection. A hover is a question ("is this the note I mean?") and a
+   * selection is an answer; drawing them the same way would make pointing at a notehead look
+   * like it had already changed what a Delete would remove. Never echoed back through
+   * `onNoteHover` — that is how a two-view highlight ends up in a loop.
+   */
+  setHover(noteIds: ReadonlyArray<string>): void {
+    const next = new Set(noteIds);
+    if (next.size === this.hovered.size && [...next].every((id) => this.hovered.has(id))) return;
+    this.hovered = next;
+    this.draw();
+  }
 
   /**
    * The one place the cursor is decided, because it has two inputs — where the pointer is and
@@ -2433,8 +2748,14 @@ export class PianoRoll {
       if (!g.moved && Math.abs(dx) < DRAG_SLOP_PX && Math.abs(g.vertical ? dy : 0) < DRAG_SLOP_PX) return;
       g.moved = true;
       this.canvas.style.cursor = 'grabbing';
-      // Dragging the picture LEFT means moving further into the take, so the scroll goes up.
-      if (this.map()) this.opts.onScrollRequest?.(Math.max(0, g.startScroll - dx));
+      // Dragging the picture LEFT means moving further into the take, so the window goes up.
+      // This is the roll's own axis now; it used to ask the integrator to scroll the SHEET
+      // through `onScrollRequest`, which was never wired and could not fire in any case, so the
+      // gesture invariant 9 documents ("left drag on background -> pan TIME") did nothing at all.
+      this.applyWindowRequest(
+        windowShowing(g.startFromSec - dx * g.startSecPerPx, 0, g.startSecPerPx * this.plotWidth, this.timeLimits()),
+        'user'
+      );
       if (g.vertical) {
         // The picture follows the hand: drag DOWN and the higher pitches come into view from
         // above, so the pitch at the top edge goes UP.
@@ -2745,8 +3066,24 @@ export class PianoRoll {
    * roll's own and is applied here.
    */
   private onWheel = (e: WheelEvent): void => {
-    // A pinch, or a wheel over the ruler. Both are "zoom this axis" and neither asks the player
-    // to know anything.
+    /*
+     * THE TIME RULER, which is new (#29).
+     *
+     * A wheel over the band along the top zooms TIME, about the pointer. It is the exact mirror
+     * of the rule the gutter already had — a wheel over a ruler zooms that ruler's axis — and it
+     * is why the ruler is drawn at all. No modifier, because the whole point of the convention is
+     * that there is nothing to know.
+     */
+    if (this.overTimeRuler(e)) {
+      const d = e.deltaY || e.deltaX;
+      if (d === 0) return;
+      e.preventDefault();
+      this.zoomTimeAt(d < 0 ? TIME_ZOOM_IN_FACTOR : TIME_ZOOM_OUT_FACTOR, this.canvasPoint(e).x);
+      return;
+    }
+
+    // A pinch, or a wheel over the pitch ruler. Both are "zoom this axis" and neither asks the
+    // player to know anything.
     const overGutter = this.gutterPx > 0 && this.localPoint(e).x < this.gutterPx;
     if (e.ctrlKey || e.metaKey || (overGutter && !e.shiftKey)) {
       const d = e.deltaY || e.deltaX;
@@ -2771,17 +3108,21 @@ export class PianoRoll {
      * sideways swipe on a Mac trackpad arrives as a large deltaX with no modifier at all, and
      * answering that with a vertical scroll would be reading a horizontal gesture backwards.
      * So: Shift, or a wheel that is genuinely mostly sideways.
+     *
+     * It PANS THE ROLL'S OWN WINDOW now. It used to ask the integrator to scroll the sheet
+     * through `onScrollRequest`, which was never wired and could not fire anyway (`map()` has
+     * returned null since the engraved axis was deleted), so a sideways swipe over the roll did
+     * nothing at all. The roll owns its time axis now, so it can simply move. With Align on the
+     * sheet follows, through `onTimeWindowChange`, which is the same route a zoom takes.
      */
     if (e.shiftKey || Math.abs(e.deltaX) > Math.abs(e.deltaY)) {
-      const m = this.map();
-      if (!m || !this.opts.onScrollRequest) return;
       // Shift+wheel arrives as deltaX on some platforms and deltaY on others, so take whichever
       // is bigger rather than guessing the platform.
       const delta = Math.abs(e.deltaX) > Math.abs(e.deltaY) ? e.deltaX : e.deltaY;
       if (delta === 0) return;
       e.preventDefault();
-      const max = Math.max(0, m.contentWidth - m.viewportWidth);
-      this.opts.onScrollRequest(Math.max(0, Math.min(max, m.scrollLeft + delta)));
+      const win = this.getTimeWindow();
+      this.panTimeBy((delta / Math.max(1, this.plotWidth)) * (win.toSec - win.fromSec));
       return;
     }
 
@@ -3112,11 +3453,31 @@ export class PianoRoll {
      * two can no longer differ because a mark that is not an applied edit cannot be made.
      */
     autoMarksApplied: number;
+
+    // --- the time axis (#29 / #30) ------------------------------------------
+    /** Seconds per plot pixel. The zoom, as one number. */
+    secPerPx: number;
+    /** True while the whole take is on screen, i.e. the time zoom is all the way out. */
+    timeZoomedOut: boolean;
+    /** The narrowest window the zoom will go to, and the widest. */
+    minWindowSec: number;
+    maxWindowSec: number;
+    /** The time ruler's height in px, or 0 when the pane is too short to spare it. */
+    rulerHeight: number;
+    /** How many grid lines are on screen, and how many of them are bar lines. */
+    gridMarks: number;
+    barMarks: number;
+    /** The bar numbers actually printed on the ruler this frame. */
+    barLabels: string[];
+    /** Cross-highlight: what the pointer is over here, and what the sheet says it is over. */
+    hoverNoteId: string | null;
+    hoveredFromSheet: string[];
   } {
     const first = this.notes[0] ?? null;
     const geo = this.geometry();
     const m = this.map();
     const firstX = first ? this.writtenToX(first.startSec) : Number.NaN;
+    const marks = this.gridMarks();
     return {
       notes: this.notes.length,
       durationSec: Number(this.durationSec.toFixed(3)),
@@ -3144,9 +3505,11 @@ export class PianoRoll {
 
       linked: false,
       linkedActive: m !== null,
-      windowFromSec: this.anchors ? Number((this.anchorSec(0) ?? 0).toFixed(4)) : null,
-      windowToSec: this.anchors ? Number((this.anchorSec(1) ?? 0).toFixed(4)) : null,
-      anchorCount: this.anchors?.length ?? 0,
+      windowFromSec: this.timeWindow ? Number(this.timeWindow.fromSec.toFixed(4)) : null,
+      windowToSec: this.timeWindow ? Number(this.timeWindow.toSec.toFixed(4)) : null,
+      // A window IS two anchors — its two ends — which is all `ui/app.ts` has ever sent. Kept
+      // reporting the same number so a check that asserts "the shared ruler is pinned" still can.
+      anchorCount: this.timeWindow ? 2 : 0,
       midPlotSec: Number(this.xToSec(this.gutterPx + this.plotWidth / 2).toFixed(4)),
       hasSheetMap: false,
       zoomedContentWidth: m ? Math.round(m.contentWidth) : null,
@@ -3185,7 +3548,18 @@ export class PianoRoll {
       autoMarks: this.autoMarks.size,
       autoMarkIds: [...this.autoMarks],
       autoMarksDrawn: this.autoMarksDrawn,
-      autoMarksApplied: this.autoMarks.size
+      autoMarksApplied: this.autoMarks.size,
+
+      secPerPx: Number(secPerPx(this.getTimeWindow(), this.plotWidth).toFixed(6)),
+      timeZoomedOut: this.isTimeZoomedOut(),
+      minWindowSec: MIN_WINDOW_SEC,
+      maxWindowSec: Number(this.timeLimits().durationSec.toFixed(3)),
+      rulerHeight: this.rulerH,
+      gridMarks: marks.length,
+      barMarks: marks.filter((m) => m.level === 'bar').length,
+      barLabels: marks.filter((m) => m.label !== null).map((m) => m.label as string),
+      hoverNoteId: this.hoverNoteId,
+      hoveredFromSheet: [...this.hovered]
     };
   }
 
@@ -3256,6 +3630,22 @@ export class PianoRoll {
     ctx.fillStyle = this.colors.bg;
     ctx.fillRect(0, 0, w, h);
 
+    // The ruler is drawn in CANVAS coordinates, and everything after it in PLOT coordinates —
+    // one translate rather than an offset threaded through forty expressions. The pitch axis,
+    // the rectangles, the hit test and `probe().firstNoteY` therefore all keep meaning exactly
+    // what they meant before the ruler existed. `localPoint()` is the matching subtraction on
+    // the way back in; those two are the whole of the change.
+    this.drawTimeRuler(ctx, w);
+    ctx.save();
+    ctx.translate(0, this.rulerH);
+    try {
+      this.drawPlot(ctx, w, h);
+    } finally {
+      ctx.restore();
+    }
+  };
+
+  private drawPlot(ctx: CanvasRenderingContext2D, w: number, h: number): void {
     const g = this.gutterPx;
     const ph = this.plotHeight;
     const { rowH, yFor } = this.geometry();
@@ -3290,42 +3680,30 @@ export class PianoRoll {
     ctx.rect(g, 0, Math.max(0, w - g), h);
     ctx.clip();
 
-    // DAW-style time columns. The ruler is linear, so adding or deleting a note
-    // cannot move any unrelated onset. Faint subdivisions, clearer beats, and
-    // strong bar lines all use the same unit the edit gestures snap to.
-    const quarterSec = 60 / (this.score?.tempoBpm || 100);
-    const gridSec = this.editGrid === 'free' ? 0 : this.snapSec;
-    const writtenEnd = Math.max(0, this.durationSec - this.originSec);
-    if (gridSec > 0 && writtenEnd > 0) {
-      let column = 0;
-      for (let sec = 0; sec <= writtenEnd + gridSec * 0.25; sec += gridSec, column++) {
-        const x = this.writtenToX(sec);
-        if (!Number.isFinite(x) || x < g - 1 || x > w) continue;
-        const nextX = this.writtenToX(Math.min(writtenEnd, sec + gridSec));
-        if (column % 2 === 1 && Number.isFinite(nextX)) {
-          ctx.save();
-          ctx.globalAlpha = 0.055;
-          ctx.fillStyle = this.colors.keyWhite;
-          ctx.fillRect(x, 0, Math.max(0, nextX - x), ph);
-          ctx.restore();
-        }
-        const isQuarter = Math.abs(sec / quarterSec - Math.round(sec / quarterSec)) < 1e-5;
-        ctx.save();
-        ctx.globalAlpha = isQuarter ? 0.34 : 0.17;
-        ctx.fillStyle = this.colors.line;
-        ctx.fillRect(Math.round(x), 0, 1, ph);
-        ctx.restore();
-      }
-    }
-
-    ctx.fillStyle = this.colors.line;
-    ctx.globalAlpha = 0.85;
-    for (const sec of this.barLinesSec) {
-      const x = this.writtenToX(sec);
+    /*
+     * DAW-STYLE GRID, AT PERFORMED TIME. (#30a)
+     *
+     * The bar lines and the beats inside them, placed at the seconds they were actually played —
+     * `barGrid()` runs the score's own tick->second mapping, the same one the notes came through,
+     * so a downbeat marker and the note on the downbeat cannot land in different columns.
+     *
+     * It used to be a grid of the EDIT unit stepped from written second zero, plus a separate
+     * pass over bar starts. Two problems, both visible: the edit grid is a preference (switch it
+     * to 'free' and the whole ruler vanished), and stepping a float in a loop over a five-minute
+     * take at a 32nd-note unit is tens of thousands of iterations a frame, almost none of them on
+     * screen. `gridMarks` returns only what is inside the window, thinned to what there is room
+     * for, and the strongest weight at any position wins so nothing is drawn twice.
+     */
+    const marks = this.gridMarks();
+    for (const mark of marks) {
+      const x = this.secToX(mark.sec);
       if (!Number.isFinite(x) || x < g - 1 || x > w) continue;
+      ctx.save();
+      ctx.globalAlpha = mark.level === 'bar' ? 0.85 : mark.level === 'beat' ? 0.34 : 0.15;
+      ctx.fillStyle = this.colors.line;
       ctx.fillRect(Math.round(x), 0, 1, ph);
+      ctx.restore();
     }
-    ctx.globalAlpha = 1;
 
     this.rects = this.layoutRects(rowH, yFor, w, g);
     this.outlinedRects = 0;
@@ -3363,7 +3741,73 @@ export class PianoRoll {
     // The vertical scrollbar last, over everything: it is chrome, it has to stay legible on top
     // of a dense passage, and it is the thing that TELLS the player the pane scrolls at all.
     this.paintVScrollbar(ctx, w);
-  };
+  }
+
+  /**
+   * The grid this frame: bars, beats and subdivisions, thinned to what there is room for.
+   *
+   * Rebuilt every frame on purpose — it depends on the window, and the window moves. The cost is
+   * a walk over the bars that overlap the view, which at riff length is single digits.
+   */
+  private gridMarks(): GridMark[] {
+    const bars = this.bars;
+    if (bars.length === 0) return [];
+    const win = this.getTimeWindow();
+    const detail = gridDetail(medianBeatSec(bars), (win.toSec - win.fromSec) / Math.max(1, this.plotWidth));
+    return gridMarks(bars, win, detail);
+  }
+
+  /**
+   * THE TIME RULER: bar numbers along the top, and the horizontal axis's own zoom target.
+   *
+   * Drawn in CANVAS coordinates — this is the only thing in the file that is — because it sits
+   * above the plot rather than in it. Its left end covers the gutter's corner, which the plot's
+   * own gutter fill no longer reaches now that the plot starts lower down.
+   */
+  private drawTimeRuler(ctx: CanvasRenderingContext2D, w: number): void {
+    const rh = this.rulerH;
+    if (rh <= 0) return;
+    const g = this.gutterPx;
+
+    ctx.save();
+    ctx.fillStyle = this.colors.gutter;
+    ctx.fillRect(0, 0, w, rh);
+    // The edge between the ruler and the music, so the band reads as chrome.
+    ctx.fillStyle = this.colors.line;
+    ctx.fillRect(0, rh - 1, w, 1);
+
+    ctx.beginPath();
+    ctx.rect(g, 0, Math.max(0, w - g), rh);
+    ctx.clip();
+
+    ctx.font = '600 9px ui-monospace, SFMono-Regular, Menlo, monospace';
+    ctx.textAlign = 'left';
+    ctx.textBaseline = 'alphabetic';
+    for (const mark of this.gridMarks()) {
+      const x = this.secToX(mark.sec);
+      if (!Number.isFinite(x) || x < g - 1 || x > w) continue;
+      // Ticks: a bar gets the full height of the band, a beat a stub, a subdivision nothing —
+      // at that density the band would be a solid block.
+      if (mark.level === 'sub') continue;
+      ctx.globalAlpha = mark.level === 'bar' ? 0.7 : 0.3;
+      ctx.fillStyle = this.colors.line;
+      const tickH = mark.level === 'bar' ? rh - 1 : 4;
+      ctx.fillRect(Math.round(x), rh - 1 - tickH, 1, tickH);
+      if (!mark.label) continue;
+      ctx.globalAlpha = 0.85;
+      ctx.fillStyle = this.colors.label;
+      ctx.fillText(mark.label, Math.round(x) + 3, 10);
+    }
+
+    // The playhead crosses the ruler too, so the moment has one unbroken line through the pane.
+    const px = this.secToX(this.positionSec);
+    if (Number.isFinite(px) && px >= g && px <= w) {
+      ctx.globalAlpha = 1;
+      ctx.fillStyle = this.colors.playhead;
+      ctx.fillRect(px - 0.5, 0, 1, rh - 1);
+    }
+    ctx.restore();
+  }
 
   /**
    * The pitch scrollbar down the right-hand edge — drawn only when there is somewhere to go.
@@ -3575,6 +4019,29 @@ export class PianoRoll {
       ctx.restore();
       ctx.globalAlpha = 1;
       ctx.lineWidth = 1;
+    }
+
+    /*
+     * The HOVER ring (#30d, inward): the sheet is pointing at these notes.
+     *
+     * Under the fills like the auto-edit halo, and much lighter than a selection: a hover is a
+     * question and a selection is an answer, and a highlight that looked like a selection would
+     * make pointing at a notehead on the staff appear to have changed what Delete would remove.
+     */
+    if (this.hovered.size > 0) {
+      ctx.save();
+      ctx.globalAlpha = 0.55;
+      ctx.strokeStyle = this.colors.text;
+      ctx.lineWidth = 1;
+      ctx.setLineDash([3, 2]);
+      for (const r of this.rects) {
+        const id = r.note.noteId;
+        if (!id || !this.hovered.has(id)) continue;
+        ctx.strokeRect(r.x - 2.5, r.y - 2.5, r.w + 5, r.h + 5);
+      }
+      ctx.setLineDash([]);
+      ctx.restore();
+      ctx.globalAlpha = 1;
     }
 
     for (const r of this.rects) {
@@ -3827,6 +4294,7 @@ export class PianoRoll {
   }
 
   destroy(): void {
+    this.clearTimeCommitTimer();
     this.canvas.removeEventListener('pointerdown', this.onPointerDown);
     this.canvas.removeEventListener('pointermove', this.onPointerMove);
     this.canvas.removeEventListener('pointerleave', this.onPointerLeave);
@@ -3965,12 +4433,6 @@ function isTypingTarget(t: EventTarget | null): boolean {
 function clampLabelY(centreY: number, fontPx: number, plotH: number): number {
   const baseline = centreY + fontPx * 0.36;
   return Math.max(fontPx, Math.min(plotH - 1, baseline));
-}
-
-/** Bar starts in WRITTEN seconds, on the same tick->second mapping as the IR's notes. */
-function barLines(score: RiffScore): number[] {
-  const secPerTick = secPerTickOf(score, score.ir.divisions || 12);
-  return score.ir.bars.map((b) => b.startTick * secPerTick);
 }
 
 function secPerTickOf(score: RiffScore, ticksPerQuarter: number): number {

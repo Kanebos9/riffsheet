@@ -156,25 +156,36 @@ describe('ROBUSTNESS — degenerate inputs must produce a valid score, not an ex
    * neighbours' attacks — sustain nobody played, invented by the engraver stretching each note
    * toward the next onset, which reads as polyphony on a monophonic line. The fixture is a
    * staccato riff at a hard 50% gate, so every played length lands exactly on the tick lattice
-   * and "engine length" is a number, not a tolerance: an eighth-slot note sounds for 3 ticks and
-   * must be written as 3.
+   * and "engine length" is a number, not a tolerance: an eighth-slot note sounds for 6 ticks at
+   * divisions=24.
    *
-   * `grid: 'free'` is the case named in the acceptance criterion. The quantized grids are
-   * checked with it because that is where the lengthening pass actually used to run — under
-   * 'free' it was already switched off, so a 'free'-only test would have passed before the
-   * deletion too and proved nothing.
+   * WHAT ISSUE #31 CHANGED HERE, and it is a deliberate narrowing. This used to demand the engine
+   * length on EVERY grid, which the old quantizer delivered by letting an off-time fall through
+   * to a finer lattice than the onset — at `grid: '1/8'` a 6-tick note kept 6 ticks and printed
+   * as a 32nd. That is how a take of repeated strikes came back as a row of eighth-note flags
+   * under a quarter-note grid. A grid is a contract about the finest value the page may print,
+   * so the claim is now the correct one:
+   *
+   *   - the played length is snapped to the grid step and to nothing else, so the most a note can
+   *     gain is ONE step. Nothing walks toward the next onset, which is what the deleted
+   *     lengthening pass did and is what this file exists to keep dead;
+   *   - at `grid: 'free'` the step is a 1/32, so the engine length survives EXACTLY. That is the
+   *     case the acceptance criterion actually named.
    */
-  it('ACCEPTANCE: a staccato take is written at engine lengths, on every grid', () => {
+  it('ACCEPTANCE: a staccato take gains at most one grid step, and nothing at all on free', () => {
     const positions = Array.from({ length: 32 }, (_, i) => ({
       beat: i / 2,
       midi: [40, 43, 45, 47, 45, 43][i % 6],
       lengthBeats: 0.5
     }));
-    // 50% of a half-beat slot at 120 BPM = 62.5 ms = exactly 3 ticks at divisions 12.
+    // 50% of a half-beat slot at 120 BPM = 62.5 ms = exactly 6 ticks at divisions 24.
     const notes = playedNotes(positions, 0.5);
-    const PLAYED_TICKS = 3;
+    const PLAYED_TICKS = 6;
+    /** The finest straight step each grid puts on offer, in ticks at divisions=24. */
+    const STEP = { free: 3, auto: 6, '1/8': 12, '1/16': 6 } as const;
 
     for (const g of ['free', 'auto', '1/8', '1/16'] as const) {
+      const step = STEP[g];
       const r = buildScore({ notes, ...grid(4) }, settings({ grid: g }));
       const written = new Map<string, number>();
       const occupied: { from: number; to: number; id: string }[] = [];
@@ -189,8 +200,11 @@ describe('ROBUSTNESS — degenerate inputs must produce a valid score, not an ex
         }
       }
       expect(written.size, `grid ${g}: every note reaches the page`).toBe(notes.length);
+      // The played length rounded onto this grid's step — never the next onset.
+      const allowed = Math.max(step, Math.round(PLAYED_TICKS / step) * step);
       for (const [id, ticks] of written) {
-        expect(ticks, `grid ${g}: ${id} was stretched past its engine length`).toBeLessThanOrEqual(PLAYED_TICKS);
+        expect(ticks, `grid ${g}: ${id} was stretched past its snapped engine length`).toBeLessThanOrEqual(allowed);
+        expect(ticks, `grid ${g}: ${id} was written shorter than one grid step`).toBeGreaterThanOrEqual(step);
       }
       occupied.sort((a, b) => a.from - b.from || a.to - b.to);
       for (let i = 1; i < occupied.length; i++) {
@@ -199,9 +213,33 @@ describe('ROBUSTNESS — degenerate inputs must produce a valid score, not an ex
         );
       }
       expect(r.ir.stats.gapsAbsorbed, `grid ${g}`).toBe(0);
-      // The silence is on the page instead: one rest per note, minus the final ring-out.
-      expect(r.ir.stats.restGlyphs, `grid ${g}`).toBeGreaterThanOrEqual(notes.length - 1);
+      // The silence reaches the page wherever the chosen grid is fine enough to show it. At
+      // grid '1/8' the note and its slot are the same size, so there is no silence left to print
+      // — that is the grid the caller asked for, not a gap that got absorbed.
+      if (step < PLAYED_TICKS * 2) {
+        expect(r.ir.stats.restGlyphs, `grid ${g}`).toBeGreaterThanOrEqual(notes.length - 1);
+      } else {
+        expect(r.ir.stats.restGlyphs, `grid ${g}`).toBe(0);
+      }
     }
+  });
+
+  it('ACCEPTANCE: grid free writes the engine length exactly, to the 1/32', () => {
+    const positions = Array.from({ length: 32 }, (_, i) => ({
+      beat: i / 2,
+      midi: [40, 43, 45, 47, 45, 43][i % 6],
+      lengthBeats: 0.5
+    }));
+    const r = buildScore({ notes: playedNotes(positions, 0.5), ...grid(4) }, settings({ grid: 'free' }));
+    const written = new Map<string, number>();
+    for (const bar of r.ir.bars) {
+      for (const beat of bar.voices[0].beats) {
+        if (beat.isRest) continue;
+        for (const n of beat.notes) written.set(n.id, (written.get(n.id) ?? 0) + beat.durTicks);
+      }
+    }
+    expect(written.size).toBe(32);
+    for (const [id, ticks] of written) expect(ticks, `${id} on free`).toBe(6);
   });
 
   it('ACCEPTANCE: the same holds across the whole stress corpus at grid free', async () => {

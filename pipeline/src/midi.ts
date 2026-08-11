@@ -12,7 +12,7 @@
  * WRITTEN. No dependency: `midi-writer-js` and `@tonejs/midi` both assume a browser/node
  * environment and this package has zero runtime deps by design.
  *
- * PPQ is 480, not the IR's 12 — MIDI has no reason to inherit the notation grid, and 480 is
+ * PPQ is 480, not the IR's 24 — MIDI has no reason to inherit the notation grid, and 480 is
  * what every DAW expects. Quantized ticks scale by exactly 40, so nothing is rounded.
  *
  */

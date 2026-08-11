@@ -206,6 +206,12 @@ export const TIPS = {
     'How many notes Riffsheet split or added on its own, listening to your recording, that you have not looked at yet. Click to step through them one at a time — each one lights up on the piano roll and the waveform and offers Keep or Revert. They disappear from here as you deal with them.',
   autoSplitAtAttacks:
     'Riffsheet listens to your recording for the moment a string is struck, and it hears repeated notes that the transcriber often runs together — two quick notes coming back as one long one. With this on, it splits that long note at the second strike, and where the transcriber wrote nothing but a clear steady note was played, it writes one in. Every change it makes is outlined on the piano roll and shaded on the waveform until you click it and choose Keep or Revert; the sheet and the tab are left clean. It is careful on purpose and would rather do nothing than guess — anything it is unsure about is highlighted without being touched. Turn it off and it stops changing notes, but still shows you where it heard something the transcriber did not.',
+  /**
+   * DEAD, like the two below it: "Follow a drifting tempo" is off for good and has no switch
+   * (#39). Kept for the same reason every other retired key here is — an exported key that
+   * disappears takes somebody's tooltip with it — and left describing what the feature did,
+   * so that whoever revives it has the sentence it shipped with.
+   */
   preciseBeats:
     'For playing that drifts. The app listens a second time and follows your actual beat instead of assuming one steady tempo. It takes longer, and it only helps if you played without a click. It changes nothing on the sheet you already have — only what happens the next time the app listens to a recording, either a new file or "Listen again".',
 
@@ -234,8 +240,16 @@ export const TIPS = {
     'Choose whether to show tablature. Bass and Guitar are starting presets; Custom accepts any practical string count and tuning. This never restricts what the listener may hear.',
   tuning:
     'Open-string pitches from the lowest string to the highest. They are printed with the tablature and determine its string and fret suggestions.',
+  /**
+   * The Quantize menu. Named `grid` still, because renaming an exported key renames it for
+   * every caller and this one is read by the notation toolbar under a name nothing else uses.
+   */
   grid:
-    'The smallest note the app is allowed to write on the sheet. Auto works it out bar by bar and is the only setting that can write straight notes and triplets in the same piece — leave it there unless the page comes out fussier than you played. Choosing a size instead forbids everything finer, so a triplet played against 1/8 loses a note. Free writes exactly what you played, with no tidying. This never changes the piano roll.',
+    'How much the sheet rounds what you played. Auto works it out bar by bar and is the only setting that can write straight notes and triplets in the same piece — leave it there unless the page comes out fussier than you played. Naming a size instead forbids everything finer, so a triplet played against 1/8 loses a note; 1/32 is there for fast picked figures that 1/16 rounds into each other, and Triplet (1/12) for music that swings in threes. Free writes exactly what you played, with no tidying at all.',
+  /**
+   * The roll's own ruler, and it keeps the plain name "Grid" on screen. The menu that used to
+   * be called Notation is "Quantize" now, so the two no longer read as the same word twice.
+   */
   rollGrid:
     'The columns drawn on the piano roll, and the size of a note you add by hand: with 1/4 selected, double-clicking an empty spot puts a quarter note there, on the nearest quarter-note line. It never re-writes what the app heard — changing it does not move a single note on the sheet. Hold Option while dragging to ignore it.',
   clef:
@@ -251,6 +265,11 @@ export const TIPS = {
   sound:
     "The recorded multisample instrument used for the app's MIDI playback.",
   noteNames: 'Show or hide the row of letter names between the sheet and the tab.',
+  // THE NEXT TWO HAVE NO CONTROL ANY MORE (#39). Naming every row and editing on the roll are
+  // simply what the roll does; the switches were taken out of the settings panel and the
+  // behaviour is hardcoded on in `ui/app.ts` §renderMain. The texts stay because removing an
+  // exported key breaks whoever imports it, and because `rollEdit` above — which IS still
+  // rendered, on the roll itself — says the same thing about the same gestures.
   rollAllNoteNames:
     'Write a letter name on every row of the piano roll, not only on the C notes. When the roll is too short to fit that many names it thins them out by itself — first down to the white-key notes, then back to the C\'s — so no two names are ever drawn on top of each other. The C\'s stay emphasised either way, so you can still find your place.',
   rollEditing:

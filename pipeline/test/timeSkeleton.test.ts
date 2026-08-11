@@ -39,23 +39,23 @@ describe('STATION 1 — seconds to beats by interpolation, not by a global tempo
     expect(s.secondsToTick(6.0)).toBeCloseTo(bar3.startTick + 2 * s.ticksPerBeat, 6);
   });
 
-  it('12 ticks per simple beat, 48 per 4/4 bar', () => {
+  it('24 ticks per simple beat, 96 per 4/4 bar', () => {
     const s = buildTimeSkeleton({ notes: [{ startSec: 0, endSec: 2, midi: 40 }], ...grid(2) }, settings());
-    expect(s.divisions).toBe(12);
-    expect(s.ticksPerBeat).toBe(12);
-    expect(s.bars[0].ticks).toBe(48);
+    expect(s.divisions).toBe(24);
+    expect(s.ticksPerBeat).toBe(24);
+    expect(s.bars[0].ticks).toBe(96);
   });
 
-  it('18 ticks per compound beat when 6/8 is manually overridden', () => {
+  it('36 ticks per compound beat when 6/8 is manually overridden', () => {
     const g = grid(4, 2, 80); // two dotted-quarter pulses per bar
     const s = buildTimeSkeleton(
       { notes: [{ startSec: 0, endSec: 5, midi: 40 }], ...g },
       settings({ timeSigOverride: [6, 8] })
     );
     expect(s.compound).toBe(true);
-    expect(s.ticksPerBeat).toBe(18);
+    expect(s.ticksPerBeat).toBe(36);
     expect(s.beatUnit.toString()).toBe('3/8');
-    expect(s.bars[0].ticks).toBe(36); // a 6/8 bar is three quarters = 36 ticks
+    expect(s.bars[0].ticks).toBe(72); // a 6/8 bar is three quarters = 72 ticks
   });
 
   it('display BPM is 60 / median inter-beat interval, rounded', () => {
@@ -166,13 +166,13 @@ describe('STATION 1 — no beats supplied', () => {
     const built = buildScore({ notes }, settings({ instrument: 'staff', tuningMidi: [], bpmOverride: 120 }));
     expect(built.ir.quantized).toBe(false);
     const upperBeat = built.ir.bars[0].voices[0].beats.find((beat) => beat.notes.some((note) => note.id === 'upper'))!;
-    expect(upperBeat.durTicks).toBe(3);
+    expect(upperBeat.durTicks).toBe(6);
     expect(built.ir.bars[0].clef.sign).toBe('G');
     expect(built.ir.bars[1].clef.sign).toBe('F');
     expect(built.ir.bars[1].clef.changed).toBe(true);
     expect(built.ir.bars.map((bar) => bar.timeSig)).toEqual([[4, 4], [3, 4]]);
-    expect(built.ir.tempo.changes).toEqual([{ tick: 0, bpm: 120 }, { tick: 48, bpm: 90 }]);
-    expect(built.toAlphaTabModelData().tempoChanges).toEqual([{ tick: 0, bpm: 120 }, { tick: 48, bpm: 90 }]);
+    expect(built.ir.tempo.changes).toEqual([{ tick: 0, bpm: 120 }, { tick: 96, bpm: 90 }]);
+    expect(built.toAlphaTabModelData().tempoChanges).toEqual([{ tick: 0, bpm: 120 }, { tick: 96, bpm: 90 }]);
     expect(built.toMusicXML()).toContain('<per-minute>90</per-minute>');
   });
 });
@@ -195,7 +195,7 @@ describe('STATION 1 — externalGrid (host DAW grid, authoritative)', () => {
     expect(s.timeSig).toEqual([4, 4]);
     expect(s.meterReason).toContain('external grid');
     // one beat is 60/90 s; the second note sits exactly on beat 2 of bar 1
-    expect(s.secondsToTick(60 / 90)).toBeCloseTo(12, 6);
+    expect(s.secondsToTick(60 / 90)).toBeCloseTo(24, 6);
   });
 
   it('honours a piecewise-constant tempo map', () => {
@@ -207,8 +207,8 @@ describe('STATION 1 — externalGrid (host DAW grid, authoritative)', () => {
       settings()
     );
     // 0..2 s at 120 BPM is four beats; then beats last 1 s each
-    expect(s.secondsToTick(2.0)).toBeCloseTo(48, 4);
-    expect(s.secondsToTick(3.0)).toBeCloseTo(60, 4);
+    expect(s.secondsToTick(2.0)).toBeCloseTo(96, 4);
+    expect(s.secondsToTick(3.0)).toBeCloseTo(120, 4);
   });
 
   it('takes explicit bar starts verbatim', () => {
@@ -230,7 +230,7 @@ describe('STATION 1 — externalGrid (host DAW grid, authoritative)', () => {
       settings()
     );
     expect(s.compound).toBe(true);
-    expect(s.ticksPerBeat).toBe(18);
+    expect(s.ticksPerBeat).toBe(36);
     // one dotted-quarter beat at 120 quarter-BPM is 0.75 s
     expect(s.beatTimesSec[s.originBeatIdx + 1] - s.beatTimesSec[s.originBeatIdx]).toBeCloseTo(0.75, 6);
   });
@@ -250,7 +250,7 @@ describe('STATION 1 — startOffsetSec anchors bar 1', () => {
     const pickup = s.bars.filter((b) => b.implicit);
     expect(pickup.length).toBe(1);
     expect(pickup[0].number).toBe(0);
-    expect(pickup[0].ticks).toBe(12); // one beat
+    expect(pickup[0].ticks).toBe(24); // one beat
     // bar 1 starts exactly at the declared origin
     const bar1 = s.bars.find((b) => !b.implicit)!;
     expect(s.secondsToTick(2.0)).toBeCloseTo(bar1.startTick, 6);
@@ -279,8 +279,8 @@ describe('STATION 1 — startOffsetSec anchors bar 1', () => {
     const first = r.ir.bars[0];
     expect(first.implicit).toBe(true);
     expect(first.number).toBe(0);
-    expect(first.durTicks).toBeLessThan(48);
+    expect(first.durTicks).toBeLessThan(96);
     expect(r.ir.bars[1].number).toBe(1);
-    expect(r.ir.bars[1].durTicks).toBe(48);
+    expect(r.ir.bars[1].durTicks).toBe(96);
   });
 });

@@ -39,7 +39,7 @@ export type {
   StepName,
   AccidentalName
 } from './ir.js';
-export { DIVISIONS } from './ir.js';
+export { DIVISIONS, THIRTYSECOND_TICKS } from './ir.js';
 
 export { Rational, R, MIN_REST, MIN_DIVISION, MIN_ALLOWED_DURATION } from './rational.js';
 
@@ -47,6 +47,7 @@ export {
   buildBarMetric,
   depthAt,
   toDurationList,
+  simplestDurationList,
   durationCount,
   glyphFor,
   nextBeatAfter,
@@ -82,7 +83,15 @@ export {
 } from './spelling.js';
 export type { SpelledPitch, DisplayNote } from './spelling.js';
 
-export { chooseClefs, CLEF_LOW_THRESHOLD, CLEF_HIGH_THRESHOLD } from './clef.js';
+export {
+  chooseClefs,
+  grandClefPair,
+  grandStaffSplitter,
+  CLEF_LOW_THRESHOLD,
+  CLEF_HIGH_THRESHOLD,
+  GRAND_SPLIT_MIDI
+} from './clef.js';
+export type { ClefDecision } from './clef.js';
 
 export {
   assignStrings,

@@ -53,22 +53,22 @@ describe('GOLDEN FILES — what each one pins', () => {
   it('external-grid: the host BPM wins over the (deliberately wrong) detected beats', () => {
     const read = readMusicXml(externalGrid);
     expect(read.tempo).toBe(100);
-    expect(read.divisions).toBe(12);
+    expect(read.divisions).toBe(24);
     expect(read.timeSig).toEqual([4, 4]);
     // eight notes across two bars, despite a mid-score tempo change to 80 BPM. Each is played
     // for 75% of its beat, so each is a dotted eighth plus a sixteenth of measured silence.
     const staff1 = read.notes.filter((n) => n.staff === 1 && !n.isRest);
     expect(staff1).toHaveLength(8);
     for (const n of staff1) expect(n.type).toBe('eighth');
-    for (const n of staff1) expect(n.duration).toBe(9);
-    for (const m of read.measureLengths) expect(m.length).toBe(48);
+    for (const n of staff1) expect(n.duration).toBe(18);
+    for (const m of read.measureLengths) expect(m.length).toBe(96);
   });
 
   it('pickup: startOffsetSec produces measure 0, implicit, one beat long', () => {
     const read = readMusicXml(pickup);
-    expect(read.measureLengths[0]).toEqual({ number: 0, implicit: true, length: 12 });
+    expect(read.measureLengths[0]).toEqual({ number: 0, implicit: true, length: 24 });
     expect(read.measureLengths[1].number).toBe(1);
-    expect(read.measureLengths[1].length).toBe(48);
+    expect(read.measureLengths[1].length).toBe(96);
     expect(read.measureLengths[1].implicit).toBe(false);
     // the anacrusis note itself survived
     const inPickup = read.notes.filter((n) => n.measure === 0 && n.staff === 1 && !n.isRest);

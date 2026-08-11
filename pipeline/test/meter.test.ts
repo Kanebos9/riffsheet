@@ -213,7 +213,7 @@ describe('largest legal symbol — end to end through buildScore', () => {
         const from = beat.startTick;
         const to = from + beat.durTicks;
         // Every tuplet member sits inside the one beat its group was decoded on.
-        expect(Math.floor(from / 12), 'a tuplet glyph crossed its own beat').toBe(Math.floor((to - 1) / 12));
+        expect(Math.floor(from / 24), 'a tuplet glyph crossed its own beat').toBe(Math.floor((to - 1) / 24));
       }
     }
   });

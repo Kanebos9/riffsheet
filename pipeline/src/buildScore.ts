@@ -25,10 +25,10 @@ import { buildTimeSkeleton, compoundEvidence, type TimeSkeleton } from './timeSk
 import { clampOverlaps, collectChords, type ChordEvent } from './chords.js';
 import { quantizeOnsets, type QuantNote } from './quantize.js';
 import { clampEventOverlaps, snapLeadingOnset, type SimplifyEvent } from './simplify.js';
-import { buildBarMetric, glyphFor, toDurationList, tupletWrittenLen, VOCABULARY, type BarMetric } from './meter.js';
+import { buildBarMetric, glyphFor, simplestDurationList, toDurationList, tupletWrittenLen, VOCABULARY, type BarMetric } from './meter.js';
 import { detectKey } from './key.js';
 import { accidentalDisplayForMeasure, spellNoteList, type DisplayNote } from './spelling.js';
-import { chooseClefs } from './clef.js';
+import { chooseClefs, grandClefPair, grandStaffSplitter } from './clef.js';
 import { assignStrings, detectLegatoPairs, survivingLegato, type TabNoteInput } from './tab.js';
 import { toMusicXML } from './musicxml.js';
 import { toMidi } from './midi.js';
@@ -188,8 +188,12 @@ export function buildScore(input: BuildInput, settings: BuildSettings): BuildRes
       rawOffTick: exact ? Math.max(exact.startTick + 1, exact.endTick) : skel.secondsToTick(Math.max(c.endSec, c.onsetSec + 1e-4))
     };
   });
+  // A symbolic source already decided every written tick, so it takes the internal 'exact' path.
+  // It must NOT borrow 'free': free now has real notation semantics (a 1/32 view of a
+  // performance) and snapping an imported eighth-triplet onto that lattice would corrupt it.
+  const freeSymbols = s.grid === 'free' && !exactSymbolicTiming;
   const rawQuant = quantizeOnsets(quantInput, {
-    grid: exactSymbolicTiming ? 'free' : s.grid,
+    grid: exactSymbolicTiming ? 'exact' : s.grid,
     ticksPerBeat: skel.ticksPerBeat,
     compound: skel.compound,
     totalTicks: skel.totalTicks
@@ -269,7 +273,7 @@ export function buildScore(input: BuildInput, settings: BuildSettings): BuildRes
       );
 
   // ---- bars: rests are constructed here, and only here ---------------------------------------
-  const built = buildBars(placed, skel, metrics, quant.tuplets, key.fifths);
+  const built = buildBars(placed, skel, metrics, quant.tuplets, key.fifths, freeSymbols);
 
   // ---- station 3b: spelling, then accidental display -----------------------------------------
   const orderedSourceNotes: { id: string; midi: number }[] = [];
@@ -356,6 +360,18 @@ export function buildScore(input: BuildInput, settings: BuildSettings): BuildRes
     previousSourceClef = sourceClef;
   }
 
+  // ---- station 3c (b): which of the two staves prints each note -------------------------------
+  // Decided HERE and nowhere else. The emitters used to hold a copy of the rule each, so a note
+  // could be engraved on the treble staff and exported on the bass one; now both read
+  // `IRNote.staffIndex`. Nothing is written when the score is not a grand staff.
+  const grandStaff = clefs.grandStaff || simultaneousSourceClefs;
+  const grandStaffClefs = clefs.pair ?? grandClefPair();
+  if (grandStaff) {
+    const allNotes = built.bars.flatMap((bar) => bar.voices.flatMap((v) => v.beats.flatMap((beat) => beat.notes)));
+    const staffOf = grandStaffSplitter(allNotes);
+    for (const note of allNotes) note.staffIndex = staffOf(note);
+  }
+
   // ---- tab + legato onto the IR notes ---------------------------------------------------------
   for (const bar of built.bars) {
     for (const v of bar.voices) {
@@ -431,7 +447,8 @@ export function buildScore(input: BuildInput, settings: BuildSettings): BuildRes
       stringCount: s.tuningMidi.length,
       capo: s.capo
     },
-    grandStaff: clefs.grandStaff || simultaneousSourceClefs,
+    grandStaff,
+    ...(grandStaff ? { grandStaffClefs } : {}),
     bars: built.bars,
     suspects: {
       repeatLoops: guard.repeatLoops,
@@ -500,12 +517,40 @@ function typeOf(len: Rational): { durationType: DurationType; dots: 0 | 1 } {
   return { durationType: best.type, dots: best.dots };
 }
 
+/**
+ * Turn a glyph-length list into the tick lengths actually emitted for a span of `total` ticks.
+ *
+ * Two jobs, both about the bar cursor being sacred: nothing may overrun the span, and nothing
+ * may be silently lost from it. A piece that would overrun is clipped; a piece with no room
+ * left is dropped; and if the vocabulary could not spend the whole span, the shortfall is handed
+ * to the last glyph rather than leaving the cursor short (`assertMeasureLength` would throw, and
+ * a measure that does not add up renders as nonsense even when it does not).
+ */
+function resolveTickPieces(pieces: Rational[], total: number): number[] {
+  const out: number[] = [];
+  let remaining = total;
+  for (const len of pieces) {
+    if (remaining <= 0) break;
+    const ticks = Math.min(len.toTicksRounded(DIVISIONS), remaining);
+    if (ticks <= 0) continue;
+    out.push(ticks);
+    remaining -= ticks;
+  }
+  if (remaining > 0) {
+    if (out.length) out[out.length - 1] += remaining;
+    else out.push(remaining);
+  }
+  return out;
+}
+
 function buildBars(
   placed: PlacedEvent[],
   skel: TimeSkeleton,
   metrics: BarMetric[],
   tuplets: { id: string; startTick: number; endTick: number; unitTicks: number; actual: number; normal: number }[],
-  keyFifths: number
+  keyFifths: number,
+  /** `grid: 'free'`: print the fewest glyphs that add up, not the metric split (#36). */
+  freeSymbols: boolean
 ): BuiltBars {
   const tupletById = new Map(tuplets.map((t) => [t.id, t]));
   const bars: IRBar[] = [];
@@ -537,27 +582,31 @@ function buildBars(
       if (to <= from) return;
       sawNote = true;
       const group = ev.tupletId ? tupletById.get(ev.tupletId) : undefined;
+      const span = Rational.fromTicks(to - from, DIVISIONS);
       const pieces: Rational[] = group
-        ? [Rational.fromTicks(to - from, DIVISIONS)]
-        : toDurationList(
-            metric,
-            Rational.fromTicks(from - barStart, DIVISIONS),
-            Rational.fromTicks(to - from, DIVISIONS),
-            'note'
-          );
+        ? [span]
+        : freeSymbols
+          ? simplestDurationList(span)
+          : toDurationList(metric, Rational.fromTicks(from - barStart, DIVISIONS), span, 'note');
+
+      // RESOLVE THE PIECES TO TICKS FIRST, then decide which one is first and which is last.
+      // Doing it inside the emit loop meant a piece that clipped to zero was skipped AFTER its
+      // predecessor had already been given `tieStart: true` for not being last — a dangling tie
+      // start, which is a broken file in MusicXML and a hanging slur on screen (#31 invariant d).
+      const tickPieces = resolveTickPieces(pieces, to - from);
+
       let t = from;
-      pieces.forEach((len, pi) => {
-        const ticks = Math.min(len.toTicksRounded(DIVISIONS), to - t);
-        if (ticks <= 0) return;
-        const first = pi === 0;
-        const lastPiece = pi === pieces.length - 1;
-        const tieStop = first ? tieInFirst : true;
-        const tieStart = lastPiece ? tieOutLast : true;
+      tickPieces.forEach((ticks, pi) => {
+        const tieStop = pi === 0 ? tieInFirst : true;
+        const tieStart = pi === tickPieces.length - 1 ? tieOutLast : true;
         // Written value inside a tuplet is the SOUNDING value scaled by actual/normal; the
         // MusicXML <type> is the written one while <duration> stays the sounding one.
+        //
+        // Outside a tuplet the glyph is read off the ticks ACTUALLY emitted rather than the
+        // nominal piece length, so `<type>` and `<duration>` can never disagree.
         const shown = group
           ? typeOf(tupletWrittenLen(metric.beatLen, Math.max(1, Math.round(ticks / group.unitTicks)), group.normal))
-          : typeOf(len);
+          : typeOf(Rational.fromTicks(ticks, DIVISIONS));
         if (tieStart || tieStop) stats.tiedGlyphs++;
         stats.noteGlyphs++;
         beats.push({
@@ -606,9 +655,8 @@ function buildBars(
         'rest'
       );
       let t = from;
-      for (const len of pieces) {
-        const ticks = Math.min(len.toTicksRounded(DIVISIONS), to - t);
-        if (ticks <= 0) continue;
+      for (const ticks of resolveTickPieces(pieces, to - from)) {
+        const len = Rational.fromTicks(ticks, DIVISIONS);
         const shown = typeOf(len);
         stats.restGlyphs++;
         if (len.lt(EIGHTH)) stats.restsShorterThanEighth++;

@@ -52,7 +52,7 @@ export interface BarSkeleton {
 
 export interface TimeSkeleton {
   divisions: number;
-  /** Ticks in one tracked beat: 12 for a simple beat, 18 for a compound (dotted) beat. */
+  /** Ticks in one tracked beat: 24 for a simple beat, 36 for a compound (dotted) beat. */
   ticksPerBeat: number;
   /** Length of one tracked beat as a fraction of a whole note: 1/4 simple, 3/8 compound. */
   beatUnit: Rational;

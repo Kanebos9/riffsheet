@@ -91,7 +91,18 @@ export interface BuildInput {
   blankBars?: number;
 }
 
-export type GridSetting = 'auto' | '1/4' | '1/8' | '1/16' | '1/8T' | 'free';
+/**
+ * The notation grid the caller asked for.
+ *
+ * `'thirtysecond'` is spelled out rather than `'1/32'` because it is a SHARED LITERAL: the
+ * webcore settings union uses the same string, and the two must match exactly or the setting
+ * silently falls through to the `default` arm on one side of the bridge. Do not "tidy" it into
+ * the `1/n` family without changing webcore in the same commit.
+ *
+ * `'free'` is not a grid at all — see quantize.ts. It is a read-only view of the input at the
+ * finest resolution notation can honestly print (a 1/32), never merged and never re-ordered.
+ */
+export type GridSetting = 'auto' | '1/4' | '1/8' | '1/16' | '1/8T' | 'thirtysecond' | 'free';
 /**
  * The page we are writing, not a guess about what produced the recording.
  *

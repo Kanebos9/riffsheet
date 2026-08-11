@@ -45,7 +45,14 @@ export type ClefMode = 'auto' | 'treble' | 'bass' | 'grand';
  * only help when added a new note manually... if it is transcribing from audio, it should
  * not quantize or snap at all."
  */
-export type NotationGrid = 'auto' | 'quarter' | 'eighth' | 'sixteenth' | 'triplet' | 'free';
+export type NotationGrid =
+  | 'auto'
+  | 'quarter'
+  | 'eighth'
+  | 'sixteenth'
+  | 'thirtysecond'
+  | 'triplet'
+  | 'free';
 export type RollGrid = 'quarter' | 'eighth' | 'sixteenth' | 'triplet' | 'free';
 
 /** The stored words each grid accepts. Exported so the UI and `migrate()` cannot drift apart. */
@@ -54,6 +61,10 @@ export const NOTATION_GRIDS: readonly NotationGrid[] = [
   'quarter',
   'eighth',
   'sixteenth',
+  // 1/32. The finest straight override the quantizer offers, asked for by players writing
+  // fast picked figures that a 1/16 brief rounds into each other. The word is the SETTINGS
+  // word; `src/pipeline/index.ts` §GRID_MAP translates it into the pipeline's '1/32'.
+  'thirtysecond',
   'triplet',
   'free'
 ];
@@ -119,13 +130,27 @@ export interface AppSettings {
    * for anyone who once opened the plugin in a small FX window.
    */
   pianoRollHeight: number;
-  /** Name every row in the roll's gutter, not only the octave C's. C's stay emphasised either way. */
+  /**
+   * Name every row in the roll's gutter, not only the octave C's. C's stay emphasised either way.
+   *
+   * NOT A SETTING ANY MORE, and the field is kept only so an older blob can be read without
+   * losing the rest of itself. Naming every row is what the roll does now: the switch was one
+   * of four in a "Piano roll" group the player asked to be taken out, and nobody who had it off
+   * had chosen it — it was simply the row above the one they came for. Forced true in
+   * `migrate()`, and the one consumer (`ui/app.ts` §renderMain, `setShowAllNames`) passes the
+   * literal rather than this field, so a stray stored `false` cannot reach the roll.
+   */
   rollAllNoteNames: boolean;
   /**
    * Drag-to-edit on the roll.
    *
    * Roll edits change the PERFORMANCE the sheet is written from, so they re-run the pipeline —
    * see `App.applyRollEdit`. That is what makes "make this note longer" possible at all.
+   *
+   * Also no longer a setting, for the same reason and by the same route as `rollAllNoteNames`:
+   * editing is always on, `migrate()` forces the field true, and `ui/app.ts` §renderMain passes
+   * `setEditable(true)` outright. A piano roll you cannot edit is a picture, and nothing in the
+   * app was better for being able to ask for one.
    */
   rollEditing: boolean;
   /**
@@ -215,9 +240,13 @@ export interface AppSettings {
   /**
    * Track a drifting tempo instead of assuming one steady one.
    *
-   * The shell runs a second listening pass for this (BRIDGE.md §3), so it is off by
-   * default and only affects the NEXT transcription — changing it does not rebuild the
-   * sheet you already have.
+   * OFF, PERMANENTLY, AND WITH NO CONTROL. The shell runs a whole second listening pass for it
+   * (BRIDGE.md §3) — minutes on a long take — and what came back was a beat grid that followed
+   * the player's drift so closely the bar lines stopped meaning anything on the page. It is
+   * kept as a field, not deleted, because a stored blob that still carries `true` has to be
+   * able to be read and normalised rather than merely spread back in; `migrate()` forces it
+   * false. `ui/app.ts` still reads it in the two places that would send it to the shell, so
+   * reviving the feature is a matter of putting a control back rather than re-wiring anything.
    */
   preciseBeats: boolean;
   /**
@@ -228,7 +257,7 @@ export interface AppSettings {
 }
 
 /** Raise this AND add a case in `migrate()` when a default has to change under people. */
-export const SETTINGS_VERSION = 8;
+export const SETTINGS_VERSION = 9;
 
 export const DEFAULT_SETTINGS: AppSettings = {
   // 'auto', NOT 'bass'. This is sent to the model as a HARD CONSTRAINT on what it is allowed to
@@ -263,6 +292,8 @@ export const DEFAULT_SETTINGS: AppSettings = {
   showNoteNames: true,
   showPianoRoll: true,
   pianoRollHeight: DEFAULT_ROLL_HEIGHT_PX,
+  // TRUE AND NO LONGER CHOOSABLE, both of them. See the field comments: the roll names every
+  // row and is always editable, and these two are what an old blob's values are normalised to.
   rollAllNoteNames: true,
   rollEditing: true,
   // ON, at the player's explicit request. It was safe to default this on only once the
@@ -298,6 +329,7 @@ export const DEFAULT_SETTINGS: AppSettings = {
   maxFret: 17,
   capo: 0,
   useHostGrid: true,
+  // FALSE, and there is no longer a switch to make it anything else. See the field comment.
   preciseBeats: false,
   settingsVersion: SETTINGS_VERSION
 };
@@ -544,6 +576,31 @@ function migrate(settings: AppSettings, stored: Partial<AppSettings>): AppSettin
   // default, which the player asked to be ON, and the old key is deleted below so it cannot
   // keep being written back forever.
   if (from < 8) settings.alignViews = DEFAULT_SETTINGS.alignViews;
+
+  // v8 -> v9: three switches stop being switches.
+  //
+  // The settings panel had grown a "Piano roll" group with four boxes in it, and the player's
+  // reading of that group was that three of the four were questions nobody wants to be asked:
+  // whether the roll may name its own rows, whether the roll may be edited, and whether to
+  // spend a second listening pass chasing a drifting tempo. Two of them are now simply how the
+  // roll behaves and the third is off for good, so the boxes are gone and the values are
+  // decided here.
+  //
+  // FORCED, not merged, and that is the entire reason this needs a version at all. A stored
+  // `false` for either roll switch is indistinguishable from a `false` somebody typed, and
+  // leaving it in place would give exactly the people who had once switched editing off a roll
+  // that silently refuses to be edited with no control anywhere to explain why. `preciseBeats`
+  // goes the other way for the same reason: a stored `true` would keep costing its owner a
+  // whole extra listening pass per take, chosen back when there was a box to un-choose it with.
+  //
+  // The fields themselves survive (see their comments) so an old blob still round-trips, and
+  // the two roll consumers in `ui/app.ts` pass literals rather than reading them — this case is
+  // what keeps the STORED copy honest, not what makes the behaviour true.
+  if (from < 9) {
+    settings.rollAllNoteNames = true;
+    settings.rollEditing = true;
+    settings.preciseBeats = false;
+  }
 
   const sampled = new Set([
     'finger-bass',

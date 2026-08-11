@@ -25,8 +25,8 @@ describe('STATION 6a — MusicXML round-trip through a real reader', () => {
     expect(findAll(doc, 'measure').length).toBe(r.ir.bars.length);
   });
 
-  it('declares divisions 12 and the score time signature', () => {
-    expect(read.divisions).toBe(12);
+  it('declares divisions 24 and the score time signature', () => {
+    expect(read.divisions).toBe(24);
     expect(read.timeSig).toEqual(r.ir.timeSig);
     expect(read.fifths).toBe(r.ir.key.fifths);
   });
@@ -163,7 +163,7 @@ describe('STATION 6a — tuplet MusicXML (both halves are required)', () => {
       );
       // <type> is the WRITTEN value: an eighth-triplet member prints as an eighth
       expect(built.ir.bars[0].voices[0].beats[0].durationType).toBe('eighth');
-      expect(built.ir.bars[0].voices[0].beats[0].durTicks).toBe(4);
+      expect(built.ir.bars[0].voices[0].beats[0].durTicks).toBe(8);
     }
   });
 });
@@ -208,7 +208,7 @@ describe('STATION 6c — alphaTab model data', () => {
   it('mirrors the bar structure', () => {
     expect(data.masterBars).toHaveLength(r.ir.bars.length);
     expect(data.tracks[0].staves[0].bars).toHaveLength(r.ir.bars.length);
-    expect(data.divisions).toBe(12);
+    expect(data.divisions).toBe(24);
   });
 
   it('INVERTS the tuning to alphaTab order: HIGH to LOW', () => {

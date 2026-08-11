@@ -125,8 +125,25 @@ input[type="number"], input[type="text"], select {
   background: var(--bg-raised);
   border-bottom: 1px solid var(--border);
   flex: 0 0 auto;
+  /*
+   * IT SCALES BEFORE IT WRAPS — see §"toolbars scale" at the foot of this file for the ladder
+   * and the reasoning. `flex-wrap` stays as the floor's safety net and nothing else: by the
+   * time the scale has bottomed out there is genuinely not a row's worth of room, and a second
+   * row is still better than a control pushed off the edge of the window.
+   */
+  zoom: var(--bar-zoom, 1);
   flex-wrap: wrap;
 }
+/*
+ * THE BUTTONS DO NOT GIVE, AND THEIR WORDS DO NOT BREAK.
+ *
+ * A button is a flex item like any other, so a squeezed header shrank "Main menu" until it set
+ * itself on two lines — which does not save the row, it makes the row TALLER, which is the one
+ * thing this bar must never do. They keep their size and the filename beside them is what
+ * gives, which is the right trade: a name you can still hover for, against a control you have
+ * to be able to hit.
+ */
+.app-header > button { flex: 0 0 auto; white-space: nowrap; }
 /* Shrink before anything else does — the export buttons must never wrap off-screen. */
 .app-header .filename {
   font-weight: 600;
@@ -331,8 +348,9 @@ input[type="number"], input[type="text"], select {
  * They shrink away before the export buttons do, and scroll rather than wrap, so a narrow
  * plugin window loses them gracefully instead of pushing Save off the edge.
  */
-/* Wraps, for the same reason `.notation-toolbar` does: the header itself already wraps, and a
-   chip that scrolled out of sight in here took the roll's own switches with it. */
+/* No zoom of its own: it is inside `.app-header`, which carries the ladder, and two nested
+   scales would make the chips shrink twice as fast as the buttons beside them. It keeps
+   `flex-wrap` for the same reason the bars do — a floor fallback, never the first answer. */
 .view-tools {
   display: flex;
   align-items: center;
@@ -340,7 +358,15 @@ input[type="number"], input[type="text"], select {
   min-width: 0;
   flex-wrap: wrap;
   row-gap: 4px;
-  flex: 0 1 auto;
+  /*
+   * IT DOES NOT SHRINK, and that is what keeps it on one line. Its children are chips with
+   * text in them and nothing to give, so a squeezed `.view-tools` does not get narrower — it
+   * wraps its own chips into a second row inside the header, which is the two-row header this
+   * whole section exists to stop. The filename beside it is the flexible one (`flex: 1 1 6ch`,
+   * `min-width: 0`) and it is the right thing to squeeze: it is a name you can still hover for,
+   * not a control you have to be able to hit.
+   */
+  flex: 0 0 auto;
 }
 .view-tools .chip { font-size: 11px; padding: 2px 9px; white-space: nowrap; }
 .view-tools select.chip {
@@ -356,24 +382,49 @@ input[type="number"], input[type="text"], select {
 .tuner-host[hidden] { display: none; }
 
 /*
- * IT WRAPS. It used to be a horizontal scroller with the scrollbar switched off, and that is
- * only survivable while the controls happen to fit: the moment Key and Capo were added, Capo
- * sat 39px past the right edge at 900x600 with nothing on screen saying so. A control you
- * cannot see and cannot discover a way to reach has been deleted as far as the player is
- * concerned — which is exactly how it was reported ("the button disappeared").
+ * IT SCALES, AND ONLY WRAPS AT THE FLOOR.
  *
- * Wrapping rather than a visible scrollbar, for the reason already written down under
- * `.engine-pick .chip-group`: "a horizontally scrolling row of chips hides the ones nobody
- * knows are there". The header above it has wrapped since day one, so this is the idiom the
- * screen already uses, not a new one. It costs a second row at narrow widths and gives back
- * the guarantee that every control on this bar is on screen at 360px.
+ * The history matters, because both of the obvious answers have already failed here. It was
+ * once a horizontal scroller with its scrollbar switched off, and the moment Key and Capo were
+ * added, Capo came to rest 39px past the right edge at 900x600 with nothing on screen saying
+ * so — reported, correctly, as the button having disappeared. So it was made to WRAP, which
+ * fixed that and bought a second failure: at every intermediate width the bar spent a whole
+ * extra row of a short plugin window on chrome, which is the opposite of what somebody dragging
+ * a window edge is asking for.
+ *
+ * What it does now is scale — the same answer, and the same mechanism (`zoom`), that the shell
+ * as a whole already uses below 860px. See §"toolbars scale" at the foot of this file. Wrapping
+ * survives underneath as the last resort, because at REAPER's 360px floor no legible scale fits
+ * eight controls on one line and a second row is still infinitely better than a control off the
+ * edge of the window.
  */
 .notation-toolbar {
   flex: 0 0 auto; display: flex; align-items: center; gap: 7px; min-height: 38px;
   padding: 5px 10px; background: var(--bg-raised); border-top: 1px solid var(--border);
   border-bottom: 1px solid var(--border); flex-wrap: wrap; row-gap: 5px;
+  /* Same ladder as the header — §"toolbars scale" below. Wrapping is the floor's fallback. */
+  zoom: var(--bar-zoom, 1);
 }
-.notation-toolbar > * { flex: 0 0 auto; max-width: 100%; }
+/*
+ * THE WIDEST THINGS GIVE GROUND FIRST, and mostly they give up space nothing is drawn in.
+ *
+ * A `<select>` takes its intrinsic width from its LONGEST option, not from the one it is
+ * showing: the Key menu reserves room for "Key: C♭ major / A♭ minor" while displaying "Key:
+ * Auto — G major", which is 50px shorter, and the Tab menu reserves room for its Fingering
+ * section. Letting them shrink therefore costs nothing at all until the row is genuinely out
+ * of space, and only then does the ellipsis appear — with the full text still one hover away
+ * in the tooltip and one click away in the open menu.
+ *
+ * `min-width: 0` is what makes that possible: a flex item's automatic minimum is its content's
+ * minimum, so without it a select refuses to shrink one pixel and the row wraps instead.
+ */
+.notation-toolbar > * { flex: 0 1 auto; max-width: 100%; min-width: 0; }
+.notation-toolbar select { min-width: 4.5em; text-overflow: ellipsis; }
+/* Numbers and their labels do not shrink: "Capo" and a 48px box are already the minimum, and
+   an ellipsised number is a wrong number. */
+.notation-toolbar .string-count, .notation-toolbar .toolbar-label { flex: 0 0 auto; }
+/* Same rule as the header's buttons: a word that breaks costs a whole row. */
+.notation-toolbar button, .notation-toolbar .toolbar-label { white-space: nowrap; }
 .notation-toolbar .toolbar-label { font-weight: 600; }
 .notation-toolbar .custom-tuning { width: 190px; }
 .notation-toolbar .string-count { display: flex; align-items: center; gap: 4px; }
@@ -381,8 +432,21 @@ input[type="number"], input[type="text"], select {
 .notation-toolbar .tuning-summary { font-size: 11.5px; color: var(--text-dim); }
 /* "1/4 would merge 12 notes". Sits right beside the grid it is about — a warning one control
    away from its cause is a warning about nothing. Coloured, because it is the one thing in
-   this row that is not a setting but a consequence. */
-.notation-toolbar .warn-row { color: var(--warn); white-space: normal; }
+   this row that is not a setting but a consequence.
+ *
+ * It is also the FIRST thing to give ground (`flex-shrink: 4`), and it truncates rather than
+ * wrapping: it is prose on a row of controls, so left to wrap it would take the whole bar to
+ * two lines on its own — the exact cost this row is trying not to pay. The count and the size
+ * are at the front of the sentence, which is the half that matters, and the whole of it is in
+ * the tooltip. */
+.notation-toolbar .warn-row {
+  color: var(--warn);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  flex: 0 4 auto;
+  min-width: 5em;
+}
 .notation-toolbar .document-bars { display: flex; align-items: center; gap: 6px; margin-left: auto; }
 
 /*
@@ -818,7 +882,50 @@ button[data-drag="midi"]:hover .drag-grip { opacity: 0.9; }
 .settings-row > .label { font-size: 12.5px; min-width: 96px; }
 .chip-group { display: flex; gap: 5px; flex-wrap: wrap; }
 
-.switch { display: flex; align-items: center; gap: 7px; cursor: pointer; }
+/*
+ * A CHECKBOX ROW IS TWO COLUMNS, AND THE TEXT WRAPS IN THE SECOND ONE.
+ *
+ * It was a flex row, and `.settings-row` added `flex-wrap: wrap` on top of it. Between them
+ * they produced the reported ugliness: a label too long for the drawer is ONE flex item, it
+ * cannot fit beside the box, so it wrapped onto a line of its own and left the checkbox
+ * stranded on the line above — a tick box floating over a paragraph, with nothing to say the
+ * two were the same control. In a 340px panel the long labels are the rule and not the
+ * exception ("Split run-together notes where I hear a second strike" is 51 characters), so
+ * this is what every checkbox row in the panel looks like, including the engine ones.
+ *
+ * A grid, because the row really is two columns: a box that never changes width, and a text
+ * column that takes what is left and wraps INSIDE itself, beside the box, never above or below
+ * it. `minmax(0, 1fr)` rather than plain `1fr` — a track's automatic minimum is its content's
+ * minimum size, so one long word would otherwise push the track, and the panel, wider than the
+ * drawer.
+ *
+ * Aligned to the FIRST LINE of the label rather than centred: centring a three-line label
+ * leaves its checkbox halfway down the paragraph, pointing at nothing.
+ *
+ * NOT ONE FONT SIZE CHANGES HERE. The complaint was the shape of the row; shrinking the text
+ * until it fits is how a settings panel becomes unreadable, and it was asked for explicitly.
+ */
+.switch {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: start;
+  column-gap: 7px;
+  cursor: pointer;
+}
+/*
+ * The box keeps its own size in its own column — a checkbox stretched by a grid track reads as
+ * a button. The platform's own 3px margins go, because the column gap is what spaces it now,
+ * and the top nudge is what lands it on the label's first line: a checkbox is shorter than a
+ * 1.45 line box, and `align-items: start` alone would hang it off the top of the text.
+ */
+.switch > input[type="checkbox"] {
+  margin: 0;
+  justify-self: start;
+  align-self: start;
+  margin-top: 2px;
+}
+/* The text column. `overflow-wrap` is for the one case a label carries an unbreakable word. */
+.switch > span { min-width: 0; overflow-wrap: break-word; }
 
 .status-row { font-size: 11.5px; color: var(--text-dim); line-height: 1.5; }
 .status-row .dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%; margin-right: 5px; }
@@ -1048,6 +1155,80 @@ button[data-drag="midi"]:hover .drag-grip { opacity: 0.9; }
      only while there is space. */
   .settings-gear .gear-label { display: none; }
   .settings-gear { padding: 5px 9px; }
+}
+
+/* ------------------------------------------------------- toolbars scale */
+/*
+ * THE SAME ARGUMENT AS ABOVE, ONE LEVEL DOWN: THE TWO TOP BARS SCALE BEFORE THE SHELL DOES.
+ *
+ * The shell's own zoom starts at 860px, and the two bars ran out of room long before that:
+ * the notation bar was already on TWO ROWS at 1280px with a tab, a tuning and a capo on it,
+ * and the header followed at about 1000. A plugin window is short before it is narrow — this
+ * is a strip of chrome above somebody's music — so every extra row of bar is a row of sheet
+ * nobody gets, and it appears at exactly the widths people actually work at.
+ *
+ * `zoom` again, for the reasons written out above: it scales layout as well as paint, so every
+ * getBoundingClientRect() in the app keeps reading true coordinates, and the controls keep
+ * their proportions — a scaled bar is the same bar, smaller, not a bar with different-sized
+ * things in it.
+ *
+ * THE NUMBERS ARE A LADDER OF COMBINED SCALES, and the combined one is what a person sees:
+ * below 860px the shell is already at 0.9 and below 620px at 0.8, so the bar's own figure has
+ * to be divided by that to keep the sequence smooth. That is why the ladder appears to step UP
+ * at 860 — 0.9 x 0.92 is 0.83, which is the next rung down from 0.84 and not a jump.
+ *
+ *      width   bar    shell   what you see
+ *     >1150    1.00   1.00    1.00
+ *      1150    0.96   1.00    0.96
+ *      1080    0.93   1.00    0.93
+ *      1010    0.90   1.00    0.90
+ *       950    0.87   1.00    0.87
+ *       900    0.84   1.00    0.84
+ *       860    0.92   0.90    0.83
+ *       820    0.89   0.90    0.80
+ *       780    0.86   0.90    0.77
+ *       740    0.82   0.90    0.74
+ *       700    0.78   0.90    0.70
+ *
+ * Measured against the worst bar this app can draw — label, clef, key, quantize, the coarse-grid
+ * warning, tab, frets, tuning and capo, 1375px of controls at full size — every one of those
+ * rungs is ONE ROW with nothing clipped and nothing off the edge. The last of the slack comes
+ * from the selects, which reserve width for their longest option and give it back under
+ * `flex-shrink` long before any label is touched; the warning truncates first and by design.
+ *
+ * BELOW 700px THE BARS WRAP AGAIN, and that is the floor's fallback rather than a failure. At
+ * REAPER's 360x280 there is no legible scale that fits nine controls on a line, and the two
+ * alternatives are both worse: a scroller hides controls behind a scrollbar nobody can see
+ * (that shipped once — Capo, 39px past the right edge, reported as the button disappearing),
+ * and a smaller scale is a bar you cannot read. A second row is the honest answer down there.
+ */
+.app-header, .notation-toolbar { --bar-zoom: 1; }
+@media (max-width: 1150px) { .app-header, .notation-toolbar { --bar-zoom: 0.96; } }
+@media (max-width: 1080px) { .app-header, .notation-toolbar { --bar-zoom: 0.93; } }
+@media (max-width: 1010px) { .app-header, .notation-toolbar { --bar-zoom: 0.9; } }
+@media (max-width: 950px)  { .app-header, .notation-toolbar { --bar-zoom: 0.87; } }
+@media (max-width: 900px)  { .app-header, .notation-toolbar { --bar-zoom: 0.84; } }
+@media (max-width: 860px)  { .app-header, .notation-toolbar { --bar-zoom: 0.92; } }
+@media (max-width: 820px)  { .app-header, .notation-toolbar { --bar-zoom: 0.89; } }
+@media (max-width: 780px)  { .app-header, .notation-toolbar { --bar-zoom: 0.86; } }
+@media (max-width: 740px)  { .app-header, .notation-toolbar { --bar-zoom: 0.82; } }
+@media (max-width: 700px)  { .app-header, .notation-toolbar { --bar-zoom: 0.78; } }
+
+/*
+ * ONE ROW, and it is this line that makes the scaling above mean anything.
+ *
+ * A wrapping flex container does not shrink its items — it puts them on another line the moment
+ * their natural sizes overrun, and `flex-shrink` only ever redistributes WITHIN a line that has
+ * already been laid out. So `flex-wrap: wrap` and "give ground gracefully" are mutually
+ * exclusive, and the bars have to say `nowrap` to get the shrinking they were given.
+ *
+ * Only above the floor. Under 700px the declaration lapses and both bars go back to wrapping,
+ * which is what keeps every control reachable at 360x280. 700 itself is on the ONE-ROW side of
+ * the line, because "down to 700" is the promise and a promise that stops one pixel early is
+ * the kind of thing somebody finds by dragging a window edge.
+ */
+@media (min-width: 700px) {
+  .app-header, .notation-toolbar { flex-wrap: nowrap; }
 }
 
 @media (max-width: 720px) {

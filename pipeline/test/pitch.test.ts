@@ -1,7 +1,8 @@
 import { describe, it, expect } from 'vitest';
 import { detectKey, majorTonicOf, semitoneTransitionScores } from '../src/key.js';
 import { accidentalDisplayForMeasure, keySignatureAlter, spellNoteList, tpcToAlter, tpcToOctave, tpcToStep } from '../src/spelling.js';
-import { chooseClefs } from '../src/clef.js';
+import { chooseClefs, grandStaffSplitter } from '../src/clef.js';
+import type { IRNote } from '../src/ir.js';
 
 const w = (midis: number[], weight = 1): { midi: number; weight: number }[] =>
   midis.map((m) => ({ midi: m, weight }));
@@ -196,9 +197,16 @@ describe('STATION 3c — stable clef policy', () => {
     expect(d.perBar.every((c) => c.sign === 'G')).toBe(true);
   });
 
-  it('a part that spans both flags the grand staff', () => {
+  it('a part that spans both gets the STACKED PAIR, not a flag for the emitters to discard', () => {
     const d = chooseClefs([[28, 31, 33], [28, 31, 33], [72, 76, 79], [72, 76, 79]], 'bass6');
     expect(d.grandStaff).toBe(true);
+    // The pair IS the layout: treble over bass, decided here and printed by both emitters.
+    // `grandStaff` used to be advisory — alphatab.ts and musicxml.ts each threw it away unless
+    // the part had no strings, and a bass6 spanning E1 to G5 got one bass staff full of ledger
+    // lines. It is now the thing that makes two staves exist.
+    expect(d.pair?.map((clef) => `${clef.sign}${clef.line}`)).toEqual(['G2', 'F4']);
+    // perBar remains the SINGLE-STAFF fallback and stays stable: a grand staff is never
+    // permission to flip the clef every few bars.
     expect(d.perBar.every((c) => c.sign === 'F')).toBe(true);
   });
 
@@ -218,10 +226,51 @@ describe('STATION 3c — stable clef policy', () => {
   });
 
   it('forced clef modes stay fixed and Grand requests a real stacked layout', () => {
-    expect(chooseClefs([[40], [76]], 'staff', 'treble').perBar.every((clef) => clef.sign === 'G')).toBe(true);
+    const treble = chooseClefs([[40], [76]], 'staff', 'treble');
+    expect(treble.perBar.every((clef) => clef.sign === 'G')).toBe(true);
     expect(chooseClefs([[76], [80]], 'staff', 'bass').perBar.every((clef) => clef.sign === 'F')).toBe(true);
+    // A forced single clef never asks for the pair, however wide the part is.
+    expect(treble.pair).toBeUndefined();
+    // 'grand' produces the pair outright instead of falling through to the median-based
+    // single-clef choice, which is what it used to do.
     const grand = chooseClefs([[60], [64]], 'staff', 'grand');
     expect(grand.grandStaff).toBe(true);
+    expect(grand.pair?.map((clef) => `${clef.sign}${clef.line}`)).toEqual(['G2', 'F4']);
     expect(new Set(grand.perBar.map((clef) => clef.sign)).size).toBe(1);
+  });
+});
+
+describe('STATION 3c — the grand-staff split (one rule, both emitters)', () => {
+  const note = (midi: number, sourceStaffIndex?: number): IRNote => ({
+    id: `n${midi}`,
+    midi,
+    step: 'C',
+    alter: 0,
+    octave: 4,
+    tieStart: false,
+    tieStop: false,
+    ...(sourceStaffIndex !== undefined ? { sourceStaffIndex } : {})
+  });
+
+  it('splits at middle C on SOUNDING pitch, upper staff first', () => {
+    const notes = [note(59), note(60), note(28), note(96)];
+    const staffOf = grandStaffSplitter(notes);
+    expect(notes.map(staffOf)).toEqual([1, 0, 1, 0]);
+  });
+
+  it('an imported two-staff source outranks the pitch rule, in both directions', () => {
+    // The engraver put the LOW note in the right hand and the HIGH note in the left. Pitch would
+    // say the opposite; the source is authoritative.
+    const notes = [note(43, 0), note(67, 1)];
+    const staffOf = grandStaffSplitter(notes);
+    expect(notes.map(staffOf)).toEqual([0, 1]);
+  });
+
+  it('falls back to pitch unless the source declared exactly two staves', () => {
+    for (const sources of [[0], [0, 1, 2]]) {
+      const notes = sources.map((index, i) => note(i === 0 ? 40 : 72, index));
+      const staffOf = grandStaffSplitter(notes);
+      expect(notes.map(staffOf), `source staves ${sources.join()}`).toEqual(notes.map((n) => (n.midi >= 60 ? 0 : 1)));
+    }
   });
 });

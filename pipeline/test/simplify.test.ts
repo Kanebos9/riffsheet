@@ -74,9 +74,9 @@ describe('STATION 2b — end to end on the shape that produced the complaint', (
     // 16 notes, each written at the length it sounded: a sixteenth, not a lengthened eighth.
     // (The last is the one note the fixture plays longer, so it is a genuine eighth.)
     expect(written.filter((g) => g.startsWith('N'))).toHaveLength(16);
-    expect(written.filter((g) => g === 'N3')).toHaveLength(15);
+    expect(written.filter((g) => g === 'N6')).toHaveLength(15);
     // ...and the silence between them is on the page rather than swallowed.
-    expect(written.filter((g) => g === 'R3')).toHaveLength(15);
+    expect(written.filter((g) => g === 'R6')).toHaveLength(15);
   });
 
   it('the deleted flag cannot switch the behaviour back on', () => {

@@ -29,6 +29,13 @@ import { buildAlphaTabScore, soundingMidi, type ScoreIndex } from '../score/from
 import { midiToName, accidentalsForKey, type Accidentals } from '../score/notes';
 import { assignFret } from '../score/tuning';
 import { stringLettersFromBounds, tuningLowToHighFromScore } from './stringLetters';
+import {
+  soleStaveKind,
+  staveKindsFromBars,
+  staveKindsFromStaves,
+  tabStaveIndex,
+  type StaveKind
+} from './staveKinds';
 import { t, TIPS } from '../ui/tips';
 import type { RiffScore } from '../pipeline';
 
@@ -539,10 +546,12 @@ export class TriView {
         if (split) hasStaffTabSplit = true;
         const namesY = this.namesYFor(barBoundsList, system);
 
-        // Octave-folded tab positions get a marker on the TAB stave's own glyph, which is
-        // why this reads barBoundsList[1] rather than the notation stave used below.
-        if (split && this.tabShifts.size > 0) {
-          for (const tabBeat of barBoundsList[1].beats) {
+        // Octave-folded tab positions get a marker on the TAB stave's own glyph. Which stave
+        // that is comes from `tabStaveIndex`, not from the number 1: on a grand staff with a
+        // tab the tab is the THIRD rendered stave, and index 1 is the bass clef.
+        const tabIndex = tabStaveIndex(staveKindsFromBars(barBoundsList));
+        if (tabIndex >= 0 && this.tabShifts.size > 0) {
+          for (const tabBeat of barBoundsList[tabIndex].beats) {
             for (const nb of tabBeat.notes ?? []) {
               const id = this.index.noteToInfo.get(nb.note)?.id;
               const shift = id ? this.tabShifts.get(id) : undefined;
@@ -653,21 +662,43 @@ export class TriView {
   }
 
   /**
+   * The two staves the names row sits between: the tab and whatever is directly above it,
+   * or — when there is no tab at all — the top two staves of a grand pair.
+   *
+   * Split out of `nameBand` so `layoutProbe` reports the measurement for the SAME pair the row
+   * was actually placed against. They read `barBoundsList[0]` and `[1]` separately once, and a
+   * three-stave score made them describe two different gaps.
+   */
+  private bandStaves(
+    barBoundsList: alphaTab.rendering.BarBounds[]
+  ): { upper: alphaTab.rendering.Bounds; lower: alphaTab.rendering.Bounds; lowerIsTab: boolean } | null {
+    if (barBoundsList.length < 2) return null;
+    const tabIndex = tabStaveIndex(staveKindsFromBars(barBoundsList));
+    const lowerIndex = tabIndex > 0 ? tabIndex : 1;
+    return {
+      upper: barBoundsList[lowerIndex - 1].visualBounds,
+      lower: barBoundsList[lowerIndex].visualBounds,
+      lowerIsTab: tabIndex > 0
+    };
+  }
+
+  /**
    * The clear band between the staff and the tab that the names row may use.
    *
    * NOT simply `staff.bottom .. tab.top`: tab fret digits are centred on the top tab line,
    * so `tab.y` is the middle of the topmost digit and the label has to stop TAB_DIGIT_RISE
-   * short of it. Getting that wrong is what put the row on top of the tab.
+   * short of it. Getting that wrong is what put the row on top of the tab. A NOTATION stave
+   * below (the bass half of a grand pair) has no fret digits hanging above its top line, so it
+   * only needs the ordinary clearance.
    */
   private nameBand(
     barBoundsList: alphaTab.rendering.BarBounds[]
   ): { top: number; bottom: number } | null {
-    if (barBoundsList.length < 2) return null;
-    const staff = barBoundsList[0].visualBounds;
-    const tab = barBoundsList[1].visualBounds;
+    const pair = this.bandStaves(barBoundsList);
+    if (!pair) return null;
     return {
-      top: staff.y + staff.h + STAFF_CLEARANCE,
-      bottom: tab.y - TAB_DIGIT_RISE
+      top: pair.upper.y + pair.upper.h + STAFF_CLEARANCE,
+      bottom: pair.lower.y - (pair.lowerIsTab ? TAB_DIGIT_RISE : STAFF_CLEARANCE)
     };
   }
 
@@ -731,11 +762,13 @@ export class TriView {
     for (const system of lookup.staffSystems) {
       for (const masterBar of system.bars) {
         const bars = masterBar.bars ?? [];
+        const pair = this.bandStaves(bars);
         const b = this.nameBand(bars);
-        if (!b) continue;
+        if (!pair || !b) continue;
         band = b;
-        staffBottom = bars[0].visualBounds.y + bars[0].visualBounds.h;
-        tabTop = bars[1].visualBounds.y;
+        // The SAME pair the row was placed against — see `bandStaves`.
+        staffBottom = pair.upper.y + pair.upper.h;
+        tabTop = pair.lower.y;
         break;
       }
       if (band) break;
@@ -1733,27 +1766,37 @@ export class TriView {
    *
    * Nearest staff centre rather than a boundary line, because a note with ledger lines
    * sits well outside its own staff box and must still belong to it.
+   *
+   * WHICH STAVE IS WHICH IS DERIVED, NOT COUNTED. This used to read "two BarBounds means
+   * notation at 0 and tab at 1", which is true of exactly one of the three shapes the app
+   * now engraves. On a GRAND STAFF the lower stave is a second notation stave, and the
+   * positional rule called it tablature — so clicking a bass-clef notehead started a STRING
+   * drag on a staff that has no strings, and the drag was then refused for a reason that made
+   * no sense on screen. `staveKindsFromBars` asks the staves themselves; see view/staveKinds.ts.
    */
   private staffAtY(y: number): StaffKind | null {
     const lookup = this.api.renderer.boundsLookup;
-    if (!lookup) return null;
-    for (const system of lookup.staffSystems) {
+    for (const system of lookup?.staffSystems ?? []) {
       for (const masterBar of system.bars) {
         const bars = masterBar.bars ?? [];
-        if (bars.length < 2) continue;
-        const a = bars[0].visualBounds;
-        const b = bars[1].visualBounds;
-        const toNotation = Math.abs(y - (a.y + a.h / 2));
-        const toTab = Math.abs(y - (b.y + b.h / 2));
-        return toNotation <= toTab ? 'notation' : 'tab';
+        if (bars.length === 0) continue;
+        const kinds = staveKindsFromBars(bars);
+        let best: StaveKind = 'other';
+        let bestDist = Number.POSITIVE_INFINITY;
+        for (let i = 0; i < bars.length; i++) {
+          const v = bars[i].visualBounds;
+          const d = Math.abs(y - (v.y + v.h / 2));
+          if (d < bestDist) {
+            bestDist = d;
+            best = kinds[i] ?? 'other';
+          }
+        }
+        return best === 'other' ? null : best;
       }
     }
-    // One stave only: whichever one it is showing.
-    const staff = this.builtModel?.tracks[0]?.staves[0];
-    if (!staff) return null;
-    if (staff.showStandardNotation && !staff.showTablature) return 'notation';
-    if (staff.showTablature && !staff.showStandardNotation) return 'tab';
-    return null;
+    // Nothing engraved yet. The model can still answer when every rendered stave is the same
+    // kind; when they are not, WHICH one is a question about geometry we do not have.
+    return soleStaveKind(staveKindsFromStaves(this.builtModel?.tracks[0]?.staves ?? []));
   }
 
   /** Screen coordinates -> the note under them, resolved to our stable id. */

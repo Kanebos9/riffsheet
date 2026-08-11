@@ -30,12 +30,16 @@ export interface Glyph {
 }
 
 /**
- * The printable vocabulary at divisions=12 per quarter.
+ * The printable vocabulary at divisions=24 per quarter, LONGEST FIRST.
  *
- * Single dots only (`maxDots = 1`, §1.4). A dotted 16th (4.5 ticks) and a 32nd (1.5 ticks)
- * are not representable at this resolution and are therefore not in the vocabulary — which is
- * exactly the intended cap: FiloBass's 46,281 human glyphs contain 0.009% 32nds and zero 32nd
- * rests (§0.1).
+ * Single dots only (`maxDots = 1`, §1.4). The bottom two entries are new at divisions=24:
+ * a dotted 16th (9 ticks) and a 32nd (3 ticks) were 4.5 and 1.5 ticks at the old resolution,
+ * so neither was representable and neither could be in the vocabulary. FiloBass's 46,281 human
+ * glyphs contain only 0.009% 32nds and ZERO 32nd rests (§0.1), so this is not a licence to
+ * print them freely — `MIN_REST` still keeps every rest at an eighth or longer, and the
+ * quantizer only offers a 1/32 lattice when the caller asks for `grid: 'thirtysecond'`.
+ * What changed is that a 32nd is now sayable at all, instead of being rounded into a glyph
+ * whose printed <type> disagreed with its own <duration>.
  */
 export const VOCABULARY: Glyph[] = [
   { len: R(1, 1), type: 'whole', dots: 0 },
@@ -45,7 +49,9 @@ export const VOCABULARY: Glyph[] = [
   { len: R(1, 4), type: 'quarter', dots: 0 },
   { len: R(3, 16), type: 'eighth', dots: 1 },
   { len: R(1, 8), type: 'eighth', dots: 0 },
-  { len: R(1, 16), type: '16th', dots: 0 }
+  { len: R(3, 32), type: '16th', dots: 1 },
+  { len: R(1, 16), type: '16th', dots: 0 },
+  { len: R(1, 32), type: '32nd', dots: 0 }
 ];
 
 export function glyphFor(len: Rational): Glyph | null {
@@ -251,6 +257,26 @@ function hardSplitOverride(m: BarMetric, s: Rational, e: Rational, kind: Duratio
     if (len.eq(twoThirdsBeat) && offsetInBeat.eq(m.beatLen.scale(1, 3))) return true;
   }
   return false;
+}
+
+/**
+ * SIMPLEST SYMBOL COMBINATION for a span — `grid: 'free'`'s engraving rule (issue #36).
+ *
+ * `toDurationList` answers a different question: "where must this span be cut so the reader can
+ * still see the beat?". That is the right question for metrical music and the wrong one for a
+ * free view, where the whole promise is that the page shows what was played and nothing more.
+ * Asking the metric rulebook for a free span produced maximal-precision tie chains — a quarter
+ * tied to a leftover fragment, over and over — which reads as a restruck note to anyone who is
+ * not counting tie arcs.
+ *
+ * So free asks for the FEWEST GLYPHS that add up exactly, longest-first inside a tie. The span
+ * is already a multiple of a 1/32 (the quantizer guarantees it), so an exact answer always
+ * exists and no glyph ever has to lie about its length.
+ */
+export function simplestDurationList(len: Rational): Rational[] {
+  if (!len.isPositive()) return [];
+  if (glyphFor(len)) return [len];
+  return greedyDecompose(len);
 }
 
 /**

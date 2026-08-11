@@ -15,19 +15,33 @@
  *  - tuplet admission strictly harder than the DP objective.
  *
  * What changed, and why:
- *  - the state set is now straight-8, straight-16 and eighth-triplet ONLY. §6.4 of
- *    midi-semantics-research.md: 3-plets only in v1, confined to a single beat, and never
- *    5/7/9-plets ("a bass riff essentially never contains a genuine septuplet, but sloppy
- *    playing produces septuplet-shaped evidence constantly").
+ *  - the state set is now straight-8, straight-16, straight-32 (opt-in only) and
+ *    eighth-triplet. §6.4 of midi-semantics-research.md: 3-plets only in v1, confined to a
+ *    single beat, and never 5/7/9-plets ("a bass riff essentially never contains a genuine
+ *    septuplet, but sloppy playing produces septuplet-shaped evidence constantly").
  *  - tuplet admission gained §6.4's two extra gates: FULL COVERAGE (all three positions
  *    occupied — "this single rule kills most false triplets") and a 25% relative error margin
  *    ("a triplet must beat the straight reading, not tie it").
  *  - THE DURATION HALF IS GONE. `quantizeStraightDuration` — the 78%-rule that generated the
  *    spurious rests (§0.3, §4.2) — is deleted. Off-times now snap on the SAME grid as their
  *    onset (spec rule R4) and the decision about what to print belongs to simplify.ts.
+ *  - AND "THE SAME GRID" MEANS IT (issue #31). The off-time used to keep a private halving
+ *    ladder for notes shorter than the grid, which put attacks and releases on different
+ *    lattices and printed eighth-note flags under a quarter-note grid. There is no escape
+ *    hatch left: a grid is a ceiling on what the page may say, in both directions.
  */
 
 import type { GridSetting } from './types.js';
+import { THIRTYSECOND_TICKS } from './ir.js';
+
+/**
+ * `'exact'` is INTERNAL and never reachable from `BuildSettings.grid`. It is the symbolic-import
+ * path: a MusicXML/MIDI source already carries written ticks, so there is nothing to decide and
+ * the numbers are converted verbatim. It used to share the `'free'` arm, which is why free could
+ * not be given honest notation semantics until the two were separated — a symbolic eighth-triplet
+ * is 8 ticks, not a multiple of a 1/32, and snapping it would corrupt an exact import.
+ */
+export type QuantGrid = GridSetting | 'exact';
 
 export interface QuantNote {
   id: string;
@@ -77,7 +91,7 @@ interface RhythmState {
  * transcribers from 59% to 4% (Cemgil, measured). Three independent systems converge on the
  * same ordering of division classes: 1 < 2 < 4 < 3 < 6 < 5 < 8.
  */
-const COMPLEXITY: Record<number, number> = { 1: 0, 2: 0.05, 4: 0.1, 3: 1.0, 6: 1.2 };
+const COMPLEXITY: Record<number, number> = { 1: 0, 2: 0.05, 4: 0.1, 3: 1.0, 6: 1.2, 8: 1.5, 12: 1.7 };
 const STATE_CHANGE_COST = 0.5;
 const TUPLET_START_COST = 1;
 const TREND_MIN_SUPPORT = 4;
@@ -107,7 +121,7 @@ function median(values: number[]): number {
  * beat and are out of scope for v1. They emerge as tied eighth-triplets, which is correct
  * arithmetic and slightly verbose notation.
  */
-function statesFor(grid: GridSetting, ticksPerBeat: number, compound: boolean): RhythmState[] {
+function statesFor(grid: QuantGrid, ticksPerBeat: number, compound: boolean): RhythmState[] {
   const out: RhythmState[] = [];
   const add = (name: string, division: number, tuplet: boolean): void => {
     const g = ticksPerBeat / division;
@@ -122,16 +136,23 @@ function statesFor(grid: GridSetting, ticksPerBeat: number, compound: boolean): 
       complexity: COMPLEXITY[division] ?? 2
     });
   };
-  // A compound beat is a dotted value: its natural divisions are 3 and 6, not 2 and 4.
+  const fine = grid === '1/16' || grid === 'thirtysecond';
+  // A compound beat is a dotted value: its natural divisions are 3 and 6, not 2 and 4, and a
+  // 1/32 inside a dotted quarter is a TWELFTH of the beat.
   if (compound) {
     add('beat', 1, false);
     if (grid !== '1/4') add('compound-8', 3, false);
-    if (grid === 'auto' || grid === '1/16') add('compound-16', 6, false);
+    if (grid === 'auto' || fine) add('compound-16', 6, false);
+    if (grid === 'thirtysecond') add('compound-32', 12, false);
     return out;
   }
   add('beat', 1, false);
   if (grid !== '1/4' && grid !== '1/8T') add('straight-8', 2, false);
-  if (grid === 'auto' || grid === '1/16') add('straight-16', 4, false);
+  if (grid === 'auto' || fine) add('straight-16', 4, false);
+  // 1/32 IS OPT-IN, never offered by 'auto'. FiloBass's 46,281 human glyphs are 0.009% 32nds
+  // (§0.1); handing the Viterbi a 1/32 lattice by default buys nothing and gives sloppy playing
+  // somewhere finer to hide. The caller has to ask for it by name.
+  if (grid === 'thirtysecond') add('straight-32', 8, false);
   if (grid === 'auto' || grid === '1/8T') add('triplet-8', 3, true);
   if (grid === 'auto') add('triplet-16', 6, true);
   return out;
@@ -208,41 +229,80 @@ function transitionCost(prev: RhythmState, next: RhythmState, adjacent: boolean)
   return cost;
 }
 
+/**
+ * HONEST FREE (issue #36). `grid: 'free'` is not a looser quantizer, it is a READ-ONLY VIEW of
+ * the input: never merge, never drop, never fill, never reorder — exactly one attack group on
+ * the page per input event, in the order they were played.
+ *
+ * It still lands on a lattice, and that is not a contradiction. The old free path rounded to the
+ * raw tick lattice, which at any `divisions` is finer than the printable vocabulary, so spans
+ * like "1 tick" reached the engraver and were printed as a 16th — a glyph whose <type> flatly
+ * contradicted its own <duration>. Notation cannot say anything finer than a 1/32, so THAT is
+ * free's resolution limit and the rounding error is bounded by half a 1/32 at the take's tempo.
+ * Inside that tolerance the engraver is then free to pick the SIMPLEST symbol combination rather
+ * than the most precise one.
+ *
+ * COLLISIONS ARE PUSHED, NOT FUSED. Two events that round onto the same slot are distinct
+ * attacks that the player actually played; the quantized path may fuse them, free may not. The
+ * later one moves to the next free slot, which costs it one 1/32 of position and keeps the
+ * one-attack-per-note contract and the play order intact.
+ */
+function quantizeFree(notes: QuantNote[]): QuantResult {
+  const unit = THIRTYSECOND_TICKS;
+  const ordered = notes
+    .map((n, i) => ({ n, i }))
+    .sort((a, b) => a.n.rawStartTick - b.n.rawStartTick || a.i - b.i);
+
+  const out: QuantResult['notes'] = [];
+  let occupied = -Infinity;
+  for (const { n } of ordered) {
+    let startTick = Math.round(n.rawStartTick / unit) * unit;
+    if (startTick <= occupied) startTick = occupied + unit;
+    occupied = startTick;
+    const rawDur = Math.max(0, n.rawOffTick - n.rawStartTick);
+    const units = Math.max(1, Math.round(rawDur / unit));
+    out.push({ id: n.id, startTick, offTick: startTick + units * unit });
+  }
+  return { notes: out, tuplets: [], basicQuantTicks: unit, jitterTicks: 0 };
+}
+
+/**
+ * The symbolic-import path. The source already decided every written tick, so positions are
+ * only rounded onto the integer lattice and coincident events are fused (two events sharing a
+ * startTick corrupts the bar cursor downstream).
+ */
+function quantizeExact(notes: QuantNote[]): QuantResult {
+  const rounded = notes
+    .map((n) => ({
+      id: n.id,
+      startTick: Math.round(n.rawStartTick),
+      offTick: Math.max(Math.round(n.rawStartTick) + 1, Math.round(n.rawOffTick))
+    }))
+    .sort((a, b) => a.startTick - b.startTick);
+  const fused: QuantResult['notes'] = [];
+  for (const n of rounded) {
+    const prev = fused[fused.length - 1];
+    if (prev && prev.startTick === n.startTick) {
+      prev.offTick = Math.max(prev.offTick, n.offTick);
+      continue;
+    }
+    fused.push(n);
+  }
+  return { notes: fused, tuplets: [], basicQuantTicks: 1, jitterTicks: 0 };
+}
+
 export function quantizeOnsets(
   notes: QuantNote[],
-  opts: { grid: GridSetting; ticksPerBeat: number; compound: boolean; totalTicks: number }
+  opts: { grid: QuantGrid; ticksPerBeat: number; compound: boolean; totalTicks: number }
 ): QuantResult {
+  if (opts.grid === 'free') return quantizeFree(notes);
+  if (opts.grid === 'exact' || !notes.length) return quantizeExact(notes);
+
   const states = statesFor(opts.grid, opts.ticksPerBeat, opts.compound);
   const straight = states.filter((s) => !s.tuplet);
   // `basicQuant`: the finest STRAIGHT subdivision actually on offer, and therefore the step
-  // an off-time is allowed to snap to.
+  // BOTH an onset and its off-time snap to.
   const finestStraight = Math.min(...straight.map((s) => s.grid));
-
-  if (opts.grid === 'free' || !notes.length) {
-    // 'free': notated = played. Positions are only rounded to the tick lattice, because
-    // MusicXML has no sub-division resolution — no musical grid is imposed at all.
-    //
-    // Rounding to the lattice can still collide two distinct onsets onto one tick, and two
-    // events sharing a startTick corrupts the bar cursor downstream. Fuse them here, exactly as
-    // the quantized path does.
-    const rounded = notes
-      .map((n) => ({
-        id: n.id,
-        startTick: Math.round(n.rawStartTick),
-        offTick: Math.max(Math.round(n.rawStartTick) + 1, Math.round(n.rawOffTick))
-      }))
-      .sort((a, b) => a.startTick - b.startTick);
-    const fused: QuantResult['notes'] = [];
-    for (const n of rounded) {
-      const prev = fused[fused.length - 1];
-      if (prev && prev.startTick === n.startTick) {
-        prev.offTick = Math.max(prev.offTick, n.offTick);
-        continue;
-      }
-      fused.push(n);
-    }
-    return { notes: fused, tuplets: [], basicQuantTicks: 1, jitterTicks: 0 };
-  }
 
   // ---- beat windows -------------------------------------------------------------------------
   const byBeat = new Map<number, QuantNote[]>();
@@ -361,16 +421,25 @@ export function quantizeOnsets(
     // position evidence alone; it is a straight note at the next beat.
     const group = candidate && startTick < candidate.endTick ? candidate : undefined;
 
-    // SPEC RULE R4: the off-time snaps on the SAME grid as its onset, never independently.
-    let offTick: number;
-    if (group) {
-      const units = Math.max(1, Math.round(rawDur / unit));
-      offTick = Math.min(group.endTick, startTick + units * unit);
-    } else {
-      const q = durationQuant(rawDur, finestStraight);
-      offTick = startTick + Math.max(q, Math.round(rawDur / q) * q);
-    }
-    if (offTick <= startTick) offTick = startTick + (group ? unit : finestStraight);
+    // SPEC RULE R4: the off-time snaps on the SAME grid as its onset, never independently —
+    // and "the same grid" means the same grid, with no finer escape hatch for short notes.
+    //
+    // This used to fall back to a halving ladder (`durationQuant`) so that a clipped note could
+    // keep a sub-grid length. That was issue #31: at `grid: '1/4'` an onset landed on the beat
+    // while its off-time landed on a 1/8 or finer step, so a take of repeated strikes came back
+    // as a row of eighth-note flags under a quarter-note grid — never a half note, never a tie.
+    // A grid is a contract about what the page is allowed to say. If the caller asked for
+    // quarters, the shortest thing the page can say is a quarter.
+    //
+    // The step is `finestStraight`, NOT this beat's decoded `state.grid`. The onset grid is
+    // decided per beat and can be as coarse as the beat itself; charging a note the whole beat
+    // because its neighbours happened to decode coarsely would invent sustain, which is the one
+    // thing simplify.ts exists to prevent. Inside a tuplet the step is the tuplet's own unit.
+    const durUnit = group ? unit : finestStraight;
+    const units = Math.max(1, Math.round(rawDur / durUnit));
+    let offTick = startTick + units * durUnit;
+    if (group) offTick = Math.min(group.endTick, offTick);
+    if (offTick <= startTick) offTick = startTick + durUnit;
     out.push({
       id: n.id,
       startTick,
@@ -383,14 +452,27 @@ export function quantizeOnsets(
 
   // Collisions after snapping: MuseScore charges a merge penalty and fuses them; here they are
   // already-separate chord events that landed on the same grid point, so fuse them too.
+  //
+  // MERGE PITCH PICK (issue #31 invariant e). A merged slot can only sound one thing, and which
+  // one is a real decision — the surviving `id` is what buildScore maps back to a chord, so it
+  // picks the PITCHES as well as the identity. Keeping the first arrival lets a 20 ms grace note
+  // silence the half note it leads into. The winner is therefore the event with the most
+  // duration-weighted evidence, measured on the RAW length before any snapping rounded the
+  // difference away; the earlier arrival keeps the slot on a tie.
+  const rawDurById = new Map(notes.map((n) => [n.id, Math.max(0, n.rawOffTick - n.rawStartTick)]));
   const deduped: QuantResult['notes'] = [];
   for (const n of out) {
     const prev = deduped[deduped.length - 1];
     if (prev && prev.startTick === n.startTick) {
       prev.offTick = Math.max(prev.offTick, n.offTick);
+      if ((rawDurById.get(n.id) ?? 0) > (rawDurById.get(prev.id) ?? 0)) {
+        prev.id = n.id;
+        if (n.tupletId === undefined) delete prev.tupletId;
+        else prev.tupletId = n.tupletId;
+      }
       continue;
     }
-    deduped.push(n);
+    deduped.push({ ...n });
   }
 
   return {
@@ -399,16 +481,4 @@ export function quantizeOnsets(
     basicQuantTicks: finestStraight,
     jitterTicks: jitter
   };
-}
-
-/**
- * The off-time's own grid, derived from the onset grid — NOT from a duration ladder.
- * A note shorter than the onset grid may still use a finer step — otherwise a staccato
- * sixteenth would round up to the grid and gain sustain it never had — but a note longer than
- * the grid never gets a finer one. This is the fix for §4.2.
- */
-function durationQuant(rawDur: number, finestStraight: number): number {
-  let q = finestStraight;
-  while (q > rawDur && q > 1) q = Math.max(1, Math.floor(q / 2));
-  return Math.max(1, q);
 }

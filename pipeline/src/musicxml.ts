@@ -19,14 +19,20 @@
  * bug. Every reader handles the plain form identically. `assertNoOctaveTrap` below is a
  * standing guard against it coming back.
  *
- * Divisions is 12 (see ir.ts). Assertions G.4 (measure cursor) and G.5 (tuplet balance) run on
+ * Divisions is 24 (see ir.ts). Assertions G.4 (measure cursor) and G.5 (tuplet balance) run on
  * every emit and throw — a schema-valid file with a wrong <backup> renders silently wrong, and
  * that is exactly the failure the research says to catch with an assertion.
+ *
+ * STAFF COUNT IS NOT FIXED AT TWO. A part is a stack of layers — one to three of them — and the
+ * measure body is written by walking that stack: emit a layer, assert it landed on the barline,
+ * back up by what it advanced, emit the next. Notation staves come first and the TAB staff last,
+ * so `<staves>` is 1 (plain), 2 (notation + tab, or a grand staff) or 3 (grand staff + tab).
  */
 
 import type { IRBar, IRBeat, IRNote, RiffsheetIR } from './ir.js';
 import { musicXmlStringFromIrString, staffTuningLineFromIrString } from './tab.js';
 import { tpcToStep } from './spelling.js';
+import { grandClefPair } from './clef.js';
 
 const esc = (s: string): string =>
   s
@@ -38,7 +44,11 @@ const esc = (s: string): string =>
     .replace(/"/g, '&quot;');
 
 export interface MusicXmlOptions {
-  /** 'two-staves' emits notation + tab; 'omit' emits the notation staff only. */
+  /**
+   * 'two-staves' (the default) adds a tablature staff below the notation when the part has
+   * strings; 'omit' emits notation only. The name is historical: with a grand staff the notation
+   * is already two staves and the tab makes a third.
+   */
   tab?: 'two-staves' | 'omit';
   partName?: string;
   /** General MIDI program - 1. 33 = Electric Bass (finger). */
@@ -112,16 +122,31 @@ export function toMusicXML(ir: RiffsheetIR, options: MusicXmlOptions = {}): stri
     : options.octaveTransposition === 'none'
       ? 0
       : ir.displayPitchOffset ?? 0;
-  const useGrand = ir.grandStaff && !useTab && isStaffOnly;
-  const sourceStaffIndexes = [...new Set(ir.bars.flatMap((bar) =>
-    bar.voices.flatMap((voice) => voice.beats.flatMap((beat) => beat.notes
-      .map((note) => note.sourceStaffIndex)
-      .filter((index): index is number => index !== undefined)))
-  ))].sort((a, b) => a - b);
-  const sourceGrand = sourceStaffIndexes.length === 2;
-  const upper = (note: IRNote): boolean => sourceGrand
-    ? note.sourceStaffIndex === sourceStaffIndexes[0]
-    : note.midi >= 60;
+  // A grand staff no longer cancels itself when the part has strings: the notation is two staves
+  // and the tab, when asked for, is a THIRD. `<staves>` counts them; nothing below assumes 2.
+  const useGrand = ir.grandStaff;
+  const grandClefs = ir.grandStaffClefs ?? grandClefPair();
+  /** Staff numbers are 1-based and printed top to bottom: notation staves first, TAB last. */
+  const notationStaves = useGrand ? 2 : 1;
+  const tabStaff = notationStaves + 1;
+  const staffCount = notationStaves + (useTab ? 1 : 0);
+  // The split lives in the IR (clef.ts `grandStaffSplitter`) so this emitter and alphatab.ts can
+  // no longer disagree about which staff a note belongs to.
+  const onStaff = (index: 0 | 1) => (note: IRNote): boolean => (note.staffIndex ?? 0) === index;
+  /** One standard-notation layer. `staff` is omitted entirely on a one-staff part, as before. */
+  const notationLayer = (voice: number, staff?: number): EmitOptions => ({
+    voice,
+    staff,
+    isTab: false,
+    // string/fret ride on the tab staff when there is one; without it they stay on the notation
+    // note, which is the only place left for a reader to find them.
+    withTechnical: !useTab,
+    withBeams: true,
+    withTuplets: true,
+    divisions: ir.divisions,
+    octaveShift: writtenShift,
+    stringCount: ir.instrument.stringCount
+  });
 
   const L: string[] = [];
   L.push('<?xml version="1.0" encoding="UTF-8" standalone="no"?>');
@@ -169,10 +194,11 @@ export function toMusicXML(ir: RiffsheetIR, options: MusicXmlOptions = {}): stri
         L.push(`        <time><beats>${bar.timeSig[0]}</beats><beat-type>${bar.timeSig[1]}</beat-type></time>`);
         lastTimeSig = timeKey;
       }
-      if (bi === 0 && (useTab || useGrand)) L.push('        <staves>2</staves>');
+      if (bi === 0 && staffCount > 1) L.push(`        <staves>${staffCount}</staves>`);
       if (useGrand && bi === 0) {
-        L.push('        <clef number="1"><sign>G</sign><line>2</line></clef>');
-        L.push('        <clef number="2"><sign>F</sign><line>4</line></clef>');
+        grandClefs.forEach((clef, i) =>
+          L.push(`        <clef number="${i + 1}"><sign>${clef.sign}</sign><line>${clef.line}</line></clef>`)
+        );
         lastClef = clefKey;
       } else if (needClef || bi === 0) {
         // Plain clef. No <clef-octave-change>: sounding pitches, §8.3.
@@ -181,8 +207,8 @@ export function toMusicXML(ir: RiffsheetIR, options: MusicXmlOptions = {}): stri
       }
       if (bi === 0 && useTab) {
         const n = ir.instrument.stringCount;
-        L.push(`        <clef number="2"><sign>TAB</sign><line>${n}</line></clef>`);
-        L.push('        <staff-details number="2" show-frets="numbers">');
+        L.push(`        <clef number="${tabStaff}"><sign>TAB</sign><line>${n}</line></clef>`);
+        L.push(`        <staff-details number="${tabStaff}" show-frets="numbers">`);
         // 'alternate' = the same music shown twice (notation + tab); stops conforming
         // importers playing it back twice.
         L.push('          <staff-type>alternate</staff-type>');
@@ -230,48 +256,51 @@ export function toMusicXML(ir: RiffsheetIR, options: MusicXmlOptions = {}): stri
     }
 
     const voice = bar.voices[0] ?? { id: 1, beats: [] };
-    const upperBeats = useGrand ? projectedBeats(voice.beats, upper) : voice.beats;
-    const advanced = emitBeats(L, upperBeats, {
-      voice: 1,
-      staff: useTab || useGrand ? 1 : undefined,
-      withTechnical: !useTab && !useGrand,
-      withBeams: true,
-      withTuplets: true,
-      divisions: ir.divisions,
-      octaveShift: writtenShift,
-      stringCount: ir.instrument.stringCount
-    });
 
-    assertMeasureLength(advanced, bar);
-
-    if (useGrand && advanced > 0) {
-      L.push(`      <backup><duration>${advanced}</duration></backup>`);
-      const lowerAdvanced = emitBeats(L, projectedBeats(voice.beats, (note) => !upper(note)), {
-        voice: 2,
-        staff: 2,
-        withTechnical: false,
-        withBeams: true,
-        withTuplets: true,
-        divisions: ir.divisions,
-        octaveShift: writtenShift,
-        stringCount: 0
-      });
-      assertMeasureLength(lowerAdvanced, bar);
-    } else if (useTab && advanced > 0) {
-      L.push(`      <backup><duration>${advanced}</duration></backup>`);
-      emitBeats(L, voice.beats, {
-        voice: 5,
-        staff: 2,
-        withTechnical: true,
-        // <tuplet> notations duplicated onto the tab staff made VexFlow throw in the old app;
-        // <time-modification> alone keeps the tab durations correct.
-        withBeams: false,
-        withTuplets: false,
-        divisions: ir.divisions,
-        octaveShift: writtenShift,
-        stringCount: ir.instrument.stringCount
+    /**
+     * THE MEASURE IS A STACK OF LAYERS, one per staff, and this list is the whole layout.
+     *
+     * It used to be an if/else hardwired for exactly two staves ("staff 1, then either the lower
+     * grand staff or the tab staff"), which is why grand + tab could not exist: there was no
+     * third arm to write. Voice numbers are pinned per ROLE, not derived from the staff number,
+     * so tab stays voice 5 whether it is staff 2 or staff 3 and existing files are unchanged.
+     */
+    const layers: { beats: IRBeat[]; options: EmitOptions }[] = useGrand
+      ? [
+          { beats: projectedBeats(voice.beats, onStaff(0)), options: notationLayer(1, 1) },
+          { beats: projectedBeats(voice.beats, onStaff(1)), options: notationLayer(2, 2) }
+        ]
+      : [{ beats: voice.beats, options: notationLayer(1, useTab ? 1 : undefined) }];
+    if (useTab) {
+      layers.push({
+        beats: voice.beats,
+        options: {
+          voice: 5,
+          staff: tabStaff,
+          isTab: true,
+          withTechnical: true,
+          // <tuplet> notations duplicated onto the tab staff made VexFlow throw in the old app;
+          // <time-modification> alone keeps the tab durations correct.
+          withBeams: false,
+          withTuplets: false,
+          divisions: ir.divisions,
+          octaveShift: writtenShift,
+          stringCount: ir.instrument.stringCount
+        }
       });
     }
+
+    // THE CURSOR RULE, unchanged in substance and now applied N-1 times: back up by what the
+    // PREVIOUS layer actually advanced, never by a nominal bar length (an unconditional
+    // barTicks backup corrupts short measures — that is the pickup bar). Every layer must land
+    // the cursor on the same barline, and G.4 says so out loud for each of them, because a
+    // wrong <backup> is a schema-valid file that simply renders in the wrong place.
+    let advanced = 0;
+    layers.forEach((layer, index) => {
+      if (index > 0 && advanced > 0) L.push(`      <backup><duration>${advanced}</duration></backup>`);
+      advanced = emitBeats(L, layer.beats, layer.options);
+      assertMeasureLength(advanced, bar);
+    });
 
     assertTupletBalance(voice.beats, bar);
     L.push('    </measure>');
@@ -287,6 +316,13 @@ export function toMusicXML(ir: RiffsheetIR, options: MusicXmlOptions = {}): stri
 interface EmitOptions {
   voice: number;
   staff?: number;
+  /**
+   * Whether this layer IS the tablature staff. It used to be inferred as `staff === 2`, which
+   * was true only while a part could never have more than two staves — on a grand staff + tab
+   * part, staff 2 is the BASS NOTATION staff, and the inference would have hidden its noteheads
+   * and swallowed its accidentals. The layer says what it is instead of being guessed at.
+   */
+  isTab: boolean;
   withTechnical: boolean;
   withBeams: boolean;
   withTuplets: boolean;
@@ -328,9 +364,9 @@ function emitNote(L: string[], beat: IRBeat, n: IRNote, isChordMember: boolean, 
   // A tied TAB continuation carries duration and tie semantics but no second fret attack;
   // hiding just that staff-2 glyph avoids a repeated digit while the notation staff keeps its
   // tie arc. Both variants still emit their tie/tied elements.
-  const suppressTabContinuation = o.staff === 2 && n.tieStop;
+  const suppressTabContinuation = o.isTab && n.tieStop;
   const suppressPrint =
-    o.staff === 2 && (suppressTabContinuation || n.unplayable || n.string === undefined || n.fret === undefined);
+    o.isTab && (suppressTabContinuation || n.unplayable || n.string === undefined || n.fret === undefined);
 
   L.push(`${NOTE_INDENT}<note${suppressPrint ? ' print-object="no"' : ''}>`);
   if (isChordMember) L.push(`${NOTE_INDENT}  <chord/>`); // must precede <pitch> (XSD order)
@@ -341,7 +377,7 @@ function emitNote(L: string[], beat: IRBeat, n: IRNote, isChordMember: boolean, 
   L.push(`${NOTE_INDENT}  <voice>${o.voice}</voice>`);
   // THE UNCONDITIONAL LAW: a pitched <note> always ships a <type>.
   L.push(`${NOTE_INDENT}  <type>${beat.durationType}</type>${'<dot/>'.repeat(beat.dots)}`);
-  if (n.accidentalDisplay && o.staff !== 2) {
+  if (n.accidentalDisplay && !o.isTab) {
     L.push(`${NOTE_INDENT}  <accidental>${n.accidentalDisplay}</accidental>`);
   }
   if (beat.tuplet) {
@@ -359,7 +395,7 @@ function emitNote(L: string[], beat: IRBeat, n: IRNote, isChordMember: boolean, 
   if (n.tieStart) notations.push('<tied type="start"/>');
   if (o.withTuplets && beat.tuplet?.start) notations.push('<tuplet type="start" number="1" bracket="yes"/>');
   if (o.withTuplets && beat.tuplet?.stop) notations.push('<tuplet type="stop" number="1"/>');
-  if (n.staccato && o.staff !== 2) notations.push('<articulations><staccato/></articulations>');
+  if (n.staccato && !o.isTab) notations.push('<articulations><staccato/></articulations>');
   if (o.withTechnical && !suppressTabContinuation && n.string !== undefined && n.fret !== undefined && !n.unplayable) {
     // THE FLIP: the IR counts 1 from the lowest string, MusicXML from the highest (§8.1).
     notations.push(

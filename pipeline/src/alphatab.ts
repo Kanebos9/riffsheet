@@ -23,6 +23,10 @@
 import type { DurationType, IRNote, RiffsheetIR } from './ir.js';
 import { grandClefPair } from './clef.js';
 import { projectStaffBeats } from './beaming.js';
+// The part's NAME is not an emitter's opinion. Both emitters print the same label for the same
+// part, so the derivation lives in one place and this one reads it; it used to hold a second copy
+// of the instrument/tuning string, which is how a screen and a file come to disagree.
+import { abbreviatePartName, defaultPartName } from './musicxml.js';
 
 /** alphaTab `Duration` enum names. */
 export type AlphaTabDuration =
@@ -111,6 +115,17 @@ export interface AlphaTabScoreData {
   masterBars: AlphaTabMasterBarData[];
   tracks: {
     name: string;
+    /**
+     * alphaTab `Track.shortName` — THE LABEL EVERY SYSTEM AFTER THE FIRST PRINTS.
+     *
+     * alphaTab's renderer draws `Track.name` beside the first system of a multi-track score and
+     * `Track.shortName` beside each later one, which is standard practice and the same division of
+     * labour MusicXML's `<part-name>`/`<part-abbreviation>` pair has. It is always populated: an
+     * empty shortName labels system 1 and then leaves the rest of the page anonymous. Consumers
+     * must set it from here rather than truncating `name` themselves — the abbreviation of a
+     * RENAMED part is derived from the new name, which a slice of a stale string cannot know.
+     */
+    shortName: string;
     /** General MIDI program. */
     program: number;
     /**
@@ -164,16 +179,13 @@ export interface AlphaTabScoreData {
   grandStaff: boolean;
 }
 
-function pitchName(midi: number): string {
-  const names = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B'];
-  return `${names[((midi % 12) + 12) % 12]}${Math.floor(midi / 12) - 1}`;
-}
-
 /** One part of a multi-track hand-off, in printed order: index 0 is the TOP track. */
 export interface AlphaTabPart {
   ir: RiffsheetIR;
   /** Track name. Omitted, the instrument/tuning summary is used, as on a single-part score. */
   name?: string;
+  /** `Track.shortName`. Omitted, it is derived from the resolved name — never left empty. */
+  abbreviation?: string;
   /** General MIDI program. Omitted, it follows the instrument. */
   program?: number;
   /** True for an imported part: it is engraved but never played. See `notationOnly` above. */
@@ -371,12 +383,10 @@ function buildTrack(part: AlphaTabPart): AlphaTabScoreData['tracks'][number] {
         }
       ];
 
+  const name = part.name ?? defaultPartName(ir);
   return {
-    name:
-      part.name ??
-      (isStaffOnly
-        ? 'Music'
-        : `${isBass ? 'Bass' : 'Guitar'} — Tuning low → high: ${ir.instrument.tuningMidi.map(pitchName).join(' ')}`),
+    name,
+    shortName: part.abbreviation || abbreviatePartName(name),
     program: part.program ?? (isStaffOnly ? 0 : isBass ? 33 : 27),
     ...(part.notationOnly ? { notationOnly: true } : {}),
     staves

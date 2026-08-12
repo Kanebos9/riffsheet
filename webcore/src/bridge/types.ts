@@ -104,9 +104,26 @@ export interface EngineStatus {
   adopted: boolean;
   /** The weights actually in use, as far as can be known. */
   model: string;
+  /** Where `model` came from ("started by Riffsheet", "unknown", ...). Prose, for showing. */
+  modelSource?: string;
+  /**
+   * The SIZE on the wire, as one word — and ABSENT whenever that is not proved.
+   *
+   * This is the field the engine chip reads to say "MuScriptor small". It is present in
+   * exactly two cases: Riffsheet started the server, so the size is the one it passed to
+   * `--model`; or somebody else started it and the operating system let the shell read that
+   * command line. Everything else leaves it undefined — an adopted server on a machine where
+   * the command line cannot be read, and a `--model` naming a path or an `hf://` URL rather
+   * than a size.
+   *
+   * UNDEFINED MEANS "UNKNOWN SIZE" AND MUST BE DRAWN AS SUCH. Falling back to
+   * `resolvedModel` here would print our own setting as though it described somebody else's
+   * server, which is the one thing this field exists to prevent. See shell/BRIDGE.md.
+   */
+  modelSize?: string;
   /** What we asked for. 'auto' has already been resolved by the time this is reported. */
   configuredModel?: string;
-  /** Which weights are on this machine, e.g. ["small","medium"]. */
+  /** Which weights are on this machine, LIGHTEST FIRST, e.g. ["small","medium"]. */
   installedModels: string[];
   /** True when a transcription is running anywhere on this machine. */
   busy: boolean;
@@ -117,6 +134,32 @@ export interface EngineStatus {
   queuePosition: number;
   ramTotalMb?: number;
   ramFreeMb?: number;
+
+  // --- this machine, not this engine -----------------------------------------------------
+  //
+  // Sent on EVERY engine's payload, beside the two memory figures, so the one system line at
+  // the top of Settings can be drawn from a status the panel already polls. "8 GB" alone said
+  // nothing about how long a transcription would take; the chip in front of it is half that
+  // answer.
+  //
+  // EVERY ONE OF THEM CAN BE UNKNOWN, and unknown must draw as nothing rather than as a
+  // placeholder: `cpuName` is '' when the machine would not say, the two counts are 0, and
+  // `cpuLoad1m` is undefined on Windows, which has no equally cheap figure.
+
+  /** The processor's own name for itself, e.g. "Apple M1". '' when unknown. */
+  cpuName?: string;
+  /** Physical cores. 0 when unknown. */
+  cpuCores?: number;
+  /** Logical processors (hardware threads). 0 when unknown. */
+  cpuThreads?: number;
+  /**
+   * The one-minute load average — the number `uptime` prints, NOT a percentage.
+   *
+   * Deliberately not normalised by the shell: divide by `cpuCores` to get a share of the
+   * machine, and do it in the one place that draws it. Absent means the platform would not
+   * say, and then nothing is drawn.
+   */
+  cpuLoad1m?: number;
   /**
    * How the engine's memory gets given back.
    *
@@ -1039,19 +1082,13 @@ export interface NativeBridge {
     beatsPerBar: number | null;
   }>;
 
-  /**
-   * Ask for different weights.
-   *
-   * Restarts the server when we own it. Refuses — politely, with a sentence the user can act
-   * on — when we adopted a server somebody else started, because that one is not ours to
-   * restart.
+  /*
+   * `setEngineModel?(model)` STOOD HERE and is gone with the size drop-down that was its only
+   * caller. The shell no longer registers it either (NativeBridge.cpp), so declaring it would
+   * describe a call that can never be answered. `auto` — lightest installed weights — and the
+   * RIFFSHEET_MUSCRIPTOR_MODEL environment variable are the two ways a size is chosen now;
+   * `engineStatus()` still REPORTS which weights are loaded, which is all the panel needs.
    */
-  setEngineModel?(model: 'auto' | 'small' | 'medium' | 'large'): Promise<{
-    ok: boolean;
-    model?: string;
-    restarted?: boolean;
-    error?: string;
-  }>;
 
   /**
    * The raw, uninterpreted playhead the host handed us, plus the marks a capture recorded.

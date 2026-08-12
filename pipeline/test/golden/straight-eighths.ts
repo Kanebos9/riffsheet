@@ -12,6 +12,7 @@ export default `<?xml version="1.0" encoding="UTF-8" standalone="no"?>
   <part-list>
     <score-part id="P1">
       <part-name>Bass — Tuning low → high: E1 A1 D2 G2</part-name>
+      <part-abbreviation>Bass</part-abbreviation>
       <score-instrument id="P1-I1"><instrument-name>Bass — Tuning low → high: E1 A1 D2 G2</instrument-name></score-instrument>
       <midi-instrument id="P1-I1"><midi-channel>1</midi-channel><midi-program>34</midi-program></midi-instrument>
     </score-part>

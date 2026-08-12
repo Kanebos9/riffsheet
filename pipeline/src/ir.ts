@@ -35,6 +35,54 @@ export const DIVISIONS = 24;
  */
 export const THIRTYSECOND_TICKS = DIVISIONS / 8;
 
+/**
+ * A WRITTEN NOTE VALUE, STATED OUTRIGHT — the editing surface's half of the duration decision.
+ *
+ * A performance says how long a note SOUNDED, in seconds; it cannot say what the page should
+ * CALL that length, because the page's vocabulary is rational and the grid the quantizer is
+ * allowed to print on is a separate contract (quantize.ts, spec rule R4). Choosing "1/32" in a
+ * duration menu while the notation grid is a 1/4 therefore cannot be expressed by editing
+ * `endSec`: the off-time would be forced straight back onto the admitted lattice. So the intent
+ * is carried as what it is — a rational written value in the written domain — and honoured as
+ * such.
+ *
+ * It is DELIBERATELY not a tick count. Ticks are a resolution (24 per quarter today, 12
+ * yesterday); `{ denominator: 8, dots: 1 }` is a dotted eighth in any resolution, survives a
+ * change to `DIVISIONS`, and is the same shape MusicXML's `<type>` + `<dot/>` pair already has.
+ */
+export interface NotationIntent {
+  /** Written value's denominator: 1 = whole, 2 = half, 4 = quarter, 8, 16, 32 = a 1/32. */
+  denominator: 1 | 2 | 4 | 8 | 16 | 32;
+  /** Augmentation dots. The printable vocabulary (meter.ts) has one at most, never two. */
+  dots: 0 | 1;
+}
+
+/** Every denominator the intent may name, in printed order longest first. */
+export const NOTATION_INTENT_DENOMINATORS: readonly NotationIntent['denominator'][] = [1, 2, 4, 8, 16, 32];
+
+/**
+ * THE INTENT'S LENGTH IN TICKS, or null when it names nothing this IR can print.
+ *
+ * A dotted 1/32 is the one combination the union admits and the tick domain does not: at 24
+ * divisions it is 4.5 ticks, so no glyph in the vocabulary can be it and no bar cursor can hold
+ * it. It is rejected here — the single place that converts — rather than being rounded into a
+ * neighbouring value the user did not ask for, and a rejected intent means the note keeps its
+ * measured length exactly as if none had been attached.
+ */
+export function notationIntentTicks(
+  intent: NotationIntent | undefined,
+  divisions: number = DIVISIONS
+): number | null {
+  if (!intent) return null;
+  if (!NOTATION_INTENT_DENOMINATORS.includes(intent.denominator)) return null;
+  if (intent.dots !== 0 && intent.dots !== 1) return null;
+  const numerator = divisions * 4 * (intent.dots ? 3 : 1);
+  const divisor = intent.denominator * (intent.dots ? 2 : 1);
+  if (numerator % divisor !== 0) return null;
+  const ticks = numerator / divisor;
+  return ticks > 0 ? ticks : null;
+}
+
 export interface IRClef {
   sign: ClefSign;
   /** Staff line the clef sits on: F clef -> 4, G clef -> 2. */
@@ -131,6 +179,16 @@ export interface IRNote {
    * how the notation above it is split.
    */
   staffIndex?: 0 | 1;
+  /**
+   * THE WRITTEN VALUE THE CALLER DECLARED for the source note, carried through unchanged.
+   *
+   * It is not what this glyph necessarily IS: a declared half note at the end of a bar is still
+   * two tied quarters if that is what the bar law makes of it, and every piece of the split
+   * carries the same declaration. The field exists so the editing surface can read back what a
+   * note was told to be — a duration menu has to show a current value, and undo/persistence have
+   * to round-trip it — rather than re-deriving an intent from glyphs the bar may have reshaped.
+   */
+  notationIntent?: NotationIntent;
 }
 
 /** One rhythmic slot: a chord, a single note, or a rest. alphaTab calls this a Beat. */

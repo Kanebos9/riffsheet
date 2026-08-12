@@ -137,6 +137,108 @@ describe('STATION 1 — no beats supplied', () => {
     expect(built.ir.bars).toHaveLength(8);
     expect(built.ir.bars.every((bar) => bar.voices[0].beats.length === 1 && bar.voices[0].beats[0].measureRest)).toBe(true);
   });
+});
+
+/**
+ * MINIMUM DOCUMENT LENGTH (Codex point 4, the bar-ops prerequisite).
+ *
+ * `blankBars` used to extend the document only while it held exactly zero notes, so the eight bars
+ * a user asked for collapsed to one the moment a note was placed and grew back when it was deleted
+ * — a length that was a function of the contents. Bar operations need the reverse: a floor the
+ * caller owns, which content is written into and deleted out of without the page reflowing.
+ */
+describe('STATION 1 — minimumBars is a floor, not a blank-document special case', () => {
+  const STAFF = { instrument: 'staff' as const, tuningMidi: [] };
+  const printed = (bars: { implicit: boolean }[]): number => bars.filter((bar) => !bar.implicit).length;
+
+  it('a blank document still gets exactly the bars it asked for', () => {
+    const skeleton = buildTimeSkeleton({ notes: [], minimumBars: 8 }, settings());
+    expect(skeleton.bars).toHaveLength(8);
+    expect(skeleton.minimumBars).toBe(8);
+  });
+
+  it('placing the first note does not collapse the document', () => {
+    const note: InputNote[] = [{ id: 'n0', startSec: 0, endSec: 0.4, midi: 40 }];
+    const before = buildScore({ notes: [], minimumBars: 8 }, settings(STAFF));
+    const after = buildScore({ notes: note, minimumBars: 8, ...grid(1) }, settings(STAFF));
+    expect(printed(before.ir.bars)).toBe(8);
+    expect(printed(after.ir.bars)).toBe(8);
+    // ...and the note is really in it, in bar 1, with the other seven bars still full-bar rests.
+    const ids = after.ir.bars.flatMap((bar) => bar.voices[0].beats.flatMap((beat) => beat.notes.map((n) => n.id)));
+    expect(ids).toEqual(['n0']);
+    expect(after.ir.bars.slice(1).every((bar) => bar.voices[0].beats[0].measureRest)).toBe(true);
+  });
+
+  it('deleting the trailing content does not shorten it below the minimum', () => {
+    const notes = playedNotes([{ beat: 0, midi: 40 }, { beat: 12, midi: 43 }], 0.8);
+    const full = buildScore(input(notes, grid(4), { minimumBars: 8 }), settings(STAFF));
+    const trimmed = buildScore(input(notes.slice(0, 1), grid(4), { minimumBars: 8 }), settings(STAFF));
+    expect(printed(full.ir.bars)).toBe(8);
+    expect(printed(trimmed.ir.bars)).toBe(8);
+  });
+
+  it('never shortens a document that is already longer than the minimum', () => {
+    const notes = playedNotes([{ beat: 0, midi: 40 }, { beat: 12, midi: 43 }], 0.8);
+    const built = buildScore(input(notes, grid(4), { minimumBars: 2 }), settings(STAFF));
+    expect(printed(built.ir.bars)).toBe(4);
+    expect(built.skeleton.minimumBars).toBe(2);
+  });
+
+  it('bars added by the floor are ordinary bars: numbered, metered and tick-contiguous', () => {
+    const notes = playedNotes([{ beat: 0, midi: 40 }], 0.8);
+    const built = buildScore(input(notes, grid(1), { minimumBars: 5 }), settings(STAFF));
+    expect(built.ir.bars.map((bar) => bar.number)).toEqual([1, 2, 3, 4, 5]);
+    let tick = 0;
+    for (const bar of built.ir.bars) {
+      expect(bar.startTick).toBe(tick);
+      expect(bar.timeSig).toEqual([4, 4]);
+      tick += bar.durTicks;
+    }
+    expect(built.skeleton.totalTicks).toBe(tick);
+    // A bar the floor added still has a real downbeat time, so the roll can draw its barline.
+    expect(built.ir.tempo.downbeatTimesSec).toHaveLength(5);
+    for (let i = 1; i < built.ir.tempo.downbeatTimesSec.length; i++) {
+      expect(built.ir.tempo.downbeatTimesSec[i]).toBeGreaterThan(built.ir.tempo.downbeatTimesSec[i - 1]);
+    }
+  });
+
+  it('a pickup measure does not count towards the minimum', () => {
+    const notes = playedNotes([{ beat: 0, midi: 40 }, { beat: 1, midi: 43 }], 0.8, 120, 0.5);
+    const built = buildScore(
+      input(notes, grid(2), { startOffsetSec: 1.0, minimumBars: 3 }),
+      settings(STAFF)
+    );
+    expect(built.ir.bars.some((bar) => bar.implicit)).toBe(true);
+    expect(printed(built.ir.bars)).toBe(3);
+  });
+
+  it('a symbolic import inside a document keeps the document its length', () => {
+    const sourceBars: NonNullable<InputNote['sourceBars']> = [
+      { startTick: 0, durationTicks: 1920, ppq: 480, timeSig: [4, 4], number: 1, implicit: false }
+    ];
+    const notes: InputNote[] = [
+      {
+        id: 's0',
+        startSec: 0,
+        endSec: 0.5,
+        midi: 60,
+        sourceTiming: { startTick: 0, endTick: 480, ppq: 480 },
+        sourceBars
+      }
+    ];
+    const built = buildScore({ notes, minimumBars: 6 }, settings(STAFF));
+    expect(printed(built.ir.bars)).toBe(6);
+    expect(built.skeleton.symbolic).toBe(true);
+  });
+
+  it('minimumBars wins over the deprecated blankBars, and both are clamped the same way', () => {
+    expect(buildTimeSkeleton({ notes: [], minimumBars: 3, blankBars: 9 }, settings()).bars).toHaveLength(3);
+    expect(buildTimeSkeleton({ notes: [], minimumBars: 0 }, settings()).minimumBars).toBe(1);
+    expect(buildTimeSkeleton({ notes: [], minimumBars: 9999 }, settings()).minimumBars).toBe(256);
+    expect(buildTimeSkeleton({ notes: [], minimumBars: 2.6 }, settings()).bars).toHaveLength(3);
+    expect(buildTimeSkeleton({ notes: [] }, settings()).minimumBars).toBe(0);
+    expect(buildTimeSkeleton({ notes: [], minimumBars: Number.NaN }, settings()).minimumBars).toBe(0);
+  });
 
   it('keeps a short last onset that quantizes forward onto the final barline', () => {
     const notes = [{ id: 'last', startSec: 7.96, endSec: 8.0, midi: 60 }];

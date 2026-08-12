@@ -18,7 +18,7 @@
  */
 
 import type { InputNote } from './types.js';
-import type { IRRepeatSuspect } from './ir.js';
+import { notationIntentTicks, type IRRepeatSuspect } from './ir.js';
 
 /** §7.3 rule 1: 30 ms is barely one cycle of a low E's fundamental (41 Hz => 24 ms period). */
 export const MIN_NOTE_SEC = 0.03;
@@ -102,6 +102,22 @@ export function isSymbolic(note: InputNote): boolean {
   return !!timing && Number.isFinite(timing.ppq) && timing.ppq > 0;
 }
 
+/**
+ * THE SUB-30 MS RULE IS ALSO A STATEMENT ABOUT A DETECTOR, and it is not true of a note whose
+ * written value a human chose.
+ *
+ * `MIN_NOTE_SEC` exists because 30 ms is barely one cycle of a low E and nothing that short can be
+ * a real detection. A DECLARED 1/32 is not a detection at all: its seconds are derived from the
+ * written value through the tempo map, and above ~250 BPM a perfectly legal 1/32 falls under the
+ * threshold. Deleting it would answer "make this note a 1/32" by removing the note — the exact
+ * shape of the symbolic-import loss this exemption already fixes one door along. The past-end
+ * filter still applies: that one is about where the audio stops, which a written value says
+ * nothing about.
+ */
+function isDeclared(note: InputNote): boolean {
+  return notationIntentTicks(note.notationIntent) !== null;
+}
+
 export function applyGuards(notes: InputNote[], audioDurationSec?: number): GuardResult {
   let pastEndDropped = 0;
   let tooShortDropped = 0;
@@ -118,7 +134,7 @@ export function applyGuards(notes: InputNote[], audioDurationSec?: number): Guar
     }
     // Clamp a note that rings past the end of the audio rather than dropping it.
     const endSec = audioDurationSec !== undefined ? Math.min(n.endSec, audioDurationSec) : n.endSec;
-    if (endSec - n.startSec < MIN_NOTE_SEC) {
+    if (endSec - n.startSec < MIN_NOTE_SEC && !isDeclared(n)) {
       tooShortDropped++;
       return;
     }

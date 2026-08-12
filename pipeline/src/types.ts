@@ -3,6 +3,16 @@
  * audio — `buildScore` is a pure function of these two objects.
  */
 
+import type { NotationIntent } from './ir.js';
+
+/**
+ * Re-exported from ir.ts, which owns the written domain. It is part of the INPUT surface too:
+ * an editing surface attaches it to an `InputNote`, so a caller must be able to name the type
+ * without importing the IR module.
+ */
+export type { NotationIntent } from './ir.js';
+export { notationIntentTicks, NOTATION_INTENT_DENOMINATORS } from './ir.js';
+
 /** One detected/played note. Times are seconds in the source audio's timeline. */
 export interface InputNote {
   startSec: number;
@@ -43,6 +53,31 @@ export interface InputNote {
   }[];
   /** Exact symbolic tempo map, attached once by score import. */
   sourceTempoChanges?: { tick: number; ppq: number; bpm: number }[];
+  /**
+   * WRITTEN DURATION, DECLARED RATHER THAN MEASURED. See `NotationIntent` in ir.ts.
+   *
+   * Present, this note's written value IS the declaration and `endSec` no longer decides it: the
+   * quantizer stops rounding the off-time onto the admitted grid for this note (quantize.ts,
+   * "SPEC RULE R4") and hands the declared length straight to the engraver. Absent — every note
+   * a detector ever produced — nothing changes anywhere.
+   *
+   * THREE LAWS STILL OUTRANK IT, because they are what makes a page legal rather than what makes
+   * it accurate:
+   *   the BAR      a declared value longer than the room left in the bar is split and TIED
+   *                across the barline, exactly as a measured one is;
+   *   the NEXT
+   *   ATTACK       one voice cannot hold two notes at once, so a declared span that reaches past
+   *                the next onset is trimmed back to it (simplify.ts `clampEventOverlaps`) —
+   *                the same trim a rounded off-time gets;
+   *   the TUPLET
+   *   LATTICE      a declared end landing strictly inside a tuplet group moves onto that group's
+   *                own lattice. Nothing else can be printed there: a span that is not a whole
+   *                number of tuplet units has no written value at all.
+   *
+   * On the symbolic/exact path (`sourceTiming` on every note of the score) the source already
+   * decided every written tick and the declaration is ignored — there is nothing left to decide.
+   */
+  notationIntent?: NotationIntent;
 }
 
 /**
@@ -87,8 +122,42 @@ export interface BuildInput {
   startOffsetSec?: number;
   /** Host-supplied grid. When present, `beats`/`downbeats` are ignored. */
   externalGrid?: ExternalGrid;
-  /** Number of full-rest bars requested for a new empty document. Ignored when notes exist. */
+  /**
+   * MINIMUM DOCUMENT LENGTH, in printed (non-pickup) bars. 1..256, or absent for "as long as the
+   * material needs".
+   *
+   * IT COEXISTS WITH NOTES, and that is the whole change from the `blankBars` it replaces. That
+   * field extended the document only while there were exactly zero notes, so a blank score the
+   * user had asked for eight bars of collapsed to one the moment the first note was placed in it,
+   * and deleting the last note grew it back — a document whose length was a function of its
+   * contents rather than a property of itself. Bar operations (insert/delete) need the opposite:
+   * a length the caller owns, which content is written into and deleted out of without the page
+   * reflowing underneath. So this is a FLOOR. The score is always at least this many bars and is
+   * longer whenever the material reaches further; nothing here ever shortens a document.
+   *
+   * Pickup/implicit measures are not counted — they are not a bar of the piece, they are the
+   * approach to bar 1, and a caller asking for eight bars means eight numbered ones.
+   */
+  minimumBars?: number;
+  /**
+   * DEPRECATED NAME for `minimumBars`, with its semantics: a blank-document bar count is just a
+   * minimum length that happened to be requested while the document was empty. Callers that pass
+   * it keep working and now keep their bars once notes arrive; `minimumBars` wins if both appear.
+   */
   blankBars?: number;
+}
+
+/**
+ * The resolved minimum document length: 0 when the caller asked for none, else 1..256.
+ *
+ * Exported because it is a two-way contract — webcore both SETS the field and displays the
+ * document length it produced, and a UI that rounded or clamped differently from the pipeline
+ * would show a number the score does not have.
+ */
+export function resolveMinimumBars(input: Pick<BuildInput, 'minimumBars' | 'blankBars'>): number {
+  const requested = input.minimumBars ?? input.blankBars;
+  if (requested === undefined || !Number.isFinite(requested)) return 0;
+  return Math.max(1, Math.min(256, Math.round(requested)));
 }
 
 /**

@@ -17,7 +17,7 @@
  * once. Silence that was played is printed as a rest, including a short one.
  */
 
-import { DIVISIONS, type IRBar, type IRBeat, type IRKeySignature, type IRNote, type IRVoice, type RiffsheetIR, type DurationType } from './ir.js';
+import { DIVISIONS, notationIntentTicks, type IRBar, type IRBeat, type IRKeySignature, type IRNote, type IRVoice, type RiffsheetIR, type DurationType } from './ir.js';
 import { Rational } from './rational.js';
 import { resolveSettings, type BuildInput, type BuildSettings, type InputNote } from './types.js';
 import { applyGuards } from './guards.js';
@@ -148,6 +148,24 @@ function exactTiming(chord: ChordEvent): { startTick: number; endTick: number; p
   return { startTick, endTick, ppq };
 }
 
+/**
+ * THE CHORD'S DECLARED WRITTEN LENGTH in ticks, or undefined when nobody declared one.
+ *
+ * A chord is ONE rhythmic slot with one written value, so its members cannot hold different ones.
+ * The editing surface sets the same intent on every note of a chord it retimes, which makes this a
+ * formality in practice; when they disagree anyway the LONGEST declaration wins, because the
+ * alternative is silently shortening a note the user explicitly lengthened. Notes without an
+ * intent do not vote — a chord where one member was edited is a chord with that member's value.
+ */
+function intentTicksOf(chord: ChordEvent): number | undefined {
+  let longest: number | null = null;
+  for (const note of chord.notes) {
+    const ticks = notationIntentTicks(note.notationIntent);
+    if (ticks !== null && (longest === null || ticks > longest)) longest = ticks;
+  }
+  return longest ?? undefined;
+}
+
 /** Add ordinary bars only when a snapped final onset (or exact symbolic duration) needs one. */
 function extendSkeletonThrough(skel: TimeSkeleton, requiredTick: number): void {
   let guard = 0;
@@ -226,14 +244,21 @@ export function buildScore(input: BuildInput, settings: BuildSettings, options: 
     const exact = sourceTiming[i];
     // The FALLBACK conversion, used only when the symbolic placer declines (mixed resolutions).
     const scale = exact ? DIVISIONS / exact.ppq : 1;
+    // A declared written value is the editor's instruction about a PERFORMED note. A symbolic
+    // source already carries written ticks for every note in the score, so there is nothing for a
+    // declaration to decide there and the exact path is left untouched (types.ts says so).
+    const intentTicks = exactSymbolicTiming ? undefined : intentTicksOf(c);
     return {
       id: `e${i}`,
       rawStartTick: exact ? exact.startTick * scale : skel.secondsToTick(c.onsetSec),
       rawOffTick: exact
         ? Math.max(exact.startTick * scale + 1, exact.endTick * scale)
-        : skel.secondsToTick(Math.max(c.endSec, c.onsetSec + 1e-4))
+        : skel.secondsToTick(Math.max(c.endSec, c.onsetSec + 1e-4)),
+      ...(intentTicks !== undefined ? { intentTicks } : {})
     };
   });
+  /** Quant ids whose written length was declared rather than measured. */
+  const declaredIds = new Set(quantInput.filter((q) => q.intentTicks !== undefined).map((q) => q.id));
   // A symbolic source already decided every written tick, so it takes the internal 'exact' path.
   // It must NOT borrow 'free': free now has real notation semantics (a 1/32 view of a
   // performance) and snapping an imported eighth-triplet onto that lattice would corrupt it.
@@ -269,8 +294,20 @@ export function buildScore(input: BuildInput, settings: BuildSettings, options: 
     // Iterative, never a spread (finding 12): a large import throws `RangeError` on
     // `Math.max(...millionNotes)` in JavaScriptCore before it computes anything at all.
     let requiredTick = -Infinity;
-    for (const note of qNotes) {
-      const candidate = exactSymbolicTiming ? note.offTick - 1 : note.startTick;
+    for (let i = 0; i < qNotes.length; i++) {
+      const note = qNotes[i];
+      let candidate = exactSymbolicTiming ? note.offTick - 1 : note.startTick;
+      // A DECLARED WRITTEN VALUE NEEDS SOMEWHERE TO BE WRITTEN, for the same reason an exact
+      // symbolic duration does: the page is otherwise clipped at the last barline and the chosen
+      // half note silently comes back a quarter. It is the DECLARATION that earns the bar, not the
+      // ring-out — a measured off-time is still discounted, which is what keeps a three-tick spill
+      // from conjuring a measure of rests. The next attack is applied first because
+      // `clampEventOverlaps` will trim there anyway, and a bar nothing reaches into is a bar of
+      // rests nobody asked for.
+      if (!exactSymbolicTiming && declaredIds.has(note.id)) {
+        const nextStart = i + 1 < qNotes.length ? qNotes[i + 1].startTick : Infinity;
+        candidate = Math.max(candidate, Math.min(note.offTick, nextStart) - 1);
+      }
       if (candidate > requiredTick) requiredTick = candidate;
     }
     extendSkeletonThrough(skel, requiredTick);
@@ -615,6 +652,10 @@ function newNote(src: InputNote, tieStart: boolean, tieStop: boolean): IRNote {
     startSec: src.startSec,
     endSec: src.endSec,
     ...(src.sourceStaffIndex !== undefined ? { sourceStaffIndex: src.sourceStaffIndex } : {}),
+    // The declaration travels with every piece of a split span: the editing surface asks "what is
+    // this note's duration set to", and the answer is what was declared, not what the bar made
+    // of it. See IRNote.notationIntent.
+    ...(src.notationIntent ? { notationIntent: src.notationIntent } : {}),
     // Carried even though v1 engraves one voice: the flattening is now visible in the IR rather
     // than being a fact only the importer ever knew (finding 1).
     ...(src.sourceVoiceIndex !== undefined ? { sourceVoiceIndex: src.sourceVoiceIndex } : {})

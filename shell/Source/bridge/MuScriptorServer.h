@@ -29,7 +29,7 @@ public:
     struct Config
     {
         juce::File venv;                  // .../muscriptor/venv
-        juce::String model = "medium";    // the RESOLVED size actually passed to --model
+        juce::String model = "small";     // the RESOLVED size actually passed to --model
         int port = 8223;
         juce::String host = "127.0.0.1";
         int startupTimeoutMs = 240000;    // first run downloads ~412 MB of weights
@@ -81,10 +81,14 @@ public:
     //==============================================================================
     // Which weights, and saying so honestly - punch-list item 10.
 
-    /** What the user asked for: 'auto', 'small', 'medium' or 'large'.
+    /** What was asked for: 'auto', or a size named by RIFFSHEET_MUSCRIPTOR_MODEL.
         'auto' is resolved against what is installed and how much memory this
-        machine has (see ModelCatalog) the moment a server is started. */
-    void setConfiguredModel (const juce::String& model);
+        machine has (see ModelCatalog) the moment a server is started.
+
+        There is no setter: the size dropdown that used to call one is gone, and
+        with it the bridge's setEngineModel(). The environment variable is read
+        once at construction, so `configuredModel` is fixed for the life of the
+        server and nothing can swap weights underneath a running job. */
     juce::String getConfiguredModel() const;
 
     /** The size 'auto' currently resolves to, plus the sentence explaining why.
@@ -108,6 +112,27 @@ public:
 
     /** Where getRunningModelDescription() came from, for the UI to show. */
     juce::String getRunningModelSource() const;
+
+    /** The SIZE the server on the wire is running - "small", "medium" or
+        "large" - or **"" when that cannot be proved**.
+
+        Separate from getRunningModelDescription() because that one is prose the
+        card prints, including the sentence "unknown - this server was already
+        running", and a chip that wants to say "MuScriptor small" needs a word it
+        can put after a name rather than a sentence to parse.
+
+        It is non-empty in exactly two cases:
+          - Riffsheet started the server, so the size is the one it passed to
+            --model itself;
+          - somebody else started it and the operating system let us read its
+            command line, and `--model` there named one of the three sizes.
+
+        Everything else answers "": an adopted server whose command line could
+        not be read (a sandboxed host, or Windows), a server identified only by
+        the HTTP handshake, and a --model that names a path or an hf:// URL
+        instead of a size - that last one is a real model but not a size, and
+        calling it "small" because it is small would be a guess. */
+    juce::String getRunningModelSize() const;
 
     /** Health-probes the reuse ports without starting anything, and updates the
         adopted/port/model reporting. Blocks for up to a couple of seconds -
@@ -394,10 +419,12 @@ private:
     // when a server is started or adopted, read from the message thread by
     // engineStatus(), so it takes a lock.
     mutable juce::CriticalSection modelLock;
-    juce::String resolvedModel { "medium" };
+    juce::String resolvedModel { "small" };
     juce::String modelReason;
     juce::String runningModelDescription;
     juce::String runningModelSource { "nothing is running yet" };
+    /** "" unless the size on the wire was PROVED - see getRunningModelSize(). */
+    juce::String runningModelSize;
 
     bool haveLiveChild() const;
 

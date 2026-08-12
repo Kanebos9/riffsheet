@@ -31,9 +31,17 @@ export type {
   GridSetting,
   Instrument,
   FingeringStyle,
-  ClefMode
+  ClefMode,
+  NotationIntent
 } from './types.js';
-export { DEFAULT_TUNINGS, DEFAULT_ANCHOR_FRET, resolveSettings } from './types.js';
+export {
+  DEFAULT_TUNINGS,
+  DEFAULT_ANCHOR_FRET,
+  resolveSettings,
+  resolveMinimumBars,
+  notationIntentTicks,
+  NOTATION_INTENT_DENOMINATORS
+} from './types.js';
 
 export type {
   RiffsheetIR,
@@ -132,7 +140,13 @@ export type { TabNoteInput, TabAssignment, TabPosition, LegatoPair } from './tab
 export { applyGuards, detectRepeatLoops, MIN_NOTE_SEC, REPEAT_MIN_RUN, REPEAT_IOI_STDDEV_SEC } from './guards.js';
 export type { GuardResult } from './guards.js';
 
-export { toMusicXML, toMultiPartMusicXML, defaultPartName } from './musicxml.js';
+export {
+  toMusicXML,
+  toMultiPartMusicXML,
+  defaultPartName,
+  defaultPartAbbreviation,
+  abbreviatePartName
+} from './musicxml.js';
 export type { MusicXmlOptions, MusicXmlPart } from './musicxml.js';
 
 export { toMidi, toMultiPartMidi, MIDI_PPQ } from './midi.js';

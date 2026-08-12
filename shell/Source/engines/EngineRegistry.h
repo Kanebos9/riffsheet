@@ -169,7 +169,7 @@ public:
         an engine that is merely not installed yet - that is how the card's
         "Select" affordance works alongside "Install", and resolution then falls
         back with a reason. Refusing while a job runs is the bridge's business,
-        not this class's: it is the same check setEngineModel() makes. */
+        not this class's. */
     SelectOutcome select (const juce::String& id);
 
     //== in-process serialisation ==============================================

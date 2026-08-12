@@ -338,16 +338,6 @@ juce::String MuScriptorServer::getBaseUrl() const
 //==============================================================================
 // Which weights are in use, and saying so honestly.
 
-void MuScriptorServer::setConfiguredModel (const juce::String& model)
-{
-    {
-        const juce::ScopedLock sl (modelLock);
-        configuredModel = model;
-    }
-
-    refreshResolvedModel();
-}
-
 juce::String MuScriptorServer::getConfiguredModel() const
 {
     const juce::ScopedLock sl (modelLock);
@@ -376,6 +366,12 @@ juce::String MuScriptorServer::getRunningModelSource() const
 {
     const juce::ScopedLock sl (modelLock);
     return runningModelSource;
+}
+
+juce::String MuScriptorServer::getRunningModelSize() const
+{
+    const juce::ScopedLock sl (modelLock);
+    return runningModelSize;
 }
 
 void MuScriptorServer::refreshResolvedModel()
@@ -456,10 +452,22 @@ void MuScriptorServer::identifyServerOnPort (int port, bool startedByUs)
 
     const juce::ScopedLock sl (modelLock);
 
+    // THE SIZE, kept separate from the prose, and only ever when it is proved.
+    // `resolvedModel` is what we passed to --model ourselves, so for our own
+    // server it IS the size - unless RIFFSHEET_MUSCRIPTOR_MODEL named a path or
+    // an hf:// URL, which is a model but not a size, and is left blank rather
+    // than mapped onto one of the three words. Same test for a command line we
+    // read off somebody else's server.
+    const auto sizeOrNothing = [] (const juce::String& candidate)
+    {
+        return ModelCatalog::isKnownModelName (candidate) ? candidate : juce::String();
+    };
+
     if (startedByUs)
     {
         runningModelDescription = resolvedModel;
         runningModelSource = "started by Riffsheet";
+        runningModelSize = sizeOrNothing (resolvedModel);
         return;
     }
 
@@ -467,12 +475,15 @@ void MuScriptorServer::identifyServerOnPort (int port, bool startedByUs)
     {
         runningModelDescription = fromCommandLine;
         runningModelSource = "read from the command line of the server on port " + juce::String (port);
+        runningModelSize = sizeOrNothing (fromCommandLine);
         return;
     }
 
-    // No guessing. Our own setting says nothing about somebody else's server.
+    // No guessing. Our own setting says nothing about somebody else's server,
+    // and that includes its size: the chip says "unknown size" rather than ours.
     runningModelDescription = "unknown - this server was already running";
     runningModelSource = "unknown";
+    runningModelSize = {};
 }
 
 bool MuScriptorServer::haveLiveChild() const
@@ -551,6 +562,7 @@ void MuScriptorServer::refreshStatus()
         const juce::ScopedLock sl (modelLock);
         runningModelDescription = {};
         runningModelSource = "nothing is running yet";
+        runningModelSize = {};
     }
 }
 
@@ -1166,6 +1178,7 @@ void MuScriptorServer::stop()
     const juce::ScopedLock ml (modelLock);
     runningModelDescription = {};
     runningModelSource = "nothing is running yet";
+    runningModelSize = {};
 }
 
 //==============================================================================
@@ -1528,6 +1541,7 @@ MuScriptorServer::StopOutcome MuScriptorServer::stopExternalServer (const juce::
         const juce::ScopedLock ml (modelLock);
         runningModelDescription = {};
         runningModelSource = "nothing is running yet";
+        runningModelSize = {};
     }
 
     outcome.stopped = true;

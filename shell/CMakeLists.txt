@@ -498,6 +498,8 @@ if(RIFFSHEET_BUILD_TESTS)
         test/PreprocessTests.cpp                 # wave 6, and it generates its own audio
         test/EngineInstallerTests.cpp            # wave 5, and it serves its own HTTP
         test/MuScriptorProbeTests.cpp            # the external-server handshake, over a real socket
+        test/ModelCatalogTests.cpp               # which size `auto` asks for - lightest installed first
+        test/SystemProbeTests.cpp                # the CPU half of the machine facts Settings draws
         test/PlaybackResamplerTests.cpp          # minutes of transport phase, at every rate x block size
         test/ChildProcessSupervisorTests.cpp     # a real, deliberately chatty child process
         # ...one file per wave, added by that wave.
@@ -520,6 +522,10 @@ if(RIFFSHEET_BUILD_TESTS)
         # a copy of it.
         Source/engines/sidecar/SidecarAdapter.cpp
         Source/bridge/SystemProbe.cpp
+        # Which MuScriptor size `auto` asks for. It speaks juce::File and
+        # juce::String and nothing else - no server, no HTTP, no plugin - which is
+        # why the whole ranking rule can be exercised in here as a pure function.
+        Source/bridge/ModelCatalog.cpp
         # The handshake half of external-server detection. It is in here and
         # MuScriptorServer.cpp is not for the reason the list above gives: this
         # file speaks juce::URL and JSON and nothing else, while the server class

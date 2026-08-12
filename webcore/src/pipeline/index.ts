@@ -24,16 +24,29 @@ import {
   type BuildSettings,
   type ExternalGrid,
   type InputNote,
+  type NotationIntent,
   type RiffsheetIR,
   type TempoSegment,
   type TempoSource,
-  type TickSecondsMap
+  type TickSecondsMap,
+  notationIntentTicks,
+  NOTATION_INTENT_DENOMINATORS
 } from '@pipeline-impl';
 
 import type { AppSettings } from '../app/state';
 import { customTuning, TUNING_PRESETS, tuningById, type TuningPreset } from '../score/tuning';
 
-export type { AlphaTabScoreData, RiffsheetIR, InputNote, TempoSegment, TempoSource, TickSecondsMap };
+export type { AlphaTabScoreData, RiffsheetIR, InputNote, NotationIntent, TempoSegment, TempoSource, TickSecondsMap };
+
+/**
+ * THE WRITTEN-VALUE VOCABULARY, re-exported so the editing surface and the engraver agree.
+ *
+ * The duration menu offers exactly the values `notationIntentTicks` can convert, and greys out
+ * the one combination the union admits but the tick domain cannot hold (a dotted 1/32). Reading
+ * the vocabulary from the pipeline rather than restating it here is what makes that true by
+ * construction instead of by a comment.
+ */
+export { notationIntentTicks, NOTATION_INTENT_DENOMINATORS };
 
 /**
  * THE AUTHORITATIVE TICK <-> SECONDS CONVERSION, handed to webcore.

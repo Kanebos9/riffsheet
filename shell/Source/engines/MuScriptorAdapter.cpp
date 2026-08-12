@@ -151,6 +151,14 @@ EngineAdapter::Status MuScriptorAdapter::status() const
     out.extra = makeObject ({
         { "model", server.getRunningModelDescription() },
         { "modelSource", server.getRunningModelSource() },
+        // The SIZE, as a bare word, and NULL rather than a guess when it cannot
+        // be proved - a server Riffsheet started names the size it passed to
+        // --model, one somebody else started names it only if the OS let us read
+        // that command line. This is what lets the chip say "MuScriptor small"
+        // without any UI-side inference: no field means no claim.
+        { "modelSize", server.getRunningModelSize().isNotEmpty()
+                           ? juce::var (server.getRunningModelSize())
+                           : juce::var() },
         { "configuredModel", server.getConfiguredModel() },
         { "resolvedModel", server.getResolvedModel() },
         { "modelReason", server.getModelReason() },

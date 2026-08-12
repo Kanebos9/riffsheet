@@ -84,7 +84,6 @@ private:
     void fnUninstallEngine   (const juce::Array<juce::var>&, Completion);
     void fnValidateExistingEngineInstall (const juce::Array<juce::var>&, Completion);
     void fnOpenEngineSetup   (const juce::Array<juce::var>&, Completion);
-    void fnSetEngineModel    (const juce::Array<juce::var>&, Completion);
     void fnStopEngine        (const juce::Array<juce::var>&, Completion);
     void fnStopExternalEngine (const juce::Array<juce::var>&, Completion);
     void fnTranscribeCancel  (const juce::Array<juce::var>&, Completion);

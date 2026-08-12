@@ -48,6 +48,15 @@ export interface QuantNote {
   /** Fractional tick from the time skeleton (per-bar origin already applied). */
   rawStartTick: number;
   rawOffTick: number;
+  /**
+   * THE WRITTEN LENGTH THE CALLER DECLARED for this event, in IR ticks — the resolved form of
+   * `InputNote.notationIntent` (see ir.ts `notationIntentTicks`). Absent on every note a detector
+   * produced, which is why nothing below changes shape when it is not there.
+   *
+   * The ONSET is quantized exactly as it always was: a declared duration is a statement about the
+   * note's written value, not about where it sits. Only the off-time stops being measured.
+   */
+  intentTicks?: number;
 }
 
 export interface QuantTupletGroup {
@@ -402,7 +411,11 @@ function quantizeFree(notes: QuantNote[]): QuantResult {
     occupied = startTick;
     const rawDur = Math.max(0, n.rawOffTick - n.rawStartTick);
     const units = Math.max(1, Math.round(rawDur / unit));
-    out.push({ id: n.id, startTick, offTick: startTick + units * unit });
+    // A DECLARED WRITTEN VALUE IS HONOURED HERE TOO. Free is a view of the input at notation's
+    // finest honest resolution, and a value the user typed is not a measurement to be re-rounded:
+    // every intent length is a whole number of 1/32s by construction (ir.ts rejects the one that
+    // is not), so it already lies on free's own lattice.
+    out.push({ id: n.id, startTick, offTick: startTick + (n.intentTicks ?? units * unit) });
   }
   return { notes: out, tuplets: [], basicQuantTicks: unit, jitterTicks: 0 };
 }
@@ -616,8 +629,28 @@ export function quantizeOnsets(
     // measured in the units of the tuplet it will actually be printed inside.
     const durUnit = group ? group.unitTicks : finestStraight;
     const units = Math.max(1, Math.round(rawDur / durUnit));
-    let offTick = startTick + units * durUnit;
-    if (group) offTick = Math.min(group.endTick, offTick);
+    let offTick: number;
+    if (n.intentTicks !== undefined) {
+      // A DECLARED WRITTEN VALUE OUTRANKS THE GRID, and it has to: the grid is a ceiling on what
+      // the page may say about a MEASUREMENT, and this length is not a measurement. Rounding a
+      // chosen 1/32 back up to the admitted quarter is the exact failure mode that makes "set
+      // this note's duration" impossible to express in seconds (Codex point 3) — the caller would
+      // watch its own instruction be undone. The bar/tie law and the next-attack trim still apply
+      // downstream; only this rounding is skipped.
+      offTick = startTick + n.intentTicks;
+      // THE TUPLET LATTICE IS NOT NEGOTIABLE, though. Inside a group every tick a note
+      // contributes must be a whole number of the group's units, because the written value of a
+      // tuplet piece IS its unit count scaled by normal/actual — a span of two and a half triplet
+      // eighths has no symbol, and `validateIR` would (correctly) refuse the score. An end that
+      // leaves the group entirely is fine: the piece inside it is then the whole remainder of the
+      // group, which is a whole unit count by construction.
+      if (group && offTick < group.endTick) {
+        offTick = group.startTick + Math.round((offTick - group.startTick) / group.unitTicks) * group.unitTicks;
+      }
+    } else {
+      offTick = startTick + units * durUnit;
+      if (group) offTick = Math.min(group.endTick, offTick);
+    }
     if (offTick <= startTick) offTick = startTick + durUnit;
     // EVERY TICK A NOTE CONTRIBUTES LIES ON THE LATTICE OF WHATEVER GROUP CONTAINS IT — the
     // off-time as much as the onset. A straight note ringing on into a later triplet beat used

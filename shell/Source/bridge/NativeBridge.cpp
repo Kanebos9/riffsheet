@@ -492,7 +492,6 @@ juce::WebBrowserComponent::Options NativeBridge::configure (juce::WebBrowserComp
         .withNativeFunction ("validateExistingEngineInstall",
                                                   bind (&NativeBridge::fnValidateExistingEngineInstall))
         .withNativeFunction ("openEngineSetup",   bind (&NativeBridge::fnOpenEngineSetup))
-        .withNativeFunction ("setEngineModel",    bind (&NativeBridge::fnSetEngineModel))
         .withNativeFunction ("stopEngine",        bind (&NativeBridge::fnStopEngine))
         // Registration is the capability test, exactly as it is for
         // listEngines: an older shell answers hasNativeFunction with false, and
@@ -2507,6 +2506,10 @@ juce::var NativeBridge::makeEngineStatusVar (const juce::String& id)
         guideStepsText.add (manifestText (step.what) + " - " + manifestText (step.detail));
     }
 
+    // Read once: two calls could return two different averages, and a payload
+    // that says "unknown" beside a number would be one poll reading two clocks.
+    const auto cpuLoad = SystemProbe::cpuLoadOneMinute();
+
     auto payload = makeObject ({
         { "ok", true },
 
@@ -2530,6 +2533,11 @@ juce::var NativeBridge::makeEngineStatusVar (const juce::String& id)
         // overwrites all of these through Status::extra below.
         { "model", "" },
         { "modelSource", "not applicable to this engine" },
+        // NULL, not "": this one is a size that must never be guessed, and the
+        // rule the page relies on is "absent means no claim". An engine with no
+        // model sizes at all makes no claim either. MuScriptor's adapter sets it
+        // when, and only when, the size was proved.
+        { "modelSize", juce::var() },
         { "configuredModel", "" },
         { "resolvedModel", "" },
         { "modelReason", "" },
@@ -2573,6 +2581,23 @@ juce::var NativeBridge::makeEngineStatusVar (const juce::String& id)
 
         { "ramTotalMb", SystemProbe::physicalRamMb() },
         { "ramFreeMb", SystemProbe::availableRamMb() },
+
+        // THE MACHINE, not the engine - which is why it is on every engine's
+        // payload rather than inside MuScriptor's half. Settings draws one system
+        // line at the top of the panel ("Apple M1 - 8 cores - 8 GB, 3.0 GB free")
+        // and it had only the two memory figures to draw it from.
+        //
+        // Cheap enough to sit in the existing 2 s poll: a cached sysctl string, a
+        // core count out of juce_core's own CPU info, and getloadavg(), which is
+        // a kernel counter read rather than a sample. Nothing here forks.
+        //
+        // "" and 0 and null mean UNKNOWN, and the page must draw nothing for them
+        // rather than "unknown CPU" or "0 cores" - Windows has no cheap load
+        // figure and answers null for that one alone.
+        { "cpuName", SystemProbe::cpuName() },
+        { "cpuCores", SystemProbe::cpuPhysicalCores() },
+        { "cpuThreads", SystemProbe::cpuLogicalCores() },
+        { "cpuLoad1m", cpuLoad >= 0.0 ? juce::var (cpuLoad) : juce::var() },
 
         // --- the engine only lives for one job ---------------------------------
         // The user's objection was that a gigabyte of model sits resident for
@@ -2694,9 +2719,9 @@ void NativeBridge::fnListEngines (const juce::Array<juce::var>&, Completion comp
 /**
     "Use this engine from now on."
 
-    Modelled on setEngineModel(), including its refusal while anything on this
-    machine is transcribing: swapping the engine under a running job is the same
-    class of bug as swapping the weights underneath it.
+    It refuses while anything on this machine is transcribing: swapping the
+    engine under a running job is the same class of bug as swapping the weights
+    underneath it.
 
     It deliberately does NOT refuse an engine that is not installed yet. That is
     how the card's "Select" affordance works alongside "Install" - the choice is
@@ -3145,76 +3170,18 @@ void NativeBridge::fnStopExternalEngine (const juce::Array<juce::var>&, Completi
                     });
 }
 
-void NativeBridge::fnSetEngineModel (const juce::Array<juce::var>& args, Completion completion)
-{
-    const auto requested = stringArg (args, 0).trim().toLowerCase();
+/*
+    fnSetEngineModel() STOOD HERE and is deleted with the drop-down that was its
+    only caller (Z-wave). It took 'auto'|'small'|'medium'|'large', refused while
+    a job was running or while we had adopted somebody else's server, and closed
+    our own server so the new weights loaded on the next transcription.
 
-    if (requested != "auto" && ! ModelCatalog::isKnownModelName (requested))
-    {
-        completion (makeError ("Unknown model \"" + requested + "\". Use auto, small, medium or large."));
-        return;
-    }
-
-    auto& server = proc.getMuScriptor();
-
-    if (server.isAdopted())
-    {
-        // Somebody else's server. Our setting is irrelevant to it and pretending
-        // otherwise would be the worst kind of lie: the UI would say "large" and
-        // the transcription would still come from their medium.
-        completion (makeError ("The transcription server on port " + juce::String (server.getActivePort())
-                               + " was started outside Riffsheet, so it belongs to whoever started it "
-                                 "and Riffsheet cannot change its model. Close that server - the "
-                                 "START-MEDIUM.command window, usually - and Riffsheet will start its "
-                                 "own with the model you picked."));
-        return;
-    }
-
-    const auto engine = EngineLock::getInstance().snapshot();
-
-    if (engine.busy)
-    {
-        completion (makeError (engine.heldByThisProcess
-                                   ? juce::String ("A transcription is running right now. Try again when "
-                                                   "it has finished.")
-                                   : "Something else on this machine is transcribing right now ("
-                                     + engine.holderLabel + "). Try again when it has finished."));
-        return;
-    }
-
-    const auto before = server.getResolvedModel();
-    const auto wasRunning = server.getState() == MuScriptorServer::State::ready;
-
-    server.setConfiguredModel (requested);
-
-    const auto after = server.getResolvedModel();
-    const auto needsRestart = wasRunning && after != before;
-
-    if (! needsRestart)
-    {
-        completion (makeObject ({ { "ok", true },
-                                  { "model", after },
-                                  { "restarted", false },
-                                  { "reason", server.getModelReason() } }));
-        return;
-    }
-
-    // stop() kills a child and waits up to five seconds, which is far too long
-    // to hold the message thread. The new weights load on the next transcription
-    // rather than now, so nobody sits watching a spinner for four minutes.
-    workers.addJob ([this, after, reason = server.getModelReason(), reply = std::move (completion)]
-                    {
-                        proc.getMuScriptor().stop();
-
-                        reply (makeObject ({ { "ok", true },
-                                             { "model", after },
-                                             { "restarted", true },
-                                             { "reason", reason },
-                                             { "message", "The old transcription server has been closed. "
-                                                          "The " + after + " model loads the next time you "
-                                                          "transcribe something." } }));
-                    });
-}
+    Two ways to choose a size survive it, and between them they cover everything
+    the call was for: `auto` picks the lightest installed weights (ModelCatalog),
+    and RIFFSHEET_MUSCRIPTOR_MODEL names a size deliberately for a harness or a
+    developer. Nothing in the product wrote the setting any more, so what was
+    left was a registered native function no page could reach - see BRIDGE.md.
+*/
 
 //==============================================================================
 /**

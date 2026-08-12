@@ -40,6 +40,7 @@ export default `{
  "tracks": [
   {
    "name": "Guitar",
+   "shortName": "Gtr.",
    "program": 27,
    "staves": [
     {
@@ -499,6 +500,7 @@ export default `{
   },
   {
    "name": "Bass",
+   "shortName": "Bs.",
    "program": 0,
    "notationOnly": true,
    "staves": [

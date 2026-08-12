@@ -34,7 +34,7 @@ import { buildScore, type BuildDiagnostics, type BuildResult } from './buildScor
 import { applyGuards } from './guards.js';
 import { buildTimeSkeleton } from './timeSkeleton.js';
 import { type IRBar, type RiffsheetIR } from './ir.js';
-import { toMultiPartMusicXML, defaultPartName, type MusicXmlOptions } from './musicxml.js';
+import { toMultiPartMusicXML, abbreviatePartName, defaultPartName, type MusicXmlOptions } from './musicxml.js';
 import { toMultiPartMidi } from './midi.js';
 import { toMultiPartAlphaTabModelData, type AlphaTabScoreData } from './alphatab.js';
 import {
@@ -72,7 +72,12 @@ export interface ScorePart {
    * tuning, which is what a single-part score has always printed.
    */
   name?: string;
-  /** `<part-abbreviation>` — the short label beside every system after the first. */
+  /**
+   * THE SHORT LABEL BESIDE EVERY SYSTEM AFTER THE FIRST — `<part-abbreviation>` in MusicXML,
+   * `Track.shortName` in the alphaTab hand-off. Omitted, it is derived from this part's resolved
+   * name (`abbreviatePartName`), so a part is never anonymous from system 2 onwards and a renamed
+   * part's short label follows the rename.
+   */
   abbreviation?: string;
   /** Defaults to 'live' for the FIRST part and 'imported' for the rest. */
   role?: PartRole;
@@ -119,7 +124,8 @@ export interface PartBuild {
   /** `P1`, `P2`, ... — the MusicXML part id, and the index into `AlphaTabScoreData.tracks`. */
   id: string;
   name: string;
-  abbreviation?: string;
+  /** Always resolved — the caller's, else derived from `name`. The label systems 2..N print. */
+  abbreviation: string;
   role: PartRole;
   /**
    * WHAT WAS PREPENDED TO THIS PART'S NOTE IDS, and it is `''` for the first part.
@@ -370,17 +376,22 @@ export function buildMultiPartScore(
 
   alignPartBars(builds.map((build) => build.ir));
 
-  const built: PartBuild[] = builds.map((build, index) => ({
-    index,
-    id: `P${index + 1}`,
-    name: parts[index].name ?? defaultPartName(build.ir),
-    ...(parts[index].abbreviation ? { abbreviation: parts[index].abbreviation } : {}),
-    role: roles[index],
-    idPrefix: prefixes[index],
-    nudgeSec: parts[index].nudgeSec ?? 0,
-    ir: build.ir,
-    diagnostics: build.diagnostics
-  }));
+  const built: PartBuild[] = builds.map((build, index) => {
+    const name = parts[index].name ?? defaultPartName(build.ir);
+    return {
+      index,
+      id: `P${index + 1}`,
+      name,
+      // The same resolution both emitters perform, reported back so the app labels a part with the
+      // string the file and the screen actually contain rather than a third guess at it.
+      abbreviation: parts[index].abbreviation || abbreviatePartName(name),
+      role: roles[index],
+      idPrefix: prefixes[index],
+      nudgeSec: parts[index].nudgeSec ?? 0,
+      ir: build.ir,
+      diagnostics: build.diagnostics
+    };
+  });
 
   const xmlOptions = (index: number): MusicXmlOptions => ({
     // Passed through only when the caller set them, so an unnamed part names itself exactly as a
@@ -430,6 +441,11 @@ export function buildMultiPartScore(
         builds.map((build, index) => ({
           ir: build.ir,
           ...(parts[index].name !== undefined ? { name: parts[index].name } : {}),
+          // THE SHORT LABEL REACHED THE FILE AND NOT THE SCREEN. `partAbbreviation` was forwarded
+          // to MusicXML from the start while alphaTab never received it at all, so an abbreviation
+          // the caller chose was printed on export and ignored on the page — the same
+          // screen-disagrees-with-file shape as finding 8's `tab`/`octaveTransposition` pair.
+          ...(parts[index].abbreviation !== undefined ? { abbreviation: parts[index].abbreviation } : {}),
           ...(parts[index].midiProgram !== undefined ? { program: parts[index].midiProgram } : {}),
           // SCREEN AND FILE SAY THE SAME THING. These two reached MusicXML only, so a guitar part
           // exported without a TAB staff and without its -12 displacement went on showing both on

@@ -22,6 +22,7 @@
 import { Rational, R } from './rational.js';
 import { DIVISIONS } from './ir.js';
 import { buildTickSecondsMap } from './tickSeconds.js';
+import { resolveMinimumBars } from './types.js';
 import type { BuildInput, BuildSettings, ExternalGrid, InputNote } from './types.js';
 
 /** A downbeat may anticipate its beat by this much and still count as that beat. */
@@ -172,6 +173,12 @@ export interface TimeSkeleton {
   /** Human-readable diagnosis of the meter decision, for the UI. */
   meterReason: string;
   totalTicks: number;
+  /**
+   * THE MINIMUM DOCUMENT LENGTH ACTUALLY APPLIED, in printed bars — 0 when the caller asked for
+   * none. Reported back because `BuildInput.minimumBars` is a two-way contract: the app sets it
+   * and then has to show the document length it got, clamped and rounded the same way.
+   */
+  minimumBars: number;
   /** true when the bar map came from a symbolic source rather than being laid down here. */
   symbolic: boolean;
   /** true when that source changes meter mid-piece — out of scope, surfaced, never silent. */
@@ -412,12 +419,48 @@ function gridFromExternal(
   return { beats, downbeats, beatsPerBar, beatUnit, compound };
 }
 
+/**
+ * MINIMUM DOCUMENT LENGTH — pad the bar list up to `minimum` PRINTED bars. Returns the new tick
+ * cursor (unchanged when nothing was added).
+ *
+ * It is a floor and never a ceiling: a document with more bars than the minimum is left exactly as
+ * it is. Each added bar copies the LAST bar's shape rather than the score's nominal meter, so
+ * padding an irregular or mid-piece-meter tail continues the meter actually in force there instead
+ * of silently reverting to bar 1's. Pickup measures do not count towards the minimum (they are not
+ * bars of the piece) but are still legal predecessors — the numbering rule is the same one
+ * `extendSkeletonThrough` uses, so an all-pickup document's first real bar is bar 1.
+ */
+function padToMinimumBars(bars: BarSkeleton[], minimum: number, startTick: number): number {
+  let tick = startTick;
+  if (minimum <= 0 || !bars.length) return tick;
+  let printed = 0;
+  for (const bar of bars) if (!bar.implicit) printed++;
+  while (printed < minimum) {
+    const previous = bars[bars.length - 1];
+    bars.push({
+      index: bars.length,
+      startBeatIdx: previous.startBeatIdx + previous.beats,
+      beats: previous.beats,
+      startTick: tick,
+      ticks: previous.ticks,
+      timeSig: [previous.timeSig[0], previous.timeSig[1]],
+      timeSigChanged: false,
+      number: previous.implicit ? 1 : previous.number + 1,
+      implicit: false
+    });
+    tick += previous.ticks;
+    printed++;
+  }
+  return tick;
+}
+
 export function buildTimeSkeleton(
   input: BuildInput,
   settings: BuildSettings,
   options: SkeletonOptions = {}
 ): TimeSkeleton {
   const notes = input.notes;
+  const minimumBars = resolveMinimumBars(input);
   // ITERATIVE EXTREMA, never a spread (finding 12): `Math.min(...oneMillionNotes)` throws
   // `RangeError: Maximum call stack size exceeded` in JavaScriptCore, which is the engine the
   // plugin's WebView runs, so the published one-million-note import limit was unreachable by
@@ -697,6 +740,11 @@ export function buildTimeSkeleton(
       beatCursor += bar.ticks / ticksPerBeat;
     }
     tick = symbolic.totalTicks;
+    // A written source states its own bars, and the minimum is a statement about the DOCUMENT
+    // rather than about the source: a caller holding a document open at eight bars keeps eight
+    // when a four-bar part is imported into it. The source's own bars are never touched, only
+    // followed.
+    tick = padToMinimumBars(bars, minimumBars, tick);
     return finishSkeleton({
       ticksPerBeat,
       beatUnit,
@@ -713,6 +761,7 @@ export function buildTimeSkeleton(
       external: !!ext,
       meterReason,
       totalTicks: tick,
+      minimumBars,
       symbolic: true,
       mixedMeter: symbolic.mixedMeter
     });
@@ -790,24 +839,12 @@ export function buildTimeSkeleton(
     tick = barTicksNominal;
   }
 
-  if (!notes.length && input.blankBars !== undefined) {
-    const requested = Math.max(1, Math.min(256, Math.round(input.blankBars)));
-    while (bars.filter((bar) => !bar.implicit).length < requested) {
-      const previous = bars[bars.length - 1];
-      bars.push({
-        index: bars.length,
-        startBeatIdx: previous.startBeatIdx + previous.beats,
-        beats: beatsPerBar,
-        startTick: tick,
-        ticks: barTicksNominal,
-        timeSig: [num, den],
-        timeSigChanged: false,
-        number: previous.number + 1,
-        implicit: false
-      });
-      tick += barTicksNominal;
-    }
-  }
+  // THE MINIMUM IS NOT CONDITIONAL ON THE DOCUMENT BEING EMPTY, and that is the fix (Codex point
+  // 4). It used to read `!notes.length && input.blankBars !== undefined`, so the eight bars a user
+  // asked for evaporated the instant the first note was placed and grew back when it was deleted —
+  // the document's length was a function of its contents. Bar operations need the reverse: a
+  // length the caller owns and content moves around inside.
+  tick = padToMinimumBars(bars, minimumBars, tick);
 
   const totalTicks = tick;
 
@@ -826,6 +863,7 @@ export function buildTimeSkeleton(
     external: !!ext,
     meterReason,
     totalTicks,
+    minimumBars,
     symbolic: false,
     mixedMeter: false
   });
@@ -854,6 +892,7 @@ function finishSkeleton(parts: {
   external: boolean;
   meterReason: string;
   totalTicks: number;
+  minimumBars: number;
   symbolic: boolean;
   mixedMeter: boolean;
 }): TimeSkeleton {
@@ -895,6 +934,7 @@ function finishSkeleton(parts: {
     external: parts.external,
     meterReason: parts.meterReason,
     totalTicks: parts.totalTicks,
+    minimumBars: parts.minimumBars,
     symbolic: parts.symbolic,
     mixedMeter: parts.mixedMeter,
 

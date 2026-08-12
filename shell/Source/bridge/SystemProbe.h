@@ -103,6 +103,39 @@ namespace SystemProbe
         what Activity Monitor means by memory being available. */
     int availableRamMb();
 
+    //== processor =============================================================
+    // All three cheap. Safe on the message thread, and polled beside the memory
+    // figures by engineStatus() - see NativeBridge::makeEngineStatusVar().
+    //
+    // WHY THEY ARE HERE. Settings shows one system line at the top, and until now
+    // the only thing this file could tell it was how much memory the machine has.
+    // "8 GB" on its own says nothing about whether a transcription is going to
+    // take twenty seconds or four minutes; the chip in front of it is half that
+    // answer. Every one of these returns an honest "do not know" rather than a
+    // plausible number, for the same reason processResidentMemoryMb() does.
+
+    /** The processor's own name for itself ("Apple M1", "Intel Core i7-9750H"),
+        or "" when the platform will not say. Never assembled out of a family
+        name and a core count - a made-up chip name is worse than none. */
+    juce::String cpuName();
+
+    /** PHYSICAL cores, or 0 when unknown. On an Apple Silicon Mac this counts
+        performance and efficiency cores together, which is what the machine has;
+        it is deliberately not a guess at how many of them a transcription will
+        actually get. */
+    int cpuPhysicalCores();
+
+    /** Logical processors (hardware threads), or 0 when unknown. Equal to
+        cpuPhysicalCores() on Apple Silicon, twice it on a hyperthreaded Intel. */
+    int cpuLogicalCores();
+
+    /** The one-minute load average, or **-1.0 when it cannot be read**.
+        NOT a percentage and not divided by the core count: it is the number
+        `uptime` prints, and the only honest way to turn it into a percentage is
+        with cpuPhysicalCores(), which the caller already has. Windows has no
+        equivalent cheap figure and answers -1.0. */
+    double cpuLoadOneMinute();
+
     //== time ==================================================================
 
     /** Milliseconds since the epoch, as a double. Used as the timestamp in every

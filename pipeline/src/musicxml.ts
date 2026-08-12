@@ -70,7 +70,15 @@ export interface MusicXmlOptions {
    * If the screen and the exported file must agree octave-for-octave, use 'conventional'.
    */
   octaveTransposition?: 'none' | 'conventional';
-  /** `<part-abbreviation>`, printed beside every system after the first. Omitted when absent. */
+  /**
+   * `<part-abbreviation>`, printed beside every system after the first.
+   *
+   * NEVER OMITTED FROM THE FILE. Absent here, it is derived from the part name
+   * (`abbreviatePartName`) rather than left out: a reader prints `<part-name>` at the first system
+   * and `<part-abbreviation>` at every later one, so a file without the second element labels
+   * system 1 and then goes anonymous for the rest of the page. On a multi-system score that is the
+   * difference between a part you can follow and two staves you have to count.
+   */
   partAbbreviation?: string;
 }
 
@@ -95,6 +103,50 @@ export function defaultPartName(ir: RiffsheetIR): string {
 function pitchName(midi: number): string {
   const names = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B'];
   return `${names[((midi % 12) + 12) % 12]}${Math.floor(midi / 12) - 1}`;
+}
+
+/**
+ * THE SHORT LABEL EVERY SYSTEM AFTER THE FIRST GETS. Conventional engraving abbreviations, then a
+ * truncation for anything unrecognised.
+ *
+ * ONE DEFINITION, BOTH EMITTERS, and that is the point of exporting it: MusicXML's
+ * `<part-abbreviation>` and alphaTab's `Track.shortName` are the same label on the same page, and
+ * webcore was independently inventing a third answer by slicing the full name to four characters —
+ * which turns "Bass — Tuning low → high: E1 A1 D2 G2" into "Bass" by luck and "Guitar — ..." into
+ * "Guit" by accident.
+ *
+ * The tuning summary is dropped first: everything from the em-dash on is a description of the
+ * instrument, not its name, and no engraver prints it beside a system.
+ */
+export function abbreviatePartName(name: string): string {
+  const head = name.split(/\s*[—–:]\s*/)[0].trim();
+  if (!head) return name.trim().slice(0, 4);
+  const known: Record<string, string> = {
+    guitar: 'Gtr.',
+    bass: 'Bass',
+    music: 'Mus.',
+    piano: 'Pno.',
+    drums: 'Dr.',
+    vocals: 'Voc.',
+    voice: 'Voc.',
+    keys: 'Keys',
+    synth: 'Syn.'
+  };
+  return head
+    .split(/\s+/)
+    .map((word) => {
+      const mapped = known[word.toLowerCase().replace(/[.]+$/, '')];
+      if (mapped) return mapped;
+      // A word short enough to print in full is printed in full; anything longer is cut to four
+      // letters and given the abbreviation dot that says it was cut.
+      return word.length <= 5 ? word : `${word.slice(0, 4)}.`;
+    })
+    .join(' ');
+}
+
+/** The abbreviation a part prints when the caller supplies neither one nor a name. */
+export function defaultPartAbbreviation(ir: RiffsheetIR): string {
+  return abbreviatePartName(defaultPartName(ir));
 }
 
 const NOTE_INDENT = '      ';
@@ -136,7 +188,8 @@ interface ResolvedPart {
   /** `P1`, `P2`, ... — the id shared by `<score-part>` and `<part>`. */
   id: string;
   name: string;
-  abbreviation?: string;
+  /** Always resolved: the caller's, else derived from the name. See `abbreviatePartName`. */
+  abbreviation: string;
   program: number;
   midiChannel: number;
   useTab: boolean;
@@ -162,13 +215,16 @@ function resolvePart(ir: RiffsheetIR, options: MusicXmlOptions, index: number): 
   const useGrand = ir.grandStaff;
   /** Staff numbers are 1-based and printed top to bottom: notation staves first, TAB last. */
   const notationStaves = useGrand ? 2 : 1;
+  const name = options.partName ?? defaultPartName(ir);
   return {
     ir,
     options,
     index,
     id: `P${index + 1}`,
-    name: options.partName ?? defaultPartName(ir),
-    ...(options.partAbbreviation ? { abbreviation: options.partAbbreviation } : {}),
+    name,
+    // A RENAMED PART TAKES ITS ABBREVIATION WITH IT. Falling back to the instrument's default here
+    // would print "Rhythm" at system 1 and "Gtr." at system 2 — two names for one staff.
+    abbreviation: options.partAbbreviation || abbreviatePartName(name),
     program,
     // Channel 10 is percussion by GM convention; step over it rather than land a pitched part on
     // it. A four-part cap means this never fires today, and it costs one comparison if it ever does.
@@ -219,7 +275,7 @@ export function toMultiPartMusicXML(parts: MusicXmlPart[]): string {
   for (const part of resolved) {
     L.push(`    <score-part id="${part.id}">`);
     L.push(`      <part-name>${esc(part.name)}</part-name>`);
-    if (part.abbreviation) L.push(`      <part-abbreviation>${esc(part.abbreviation)}</part-abbreviation>`);
+    L.push(`      <part-abbreviation>${esc(part.abbreviation)}</part-abbreviation>`);
     L.push(`      <score-instrument id="${part.id}-I1"><instrument-name>${esc(part.name)}</instrument-name></score-instrument>`);
     L.push(
       `      <midi-instrument id="${part.id}-I1"><midi-channel>${part.midiChannel}</midi-channel><midi-program>${part.program + 1}</midi-program></midi-instrument>`

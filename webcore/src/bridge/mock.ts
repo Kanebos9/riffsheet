@@ -117,9 +117,9 @@ const MOCK_MUSCRIPTOR_STEPS: GuideStep[] = [
     detail: 'Still in Terminal: ./venv/bin/pip install muscriptor — this is the part that takes a few minutes.'
   },
   {
-    what: 'Accept the model licence, once',
+    what: 'Accept the licence for the small model, once',
     detail:
-      'The weights are gated: sign in at huggingface.co, open the MuScriptor model page, accept the licence, then make a Read token in your account settings. The engine asks for it the first time and never again.'
+      'The weights are gated: sign in at huggingface.co, open the muscriptor-small model page, accept the licence, then make a Read token in your account settings. The engine asks for it the first time and never again. SMALL is the one to accept — it is what Riffsheet asks for, it holds about 0.9 GB of memory while it runs, and medium wants twice that for a difference most takes will not show.'
   },
   {
     what: 'Come back and press Check again',
@@ -127,6 +127,26 @@ const MOCK_MUSCRIPTOR_STEPS: GuideStep[] = [
       'Riffsheet looks in ~/muscriptor/venv by itself, along with everywhere else listed below. Installed it somewhere unusual? Use the custom-location box under this list.'
   }
 ];
+
+/**
+ * The pretend machine, as the shell describes a real one (BRIDGE.md, `engineStatus`).
+ *
+ * ONE COPY, because it is on every engine's payload: it describes the MACHINE, not the engine,
+ * and Settings draws one system line at the top of the panel from it. The numbers are this
+ * project's own development Mac, which is the case worth modelling — 8 GB is exactly the
+ * machine where a 5 GB model does not fit.
+ *
+ * `cpuLoad1m` is a load AVERAGE, not a percentage: 1.8 on 8 cores is a quiet machine. It is a
+ * fixed number rather than a wandering one so a probe can assert what the line says.
+ */
+const MOCK_MACHINE = {
+  ramTotalMb: 8192,
+  ramFreeMb: 3072,
+  cpuName: 'Apple M1',
+  cpuCores: 8,
+  cpuThreads: 8,
+  cpuLoad1m: 1.8
+} as const;
 
 /**
  * The engines the picker offers, as the browser mock describes them.
@@ -219,7 +239,11 @@ const MOCK_ENGINES: readonly EngineSummary[] = [
     producesConfidence: false,
     producesVelocity: false,
     approxDiskBytes: 0,
-    approxPeakRssMb: 1800,
+    // 900, matching the shell's manifest: the card says "about N of memory while it runs", and
+    // what runs is what `auto` asks for — the lightest installed size, which on a machine that
+    // followed the guide is small. Medium's 1.8 GB would be a claim about a model Riffsheet
+    // does not pick by itself.
+    approxPeakRssMb: 900,
     installing: false,
     detail: '',
     error: null,
@@ -455,8 +479,24 @@ export function createMockBridge(options: MockOptions = {}): NativeBridge {
     // A server somebody else started, which is what makes `stopEngine` refuse and
     // `stopExternalEngine` the only way out of it. See both, above.
     adopted: engineExternalRunning,
-    model: 'mock',
+    // THE TWO CASES THE SIZE FIELD EXISTS FOR, modelled rather than averaged.
+    //
+    // A server this pretend Riffsheet started knows its own size, because it passed it to
+    // `--model` — so `model`, `modelSource` and `modelSize` all agree on `small`, which is what
+    // `auto` picks now (lightest installed; see shell/BRIDGE.md). A server somebody ELSE started
+    // is the honest-unknown case: the prose says so and `modelSize` is absent, never filled in
+    // from our own setting. Flip between them with `__RIFFSHEET_MOCKEXTERNAL__`.
+    model: engineExternalRunning ? 'unknown - this server was already running' : 'small',
+    modelSource: engineExternalRunning
+      ? 'unknown'
+      : engineAvailable
+        ? 'started by Riffsheet'
+        : 'nothing is running yet',
+    // Undefined, not null and not '': "no claim". The chip must read this and say "unknown
+    // size" rather than reaching for `resolvedModel`.
+    modelSize: engineExternalRunning || !engineAvailable ? undefined : 'small',
     configuredModel: 'auto',
+    // Lightest first, the order the shell reports them in.
     installedModels: ['small', 'medium'],
     // The whole size table, as the shell sends it (BRIDGE.md §3.2): a figure, whether the
     // weights are on disk, and whether the size fits inside the auto rule's 40%-of-RAM
@@ -471,8 +511,7 @@ export function createMockBridge(options: MockOptions = {}): NativeBridge {
     busyOwner: null,
     queueLength: 0,
     queuePosition: 0,
-    ramTotalMb: 8192,
-    ramFreeMb: 3072,
+    ...MOCK_MACHINE,
     stopsAfterEachJob: true,
     idleSeconds: 0,
     canStop: false,
@@ -536,14 +575,17 @@ export function createMockBridge(options: MockOptions = {}): NativeBridge {
       port: 0,
       adopted: false,
       model: e.install === 'bundled' ? 'built in' : e.name,
+      modelSource: 'not applicable to this engine',
+      // No sizes at all, so no size claim. Absent, exactly as the shell sends it for these.
+      modelSize: undefined,
       configuredModel: 'not applicable to this engine',
       installedModels: [] as string[],
       busy: false,
       busyOwner: null,
       queueLength: 0,
       queuePosition: 0,
-      ramTotalMb: 8192,
-      ramFreeMb: 3072,
+      // The machine is the machine, whichever engine is being asked about.
+      ...MOCK_MACHINE,
       stopsAfterEachJob: e.install !== 'bundled',
       idleSeconds: 0,
       canStop: false,
@@ -708,10 +750,6 @@ export function createMockBridge(options: MockOptions = {}): NativeBridge {
       await new Promise((done) => setTimeout(done, 60));
       // Same engine `engineStatus()` answers for, and for the same reason.
       return statusForEngine(resolveEngine(true).id);
-    },
-
-    async setEngineModel(model) {
-      return { ok: true, model, restarted: false };
     },
 
     /**

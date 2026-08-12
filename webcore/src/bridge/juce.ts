@@ -241,6 +241,9 @@ interface ShellEngineStatus {
   port?: number;
   adopted?: boolean;
   model?: string;
+  modelSource?: string;
+  /** A proved size, or null/absent. NEVER inferred from anything else here — see types.ts. */
+  modelSize?: string | null;
   configuredModel?: string;
   installedModels?: string[];
   busy?: boolean;
@@ -249,6 +252,10 @@ interface ShellEngineStatus {
   queuePosition?: number;
   ramTotalMb?: number;
   ramFreeMb?: number;
+  cpuName?: string;
+  cpuCores?: number;
+  cpuThreads?: number;
+  cpuLoad1m?: number | null;
   stopsAfterEachJob?: boolean;
   idleSeconds?: number;
   canStop?: boolean;
@@ -357,6 +364,15 @@ function toEngineStatus(s: ShellEngineStatus | null): EngineStatus | null {
     port: s.port ?? 0,
     adopted: s.adopted === true,
     model: s.model ?? 'unknown',
+    modelSource: s.modelSource,
+    // A SIZE OR NOTHING. Kept only when the shell sent one of the three words: null is what a
+    // shell sends for "not proved", an older shell sends nothing at all, and anything else
+    // (a path, an hf:// URL) is a model but not a size. Defaulting this to `resolvedModel`
+    // would put our own setting on a chip describing somebody else's server.
+    modelSize:
+      s.modelSize === 'small' || s.modelSize === 'medium' || s.modelSize === 'large'
+        ? s.modelSize
+        : undefined,
     configuredModel: s.configuredModel,
     installedModels: Array.isArray(s.installedModels) ? s.installedModels : [],
     busy: s.busy === true,
@@ -365,6 +381,14 @@ function toEngineStatus(s: ShellEngineStatus | null): EngineStatus | null {
     queuePosition: s.queuePosition ?? 0,
     ramTotalMb: s.ramTotalMb,
     ramFreeMb: s.ramFreeMb,
+    // The machine's own line. Unknown stays unknown all the way through: '' and 0 are the
+    // shell's own "would not say" values and are passed on rather than turned into a
+    // placeholder, and a load average is dropped unless it is a real non-negative number
+    // (the shell sends null on Windows, and -1 never reaches here).
+    cpuName: typeof s.cpuName === 'string' ? s.cpuName : undefined,
+    cpuCores: typeof s.cpuCores === 'number' && s.cpuCores > 0 ? s.cpuCores : undefined,
+    cpuThreads: typeof s.cpuThreads === 'number' && s.cpuThreads > 0 ? s.cpuThreads : undefined,
+    cpuLoad1m: typeof s.cpuLoad1m === 'number' && s.cpuLoad1m >= 0 ? s.cpuLoad1m : undefined,
     stopsAfterEachJob: s.stopsAfterEachJob === true,
     idleSeconds: s.idleSeconds,
     canStop: s.canStop === true,
@@ -1154,8 +1178,7 @@ export function createJuceBridge(): NativeBridge {
     selectEngine: hasNativeFunction('selectEngine')
       ? async (id: string) => {
           // Not `call()`: "I will not swap the engine while it is transcribing" is an answer
-          // to put on screen, not an exception to swallow — the same treatment
-          // `setEngineModel` gets for the same reason.
+          // to put on screen, not an exception to swallow.
           const fn = await nativeFn('selectEngine');
           const r = (await fn(id)) as NativeResult & {
             configuredEngine?: string;
@@ -1327,21 +1350,6 @@ export function createJuceBridge(): NativeBridge {
       ? async (jobId?: number) => {
           const r = await call<{ cancelled?: number }>('transcribeCancel', jobId).catch(() => null);
           return { cancelled: r?.cancelled ?? 0 };
-        }
-      : undefined,
-
-    setEngineModel: hasNativeFunction('setEngineModel')
-      ? async (model) => {
-          // Not `call()`: a refusal ("that server is not ours to restart") is an expected
-          // answer the panel shows to the user, not an exception.
-          const fn = await nativeFn('setEngineModel');
-          const r = (await fn(model)) as NativeResult & { model?: string; restarted?: boolean };
-          return {
-            ok: r?.ok !== false,
-            model: typeof r?.model === 'string' ? r.model : undefined,
-            restarted: r?.restarted === true,
-            error: r?.ok === false ? (r.error ?? 'the engine would not change model') : undefined
-          };
         }
       : undefined,
 

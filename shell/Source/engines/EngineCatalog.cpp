@@ -50,10 +50,12 @@ namespace
         { "Install MuScriptor into it",
           "Still in Terminal: ./venv/bin/pip install muscriptor — this is the part that takes a "
           "few minutes." },
-        { "Accept the model licence, once",
-          "The weights are gated: sign in at huggingface.co, open the MuScriptor model page, "
-          "accept the licence, then make a Read token in your account settings. The engine asks "
-          "for it the first time and never again." },
+        { "Accept the licence for the small model, once",
+          "The weights are gated: sign in at huggingface.co, open the muscriptor-small model "
+          "page, accept the licence, then make a Read token in your account settings. The engine "
+          "asks for it the first time and never again. SMALL is the one to accept — it is what "
+          "Riffsheet asks for, it holds about 0.9 GB of memory while it runs, and medium wants "
+          "twice that for a difference most takes will not show." },
         { "Come back and press Check again",
           "Riffsheet looks in ~/muscriptor/venv by itself, along with everywhere else listed "
           "below. Installed it somewhere unusual? Use the custom-location box under this list." }
@@ -139,7 +141,12 @@ namespace
         /*needsGainNorm*/ true,  /*needsTuningNorm*/ true,  /*preferredInputRate*/ 0.0,
         "see upstream", "CC BY-NC 4.0 (gated)", /*redistributable*/ false,
         {},                       // NEVER a download. This is the AGPL red line.
-        "engine", "", "", "", 0, 1800,
+        // approxPeakRssMb is 900, not 1800: the card says "about N of memory while
+        // it runs", and what runs is whatever `auto` asked for - which is now the
+        // LIGHTEST installed size, and on a machine following the guide that is
+        // small (see ModelCatalog). Quoting medium's 1.8 GB would be a claim about
+        // a model Riffsheet no longer picks by itself.
+        "engine", "", "", "", 0, 900,
         kMuScriptorSteps, 5 },
 
       //------------------------------------------------------------------------ bass-v2

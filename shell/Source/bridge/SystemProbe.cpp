@@ -4,6 +4,7 @@
  #include <signal.h>
  #include <errno.h>
  #include <unistd.h>
+ #include <stdlib.h>     // getloadavg
 #endif
 
 #if JUCE_MAC
@@ -339,6 +340,53 @@ int availableRamMb()
 
    #else
     return 0;
+   #endif
+}
+
+//==============================================================================
+juce::String cpuName()
+{
+    // JUCE reads machdep.cpu.brand_string on macOS (which answers "Apple M1" on
+    // Apple Silicon as well as the full Intel string), /proc/cpuinfo's "model
+    // name" on Linux, and the registry on Windows. Every one of those can come
+    // back empty, and an empty string is passed straight through: the caller's
+    // contract is that "" means "the machine would not say".
+    //
+    // Cached, because it cannot change while the process lives and this is
+    // called from a 2 Hz status poll.
+    static const juce::String cached = juce::SystemStats::getCpuModel().trim();
+    return cached;
+}
+
+int cpuPhysicalCores()
+{
+    return juce::jmax (0, juce::SystemStats::getNumPhysicalCpus());
+}
+
+int cpuLogicalCores()
+{
+    return juce::jmax (0, juce::SystemStats::getNumCpus());
+}
+
+double cpuLoadOneMinute()
+{
+   #if JUCE_MAC || JUCE_LINUX
+    // getloadavg() is three doubles out of the kernel's own running average -
+    // no fork, no parsing, no sampling window of our own to get wrong. It is
+    // the figure `uptime` prints, and it is returned raw for the reason the
+    // header gives: dividing by the core count here would bake one reading of
+    // "busy" into the bridge.
+    double averages[3] = { -1.0, -1.0, -1.0 };
+
+    if (::getloadavg (averages, 3) < 1 || averages[0] < 0.0)
+        return -1.0;
+
+    return averages[0];
+   #else
+    // No cheap equivalent: Windows wants a performance counter opened and
+    // sampled twice over an interval, which is a different kind of thing from
+    // everything else in this file. -1.0 is honest and the UI draws nothing.
+    return -1.0;
    #endif
 }
 

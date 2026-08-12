@@ -4,8 +4,17 @@ namespace ModelCatalog
 {
 namespace
 {
-    /** Largest first - the order auto-selection walks. */
-    const char* const sizesLargestFirst[] = { "large", "medium", "small" };
+    /** Lightest first - the order auto-selection walks, and the order every
+        list this file produces comes out in.
+
+        It used to be largest first, because "bigger is better when it fits".
+        The owner's decision reversed that: the machine Riffsheet runs on is
+        somebody's DAW machine with a session already in it, and the engine is a
+        Python process that holds its weights resident for the length of a job.
+        Auto now asks for the LIGHTEST thing that is installed, and a heavier
+        model is something a person chooses, never something Riffsheet picks for
+        them. */
+    const char* const sizesLightestFirst[] = { "small", "medium", "large" };
 
     juce::File fromEnvironment (const char* name)
     {
@@ -71,7 +80,7 @@ juce::StringArray installedModels()
     if (! cache.isDirectory())
         return found;
 
-    for (const auto* size : sizesLargestFirst)
+    for (const auto* size : sizesLightestFirst)
     {
         const auto dir = cache.getChildFile ("models--MuScriptor--muscriptor-" + juce::String (size));
 
@@ -99,19 +108,26 @@ bool fitsInPhysicalRam (const juce::String& model, int ramTotalMb)
 //==============================================================================
 Choice chooseAutomatically (const juce::StringArray& installed, int ramTotalMb, int ramFreeMb)
 {
+    // NOTHING INSTALLED. The first run asks for SMALL, which is the size the
+    // setup guide installs and the lightest thing the server can be told to
+    // fetch. This used to say "medium" and it was the one place the fresh-install
+    // path disagreed with everything else: a machine with no weights on it is
+    // exactly the machine that should not be handed a 1.8 GB download and a
+    // 1.8 GB resident process without being asked.
     if (installed.isEmpty())
-        return { "medium",
-                 "No weights are on this machine yet, so Riffsheet is asking for the medium "
-                 "model - the server will download it the first time you transcribe." };
+        return { "small",
+                 "No weights are on this machine yet, so Riffsheet is asking for the small "
+                 "model - the lightest one, and the one the setup guide installs. The server "
+                 "will download it the first time you transcribe." };
 
-    // Largest first, keeping only the sizes actually on disk.
+    // Lightest first, keeping only the sizes actually on disk.
     juce::StringArray candidates;
 
-    for (const auto* size : sizesLargestFirst)
+    for (const auto* size : sizesLightestFirst)
         if (installed.contains (size))
             candidates.add (size);
 
-    const auto smallestInstalled = candidates[candidates.size() - 1];
+    const auto smallestInstalled = candidates[0];
 
     // Step 2: what this machine can physically carry. See the header for the
     // arithmetic behind the 40%.
@@ -127,30 +143,24 @@ Choice chooseAutomatically (const juce::StringArray& installed, int ramTotalMb, 
                  "every model you have installed, so Riffsheet picked the smallest one ("
                  + smallestInstalled + ")." };
 
-    auto chosen = affordable[0];
-    juce::String reason = "Using the largest weights you have installed that this machine can carry ("
-                        + chosen + ", about " + juce::String (estimatedResidentMb (chosen) / 1000.0, 1)
-                        + " GB while it runs).";
+    // Step 3: the lightest size that clears the physical-RAM ceiling. `affordable`
+    // is already lightest first, so this IS the pick - there is no step down to
+    // make afterwards and no larger model to grow into.
+    const auto chosen = affordable[0];
+    juce::String reason = "Using the lightest weights you have installed (" + chosen + ", about "
+                        + juce::String (estimatedResidentMb (chosen) / 1000.0, 1)
+                        + " GB while it runs). Riffsheet only asks for a heavier model when you "
+                          "install one and nothing lighter is here.";
 
-    // Step 3: free memory right now. Only ever a step DOWN, and never past the
-    // smallest thing on disk - picking something that is not installed would
-    // start a download, which helps nobody.
-    if (ramFreeMb > 0)
-    {
-        while (ramFreeMb < estimatedResidentMb (chosen) + 400)
-        {
-            const auto next = affordable.indexOf (chosen) + 1;
-
-            if (next >= affordable.size())
-                break;
-
-            const auto smaller = affordable[next];
-            reason = "Only about " + juce::String (ramFreeMb) + " MB of memory is free right now, so "
-                     "Riffsheet stepped down from " + chosen + " to " + smaller + " rather than push "
-                     "this machine into swapping.";
-            chosen = smaller;
-        }
-    }
+    // Free memory right now. It can no longer change the choice - the choice is
+    // already the lightest thing on this disk that fits - so it only changes what
+    // the card SAYS, and only when it is the interesting case: the machine is
+    // short of memory and there is nothing lighter to fall back to.
+    if (ramFreeMb > 0 && ramFreeMb < estimatedResidentMb (chosen) + 400)
+        reason = "Only about " + juce::String (ramFreeMb) + " MB of memory is free right now and "
+                 + chosen + " is the lightest model you have installed (it wants about "
+                 + juce::String (estimatedResidentMb (chosen)) + " MB), so Riffsheet is using it "
+                 "rather than anything heavier.";
 
     return { chosen, reason };
 }

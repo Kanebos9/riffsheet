@@ -7,7 +7,14 @@
 
     Riffsheet used to ask for "medium" and nothing else, hardcoded. Somebody with
     small, medium AND large downloaded had no way of telling which one was
-    running, and no way to choose - which is punch-list item 10.
+    running - which is punch-list item 10.
+
+    WHAT PICKS, NOW. Riffsheet picks, and it picks the LIGHTEST size that is
+    installed (chooseAutomatically() below spells out the rule). There is no
+    size chooser in Settings any more: a dropdown that offers three sizes is a
+    question a musician cannot answer, and the two honest ways to override the
+    pick both survive - install only the size you want, or set
+    RIFFSHEET_MUSCRIPTOR_MODEL, which nothing here auto-selects around.
 
     WHERE THE WEIGHTS LIVE. MuScriptor resolves a bare size keyword to
     `hf://MuScriptor/muscriptor-<size>/model.safetensors` (its own
@@ -34,7 +41,9 @@ namespace ModelCatalog
     /** Where huggingface_hub keeps its cache on this machine. */
     juce::File cacheDirectory();
 
-    /** Which of small/medium/large have usable weights on disk, largest first.
+    /** Which of small/medium/large have usable weights on disk, LIGHTEST FIRST -
+        the order auto-selection walks, so the head of this list is the thing
+        `auto` will ask for whenever the machine can carry it.
         Empty is a perfectly normal answer on a fresh machine. */
     juce::StringArray installedModels();
 
@@ -49,7 +58,8 @@ namespace ModelCatalog
         second copy of "* 5 <= * 2" is exactly how the UI ends up telling the
         user something the resolver does not believe. engineStatus() reports it
         per model so a card can list all three sizes with an honest "this
-        machine cannot carry that one"; chooseAutomatically() uses it to pick.
+        machine cannot carry that one"; chooseAutomatically() uses it to drop
+        sizes before it takes the lightest of what is left.
         `ramTotalMb <= 0` means "could not tell", and answers true rather than
         hiding every model behind an unknown. */
     bool fitsInPhysicalRam (const juce::String& model, int ramTotalMb);
@@ -71,23 +81,29 @@ namespace ModelCatalog
         that a second copy of the medium server costs "about another gigabyte",
         and the weights on disk are 1.1 GB for medium.)
 
-          1. Prefer the LARGEST installed weights. Bigger is better when it fits.
+          1. Prefer the LIGHTEST installed weights. This is the owner's decision
+             and it reverses what this function used to do: Riffsheet shares a
+             machine with a DAW session, and the cheapest model that is actually
+             on the disk is the one a person did not have to be asked about. A
+             heavier model is a CHOICE, never an automatic pick - somebody who
+             wants medium installs medium and selects it, or sets
+             RIFFSHEET_MUSCRIPTOR_MODEL.
           2. Drop any size whose estimate is more than 40% of PHYSICAL RAM. That
              makes small want 2.3 GB, medium 4.5 GB and large 12.5 GB of machine.
-             This 8 GB Mac therefore runs medium and will never pick large, which
-             is the intended outcome: the owner has complained about memory and a
-             5 GB model on an 8 GB machine is a swap storm, not a transcription.
-          3. Then look at what is actually FREE right now. If less is available
-             than the model needs plus 400 MB of headroom, step down one size -
-             but NEVER below the smallest thing that is installed. Choosing
-             something that is not on disk would trigger a download, which is
-             the opposite of helping.
-          4. If nothing is installed at all, ask for "medium" exactly as before
-             and let the server download it. That is today's behaviour and it
-             stays the default for a first run.
+             The ceiling still applies, so on a machine too small even for the
+             lightest installed size the answer is that size anyway (see below)
+             rather than nothing.
+          3. FREE memory right now cannot change the answer any more - step 1
+             already picked the lightest thing on the disk, and stepping "down"
+             to something that is not installed would trigger a download, which
+             is the opposite of helping. It changes only the SENTENCE, so a
+             machine under memory pressure says so honestly.
+          4. If nothing is installed at all, ask for "small". That is the size
+             the setup guide installs, and a fresh machine is precisely the one
+             that must not be handed a heavier download it never asked for.
 
-        `ramFreeMb` may be 0 for "could not tell", in which case step 3 is
-        skipped rather than guessed at.
+        `ramFreeMb` may be 0 for "could not tell", in which case the wording in
+        step 3 is skipped rather than guessed at.
     */
     Choice chooseAutomatically (const juce::StringArray& installed, int ramTotalMb, int ramFreeMb);
 

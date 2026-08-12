@@ -712,10 +712,11 @@ engineStatus(id?: string): Promise<{
 
   model: string,                // the weights actually in use, best known
   modelSource: string,          // where that answer came from
+  modelSize: 'small' | 'medium' | 'large' | null,   // PROVED size, else null — see below
   configuredModel: string,      // 'auto' | 'small' | 'medium' | 'large'
   resolvedModel: string,        // what 'auto' currently means
   modelReason: string,          // a plain sentence explaining the choice
-  installedModels: string[],    // weights found on disk, e.g. ["medium"]
+  installedModels: string[],    // weights found on disk, LIGHTEST FIRST, e.g. ["small","medium"]
   models: Array<{               // ALL THREE sizes, installed or not — see below
     name: 'small' | 'medium' | 'large',
     approxResidentMb: number,   // 900 | 1800 | 5000
@@ -736,6 +737,12 @@ engineStatus(id?: string): Promise<{
 
   ramTotalMb: number,
   ramFreeMb: number,            // what could be handed out without swapping; 0 = unknown
+
+  // --- the machine, on every engine's payload (Settings' system line) -------
+  cpuName: string,              // "Apple M1"; "" = the machine would not say
+  cpuCores: number,             // physical cores; 0 = unknown
+  cpuThreads: number,           // logical processors; 0 = unknown
+  cpuLoad1m: number | null,     // one-minute load average, NOT a percentage; null = unknown
 
   stopsAfterEachJob: true,      // the engine dies at the end of every job; see below
   idleSeconds: number,          // since the last job finished anywhere on this machine
@@ -892,7 +899,7 @@ selectEngine(id: 'auto' | string): Promise<
 
 Stores the choice in `<appSupport>/engine.json` beside the venv — the one
 setting a Finder-launched DAW can actually read — and answers with what that
-choice resolves to. Modelled on `setEngineModel`, including its refusal:
+choice resolves to. Its refusals:
 
 - **It refuses while anything on this machine is transcribing.** Swapping the
   engine under a running job is the same class of bug as swapping the weights.
@@ -1248,12 +1255,20 @@ landing with the installer wave); everything else stays a guide.
 
 **`model` is the honest answer, not our setting.** Three cases:
 
-| situation | `model` | `modelSource` |
-|---|---|---|
-| a server we started | the size we passed to `--model` | `"started by Riffsheet"` |
-| somebody else's server, readable | the size from **its own command line** | `"read from the command line of the server on port 8222"` |
-| somebody else's server, unreadable | `"unknown - this server was already running"` | `"unknown"` |
-| nothing running yet | what `auto` would start | `"nothing is running yet"` |
+| situation | `model` | `modelSource` | `modelSize` |
+|---|---|---|---|
+| a server we started | the size we passed to `--model` | `"started by Riffsheet"` | that size |
+| somebody else's server, readable | the size from **its own command line** | `"read from the command line of the server on port 8222"` | that size |
+| somebody else's server, unreadable | `"unknown - this server was already running"` | `"unknown"` | `null` |
+| nothing running yet | what `auto` would start | `"nothing is running yet"` | `null` |
+
+**`modelSize` is a size or nothing.** It exists so a chip can print
+`"MuScriptor small"` without parsing prose, and it is `null` for every case where
+the size is not proved — including a `--model` (ours, from
+`RIFFSHEET_MUSCRIPTOR_MODEL`, or theirs) that names a path or an `hf://` URL
+rather than one of the three words. That is a real model but not a size, and
+naming a size for it would be a guess. A UI that finds no `modelSize` must say
+*unknown size*, never substitute `resolvedModel`.
 
 MuScriptor's `/health` answers `{"status":"ok"}` and nothing else, and no other
 endpoint names the model (checked against the installed `server.py`), so reading
@@ -1265,39 +1280,58 @@ guessing.
 `<cache>/models--MuScriptor--muscriptor-{small,medium,large}` with real weights
 behind the snapshot symlink. `HF_HOME` and `HUGGINGFACE_HUB_CACHE` are honoured.
 
-```ts
-setEngineModel(model: 'auto' | 'small' | 'medium' | 'large'): Promise<
-    { ok: true,  model: string, restarted: boolean, reason: string, message?: string }
-  | { ok: false, error: string }>
-```
+### `setEngineModel()` is gone — there are two ways to choose a size, and neither is a call
 
-`restarted: true` means the old server has been **closed**; the new weights load
-on the next transcription rather than blocking this call for up to four minutes.
-`message` says that in a sentence you can show.
+`setEngineModel(model)` was **removed** along with the Settings size drop-down
+that was its only caller: the native function is no longer registered, and
+`webcore/src/bridge/types.ts` no longer declares it. It took
+`'auto' | 'small' | 'medium' | 'large'`, refused while a job was running or while
+we had adopted somebody else's server, and closed our own server so the new
+weights loaded on the next transcription.
 
-It refuses, politely, in two cases:
+Nothing regressed with it, because the two paths that actually decide a size both
+survive:
 
-- **we adopted somebody else's server** — our setting is irrelevant to it, and
-  saying "large" while their medium does the work would be the worst kind of lie;
-- **something is transcribing right now** — restarting the server underneath a
-  running job would lose it.
+- **`auto`** — the lightest installed weights, resolved by `ModelCatalog` at the
+  moment a server starts. This is what every player gets.
+- **`RIFFSHEET_MUSCRIPTOR_MODEL`** — names a size deliberately, for a harness or
+  a developer. Read once at construction, so `configuredModel` is fixed for the
+  life of the server and nothing can swap weights underneath a running job. This
+  is why `MuScriptorServer` has `getConfiguredModel()` and no setter.
 
-**What `auto` means.** Prefer the largest installed weights, then step down for
-memory. Loaded, the server holds roughly 0.9 GB (small), 1.8 GB (medium) or 5 GB
-(large), Python and the Metal buffers included.
+`engineStatus()` still **reports** which weights are loaded (`resolvedModel`,
+`modelSize`, `runningModelDescription`), which is all the Settings panel ever
+needed: the card says what is ACTUALLY in memory instead of offering a preference
+about it. The reasoning for dropping the control is in
+`webcore/src/ui/settings.ts` where `ENGINE_MODELS` used to be — briefly, a shell
+that adopts a server it did not start cannot honour the preference at all, and
+where it could be honoured it invited somebody with 8 GB to pick "large".
+
+**What `auto` means.** Prefer the **lightest** installed weights. Loaded, the
+server holds roughly 0.9 GB (small), 1.8 GB (medium) or 5 GB (large), Python and
+the Metal buffers included.
 
 1. Drop any size needing more than **40% of physical RAM** — so small wants a
-   2.3 GB machine, medium 4.5 GB and large 12.5 GB. This 8 GB Mac therefore
-   never picks large.
-2. Then, if **free** RAM is under the model's estimate plus 400 MB, step down one
-   size — but **never below the smallest thing installed**, because choosing
-   something that is not on disk would start a download instead of helping.
-3. Nothing installed at all → ask for `"medium"` and let the server download it,
-   exactly as before.
+   2.3 GB machine, medium 4.5 GB and large 12.5 GB. If that drops everything
+   installed, the smallest installed size is used anyway and the sentence says
+   the machine is tight.
+2. Take the **lightest** of what is left. Free RAM can no longer change the
+   answer — the answer is already the lightest thing on the disk — so it changes
+   only the sentence, which says so when free memory is under the estimate plus
+   400 MB.
+3. Nothing installed at all → ask for `"small"`, the size the setup guide
+   installs, and let the server download it.
+
+This reverses the old largest-first rule, and it is a product decision: Riffsheet
+shares a machine with a DAW session, so a heavier model is something a person
+chooses (by installing only that size, or with
+`RIFFSHEET_MUSCRIPTOR_MODEL`), never something Riffsheet picks for them. There
+is no size dropdown in Settings any more.
 
 Measured on this machine: 8192 MB total, ~1370 MB free, only `medium` installed →
-**medium**, "Using the largest weights you have installed that this machine can
-carry".
+**medium** (it is the only thing on the disk), "Only about 1370 MB of memory is
+free right now and medium is the lightest model you have installed". With small
+also installed the same machine answers **small**.
 
 `RIFFSHEET_MUSCRIPTOR_MODEL` still overrides everything and disables
 auto-selection.

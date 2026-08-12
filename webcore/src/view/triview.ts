@@ -43,15 +43,10 @@ import {
 import type { EngravedExtent } from './timeAxis';
 // The one wheel-to-zoom law, borrowed rather than restated: a pinch over the SHEET and a pinch
 // over the ROLL have to be worth exactly the same amount, or the coupled pair pulls apart in the
-// hand. See `wheelZoomFactor`'s note on why it is exponential and clamped.
-import { wheelZoomFactor, WHEEL_ZOOM_MAX_STEP } from './pianoroll';
-import { PinchAccumulator } from './timeAxis';
-
-/**
- * How long a pinch on one road blocks the other. See `PianoRoll`'s constant of the same name —
- * one number, two surfaces, because it is a property of the trackpad and not of either pane.
- */
-const PINCH_DEDUPE_MS = 250;
+// hand. That used to mean two copies of the road/dedupe/baseline machinery on two surfaces (three,
+// with the waveform strip) which drifted apart in exactly the ways view/gesture.ts documents.
+// There is one copy now, and what is left here is the sheet's own coordinates.
+import { PinchGesture } from './gesture';
 import { countRendererCredits, stripRendererCredit } from './watermark';
 import { t, TIPS } from '../ui/tips';
 import type { RiffScore } from '../pipeline';
@@ -81,7 +76,7 @@ export interface TriViewViewport {
  */
 export interface NoteDragPreview {
   noteId: string;
-  kind: 'pitch' | 'string';
+  kind: 'pitch' | 'string' | 'time';
   steps: number;
   valid: boolean;
 }
@@ -99,6 +94,14 @@ export interface NoteDragPreview {
  */
 export type NoteDragCommit =
   | { noteId: string; kind: 'pitch'; semitones: number }
+  /**
+   * A HORIZONTAL drag: the same note, attacked at a different written time.
+   *
+   * `tick` is where it was dropped, unrounded, for the same reason `SheetTarget.tick` is: the
+   * beat it should land on is a question about the meter. The app rounds and then applies the
+   * collision law — see edit/performanceEdit.ts.
+   */
+  | { noteId: string; kind: 'time'; tick: number }
   | {
       noteId: string;
       kind: 'string';
@@ -191,6 +194,11 @@ export interface TriViewOptions {
    * of it and the sheet is about to be re-engraved underneath.
    */
   onPartLabelClick?: (trackIndex: number, rect: { x: number; y: number; w: number; h: number }) => void;
+  /**
+   * A RIGHT-CLICK ON THE SHEET, resolved to a semantic target. The browser's own menu is
+   * already suppressed by the time this fires; see `onContextMenu` and `SheetTarget`.
+   */
+  onSheetContextMenu?: (target: SheetTarget) => void;
   // `onZoomChange` stood here and is gone (finding 14). It was documented as identifying
   // SHEET-ORIGINATED zoom, and it could not: `ui/app.ts` also called `setZoom()` to carry a ROLL
   // zoom onto the sheet, and this fired for that too. So the one caller — `adoptNextAlignSpan` —
@@ -210,6 +218,60 @@ export interface NoteHit {
    * route on too. Null when there is no way to tell.
    */
   staff: StaffKind | null;
+  /**
+   * WHICH PART THIS IS, carried on every hit rather than looked up per decision.
+   *
+   * A note id was not enough identity and the gap was reachable: an EMPTY imported staff has no
+   * note under the pointer, so a guard written as "is this note id an imported one?" answered
+   * "no" for the one case where the answer matters most, and the press fell through to seek or
+   * to an edit on a part that is paper. `trackIndex` comes off `bar.staff.track`, so it is the
+   * engraving's own answer and it is there whether or not a note resolved.
+   */
+  trackIndex: number | null;
+  /** True when `trackIndex` is the take's own part — the only part v1 edits. */
+  live: boolean;
+  /** The MASTER bar under the pointer, 0-based. Null when nothing is engraved there. */
+  barIndex: number | null;
+}
+
+/**
+ * WHERE A RIGHT-CLICK LANDED, as a semantic target rather than as a pixel.
+ *
+ * Everything the context menu has to decide — which items exist, which are enabled, what the
+ * ticked value is — is a question about the MUSIC at that point, and the sheet is the only
+ * object that can answer it: it owns the engraving's geometry, the clefs and the staff ladder.
+ * So the sheet answers all of it once, and `ui/app.ts` builds a menu out of the answer without
+ * ever converting a pixel itself.
+ */
+export interface SheetTarget {
+  /** Client coordinates of the press, for placing the menu. */
+  clientX: number;
+  clientY: number;
+  /** The note under the pointer, if the press was on one. */
+  noteId: string | null;
+  /** Which part, and whether it is the live one. See `NoteHit.trackIndex`. */
+  trackIndex: number | null;
+  live: boolean;
+  /** The master bar the press was in, 0-based. */
+  barIndex: number | null;
+  /** Which staff, so an "add note" on the TAB can be refused rather than guessed at. */
+  staff: StaffKind | null;
+  /**
+   * The engraved tick under the pointer, unrounded.
+   *
+   * NOT snapped to a beat here: rounding needs the meter and the divisions, which live in the
+   * IR, and the sheet does not hold the IR's bar list. `ui/app.ts` rounds it. Handing over a
+   * rounded number would be this file guessing at music theory with geometry.
+   */
+  tick: number | null;
+  /**
+   * The MIDI pitch the pointer's height names on a NOTATION staff, in the current key.
+   *
+   * Null over a TAB staff, and deliberately: a y over a tab identifies a STRING, not a pitch,
+   * and the fret is the other half of the answer. Inventing an open-string note there would be
+   * a surprise, so empty-space "Add note" exists on notation staves only.
+   */
+  midi: number | null;
 }
 
 export interface RenderInfo {
@@ -371,12 +433,69 @@ const DRAG_THRESHOLD_PX = 3;
 /** Matches `AppSettings.maxFret`'s default. Overridden through the option or `setFretLimit`. */
 const DEFAULT_MAX_FRET = 17;
 
+/**
+ * THE TOP PRINTED LINE OF EACH CLEF, as a diatonic index where 0 is middle C (C4, MIDI 60).
+ *
+ * Counting in DIATONIC steps rather than semitones is not a convenience: a staff position is a
+ * letter, not a pitch, which is exactly why the key signature has to be applied afterwards. Two
+ * clefs are listed because two are engraved — treble and bass. Anything else falls back to
+ * treble rather than answering with a pitch it cannot justify.
+ *
+ *   G2 (treble)  top line F5 = C4 + 10 diatonic steps
+ *   F4 (bass)    top line A3 = C4 - 2 diatonic steps
+ */
+const TOP_LINE_DIATONIC: Partial<Record<alphaTab.model.Clef, number>> = {
+  [alphaTab.model.Clef.G2]: 10,
+  [alphaTab.model.Clef.F4]: -2,
+  [alphaTab.model.Clef.C3]: 4,
+  [alphaTab.model.Clef.C4]: 2
+};
+
+/** Semitones above C for each letter of the scale, C D E F G A B. */
+const DIATONIC_SEMITONES = [0, 2, 4, 5, 7, 9, 11] as const;
+/** The order sharps are added in, as scale degrees: F C G D A E B. */
+const SHARP_ORDER = [3, 0, 4, 1, 5, 2, 6] as const;
+/** And flats: B E A D G C F. */
+const FLAT_ORDER = [6, 2, 5, 1, 4, 0, 3] as const;
+
+/** What the key signature does to one letter. ±1 semitone, or nothing. */
+function keyAlteration(degree: number, fifths: number): number {
+  if (fifths > 0) return SHARP_ORDER.slice(0, Math.min(7, fifths)).includes(degree as 0) ? 1 : 0;
+  if (fifths < 0) return FLAT_ORDER.slice(0, Math.min(7, -fifths)).includes(degree as 0) ? -1 : 0;
+  return 0;
+}
+
+/** A diatonic index (0 = C4) as a sounding MIDI note, in the given key. */
+function diatonicToMidi(index: number, fifths: number): number {
+  const octave = Math.floor(index / 7);
+  const degree = index - octave * 7;
+  const midi = 60 + octave * 12 + DIATONIC_SEMITONES[degree] + keyAlteration(degree, fifths);
+  return Math.max(0, Math.min(127, midi));
+}
+
 /** Everything one in-flight note drag needs to remember. See the drag section on the class. */
 interface DragState {
   noteId: string;
   note: alphaTab.model.Note;
   staff: StaffKind;
   startClientY: number;
+  startClientX: number;
+  /**
+   * WHICH AXIS THIS DRAG IS ABOUT, decided once and then locked (Z4d).
+   *
+   * Null until the pointer has moved past the threshold. A horizontal drag now means "attack it
+   * somewhere else" and a vertical one still means pitch (or string), so without a lock an
+   * ordinary diagonal wobble on a pitch drag would also move the note in time — a hand that
+   * meant one thing doing two. Whichever component was larger when the drag was recognised wins,
+   * and it keeps winning: re-deciding mid-drag would make the note jitter between two meanings.
+   */
+  axis: 'pitch' | 'time' | null;
+  /** Time drags only: where the note was dropped, unrounded. See `NoteDragCommit`. */
+  tick: number | null;
+  /** Time drags only: the ghost's x offset from the grabbed glyph, in content px. */
+  dx: number;
+  /** False on an imported part, where a drag may look at the music and change nothing. */
+  editable: boolean;
   /** The grabbed glyph, in content coordinates — the ghost is drawn relative to it. */
   head: { x: number; y: number; w: number; h: number };
   /** Pointer travel per step: half a staff space on the staff, one line gap on the tab. */
@@ -650,12 +769,14 @@ export class TriView {
     });
 
     this.scroller.addEventListener('pointerdown', this.onPointerDown);
+    this.scroller.addEventListener('contextmenu', this.onContextMenu);
     this.scroller.addEventListener('scroll', this.onScroll, { passive: true });
     // Not passive: a pinch arrives as a ctrl-wheel and the browser would zoom the whole plugin
     // window with it unless this says it was handled. See `onSheetWheel`.
     this.scroller.addEventListener('wheel', this.onSheetWheel, { passive: false });
     this.scroller.addEventListener('gesturestart', this.onGestureStart, { passive: false });
     this.scroller.addEventListener('gesturechange', this.onGestureChange, { passive: false });
+    this.scroller.addEventListener('gestureend', this.onGestureEnd, { passive: false });
     // Hover only: the cursor has to say "this note can be moved up and down" before
     // anybody tries it. The drag itself listens on window, so it survives the pointer
     // leaving the element mid-gesture.
@@ -1229,8 +1350,19 @@ export class TriView {
   }
 
   /**
-   * The two staves the names row sits between: the tab and whatever is directly above it,
-   * or — when there is no tab at all — the top two staves of a grand pair.
+   * The two staves the names row sits between: the TAB, and whatever is directly above it.
+   *
+   * "Between" means notation-to-tab and nothing else. It used to fall back to the top two staves
+   * of a grand pair when there was no tab at all, and that gap is not a label lane: it is where
+   * the treble staff's downward stems, its ledger lines below the staff, and the bass staff's
+   * upward stems and ledger lines all go. A grand staff with tablature OFF printed the whole row
+   * on top of that ink — reported from the field, and visible in the screenshot as note names
+   * sitting on beams and noteheads. Widening MULTI_STAFF_GAP would not have cured it either:
+   * alphaTab consumes that number in LAYOUT units and multiplies the finished geometry by
+   * `display.scale`, so one value that clears a beam at scale 1 is 60% of itself at 0.6.
+   *
+   * With no tab there is no band, and `namesYFor` takes the 'above' fallback it already has for
+   * a single-stave score — the same row, in the place it is already proven to work.
    *
    * Split out of `nameBand` so `layoutProbe` reports the measurement for the SAME pair the row
    * was actually placed against. They read `barBoundsList[0]` and `[1]` separately once, and a
@@ -1238,14 +1370,14 @@ export class TriView {
    */
   private bandStaves(
     barBoundsList: alphaTab.rendering.BarBounds[]
-  ): { upper: alphaTab.rendering.Bounds; lower: alphaTab.rendering.Bounds; lowerIsTab: boolean } | null {
+  ): { upper: alphaTab.rendering.Bounds; lower: alphaTab.rendering.Bounds } | null {
     if (barBoundsList.length < 2) return null;
     const tabIndex = tabStaveIndex(staveKindsFromBars(barBoundsList));
-    const lowerIndex = tabIndex > 0 ? tabIndex : 1;
+    // < 1 rather than < 0: a tab engraved ABOVE everything else has nothing to be between.
+    if (tabIndex < 1) return null;
     return {
-      upper: barBoundsList[lowerIndex - 1].visualBounds,
-      lower: barBoundsList[lowerIndex].visualBounds,
-      lowerIsTab: tabIndex > 0
+      upper: barBoundsList[tabIndex - 1].visualBounds,
+      lower: barBoundsList[tabIndex].visualBounds
     };
   }
 
@@ -1254,9 +1386,7 @@ export class TriView {
    *
    * NOT simply `staff.bottom .. tab.top`: tab fret digits are centred on the top tab line,
    * so `tab.y` is the middle of the topmost digit and the label has to stop TAB_DIGIT_RISE
-   * short of it. Getting that wrong is what put the row on top of the tab. A NOTATION stave
-   * below (the bass half of a grand pair) has no fret digits hanging above its top line, so it
-   * only needs the ordinary clearance.
+   * short of it. Getting that wrong is what put the row on top of the tab.
    */
   private nameBand(
     barBoundsList: alphaTab.rendering.BarBounds[]
@@ -1265,7 +1395,7 @@ export class TriView {
     if (!pair) return null;
     return {
       top: pair.upper.y + pair.upper.h + STAFF_CLEARANCE,
-      bottom: pair.lower.y - (pair.lowerIsTab ? TAB_DIGIT_RISE : STAFF_CLEARANCE)
+      bottom: pair.lower.y - TAB_DIGIT_RISE
     };
   }
 
@@ -2089,12 +2219,25 @@ export class TriView {
       // Always swallowed, both branches: an unhandled ctrl-wheel is the browser's page zoom,
       // which inside a plugin window resizes the entire UI and cannot be got back from.
       e.preventDefault();
-      if (e.altKey) return;
       const d = e.deltaY || e.deltaX;
       if (d === 0) return;
-      // One pinch, one zoom, whichever road WebKit sent it down. See `claimPinch`.
-      if (!this.claimPinch('wheel')) return;
-      this.opts.onPinch?.(wheelZoomFactor(d, e.deltaMode), e.clientX);
+      // One pinch, one zoom, whichever road WebKit sent it down — and the road is claimed for
+      // Option+pinch too, even though this pane has no pitch axis to give it. Claiming only for
+      // the axis a surface HAPPENS to own is what let the same Option+pinch be counted on both
+      // roads over the roll. See view/gesture.ts.
+      const out = this.pinch.read({
+        kind: 'wheel',
+        atMs: performance.now(),
+        delta: d,
+        deltaMode: e.deltaMode,
+        ctrlKey: e.ctrlKey,
+        metaKey: e.metaKey,
+        altKey: e.altKey
+      });
+      // The sheet has one axis. A pitch zoom is swallowed here rather than forwarded, exactly as
+      // it always was — the roll is the pane with a pitch axis.
+      if (out.kind !== 'zoom' || out.axis !== 'time') return;
+      this.opts.onPinch?.(out.factor, e.clientX);
       return;
     }
     const lines = e.deltaMode === 1 ? 16 : e.deltaMode === 2 ? 400 : 1;
@@ -2107,46 +2250,37 @@ export class TriView {
     this.setScrollLeft(this.scroller.scrollLeft + dy);
   };
 
-  /** Safari/WKWebView's pinch. Same two rules; see `PianoRoll.onGestureChange` for the units. */
-  private gestureScale = 1;
-  /** Sub-threshold ratios, kept rather than dropped — the same class the roll uses (finding 10). */
-  private pinch = new PinchAccumulator();
-  private lastPinchMs = 0;
-  private pinchRoad: 'wheel' | 'gesture' | null = null;
-
-  /** ONE PINCH, ONE ZOOM (finding 12). The roll's `claimPinch`, on this surface. */
-  private claimPinch(road: 'wheel' | 'gesture'): boolean {
-    const t = performance.now();
-    if (this.pinchRoad !== null && this.pinchRoad !== road && t - this.lastPinchMs < PINCH_DEDUPE_MS) {
-      return false;
-    }
-    this.pinchRoad = road;
-    this.lastPinchMs = t;
-    return true;
-  }
+  /** Safari/WKWebView's pinch, and the ctrl-wheel's, under one law. See view/gesture.ts. */
+  private pinch = new PinchGesture();
 
   private onGestureStart = (e: Event): void => {
     e.preventDefault();
-    this.gestureScale = (e as Event & { scale?: number }).scale ?? 1;
-    this.pinch.reset();
+    this.pinch.read({
+      kind: 'gesturestart',
+      atMs: performance.now(),
+      scale: (e as Event & { scale?: number }).scale
+    });
   };
 
   private onGestureChange = (e: Event): void => {
     const g = e as Event & { scale?: number; altKey?: boolean; clientX?: number };
-    const scale = g.scale;
-    if (!scale || !Number.isFinite(scale) || scale <= 0) return;
+    if (!g.scale || !Number.isFinite(g.scale) || g.scale <= 0) return;
     e.preventDefault();
-    const ratio = scale / (this.gestureScale > 0 ? this.gestureScale : 1);
-    this.gestureScale = scale;
-    if (g.altKey) return;
-    const stepped = this.pinch.take(ratio);
-    if (stepped === null) return;
-    if (!this.claimPinch('gesture')) return;
+    const out = this.pinch.read({
+      kind: 'gesturechange',
+      atMs: performance.now(),
+      scale: g.scale,
+      altKey: g.altKey
+    });
+    if (out.kind !== 'zoom' || out.axis !== 'time') return;
     const rect = this.scroller.getBoundingClientRect();
-    this.opts.onPinch?.(
-      Math.min(WHEEL_ZOOM_MAX_STEP, Math.max(1 / WHEEL_ZOOM_MAX_STEP, stepped)),
-      g.clientX ?? rect.left + rect.width / 2
-    );
+    this.opts.onPinch?.(out.factor, g.clientX ?? rect.left + rect.width / 2);
+  };
+
+  /** The fingers left the trackpad. Nothing was listening for this until now — see view/gesture.ts. */
+  private onGestureEnd = (e: Event): void => {
+    e.preventDefault();
+    this.pinch.read({ kind: 'gestureend', atMs: performance.now() });
   };
 
   /**
@@ -2972,6 +3106,11 @@ export class TriView {
       note: hit.note,
       staff: hit.staff,
       startClientY: e.clientY,
+      startClientX: e.clientX,
+      axis: null,
+      tick: null,
+      dx: 0,
+      editable: hit.live,
       head: { x: head.x, y: head.y, w: head.w, h: head.h },
       stepPx: stepPx > 0 ? stepPx : 1,
       steps: 0,
@@ -2983,13 +3122,33 @@ export class TriView {
     };
   }
 
-  private updateDrag(clientY: number, altKey: boolean): void {
+  private updateDrag(clientX: number, clientY: number, altKey: boolean): void {
     const d = this.drag;
     if (!d || !this.index) return;
     const dy = clientY - d.startClientY;
-    if (!d.moved && Math.abs(dy) < DRAG_THRESHOLD_PX) return;
+    const dx = clientX - d.startClientX;
+    if (!d.moved && Math.max(Math.abs(dy), Math.abs(dx)) < DRAG_THRESHOLD_PX) return;
+    // THE LOCK, taken at the moment the drag is recognised and never revisited. See `DragState`.
+    if (d.axis === null) d.axis = Math.abs(dx) > Math.abs(dy) ? 'time' : 'pitch';
     d.moved = true;
     d.chromatic = altKey;
+
+    if (d.axis === 'time') {
+      d.dx = dx;
+      // A CONTENT x, not a client one: the ghost is drawn inside the scrolled stack, and the
+      // tick has to come from the same axis the engraving publishes.
+      const contentX = clientX - this.host.getBoundingClientRect().left;
+      d.tick = this.contentXToTick(contentX);
+      // An imported part is paper. The gesture is shown as refused rather than ignored, so the
+      // player learns the rule from the picture instead of from nothing happening.
+      d.valid = d.editable && d.tick !== null && Math.abs(dx) >= DRAG_THRESHOLD_PX;
+      d.label = d.editable ? 'move in time' : 'imported part';
+      d.steps = 0;
+      this.drawGhost();
+      this.lastDragPreview = { noteId: d.noteId, kind: 'time', steps: 0, valid: d.valid };
+      this.opts.onNoteDragPreview?.(this.lastDragPreview);
+      return;
+    }
 
     // Screen y grows downward; pitch and string number both grow upward.
     const steps = -Math.round(dy / d.stepPx);
@@ -3071,8 +3230,49 @@ export class TriView {
 
     const colors = readOverlayColors();
     const stroke = d.valid ? colors.accent : colors.danger;
-    const y = d.head.y - d.steps * d.stepPx;
+    // A TIME drag moves the box sideways and leaves the height alone; a pitch/string drag does
+    // the opposite. One ghost, one axis, because the drag itself is locked to one axis.
+    const y = d.axis === 'time' ? d.head.y : d.head.y - d.steps * d.stepPx;
+    const x = d.axis === 'time' ? d.head.x + d.dx : d.head.x;
     const pad = 3;
+
+    if (d.axis === 'time') {
+      const box = document.createElementNS(SVG_NS, 'rect');
+      box.setAttribute('x', String(x - pad));
+      box.setAttribute('y', String(y - pad));
+      box.setAttribute('width', String(d.head.w + pad * 2));
+      box.setAttribute('height', String(d.head.h + pad * 2));
+      box.setAttribute('rx', '3');
+      box.style.fill = 'none';
+      box.style.stroke = stroke;
+      box.style.strokeWidth = '2';
+      if (!d.valid) box.style.strokeDasharray = '3 3';
+      this.ghostGroup.appendChild(box);
+
+      const cy = d.head.y + d.head.h / 2;
+      const line = document.createElementNS(SVG_NS, 'line');
+      line.setAttribute('x1', String(d.head.x + d.head.w / 2));
+      line.setAttribute('x2', String(x + d.head.w / 2));
+      line.setAttribute('y1', String(cy));
+      line.setAttribute('y2', String(cy));
+      line.style.stroke = stroke;
+      line.style.strokeWidth = '1';
+      line.style.strokeDasharray = '2 3';
+      line.style.opacity = '0.7';
+      this.ghostGroup.appendChild(line);
+
+      const text = document.createElementNS(SVG_NS, 'text');
+      text.setAttribute('x', String(x + d.head.w + 7));
+      text.setAttribute('y', String(y - 6));
+      text.textContent = d.label;
+      text.style.font = '700 11px ui-monospace, SFMono-Regular, Menlo, monospace';
+      text.style.fill = stroke;
+      text.style.stroke = colors.paper;
+      text.style.strokeWidth = '3px';
+      text.style.paintOrder = 'stroke';
+      this.ghostGroup.appendChild(text);
+      return;
+    }
 
     const box = document.createElementNS(SVG_NS, 'rect');
     box.setAttribute('x', String(d.head.x - pad));
@@ -3124,7 +3324,15 @@ export class TriView {
     this.ghostGroup.replaceChildren();
     if (!d) return;
     this.opts.onNoteDragPreview?.(null);
-    if (!d.moved || !d.valid || d.steps === 0) return;
+    if (!d.moved || !d.valid) return;
+
+    if (d.axis === 'time') {
+      if (d.tick === null) return;
+      this.lastDragCommit = { noteId: d.noteId, kind: 'time', tick: d.tick };
+      this.opts.onNoteDragCommit?.(this.lastDragCommit);
+      return;
+    }
+    if (d.steps === 0) return;
 
     if (d.staff === 'notation') {
       this.lastDragCommit = { noteId: d.noteId, kind: 'pitch', semitones: d.semitones };
@@ -3154,7 +3362,7 @@ export class TriView {
 
   private onDragMove = (e: PointerEvent): void => {
     if (!this.drag) return;
-    this.updateDrag(e.clientY, e.altKey);
+    this.updateDrag(e.clientX, e.clientY, e.altKey);
   };
 
   private onDragUp = (): void => {
@@ -3261,7 +3469,20 @@ export class TriView {
     return soleStaveKind(staveKindsFromStaves(this.builtModel?.tracks[0]?.staves ?? []));
   }
 
-  /** Screen coordinates -> the note under them, resolved to our stable id. */
+  /**
+   * Screen coordinates -> the note under them, resolved to our stable id.
+   *
+   * NEAREST NOTEHEAD WITHIN A RADIUS, not "inside the notehead's box" (Z4e). alphaTab's
+   * `getNoteAtPos` is an exact containment test against a glyph that is about nine pixels tall
+   * at default zoom, so a press four pixels high of centre selected nothing and the sheet felt
+   * like it was ignoring the player — while the piano roll, whose rule has always been
+   * nearest-centre, felt fine. The same rule is used here: alphaTab answers first (it is exact
+   * and it is free), and only when it does not does this fall back to the nearest notehead
+   * centre inside `NOTE_HIT_RADIUS_PX`.
+   *
+   * The radius is in SCREEN pixels and is deliberately not scaled: it describes how accurately
+   * a hand can point, which does not change when the engraving does.
+   */
   hitTest(clientX: number, clientY: number): NoteHit | null {
     const lookup = this.api.renderer.boundsLookup;
     if (!lookup) return null;
@@ -3270,10 +3491,16 @@ export class TriView {
     const x = clientX - hostRect.left;
     const y = clientY - hostRect.top;
 
-    const beat = lookup.getBeatAtPos(x, y);
+    let beat = lookup.getBeatAtPos(x, y);
+    let note = beat ? lookup.getNoteAtPos(beat, x, y) : null;
+    if (!note) {
+      const near = this.nearestNoteHead(x, y);
+      if (near) {
+        note = near.note;
+        beat = near.note.beat;
+      }
+    }
     if (!beat) return null;
-
-    const note = lookup.getNoteAtPos(beat, x, y);
     const beatBounds = lookup.findBeat(beat);
 
     let rect = { x: 0, y: 0, w: 0, h: 0 };
@@ -3302,8 +3529,281 @@ export class TriView {
       note,
       beat,
       rect,
-      staff: this.staffAtY(y)
+      staff: this.staffAtY(y),
+      ...this.identityOf(beat, y)
     };
+  }
+
+  /**
+   * Pixels within which a press counts as being ON a notehead. See `hitTest`.
+   *
+   * Twelve, matched to the roll's own tolerance rather than picked: a notehead is about nine
+   * screen pixels tall at scale 1, so this is "within about one notehead of the centre", which
+   * is what a player means by clicking on it.
+   */
+  private static readonly NOTE_HIT_RADIUS_PX = 12;
+
+  /** The closest notehead centre to a content point, inside the radius. Null past it. */
+  private nearestNoteHead(x: number, y: number): { note: alphaTab.model.Note; dist: number } | null {
+    const lookup = this.api.renderer.boundsLookup;
+    if (!lookup) return null;
+    const limit = TriView.NOTE_HIT_RADIUS_PX;
+    let best: { note: alphaTab.model.Note; dist: number } | null = null;
+    for (const system of lookup.staffSystems) {
+      for (const masterBar of system.bars) {
+        for (const barBounds of masterBar.bars ?? []) {
+          for (const bb of barBounds.beats) {
+            // Cheap reject on the beat's own column before looking at its noteheads: a system
+            // holds hundreds of beats and only the ones near this x can win.
+            if (bb.visualBounds.x - limit > x || bb.visualBounds.x + bb.visualBounds.w + limit < x) continue;
+            for (const nb of bb.notes ?? []) {
+              const r = nb.noteHeadBounds;
+              const dx = x - (r.x + r.w / 2);
+              const dy = y - (r.y + r.h / 2);
+              const dist = Math.hypot(dx, dy);
+              if (dist > limit) continue;
+              if (!best || dist < best.dist) best = { note: nb.note, dist };
+            }
+          }
+        }
+      }
+    }
+    return best;
+  }
+
+  /** Part and bar identity for a beat. See `NoteHit.trackIndex` for why every hit carries it. */
+  private identityOf(
+    beat: alphaTab.model.Beat | null,
+    contentY: number
+  ): { trackIndex: number | null; live: boolean; barIndex: number | null } {
+    const track = beat?.voice?.bar?.staff?.track?.index;
+    const trackIndex = typeof track === 'number' ? track : this.trackAtY(contentY);
+    const barIndex = beat?.voice?.bar?.masterBar?.index ?? null;
+    return {
+      trackIndex,
+      live: trackIndex !== null && trackIndex === this.liveTrackIndex(),
+      barIndex: typeof barIndex === 'number' ? barIndex : null
+    };
+  }
+
+  /**
+   * Which TRACK a content y is over, when no beat resolved.
+   *
+   * The empty-imported-staff case: there is no note and no beat under the pointer, and without
+   * this the target would carry no part identity at all and the guard would pass by default.
+   */
+  private trackAtY(y: number): number | null {
+    const lookup = this.api.renderer.boundsLookup;
+    let bestTrack: number | null = null;
+    let bestDist = Number.POSITIVE_INFINITY;
+    for (const system of lookup?.staffSystems ?? []) {
+      for (const masterBar of system.bars) {
+        for (const barBounds of masterBar.bars ?? []) {
+          const track = barBounds.bar?.staff?.track?.index;
+          if (typeof track !== 'number') continue;
+          const v = barBounds.visualBounds;
+          const dist = Math.abs(y - (v.y + v.h / 2));
+          if (dist < bestDist) {
+            bestDist = dist;
+            bestTrack = track;
+          }
+        }
+      }
+      if (bestTrack !== null) return bestTrack;
+    }
+    return bestTrack;
+  }
+
+  /**
+   * A right-click, resolved to everything the menu needs. Null when the sheet cannot answer.
+   *
+   * The one entry point for the context menu, so the sheet decides part, bar, staff, tick and
+   * pitch once, together, off the same geometry — rather than the app asking four questions and
+   * getting answers from four different frames.
+   */
+  targetAt(clientX: number, clientY: number): SheetTarget | null {
+    const lookup = this.api.renderer.boundsLookup;
+    if (!lookup) return null;
+    const hostRect = this.host.getBoundingClientRect();
+    const x = clientX - hostRect.left;
+    const y = clientY - hostRect.top;
+
+    const hit = this.hitTest(clientX, clientY);
+    const staff = hit?.staff ?? this.staffAtY(y);
+    // WHICH PART, ANSWERED BY THE THING THE POINTER IS ACTUALLY ON. With a notehead under it,
+    // that note's own track is the answer and there is nothing to argue about. WITHOUT one,
+    // the beat alphaTab reports is not evidence: `getBeatAtPos` is generous vertically, so a
+    // press on an empty imported staff comes back with a beat from the take's staff above it —
+    // and the menu would then offer edits on a part that is paper. The y is the only honest
+    // witness there, so `trackAtY` decides.
+    const identity = hit?.noteId
+      ? { trackIndex: hit.trackIndex, live: hit.live, barIndex: hit.barIndex }
+      : { ...this.identityOf(null, y), barIndex: hit?.barIndex ?? null };
+    // The BAR is answerable from geometry even where no beat is, which is what makes the bar
+    // menu reachable on the empty half of a grand staff.
+    const barIndex = identity.barIndex ?? this.barIndexAtX(x);
+    return {
+      clientX,
+      clientY,
+      noteId: hit?.noteId ?? null,
+      trackIndex: identity.trackIndex,
+      live: identity.live,
+      barIndex,
+      staff,
+      tick: this.contentXToTick(x),
+      midi: staff === 'notation' ? this.midiAtStaffY(x, y) : null
+    };
+  }
+
+  /**
+   * VERIFICATION ONLY: where the live part's noteheads are, and one point of empty staff.
+   *
+   * In CLIENT coordinates, because what the probe does with them is dispatch a pointer event,
+   * and every conversion it would otherwise do itself is a chance for the test to be measuring
+   * its own arithmetic instead of the engraving. Read straight off `BeatBounds.notes`, which is
+   * the same geometry `hitTest` uses.
+   */
+  editProbe(): {
+    noteHeads: Array<{ id: string; x: number; y: number; w: number; h: number }>;
+    /** A point on a NOTATION staff of the live part with no notehead anywhere near it. */
+    emptyNotation: { x: number; y: number } | null;
+    /**
+     * A point on an IMPORTED part's staff, or null when the score has only the take.
+     *
+     * The case a note-id guard cannot reach: an EMPTY imported staff has no note under the
+     * pointer, so "is this note id imported?" answers no. See `NoteHit.trackIndex`.
+     */
+    importedStaff: { x: number; y: number } | null;
+  } {
+    const lookup = this.api.renderer.boundsLookup;
+    const hostRect = this.host.getBoundingClientRect();
+    const noteHeads: Array<{ id: string; x: number; y: number; w: number; h: number }> = [];
+    const staves: Array<{ x: number; y: number; w: number; h: number }> = [];
+    let importedStaff: { x: number; y: number } | null = null;
+    const live = this.liveTrackIndex();
+    for (const system of lookup?.staffSystems ?? []) {
+      for (const masterBar of system.bars) {
+        const bars = masterBar.bars ?? [];
+        const kinds = staveKindsFromBars(bars);
+        for (let i = 0; i < bars.length; i++) {
+          const bounds = bars[i];
+          if (bounds.bar?.staff?.track?.index !== live) {
+            const v = bounds.visualBounds;
+            const x = Math.round(v.x + v.w / 2 + hostRect.left);
+            if (!importedStaff && x > hostRect.left + LEFT_INSET_PX && x < window.innerWidth - 8) {
+              importedStaff = { x, y: Math.round(v.y + v.h / 2 + hostRect.top) };
+            }
+            continue;
+          }
+          if (kinds[i] === 'notation') staves.push({ ...bounds.visualBounds });
+          for (const bb of bounds.beats) {
+            for (const nb of bb.notes ?? []) {
+              const id = this.index?.noteToInfo.get(nb.note)?.id;
+              if (!id) continue;
+              const r = nb.noteHeadBounds;
+              noteHeads.push({
+                id,
+                x: Math.round(r.x + r.w / 2 + hostRect.left),
+                y: Math.round(r.y + r.h / 2 + hostRect.top),
+                w: Math.round(r.w),
+                h: Math.round(r.h)
+              });
+            }
+          }
+        }
+      }
+    }
+    // The first place on a notation staff that is at least 40px from every notehead AND on
+    // screen. Deliberately measured rather than guessed: on a dense take there may not be one,
+    // and a probe that clicked "somewhere empty" without checking would be testing nothing.
+    // THE WIDEST GAP BETWEEN TWO NOTEHEADS, and its midpoint — which is the emptiest point on
+    // the staff that is still INSIDE the music. Two ends had to be excluded for a reason each:
+    // left of the first note is the clef/key/meter prefix, which is real page width before the
+    // score's own tick 0; right of the last note is past the end of the take, where the
+    // pipeline's past-end filter drops what is drawn there. A probe pointing at either would be
+    // testing the guards rather than the feature.
+    const xs = [...new Set(noteHeads.map((n) => n.x))].sort((a, b) => a - b);
+    let emptyNotation: { x: number; y: number } | null = null;
+    const staff = staves[0];
+    // A BLANK SCORE HAS NO NOTEHEADS AT ALL, so there are no gaps to be widest — the whole staff
+    // is one. Its own middle, clamped onto the screen, is the honest answer there.
+    if (staff && xs.length < 2) {
+      const left = Math.max(staff.x + hostRect.left, hostRect.left + LEFT_INSET_PX + 40);
+      const right = Math.min(staff.x + staff.w + hostRect.left, window.innerWidth - 20);
+      if (right > left) {
+        emptyNotation = {
+          x: Math.round((left + right) / 2),
+          y: Math.round(staff.y + staff.h / 2 + hostRect.top)
+        };
+      }
+    }
+    if (staff && xs.length >= 2) {
+      const y = Math.round(staff.y + staff.h / 2 + hostRect.top);
+      let widest = 0;
+      for (let i = 1; i < xs.length; i++) {
+        const mid = Math.round((xs[i - 1] + xs[i]) / 2);
+        const gap = xs[i] - xs[i - 1];
+        if (gap <= widest) continue;
+        if (mid < hostRect.left + LEFT_INSET_PX || mid > window.innerWidth - 8) continue;
+        widest = gap;
+        emptyNotation = { x: mid, y };
+      }
+    }
+    return { noteHeads, emptyNotation, importedStaff };
+  }
+
+  private barIndexAtX(x: number): number | null {
+    const lookup = this.api.renderer.boundsLookup;
+    for (const system of lookup?.staffSystems ?? []) {
+      for (const masterBar of system.bars) {
+        const b = masterBar.visualBounds;
+        if (x >= b.x && x <= b.x + b.w) return masterBar.index;
+      }
+    }
+    return null;
+  }
+
+  /**
+   * THE STAFF LADDER: a height over a notation staff, as a sounding MIDI pitch in the key.
+   *
+   * Read off the engraved bar's own `visualBounds` — five lines, so `h / 4` is one staff space
+   * and half of that is one staff POSITION — and off that bar's own CLEF, which is the only
+   * thing that says what the top line is called. A grand staff has two different answers at two
+   * different heights and this asks the stave under the pointer, not the first one.
+   *
+   * The key signature is applied, because a click on the F line in D major means F#: the player
+   * is pointing at a place on the staff, and what that place sounds like is what the key says.
+   * An accidental they want on top of that is a note they can then drag.
+   */
+  private midiAtStaffY(x: number, y: number): number | null {
+    const lookup = this.api.renderer.boundsLookup;
+    if (!lookup) return null;
+    let best: { bounds: alphaTab.rendering.Bounds; clef: alphaTab.model.Clef } | null = null;
+    let bestDist = Number.POSITIVE_INFINITY;
+    for (const system of lookup.staffSystems) {
+      for (const masterBar of system.bars) {
+        const bars = masterBar.bars ?? [];
+        const kinds = staveKindsFromBars(bars);
+        for (let i = 0; i < bars.length; i++) {
+          if (kinds[i] !== 'notation') continue;
+          const b = bars[i];
+          const v = b.visualBounds;
+          if (x < v.x - 8 || x > v.x + v.w + 8) continue;
+          const dist = Math.abs(y - (v.y + v.h / 2));
+          if (dist < bestDist) {
+            bestDist = dist;
+            best = { bounds: v, clef: b.bar?.clef ?? alphaTab.model.Clef.G2 };
+          }
+        }
+      }
+    }
+    if (!best || best.bounds.h <= 0) return null;
+    // One staff POSITION is half a space, and four spaces span the five printed lines.
+    const positionPx = best.bounds.h / 8;
+    if (!(positionPx > 0)) return null;
+    const stepsBelowTopLine = Math.round((y - best.bounds.y) / positionPx);
+    const topLine = TOP_LINE_DIATONIC[best.clef] ?? 10;
+    return diatonicToMidi(topLine - stepsBelowTopLine, this.keyFifths);
   }
 
   /** Names-row click: we only have an x, so resolve by nearest beat anchor. */
@@ -3341,7 +3841,8 @@ export class TriView {
         h: best.visualBounds.h
       },
       // A names-row click has no meaningful y on either staff.
-      staff: null
+      staff: null,
+      ...this.identityOf(best.beat, best.visualBounds.y + best.visualBounds.h / 2)
     };
   }
 
@@ -3354,6 +3855,11 @@ export class TriView {
    * roll, and changing the note is the drag.
    */
   private onPointerDown = (e: PointerEvent): void => {
+    // THE BUTTON, BEFORE ANYTHING ELSE (Z4ii). This used to select and seek without ever looking
+    // at which button was pressed, so a right-click on a note selected it and a right-click on
+    // empty space SEEKED THE TRANSPORT — the playhead jumped as the context menu opened. The
+    // menu is raised from `contextmenu` below; nothing about a secondary press belongs here.
+    if (e.button !== 0) return;
     const target = e.target as HTMLElement;
     // A press on a printed part name is a press on ITS control, not on the music behind it.
     // Without this the press falls through to the seek below and the transport jumps to bar 1
@@ -3368,7 +3874,7 @@ export class TriView {
       this.opts.onNoteClick?.(hit);
       // Only a real notehead can be dragged. A beat hit with no note resolved (a rest, or
       // a click in the beat's whitespace) selects and stops there.
-      if (hit.note && hit.noteId && hit.staff && e.button === 0) {
+      if (hit.note && hit.noteId && hit.staff) {
         this.beginDrag(hit, e);
         if (this.drag) {
           this.attachDragListeners();
@@ -3381,6 +3887,22 @@ export class TriView {
     this.selectionStaffKind = null;
     const beatAtX = this.hitTestByX(e.clientX);
     if (beatAtX) this.opts.onSeekRequest?.(beatAtX.beat.absolutePlaybackStart);
+  };
+
+  /**
+   * RIGHT-CLICK IS EDIT, and it is its own road.
+   *
+   * On `contextmenu` rather than on a `pointerdown` with `button === 2`, because that is the one
+   * event every way of asking for a menu produces: a right press, a two-finger tap, Ctrl-click
+   * on macOS, and the keyboard's own context key. `preventDefault` is unconditional — the
+   * browser's menu offers Reload and Inspect inside a plugin window, which is at best noise and
+   * at worst the take.
+   */
+  private onContextMenu = (e: MouseEvent): void => {
+    e.preventDefault();
+    const target = this.targetAt(e.clientX, e.clientY);
+    if (!target) return;
+    this.opts.onSheetContextMenu?.(target);
   };
 
   /**
@@ -3418,10 +3940,12 @@ export class TriView {
     this.detachDragListeners();
     this.drag = null;
     this.scroller.removeEventListener('pointerdown', this.onPointerDown);
+    this.scroller.removeEventListener('contextmenu', this.onContextMenu);
     this.scroller.removeEventListener('scroll', this.onScroll);
     this.scroller.removeEventListener('wheel', this.onSheetWheel);
     this.scroller.removeEventListener('gesturestart', this.onGestureStart);
     this.scroller.removeEventListener('gesturechange', this.onGestureChange);
+    this.scroller.removeEventListener('gestureend', this.onGestureEnd);
     this.scroller.removeEventListener('pointermove', this.onHoverMove);
     this.scroller.removeEventListener('pointerleave', this.onHoverLeave);
     this.api.destroy();

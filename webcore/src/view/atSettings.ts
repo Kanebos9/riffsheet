@@ -179,6 +179,32 @@ export function applyStaffTabGap(
 }
 
 /**
+ * NO RHYTHM STEMS ON THE TAB. Measured in 1.8.4, and the fix for a reported collision.
+ *
+ * alphaTab's default is `TabRhythmMode.Automatic`, and Automatic is not "off": it resolves per
+ * STAVE to `Hidden` when that stave also shows standard notation, and to `ShowWithBars` when it
+ * does not (alphaTab.core.mjs, `TabBarRenderer.rhythmMode`). Riffsheet produces two shapes and
+ * Automatic answers them differently:
+ *
+ *   notation + tab   ONE Staff with both flags   -> the tab stave shows notation -> Hidden
+ *   grand + tab      a THIRD, tab-only Staff     -> no notation on it            -> ShowWithBars
+ *
+ * So a grand staff with tablature grew a full set of stems, beams, flags and tuplet brackets
+ * hanging under the tab — a second, redundant engraving of a rhythm already written twice above
+ * it — and alphaTab reserves vertical room for that ink only when the bar carries TUPLETS
+ * (`registerOverflowBottom` is called for the tuplet case alone), so on ordinary rhythm it is
+ * drawn outside the stave's own box and lands on whatever is below. That is the reported bleed.
+ *
+ * `Hidden` is stated explicitly rather than left to Automatic because the correct answer here is
+ * a property of THIS product, not of the stave: Riffsheet always engraves standard notation above
+ * its live tablature, and imported parts are notation-only, so a tab stave never carries a rhythm
+ * the reader cannot already see one line up. Automatic's other branch has no case in this app.
+ */
+export function applyTabRhythm(settings: alphaTab.Settings): void {
+  settings.notation.rhythmMode = alphaTab.TabRhythmMode.Hidden;
+}
+
+/**
  * Where the offline assets live, resolved against the document rather than the script.
  *
  * This matters more than it looks. The alphaTab Vite plugin copies Bravura to
@@ -208,6 +234,7 @@ export function createSettings(view: Partial<ViewSettings> = {}): alphaTab.Setti
   // what we set in build.ts. ScoreTab would force both even for a staff that wants one.
   settings.display.staveProfile = alphaTab.StaveProfile.Default;
   settings.display.scale = v.scale;
+  applyTabRhythm(settings);
   applyStaffTabGap(settings, v.namesGap);
   setLeftPadding(settings, v.leftPadPx);
 

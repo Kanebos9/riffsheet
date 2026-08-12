@@ -33,14 +33,14 @@ export interface RollEditResult {
  * (§4.8), so a shorter note would be deleted by the next rebuild and the player would watch
  * their own edit disappear.
  */
-const MIN_DUR_SEC = 0.04;
+export const MIN_DUR_SEC = 0.04;
 
 /** MIDI note numbers only. A drag past either end stops at the end rather than wrapping. */
 export function clampMidi(midi: number): number {
   return Math.max(0, Math.min(127, Math.round(midi)));
 }
 
-const byTimeThenPitch = (a: InputNote, b: InputNote): number =>
+export const byTimeThenPitch = (a: InputNote, b: InputNote): number =>
   a.startSec - b.startSec || a.midi - b.midi;
 
 // ---------------------------------------------------------------------------
@@ -69,21 +69,21 @@ const byTimeThenPitch = (a: InputNote, b: InputNote): number =>
 // `source*` fields (clef, staff, transposition) describe the STAFF a note was written on, which
 // dragging the note does not change.
 
-type SourceTiming = NonNullable<InputNote['sourceTiming']>;
+export type SourceTiming = NonNullable<InputNote['sourceTiming']>;
 
-function ticksPerSec(tempoBpm: number, ppq: number): number {
+export function ticksPerSec(tempoBpm: number, ppq: number): number {
   return ((tempoBpm || 100) / 60) * ppq;
 }
 
 /** The same note, later or earlier by `deltaSec`, in its own ticks. */
-function movedTiming(timing: SourceTiming | undefined, deltaSec: number, tempoBpm: number): SourceTiming | null {
+export function movedTiming(timing: SourceTiming | undefined, deltaSec: number, tempoBpm: number): SourceTiming | null {
   if (!timing || !Number.isFinite(timing.ppq) || timing.ppq <= 0) return null;
   const startTick = Math.max(0, Math.round(timing.startTick + deltaSec * ticksPerSec(tempoBpm, timing.ppq)));
   return { startTick, endTick: startTick + Math.max(1, timing.endTick - timing.startTick), ppq: timing.ppq };
 }
 
 /** The same onset, held for `durationSec` instead. */
-function resizedTiming(timing: SourceTiming | undefined, durationSec: number, tempoBpm: number): SourceTiming | null {
+export function resizedTiming(timing: SourceTiming | undefined, durationSec: number, tempoBpm: number): SourceTiming | null {
   if (!timing || !Number.isFinite(timing.ppq) || timing.ppq <= 0) return null;
   const ticks = Math.max(1, Math.round(durationSec * ticksPerSec(tempoBpm, timing.ppq)));
   return { startTick: timing.startTick, endTick: timing.startTick + ticks, ppq: timing.ppq };
@@ -99,7 +99,7 @@ function resizedTiming(timing: SourceTiming | undefined, durationSec: number, te
  * Null unless EVERY existing note carries ticks: below that the score is already on the
  * quantized path, and giving one note exact ticks would not put it back on the exact one.
  */
-function addedTiming(
+export function addedTiming(
   notes: InputNote[],
   startSec: number,
   durationSec: number,
@@ -125,7 +125,7 @@ function addedTiming(
  * on. Deleting that one note therefore handed the whole score back to meter detection — a
  * 3/4 import printed as 4/4 because the player removed its first note.
  */
-function keepStructureCarriers(before: InputNote[], after: InputNote[]): InputNote[] {
+export function keepStructureCarriers(before: InputNote[], after: InputNote[]): InputNote[] {
   const carriers = new Map<number, InputNote>();
   for (const n of before) {
     const track = n.sourceTrackIndex ?? 0;

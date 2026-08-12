@@ -1,0 +1,112 @@
+{
+  "name": "roll-ctrlwheel-chromium",
+  "provenance": "captured",
+  "engine": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrome/151.0.0.0 Safari/537.36",
+  "note": "A pinch-in over the piano roll as the browser ITSELF delivered it to the shipped handlers — dispatched through CDP Input, so every event is isTrusted. The ONLY road on Windows/WebView2, which is Chromium; on macOS/WKWebView the same fingers also produce the gesture* road, which no Chromium can emit — see roll-webkit-both-roads.json and the recipe in scripts/scrollzoom-probe.mjs.",
+  "events": [
+    {
+      "kind": "wheel",
+      "atMs": 22887.9,
+      "delta": -8,
+      "deltaMode": 0,
+      "ctrlKey": true,
+      "metaKey": false,
+      "altKey": false,
+      "isTrusted": true,
+      "cancelable": true,
+      "defaultPrevented": true,
+      "target": "pianoroll"
+    },
+    {
+      "kind": "wheel",
+      "atMs": 22960.6,
+      "delta": -8,
+      "deltaMode": 0,
+      "ctrlKey": true,
+      "metaKey": false,
+      "altKey": false,
+      "isTrusted": true,
+      "cancelable": true,
+      "defaultPrevented": true,
+      "target": "pianoroll"
+    },
+    {
+      "kind": "wheel",
+      "atMs": 23024.5,
+      "delta": -8,
+      "deltaMode": 0,
+      "ctrlKey": true,
+      "metaKey": false,
+      "altKey": false,
+      "isTrusted": true,
+      "cancelable": true,
+      "defaultPrevented": true,
+      "target": "pianoroll"
+    },
+    {
+      "kind": "wheel",
+      "atMs": 23107.2,
+      "delta": -8,
+      "deltaMode": 0,
+      "ctrlKey": true,
+      "metaKey": false,
+      "altKey": false,
+      "isTrusted": true,
+      "cancelable": true,
+      "defaultPrevented": true,
+      "target": "pianoroll"
+    },
+    {
+      "kind": "wheel",
+      "atMs": 23192.4,
+      "delta": -8,
+      "deltaMode": 0,
+      "ctrlKey": true,
+      "metaKey": false,
+      "altKey": false,
+      "isTrusted": true,
+      "cancelable": true,
+      "defaultPrevented": true,
+      "target": "pianoroll"
+    },
+    {
+      "kind": "wheel",
+      "atMs": 23272.5,
+      "delta": -8,
+      "deltaMode": 0,
+      "ctrlKey": true,
+      "metaKey": false,
+      "altKey": false,
+      "isTrusted": true,
+      "cancelable": true,
+      "defaultPrevented": true,
+      "target": "pianoroll"
+    },
+    {
+      "kind": "wheel",
+      "atMs": 23338.5,
+      "delta": -8,
+      "deltaMode": 0,
+      "ctrlKey": true,
+      "metaKey": false,
+      "altKey": false,
+      "isTrusted": true,
+      "cancelable": true,
+      "defaultPrevented": true,
+      "target": "pianoroll"
+    },
+    {
+      "kind": "wheel",
+      "atMs": 23422,
+      "delta": -8,
+      "deltaMode": 0,
+      "ctrlKey": true,
+      "metaKey": false,
+      "altKey": false,
+      "isTrusted": true,
+      "cancelable": true,
+      "defaultPrevented": true,
+      "target": "pianoroll"
+    }
+  ]
+}

@@ -946,6 +946,220 @@ async function main() {
       );
     }
 
+    // =====================================================================
+    // THE PINCH ROADS — captured, then contested (Z3)
+    // =====================================================================
+    //
+    // WHAT THIS CAN AND CANNOT PROVE, said first because the difference is the whole point.
+    //
+    // macOS delivers one trackpad pinch to a WKWebView down TWO roads — a `wheel` with `ctrlKey`
+    // forced on, and WebKit's own `gesturestart`/`gesturechange`/`gestureend` — and applying both
+    // is one pinch zoomed twice. Chromium implements only the first road and has never
+    // implemented `GestureEvent` at all, so a headless-Chrome probe CANNOT deliver the second one
+    // and no amount of it running green is evidence about WKWebView.
+    //
+    // So this does two separable things:
+    //
+    //   1. CAPTURES the wheel road as the browser actually delivers it to the shipped handlers,
+    //      with `isTrusted`, `deltaMode`, the modifiers and whether the handler called
+    //      `preventDefault`, and writes it to scripts/fixtures/gesture/ as a fixture with its
+    //      provenance on its face. That road is not a Chromium curiosity: it is the ONLY road on
+    //      Windows/WebView2, which is Chromium, so this is the Windows path measured.
+    //   2. CONTESTS the two roads at the real app by dispatching the WKWebView-shaped
+    //      `gesture*` stream alongside the wheel one. Those events are synthesised, and the
+    //      capture records them as untrusted so nobody can mistake the file for a hardware trace
+    //      — but the HANDLERS do not know that, so "one gesture produced one zoom command"
+    //      is a real statement about our code, which is the part that was broken.
+    //
+    // TO TURN THE CONSTRUCTED FIXTURE INTO A HARDWARE ONE: build the webcore dist, point the
+    // shell at it with the disk-bundle override in shell/Source/bridge/WebResources.cpp, load the
+    // plugin, paste `RECORDER` below into the webview's console, pinch the trackpad, and copy
+    // `window.__RSGT__.events` into scripts/fixtures/gesture/. Nothing else about this probe or
+    // scripts/gesture-test.ts has to change: the fixture's `provenance` field is what they read.
+    {
+      /** A capture-phase recorder. Also the snippet to paste into a real WKWebView. */
+      const RECORDER = `(() => {
+        const T = { events: [] };
+        window.__RSGT__ = T;
+        const kinds = ['wheel', 'gesturestart', 'gesturechange', 'gestureend'];
+        const rec = (e) => {
+          T.events.push({
+            kind: e.type,
+            atMs: Math.round(e.timeStamp * 1000) / 1000,
+            delta: e.type === 'wheel' ? (e.deltaY || e.deltaX) : undefined,
+            deltaMode: e.type === 'wheel' ? e.deltaMode : undefined,
+            scale: typeof e.scale === 'number' ? e.scale : undefined,
+            ctrlKey: !!e.ctrlKey, metaKey: !!e.metaKey, altKey: !!e.altKey,
+            isTrusted: e.isTrusted, cancelable: e.cancelable, defaultPrevented: null,
+            target: e.target && e.target.className ? String(e.target.className).slice(0, 40) : null
+          });
+        };
+        // Recorded on the way DOWN so the record exists before any handler runs, and patched on
+        // the way back UP so \`defaultPrevented\` says what the handler actually did.
+        for (const k of kinds) {
+          window.addEventListener(k, rec, { capture: true });
+          window.addEventListener(k, (e) => {
+            const last = T.events[T.events.length - 1];
+            if (last && last.kind === e.type) last.defaultPrevented = e.defaultPrevented;
+          }, { capture: false });
+        }
+        return true;
+      })()`;
+      await ev(RECORDER);
+
+      const roll = await rectOf('.pianoroll');
+      const cx = roll.left + roll.width / 2;
+      const cy = roll.top + roll.height / 2;
+
+      // ROOM TO MOVE, first. Everything below zooms IN, and a check that counts commands is
+      // meaningless against a saturated axis — a refused command is not logged as applied. So
+      // both axes are wound out to their far end before anything is counted.
+      for (let i = 0; i < 30; i++) await ev(wheelAt('.pianoroll', cx, cy, 0, 40, true));
+      await ev(`(() => {
+        const el = document.querySelector('.pianoroll');
+        for (let i = 0; i < 20; i++) {
+          el.dispatchEvent(new WheelEvent('wheel', { bubbles: true, cancelable: true,
+            clientX: ${cx}, clientY: ${cy}, deltaX: 0, deltaY: 60, deltaMode: 0, altKey: true }));
+        }
+        return true;
+      })()`);
+      await settle(700);
+
+      // --- 1. the wheel road, captured -------------------------------------------------
+      await ev(`(() => { window.__RSGT__.events.length = 0; return true; })()`);
+      await resetLog();
+      for (let i = 0; i < 8; i++) {
+        // THROUGH THE BROWSER, not through `dispatchEvent`. `Input.dispatchMouseEvent` makes the
+        // ENGINE synthesise the event, so what the handler receives is `isTrusted: true` with the
+        // engine's own `deltaMode` and modifier plumbing — which is the difference between a
+        // capture and a hand-written stream, and is asserted below. `modifiers: 2` is Ctrl,
+        // which is how macOS and Windows both spell "the fingers are pinching".
+        await cdp.send('Input.dispatchMouseEvent', {
+          type: 'mouseWheel', x: cx, y: cy, deltaX: 0, deltaY: -8, modifiers: 2, pointerType: 'mouse'
+        });
+        await settle(30);
+      }
+      await settle(500);
+      const wheelTrace = await json(`JSON.stringify(window.__RSGT__.events)`);
+      const wheelLog = (await vp()).log.filter((l) => l.kind === 'zoom' && l.applied);
+      say('wheel road', { events: wheelTrace.length, zoomCommands: wheelLog.length });
+      check(
+        'pinch roads: the wheel road is delivered as a TRUSTED ctrl-wheel and swallowed by the handler',
+        wheelTrace.length === 8 &&
+          wheelTrace.every(
+            (e) => e.kind === 'wheel' && e.ctrlKey && e.isTrusted === true && e.defaultPrevented === true
+          ),
+        JSON.stringify(wheelTrace[0] ?? null)
+      );
+      check(
+        'pinch roads: eight wheel events of one pinch are eight zoom commands, not sixteen',
+        wheelLog.length === 8,
+        `zoom commands = ${wheelLog.length}`
+      );
+      check(
+        'pinch roads: this engine never dispatches a GestureEvent (so WebView2/Windows is wheel-only)',
+        wheelTrace.every((e) => e.kind === 'wheel'),
+        wheelTrace.map((e) => e.kind).join(',')
+      );
+
+      await mkdir(join(ROOT, 'scripts', 'fixtures', 'gesture'), { recursive: true });
+      await writeFile(
+        join(ROOT, 'scripts', 'fixtures', 'gesture', 'roll-ctrlwheel-chromium.json'),
+        JSON.stringify(
+          {
+            name: 'roll-ctrlwheel-chromium',
+            provenance: 'captured',
+            engine: await ev('navigator.userAgent'),
+            note:
+              'A pinch-in over the piano roll as the browser ITSELF delivered it to the shipped ' +
+              'handlers — dispatched through CDP Input, so every event is isTrusted. ' +
+              'The ONLY road on Windows/WebView2, which is Chromium; on macOS/WKWebView the same ' +
+              'fingers also produce the gesture* road, which no Chromium can emit — see ' +
+              'roll-webkit-both-roads.json and the recipe in scripts/scrollzoom-probe.mjs.',
+            events: wheelTrace
+          },
+          null,
+          2
+        ) + '\n'
+      );
+
+      // --- 2. both roads at once, at the real app ---------------------------------------
+      //
+      // THE BUG, AS A RECIPE: WKWebView sends both, and the roll used to apply both. Worse for
+      // Option+pinch, where the wheel handler applied the vertical zoom and returned BEFORE
+      // claiming the road, so the gesture copy always found the road free.
+      // `GestureEvent` is not constructible outside WebKit, and the handlers read it
+      // structurally (`scale`, `altKey`, `clientX`) precisely so that it need not be: a plain
+      // Event with those properties is indistinguishable to them, which is what makes this
+      // testable at all. The capture records `isTrusted: false` for every one of them.
+      const gestureAt = (selector, type, scale, alt) =>
+        '(() => {' +
+        '  const el = document.querySelector(' + JSON.stringify(selector) + ');' +
+        '  if (!el) return "missing";' +
+        '  const e = new Event(' + JSON.stringify(type) + ', { bubbles: true, cancelable: true });' +
+        (scale === null ? '' : '  e.scale = ' + scale + ';') +
+        '  e.altKey = ' + (alt ? 'true' : 'false') + ';' +
+        '  e.clientX = ' + cx + '; e.clientY = ' + cy + ';' +
+        '  el.dispatchEvent(e);' +
+        '  return e.defaultPrevented;' +
+        '})()';
+      await ev(`(() => { window.__RSGT__.events.length = 0; return true; })()`);
+      await resetLog();
+      await ev(gestureAt('.pianoroll', 'gesturestart', 1, false));
+      for (let i = 1; i <= 6; i++) {
+        // The same fingers, both roads, interleaved exactly as a dual-delivery build would.
+        await ev(wheelAt('.pianoroll', cx, cy, 0, -8, true));
+        await ev(gestureAt('.pianoroll', 'gesturechange', 1 + i * 0.02, false));
+        await settle(30);
+      }
+      await ev(gestureAt('.pianoroll', 'gestureend', null, false));
+      await settle(500);
+      const bothTrace = await json(`JSON.stringify(window.__RSGT__.events)`);
+      const bothLog = (await vp()).log.filter((l) => l.kind === 'zoom' && l.applied);
+      say('both roads', {
+        events: bothTrace.length,
+        wheels: bothTrace.filter((e) => e.kind === 'wheel').length,
+        gestures: bothTrace.filter((e) => e.kind !== 'wheel').length,
+        zoomCommands: bothLog.length
+      });
+      check(
+        'pinch roads: one pinch delivered on BOTH roads is still six zoom commands, not twelve',
+        bothLog.length === 6,
+        `zoom commands = ${bothLog.length} for 6 wheel + 6 gesturechange events`
+      );
+      check(
+        'pinch roads: gestureend is registered and swallowed (nothing listened for it before)',
+        bothTrace.some((e) => e.kind === 'gestureend' && e.defaultPrevented === true),
+        JSON.stringify(bothTrace.filter((e) => e.kind === 'gestureend'))
+      );
+
+      // --- 3. Option+pinch, the fault Codex found ---------------------------------------
+      const pitchBefore = await json('JSON.stringify(window.__RIFFSHEET_PIANOROLL__().roll.pxPerSemitone)');
+      await ev(`(() => { window.__RSGT__.events.length = 0; return true; })()`);
+      await ev(gestureAt('.pianoroll', 'gesturestart', 1, true));
+      await ev(`(() => {
+        const el = document.querySelector('.pianoroll');
+        el.dispatchEvent(new WheelEvent('wheel', { bubbles: true, cancelable: true,
+          clientX: ${cx}, clientY: ${cy}, deltaX: 0, deltaY: -40, deltaMode: 0,
+          ctrlKey: true, altKey: true }));
+        return true;
+      })()`);
+      await ev(gestureAt('.pianoroll', 'gesturechange', 1.06, true));
+      await ev(gestureAt('.pianoroll', 'gestureend', null, true));
+      await settle(400);
+      const pitchAfter = await json('JSON.stringify(window.__RIFFSHEET_PIANOROLL__().roll.pxPerSemitone)');
+      // ONE event's worth, not two. The wheel road owns the gesture, so the ratio is exactly the
+      // wheel's own factor — `exp(40 * 0.0015)` clamped by the 1.06 anti-jump step.
+      const wanted = Math.min(1.06, Math.exp(40 * 0.0015));
+      const got = pitchAfter / pitchBefore;
+      say('option+pinch', { before: pitchBefore, after: pitchAfter, ratio: got, wanted, doubled: wanted * 1.06 });
+      check(
+        'pinch roads: Option+pinch on both roads zooms pitch ONCE (it used to zoom on both)',
+        Math.abs(got - wanted) < 0.005,
+        `pitch x${got.toFixed(4)}, wanted x${wanted.toFixed(4)}, the bug gave up to x${(wanted * 1.06).toFixed(4)}`
+      );
+    }
+
     check('no console errors', errors.length === 0, errors.slice(0, 3).join(' | '));
     console.log(`\n${failures === 0 ? 'ALL PASS' : `${failures} FAILED`}  (${results.length} checks)`);
     await writeFile(join(OUT, 'scrollzoom-probe.json'), JSON.stringify({ results }, null, 2));

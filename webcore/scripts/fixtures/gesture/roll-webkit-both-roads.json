@@ -1,0 +1,26 @@
+{
+  "name": "roll-webkit-both-roads",
+  "provenance": "constructed",
+  "engine": "WKWebView (macOS) — SHAPE ONLY, NOT A HARDWARE CAPTURE",
+  "note": "One pinch-in over the piano roll as a dual-delivery WKWebView build sends it: a ctrl-wheel AND WebKit's gesturestart/gesturechange/gestureend for the same fingers, interleaved. Written from WebKit's GestureEvent contract — cumulative `scale` starting at 1 on gesturestart, monotone through the pinch, gestureend on lift — because no machine in this repo's CI can produce one: Chromium has never implemented GestureEvent. TO REPLACE THIS WITH A REAL TRACE: build webcore's dist, point the shell at it with the disk-bundle override (shell/Source/bridge/WebResources.cpp), load the plugin in a host, paste the RECORDER snippet from scripts/scrollzoom-probe.mjs into the webview, pinch the trackpad, and paste window.__RSGT__.events in here with provenance set to 'captured'. Nothing else changes: scripts/gesture-test.ts reads the provenance field and asserts accordingly. Until somebody does that, every claim in this repo about WKWebView TIMING is a claim about the shape, and the claim about our HANDLERS — one gesture, one zoom command — is proven live in scripts/scrollzoom-probe.mjs, which dispatches this same shape at the real app.",
+  "events": [
+    { "kind": "gesturestart", "atMs": 0, "scale": 1, "ctrlKey": false, "metaKey": false, "altKey": false, "isTrusted": false, "cancelable": true },
+    { "kind": "wheel", "atMs": 8, "delta": -6.5, "deltaMode": 0, "ctrlKey": true, "metaKey": false, "altKey": false, "isTrusted": false, "cancelable": true },
+    { "kind": "gesturechange", "atMs": 9, "scale": 1.0098, "ctrlKey": false, "metaKey": false, "altKey": false, "isTrusted": false, "cancelable": true },
+    { "kind": "wheel", "atMs": 24, "delta": -7.2, "deltaMode": 0, "ctrlKey": true, "metaKey": false, "altKey": false, "isTrusted": false, "cancelable": true },
+    { "kind": "gesturechange", "atMs": 25, "scale": 1.0207, "ctrlKey": false, "metaKey": false, "altKey": false, "isTrusted": false, "cancelable": true },
+    { "kind": "wheel", "atMs": 41, "delta": -9.4, "deltaMode": 0, "ctrlKey": true, "metaKey": false, "altKey": false, "isTrusted": false, "cancelable": true },
+    { "kind": "gesturechange", "atMs": 42, "scale": 1.0349, "ctrlKey": false, "metaKey": false, "altKey": false, "isTrusted": false, "cancelable": true },
+    { "kind": "wheel", "atMs": 58, "delta": -11.1, "deltaMode": 0, "ctrlKey": true, "metaKey": false, "altKey": false, "isTrusted": false, "cancelable": true },
+    { "kind": "gesturechange", "atMs": 59, "scale": 1.0518, "ctrlKey": false, "metaKey": false, "altKey": false, "isTrusted": false, "cancelable": true },
+    { "kind": "wheel", "atMs": 75, "delta": -10.3, "deltaMode": 0, "ctrlKey": true, "metaKey": false, "altKey": false, "isTrusted": false, "cancelable": true },
+    { "kind": "gesturechange", "atMs": 76, "scale": 1.0674, "ctrlKey": false, "metaKey": false, "altKey": false, "isTrusted": false, "cancelable": true },
+    { "kind": "wheel", "atMs": 92, "delta": -8.8, "deltaMode": 0, "ctrlKey": true, "metaKey": false, "altKey": false, "isTrusted": false, "cancelable": true },
+    { "kind": "gesturechange", "atMs": 93, "scale": 1.0808, "ctrlKey": false, "metaKey": false, "altKey": false, "isTrusted": false, "cancelable": true },
+    { "kind": "wheel", "atMs": 109, "delta": -6.1, "deltaMode": 0, "ctrlKey": true, "metaKey": false, "altKey": false, "isTrusted": false, "cancelable": true },
+    { "kind": "gesturechange", "atMs": 110, "scale": 1.0901, "ctrlKey": false, "metaKey": false, "altKey": false, "isTrusted": false, "cancelable": true },
+    { "kind": "wheel", "atMs": 126, "delta": -3.4, "deltaMode": 0, "ctrlKey": true, "metaKey": false, "altKey": false, "isTrusted": false, "cancelable": true },
+    { "kind": "gesturechange", "atMs": 127, "scale": 1.0953, "ctrlKey": false, "metaKey": false, "altKey": false, "isTrusted": false, "cancelable": true },
+    { "kind": "gestureend", "atMs": 148, "scale": 1.0953, "ctrlKey": false, "metaKey": false, "altKey": false, "isTrusted": false, "cancelable": true }
+  ]
+}

@@ -206,13 +206,20 @@ import {
   TIME_ZOOM_IN_FACTOR,
   TIME_ZOOM_OUT_FACTOR,
   secPerPx,
-  PinchAccumulator,
   type BarSpan,
   type GridMark,
   type TimeLimits,
   type TimeWindow,
   type ViewportCommand
 } from './timeAxis';
+// THE ONE PINCH LAW, borrowed rather than restated. Three surfaces used to carry three copies of
+// the road/dedupe/baseline machinery and drifted apart; view/gesture.ts is the only copy now, and
+// what is left here is coordinates. `wheelZoomFactor` and `WHEEL_ZOOM_MAX_STEP` moved with it and
+// are re-exported below, because they are the same law seen from the other end and half the app
+// imports them from this file.
+import { PinchGesture, wheelZoomFactor, WHEEL_ZOOM_MAX_STEP } from './gesture';
+
+export { wheelZoomFactor, WHEEL_ZOOM_MAX_STEP };
 
 /**
  * The default ruler for a document with no score yet: 4/4 at the app's fallback tempo.
@@ -679,28 +686,16 @@ const FIT_FLOOR_PX_PER_SEMITONE = 0.5;
 const VZOOM_IN_FACTOR = 1.15;
 const VZOOM_OUT_FACTOR = 1 / 1.15;
 
-/**
- * TRACKPAD ZOOM, DAMPED (G15). How much zoom one pixel of two-finger travel is worth.
+/*
+ * THE TRACKPAD ZOOM LAW MOVED, WHOLE, TO view/gesture.ts.
  *
- * The discrete factors above are one NOTCH of a mouse wheel — one deliberate act, one visible
- * step. A trackpad is not that: a single lazy two-finger flick delivers dozens of wheel events,
- * and answering each of them with a 15% or 25% step multiplies out to an enormous jump. The
- * reported symptom was exactly that, "it goes drastic".
- *
- * So the factor is exponential in the delta — `exp(-delta * k)`, which composes correctly
- * (two events of 10px are worth exactly one of 20) and is its own inverse in the other
- * direction, so a flick one way and back lands where it started.
+ * `WHEEL_ZOOM_PER_PX`, `WHEEL_ZOOM_MAX_STEP`, `wheelZoomFactor` and the pinch-road dedupe
+ * (`PINCH_DEDUPE_MS` and `claimPinch`) stood here and were COPIED into the sheet and the
+ * waveform strip, so one gesture had three implementations and three sets of the same bugs.
+ * There is one now. The two names half the app imports from this file are re-exported at the
+ * top so no caller had to change.
  */
-const WHEEL_ZOOM_PER_PX = 0.0015;
-/**
- * The most a SINGLE wheel event may zoom, in either direction.
- *
- * The anti-jump clamp, and the reason it is a clamp rather than a smaller gain: some platforms
- * (and every plain mouse) send one enormous delta — 100, 120, or a whole 'page' in
- * `deltaMode` 1 — where a trackpad sends twenty small ones. A gain low enough to make those
- * bearable would make a trackpad feel dead. 6% is a step you can see and cannot be thrown by.
- */
-export const WHEEL_ZOOM_MAX_STEP = 1.06;
+
 
 // `OWN_ZOOM_ECHO_MS` stood here (700 ms) and is gone with `holdSpan` and `adoptNextAlignSpan`.
 // It was a clock trying to answer "was this window my own zoom coming back?", which is a question
@@ -708,25 +703,7 @@ export const WHEEL_ZOOM_MAX_STEP = 1.06;
 // including a plain horizontal pan, so for 700 ms after any pan the roll would accept whatever
 // span the sheet's engraving happened to produce and a pan became a zoom (finding 4). Commands
 // carry their own typed source now, and programmatic setters are silent, so there is no echo.
-//
-// How long a pinch and its dedupe partner are treated as one gesture. WebKit emits BOTH a
-// ctrl-wheel and a legacy `gesturechange` for a single trackpad pinch on some builds, and both
-// used to be applied — one pinch, zoomed twice (finding 12). Whichever arrives first wins the
-// gesture and the other road is ignored until this has elapsed with nothing on it.
-const PINCH_DEDUPE_MS = 250;
 
-/**
- * One wheel event's worth of zoom. Negative delta (up, or left) zooms IN, matching every notch
- * gesture in the app; the result is a multiplier for `zoomTimeAt` / `zoomVerticalAt`.
- *
- * `deltaMode` is honoured because a Windows mouse reports LINES (mode 1) and some browsers
- * report PAGES (mode 2): taking those numbers as pixels would make one notch worth nothing.
- */
-export function wheelZoomFactor(delta: number, deltaMode = 0): number {
-  const px = delta * (deltaMode === 1 ? 16 : deltaMode === 2 ? 400 : 1);
-  const raw = Math.exp(-px * WHEEL_ZOOM_PER_PX);
-  return Math.min(WHEEL_ZOOM_MAX_STEP, Math.max(1 / WHEEL_ZOOM_MAX_STEP, raw));
-}
 /** The whole keyboard, in the pitch coordinate the scroll is expressed in. */
 const MIDI_TOP = 128;
 
@@ -1135,11 +1112,8 @@ export class PianoRoll {
   /** A window that arrived from the app mid-gesture, waiting for the pointer to come up. Boxed so
    *  that a deferred `null` (the whole take) differs from "nothing arrived". */
   private deferredWindow: { value: TimeWindow | null } | null = null;
-  /** Sub-threshold pinch ratios, kept rather than dropped. See `timeAxis.PinchAccumulator`. */
-  private pinch = new PinchAccumulator();
-  /** When the last pinch reached the reducer, and which road it came in on. `PINCH_DEDUPE_MS`. */
-  private lastPinchMs = 0;
-  private pinchRoad: 'wheel' | 'gesture' | null = null;
+  /** The whole pinch law — road, dedupe, accumulator — in one object. See view/gesture.ts. */
+  private pinch = new PinchGesture();
   /** The note the pointer is over, for the sheet to ring. Null when it is over nothing. */
   private hoverNoteId: string | null = null;
   /** Notes the SHEET says the pointer is over. Drawn like a light selection — see `setHover`. */
@@ -1241,6 +1215,8 @@ export class PianoRoll {
     // Safari/WKWebView's own pinch. Harmless everywhere else — no other engine fires them.
     this.canvas.addEventListener('gesturestart', this.onGestureStart, { passive: false });
     this.canvas.addEventListener('gesturechange', this.onGestureChange, { passive: false });
+    // THE END OF CONTACT, which no surface listened for until now. See view/gesture.ts.
+    this.canvas.addEventListener('gestureend', this.onGestureEnd, { passive: false });
     // The drag listeners live for the object's whole life rather than per gesture, so there
     // is exactly one place that adds them and exactly one that removes them. They return
     // immediately when nothing is being dragged.
@@ -1526,25 +1502,6 @@ export class PianoRoll {
   /** One line, so every gesture below reaches the app's reducer by the same road. */
   private command(cmd: ViewportCommand): void {
     this.opts.onViewportCommand?.(cmd);
-  }
-
-  /**
-   * ONE PINCH, ONE ZOOM (finding 12). Returns false for the other road's copy of this gesture.
-   *
-   * macOS delivers a trackpad pinch as a ctrl-wheel; WKWebView ALSO delivers the legacy
-   * `gesturestart`/`gesturechange` pair, and on the builds that emit both, both handlers used to
-   * fire and the pinch was applied twice. Whichever road speaks first owns the gesture, and the
-   * other is refused until `PINCH_DEDUPE_MS` has passed with nothing on it. Same road again is
-   * always allowed — that is just the next event of the same pinch.
-   */
-  private claimPinch(road: 'wheel' | 'gesture'): boolean {
-    const t = now();
-    if (this.pinchRoad !== null && this.pinchRoad !== road && t - this.lastPinchMs < PINCH_DEDUPE_MS) {
-      return false;
-    }
-    this.pinchRoad = road;
-    this.lastPinchMs = t;
-    return true;
   }
 
   /** Whatever arrived while the pointer was down. Called from the one place a gesture ends. */
@@ -3371,16 +3328,28 @@ export class PianoRoll {
     if (pinch || e.altKey) {
       const d = e.deltaY || e.deltaX;
       if (d === 0) return;
+      // Always swallowed, whatever the law decides below: an unhandled ctrl-wheel is the
+      // browser's page zoom, which inside a plugin window resizes the entire UI.
       e.preventDefault();
-      // Option picks the other axis. Alt on its own (no pinch) is kept as the pitch zoom a
-      // plain MOUSE has always had here — a mouse cannot pinch, and it was shipped.
-      if (e.altKey) {
-        this.zoomVerticalAt(zoom(d), this.localPoint(e).y);
-        return;
-      }
-      // One pinch, one zoom, whichever road WebKit chose to send it down. See `claimPinch`.
-      if (pinch && !this.claimPinch('wheel')) return;
-      this.zoomTimeAt(zoom(d), this.canvasPoint(e).x);
+      // ONE ROAD PER GESTURE, DECIDED BEFORE THE AXIS. Option picks the other axis, and the
+      // altKey branch used to sit ABOVE the road claim and apply the vertical zoom without
+      // claiming — so WKWebView's GestureEvent copy of the same Option+pinch claimed the free
+      // road and zoomed pitch a second time. The claim is unconditional on a pinch now, and
+      // which axis it moves is read off the same decision. Alt on its own (no pinch) is still
+      // the pitch zoom a plain MOUSE has always had here — a mouse cannot pinch, so it is on no
+      // road and cannot be anybody's duplicate. See view/gesture.ts.
+      const out = this.pinch.read({
+        kind: 'wheel',
+        atMs: now(),
+        delta: d,
+        deltaMode: e.deltaMode,
+        ctrlKey: e.ctrlKey,
+        metaKey: e.metaKey,
+        altKey: e.altKey
+      });
+      if (out.kind !== 'zoom') return;
+      if (out.axis === 'pitch') this.zoomVerticalAt(out.factor, this.localPoint(e).y);
+      else this.zoomTimeAt(out.factor, this.canvasPoint(e).x);
       return;
     }
 
@@ -3446,37 +3415,41 @@ export class PianoRoll {
    * `zoomTimeAt`/`zoomVerticalAt` with the same units and a pinch feels identical either way.
    *
    * Typed structurally rather than against `GestureEvent`, which is not in the standard DOM lib.
+   *
+   * `gestureend` was not registered by ANY surface until now, which is why the road could only be
+   * released by a timeout and a slow pinch could be handed to the other road halfway through.
+   * The end of contact is the end of the road; see view/gesture.ts.
+   *
+   * WINDOWS / WEBVIEW2: none of this fires. `GestureEvent` is a WebKit API and Chromium has
+   * never implemented it, so on Windows the pinch arrives down the WHEEL path in `onWheel` and
+   * nothing else — one road, never contested, and the dedupe collapses to "the wheel road claims
+   * and nobody argues". That is measured for Chromium (scripts/scrollzoom-probe.mjs asserts that
+   * this engine dispatches no GestureEvent at all) and stated for WebView2, which is Chromium;
+   * see `PINCH_ROADS` in view/gesture.ts for what is measured and what is inferred.
    */
-  private gestureScale = 1;
-
   private onGestureStart = (e: Event): void => {
     e.preventDefault();
-    this.gestureScale = (e as Event & { scale?: number }).scale ?? 1;
-    this.pinch.reset();
+    this.pinch.read({ kind: 'gesturestart', atMs: now(), scale: (e as Event & { scale?: number }).scale });
   };
 
   private onGestureChange = (e: Event): void => {
     const g = e as Event & { scale?: number; altKey?: boolean; clientX?: number; clientY?: number };
-    const scale = g.scale;
-    if (!scale || !Number.isFinite(scale) || scale <= 0) return;
+    if (!g.scale || !Number.isFinite(g.scale) || g.scale <= 0) return;
     e.preventDefault();
-    const ratio = scale / (this.gestureScale > 0 ? this.gestureScale : 1);
-    this.gestureScale = scale;
-    // ACCUMULATED, NOT DROPPED (finding 10). The baseline advances on every event whether or not
-    // the ratio was big enough to use, so a discarded fraction used to be gone for good; folded
-    // in, it simply arrives one event later.
-    const stepped = this.pinch.take(ratio);
-    if (stepped === null) return;
-    if (!this.claimPinch('gesture')) return;
-    // Clamped by the same anti-jump step a wheel gets, so one violent pinch cannot throw the view.
-    const factor = Math.min(WHEEL_ZOOM_MAX_STEP, Math.max(1 / WHEEL_ZOOM_MAX_STEP, stepped));
+    const out = this.pinch.read({ kind: 'gesturechange', atMs: now(), scale: g.scale, altKey: g.altKey });
+    if (out.kind !== 'zoom') return;
     const rect = this.canvas.getBoundingClientRect();
     const at = {
       clientX: g.clientX ?? rect.left + rect.width / 2,
       clientY: g.clientY ?? rect.top + rect.height / 2
     };
-    if (g.altKey) this.zoomVerticalAt(factor, this.localPoint(at).y);
-    else this.zoomTimeAt(factor, this.canvasPoint(at).x);
+    if (out.axis === 'pitch') this.zoomVerticalAt(out.factor, this.localPoint(at).y);
+    else this.zoomTimeAt(out.factor, this.canvasPoint(at).x);
+  };
+
+  private onGestureEnd = (e: Event): void => {
+    e.preventDefault();
+    this.pinch.read({ kind: 'gestureend', atMs: now() });
   };
 
   /**
@@ -4707,6 +4680,7 @@ export class PianoRoll {
     this.canvas.removeEventListener('wheel', this.onWheel);
     this.canvas.removeEventListener('gesturestart', this.onGestureStart);
     this.canvas.removeEventListener('gesturechange', this.onGestureChange);
+    this.canvas.removeEventListener('gestureend', this.onGestureEnd);
     window.removeEventListener('pointermove', this.onWindowPointerMove);
     window.removeEventListener('pointerup', this.onWindowPointerUp);
     window.removeEventListener('pointercancel', this.onWindowPointerUp);

@@ -108,6 +108,17 @@ export interface IRNote {
   /** Symbolic source staff identity, used to retain real grand-staff placement. */
   sourceStaffIndex?: number;
   /**
+   * SOURCE VOICE IDENTITY, carried through losslessly even though v1 engraves ONE voice.
+   *
+   * The IR has always been able to hold several voices (`IRBar.voices` is a list); the pipeline
+   * has never produced more than one, and phase 1 of symbolic import does not change that. What
+   * it does change is that the information no longer evaporates: the import used to drop the
+   * voice number in its dedup key, so nobody downstream could even tell that a two-voice source
+   * had been flattened. Now the identity survives to the IR, the flattening is counted, and the
+   * diagnostic says so out loud. The full multi-voice model is a separate project.
+   */
+  sourceVoiceIndex?: number;
+  /**
    * WHICH NOTATION STAFF PRINTS THIS NOTE — 0 is the upper (treble) staff, 1 the lower (bass).
    *
    * This is the OUTPUT side of the decision, the counterpart of `sourceStaffIndex`, which is the
@@ -234,6 +245,17 @@ export interface RiffsheetIR {
   compound: boolean;
   /** Uniform written-staff offset from sounding MIDI, retained from symbolic/OMR import. */
   displayPitchOffset?: number;
+  /**
+   * WHETHER THE TABLATURE STAFF IS PRINTED — a VIEW of this part, never a different part.
+   *
+   * 'omit' hides the tab and changes nothing else: same instrument, same tuning, same string
+   * count, same written octave. Hiding it used to be expressed by rebuilding the score as
+   * `instrument: 'staff'` with an empty tuning, which is a different instrument identity, and
+   * the written octave rides on that identity — a fretted part is engraved 8va. So turning Tab
+   * off dropped the notation a full octave onto ledger lines (X1). Absent means 'two-staves',
+   * which is what every build produced before this field existed.
+   */
+  tab?: 'two-staves' | 'omit';
   instrument: {
     kind: string;
     /** Open-string MIDI numbers, LOW to HIGH. */

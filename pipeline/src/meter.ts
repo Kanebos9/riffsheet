@@ -345,3 +345,34 @@ export function tupletWrittenLen(beatLen: Rational, units: number, normal = 2): 
 export function tupletActualLen(beatLen: Rational, units: number, actual = 3): Rational {
   return beatLen.scale(units, actual);
 }
+
+/**
+ * HOW MANY GLYPHS A `units`-UNIT SPAN INSIDE A GROUP COSTS, in reading order — the tuplet
+ * domain's answer to `toDurationList`.
+ *
+ * A span inside a group used to be one glyph however long it was, on the reading that a tuplet
+ * unit count always has a written value. Most do: at 3:2 over a quarter beat, 1, 2 and 3 units
+ * are an eighth, a quarter and a dotted quarter. FIVE units of a sextuplet are not — the written
+ * value is 5/16 of a whole note, which no symbol names — so `typeOf` fell back to the nearest
+ * thing it could name and the beat shipped a `<type>` contradicting its own `<duration>`.
+ *
+ * So the span is cut into unit counts that ARE sayable, longest first, and the caller ties them
+ * exactly as it ties a metric split. Every count is reachable: one unit is printable by
+ * construction (quantize.ts refuses a group whose unit has no written value), so the worst case
+ * is a run of single units.
+ */
+export function tupletUnitPieces(beatLen: Rational, units: number, normal: number): number[] {
+  if (units <= 0) return [];
+  const best: (number[] | null)[] = [[]];
+  for (let n = 1; n <= units; n++) {
+    let found: number[] | null = null;
+    // Descending, so the longest printable value wins a tie on glyph count.
+    for (let take = n; take >= 1; take--) {
+      if (!glyphFor(tupletWrittenLen(beatLen, take, normal))) continue;
+      const rest = best[n - take];
+      if (rest && (!found || rest.length + 1 < found.length)) found = [take, ...rest];
+    }
+    best.push(found);
+  }
+  return best[units] ?? [units];
+}

@@ -83,12 +83,35 @@ export function detectRepeatLoops(notes: InputNote[]): IRRepeatSuspect[] {
   return out;
 }
 
+/**
+ * BOTH GUARDS ARE STATEMENTS ABOUT A DETECTOR, and neither is true of a symbolic source.
+ *
+ * A note that carries `sourceTiming` was WRITTEN by a human in a score editor, not inferred from
+ * a spectrogram. It cannot be a sub-30 ms artefact of a decoder that never stopped, because no
+ * decoder was involved: at 140 BPM a legal 64th note lasts 27 ms and the unconditional
+ * `MIN_NOTE_SEC` filter deleted it outright, which is how an imported score quietly lost notes
+ * it plainly contained. Likewise the past-end filter compares against an AUDIO duration; an
+ * imported part has no audio, and where the caller supplies one anyway (a score imported beside
+ * a take) it describes the take, not the import.
+ *
+ * So a symbolic note is exempt from both. Everything else — chord grouping, overlap clamping,
+ * repeat-loop flagging — is unchanged, and a detected note is guarded exactly as before.
+ */
+export function isSymbolic(note: InputNote): boolean {
+  const timing = note.sourceTiming;
+  return !!timing && Number.isFinite(timing.ppq) && timing.ppq > 0;
+}
+
 export function applyGuards(notes: InputNote[], audioDurationSec?: number): GuardResult {
   let pastEndDropped = 0;
   let tooShortDropped = 0;
 
   const kept: { note: InputNote; originalIndex: number }[] = [];
   notes.forEach((n, originalIndex) => {
+    if (isSymbolic(n)) {
+      kept.push({ note: { ...n }, originalIndex });
+      return;
+    }
     if (audioDurationSec !== undefined && n.startSec >= audioDurationSec) {
       pastEndDropped++;
       return;

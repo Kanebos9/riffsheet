@@ -273,6 +273,16 @@ export interface OnsetOptions {
   minStrength?: number;
   /** Width of the moving-median window used for the adaptive threshold. */
   medianWindowSec?: number;
+  /**
+   * How far through the spectral pass we are, 0..1. THE ONLY REASON THIS EXISTS is that the
+   * detector runs off the main thread now (`audio/engineWorker.ts`), and a job that takes
+   * seconds and says nothing is indistinguishable from a job that has hung.
+   *
+   * Called from the frame loop and nowhere else, at most a few dozen times per pass, so it costs
+   * nothing measurable and cannot change what the detector reports. Every existing caller omits
+   * it and gets exactly the function it always had.
+   */
+  onProgress?: (fraction: number) => void;
 }
 
 /** The minimal shape `matchOnsets` needs from a note. Extra fields are preserved. */
@@ -502,7 +512,12 @@ export function detectOnsets(
   const fluxLow = new Float64Array(frames);
   const fluxBroad = new Float64Array(frames);
 
+  // Report about forty times over the whole pass, whatever its length: often enough that a
+  // progress bar moves on a two-second riff, rare enough that a ten-minute take does not spend
+  // its time posting messages. See `onProgress`.
+  const progressEvery = Math.max(1, Math.floor(frames / 40));
   for (let m = 0; m < frames; m++) {
+    if (opts.onProgress && m % progressEvery === 0) opts.onProgress(m / frames);
     // The window is centred half a hop LATE so that the difference below lands on `m * hop`.
     const centre = (m + 0.5) * hop;
     longFft.magnitudes(work, centre, magLong);

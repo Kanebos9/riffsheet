@@ -3,6 +3,8 @@
 #include "SystemProbe.h"
 #include "sidecar/ProcessOutputReader.h"
 #include <BinaryData.h>
+#include <map>
+#include <mutex>
 
 /*
     The installer, end to end.
@@ -486,14 +488,121 @@ juce::File EngineInstaller::engineDirectory (const juce::String& id)
     return enginesRoot().getChildFile (id);
 }
 
-juce::File EngineInstaller::incomingDirectory (const juce::String& id)
+juce::File EngineInstaller::newIncomingDirectory (const juce::String& id)
 {
-    return enginesRoot().getChildFile (id + ".incoming");
+    return enginesRoot().getChildFile (id + ".incoming-" + juce::Uuid().toDashedString());
+}
+
+juce::File EngineInstaller::newPreviousDirectory (const juce::String& id)
+{
+    return enginesRoot().getChildFile (id + ".previous-" + juce::Uuid().toDashedString());
+}
+
+int EngineInstaller::sweepStaleStaging (const juce::String& id, const juce::File& keep)
+{
+    const auto root = enginesRoot();
+
+    if (! root.isDirectory())
+        return 0;
+
+    int removed = 0;
+
+    // Two passes' worth of wildcard in one iterator. findDirectories only: a
+    // FILE called `<id>.incoming-...` is not something this code made, and
+    // deleting things we did not create is how a cleanup becomes an incident.
+    for (const auto& item : juce::RangedDirectoryIterator (root, false, id + ".incoming-*;" + id + ".previous-*",
+                                                           juce::File::findDirectories))
+    {
+        const auto directory = item.getFile();
+
+        if (directory == keep)
+            continue;
+
+        if (directory.deleteRecursively())
+            ++removed;
+    }
+
+    return removed;
 }
 
 juce::File EngineInstaller::downloadsDirectory (const juce::String& id)
 {
     return enginesRoot().getChildFile (".downloads").getChildFile (id);
+}
+
+//==============================================================================
+namespace
+{
+    /*  The in-process half of ScopedInstallLock - see the header for why one
+        lock is not enough. One mutex per engine id, created on first use and
+        never destroyed: there are a handful of engine ids in the whole
+        application, and a map that erased entries would need its own lock held
+        across the try, which is the thing being built here. */
+    std::mutex& installMutexFor (const juce::String& id)
+    {
+        static std::mutex mapLock;
+        static std::map<juce::String, std::unique_ptr<std::mutex>> mutexes;
+
+        const std::lock_guard<std::mutex> guard (mapLock);
+        auto& slot = mutexes[id];
+
+        if (slot == nullptr)
+            slot = std::make_unique<std::mutex>();
+
+        return *slot;
+    }
+
+    /*  A lock file name that is legal on every platform and cannot collide with
+        another application's. Engine ids are already `[a-z0-9-]`, but a manifest
+        is data and this is a filesystem path. */
+    juce::String installLockName (const juce::String& id)
+    {
+        return "riffsheet-engine-install-" + id.retainCharacters ("abcdefghijklmnopqrstuvwxyz"
+                                                                  "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_");
+    }
+}
+
+EngineInstaller::ScopedInstallLock::ScopedInstallLock (const juce::String& engineId)
+    : id (engineId)
+{
+    // In-process first, and non-blocking. It is the cheaper test and the one
+    // that actually fires: two plugin instances in one DAW is the common case,
+    // and it is precisely the case an fcntl lock cannot see.
+    if (! installMutexFor (id).try_lock())
+        return;
+
+    inProcess = true;
+
+    // Then the machine. timeOutMillisecs = 0 means "try once and tell me" -
+    // enter() returns false when another process holds it, because JUCE drops
+    // the file handle on a failed lock and reports that as a failed enter.
+    across = std::make_unique<juce::InterProcessLock> (installLockName (id));
+
+    if (! across->enter (0))
+    {
+        across.reset();
+        installMutexFor (id).unlock();
+        inProcess = false;
+        return;
+    }
+
+    held = true;
+}
+
+EngineInstaller::ScopedInstallLock::~ScopedInstallLock()
+{
+    if (across != nullptr)
+        across->exit();
+
+    if (inProcess)
+        installMutexFor (id).unlock();
+}
+
+juce::String EngineInstaller::ScopedInstallLock::whoElse() const
+{
+    return "Another Riffsheet window is already installing or removing this engine. "
+           "Wait for it to finish - they share the same folder, and two at once would "
+           "leave a half-built engine behind.";
 }
 
 juce::int64 EngineInstaller::bytesOnDisk (const juce::File& directory)
@@ -1489,11 +1598,43 @@ EngineInstaller::Result EngineInstaller::install (const EngineManifest& engine, 
         return finish (false);
     }
 
+    //-- 1b. the right to touch this engine's folders --------------------------
+    //
+    // Taken here, before the first byte is written and after the cheap "is this
+    // even installable" work, and held for the rest of the function. Everything
+    // past this point moves and recursively deletes whole trees under
+    // <appSupport>/engines/<id>, and until now nothing coordinated that between
+    // the standalone app and however many plugin instances the user has open.
+    // Two installs of the same engine at once deleted each other's staging
+    // directories mid-write, and the loser saw a failure that read like a
+    // corrupt download.
+    const ScopedInstallLock installLock (manifestText (engine.id));
+
+    if (! installLock.isHeld())
+    {
+        result.error = installLock.whoElse();
+        return finish (false);
+    }
+
     const auto engineDir = engineDirectory (engine.id);
-    const auto incoming  = incomingDirectory (engine.id);
     const auto downloads = downloadsDirectory (engine.id);
 
     enginesRoot().createDirectory();
+
+    // A directory of our own, named with a UUID. Belt and braces on the lock
+    // above: on a machine where the lock cannot be taken - a sandboxed host with
+    // no access to the lock file's folder - two installs still cannot reach each
+    // other's bytes, because there is no shared path left to reach.
+    const auto incoming = newIncomingDirectory (manifestText (engine.id));
+
+    // ...and with the lock held, anything ELSE matching that shape is rubbish
+    // from a run that crashed or was force-quit: nobody can be using it, because
+    // using it would mean holding this lock. Left alone it accumulates a
+    // half-built venv per crash.
+    if (const auto swept = sweepStaleStaging (manifestText (engine.id), incoming); swept > 0)
+        juce::Logger::writeToLog ("Riffsheet/EngineInstaller: cleared " + juce::String (swept)
+                                  + " staging director" + (swept == 1 ? "y" : "ies")
+                                  + " left by an earlier run");
 
     if (const auto complaint = checkDiskSpace (enginesRoot(), requiredFreeBytes (plan));
         complaint.isNotEmpty())
@@ -1533,8 +1674,10 @@ EngineInstaller::Result EngineInstaller::install (const EngineManifest& engine, 
         return finish (false);
     }
 
-    incoming.deleteRecursively();
-
+    // No delete-first any more: `incoming` is a UUID nothing has ever used, and
+    // the sweep above has already dealt with what earlier runs left. Deleting a
+    // shared `<id>.incoming` here is exactly what used to land on another
+    // window's half-built engine.
     if (! incoming.createDirectory())
     {
         result.error = "Could not create " + incoming.getFullPathName();
@@ -1719,8 +1862,10 @@ EngineInstaller::Result EngineInstaller::install (const EngineManifest& engine, 
     // is run. A failure rolls the old one back and the user is where they
     // started - which is the same promise the staging directory was making,
     // kept at the other end.
-    const auto previous = enginesRoot().getChildFile (manifestText (engine.id) + ".previous");
-    previous.deleteRecursively();
+    // UUID'd for the same reason `incoming` is, and with the same consequence:
+    // there is no delete-first here either, because there is nothing at this
+    // path to delete and nothing another process could have put there.
+    const auto previous = newPreviousDirectory (manifestText (engine.id));
 
     if (engineDir.exists() && ! engineDir.moveFileTo (previous))
     {
@@ -1859,14 +2004,36 @@ EngineInstaller::Result EngineInstaller::uninstall (const EngineManifest& engine
         return result;
     }
 
+    // The same lock install() takes, for the stronger reason: this deletes the
+    // engine directory outright, and doing that underneath a running install
+    // would leave the user with neither the old engine nor the new one.
+    const ScopedInstallLock installLock (manifestText (engine.id));
+
+    if (! installLock.isHeld())
+    {
+        result.error = installLock.whoElse();
+        return result;
+    }
+
     const auto engineDir = engineDirectory (engine.id);
     const auto downloads = downloadsDirectory (engine.id);
-    const auto incoming  = incomingDirectory (engine.id);
 
-    result.bytesOnDisk = bytesOnDisk (engineDir) + bytesOnDisk (downloads) + bytesOnDisk (incoming);
+    // Staging trees are counted before they are swept, so "freed 113 MB" is the
+    // truth rather than the part of it that happened to be in the final tree.
+    juce::int64 staging = 0;
+
+    for (const auto& item : juce::RangedDirectoryIterator (enginesRoot(), false,
+                                                           manifestText (engine.id) + ".incoming-*;"
+                                                               + manifestText (engine.id) + ".previous-*",
+                                                           juce::File::findDirectories))
+        staging += bytesOnDisk (item.getFile());
+
+    result.bytesOnDisk = bytesOnDisk (engineDir) + bytesOnDisk (downloads) + staging;
 
     engineDir.deleteRecursively();
-    incoming.deleteRecursively();
+    // Every staging tree for this engine. Safe because the lock is held: no
+    // other process can be mid-install, so anything matching is ours or dead.
+    sweepStaleStaging (manifestText (engine.id), juce::File());
     downloads.deleteRecursively();
 
     result.ok = ! engineDir.exists();

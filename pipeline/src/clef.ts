@@ -73,8 +73,18 @@ export function chooseClefs(
     ? TREBLE
     : BASS;
   const chosen = mode === 'treble' ? TREBLE : mode === 'bass' ? BASS : automatic;
-  const min = pitches.length ? Math.min(...pitches) : NaN;
-  const max = pitches.length ? Math.max(...pitches) : NaN;
+  // Iterative, never `Math.min(...pitches)`: a spread of a million arguments throws `RangeError`
+  // in JavaScriptCore long before it computes anything (finding 12).
+  let min = Infinity;
+  let max = -Infinity;
+  for (const p of pitches) {
+    if (p < min) min = p;
+    if (p > max) max = p;
+  }
+  if (!pitches.length) {
+    min = NaN;
+    max = NaN;
+  }
   // A grand staff is a layout request, never permission to flip clefs every few bars: the two
   // staves are simultaneous and each keeps its own clef for the whole part. 'grand' asks for the
   // pair outright; 'auto' still promotes to it when the part is genuinely too wide for one staff.

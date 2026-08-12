@@ -18,18 +18,40 @@
 
 import {
   buildScore as teamCBuildScore,
+  buildTickSecondsMap,
   type AlphaTabScoreData,
   type BuildInput,
   type BuildSettings,
   type ExternalGrid,
   type InputNote,
-  type RiffsheetIR
+  type RiffsheetIR,
+  type TempoSegment,
+  type TempoSource,
+  type TickSecondsMap
 } from '@pipeline-impl';
 
 import type { AppSettings } from '../app/state';
 import { customTuning, TUNING_PRESETS, tuningById, type TuningPreset } from '../score/tuning';
 
-export type { AlphaTabScoreData, RiffsheetIR, InputNote };
+export type { AlphaTabScoreData, RiffsheetIR, InputNote, TempoSegment, TempoSource, TickSecondsMap };
+
+/**
+ * THE AUTHORITATIVE TICK <-> SECONDS CONVERSION, handed to webcore.
+ *
+ * Every second<->tick helper on this side of the wall is a single multiply by
+ * `60 / displayBpm / divisions`, and that expression is a lie the moment a score carries
+ * `ir.tempo.changes`: one number cannot describe two tempi, so the bar lines, the loop bounds and
+ * the notes handed to the synth all drift further apart the further past the change you look.
+ * `buildTickSecondsMap` is the pipeline's piecewise answer — the same one the MIDI writer and the
+ * MusicXML tempo directions come from — so a consumer that goes through it agrees with the file
+ * we export by construction.
+ *
+ * It is re-exported rather than reimplemented because a second copy of this arithmetic is exactly
+ * how the pipeline came to disagree with itself in the first place. Build it from a score's
+ * `ir` (a `RiffsheetIR` is already a `TempoSource`); it is a plain object with no back-reference
+ * to the IR, so a caller may cache one per score for as long as that score exists.
+ */
+export { buildTickSecondsMap };
 
 /** What every consumer in webcore actually holds. */
 export interface RiffScore {
@@ -117,8 +139,25 @@ export interface BuildRequest {
   title?: string;
 }
 
+/**
+ * THE PART'S IDENTITY, which "Tab: Off" is not allowed to change (X1).
+ *
+ * Turning the tablature staff off used to return null here, so the build received an empty tuning
+ * and `instrument: 'staff'`. That is a DIFFERENT INSTRUMENT, not a different view of this one,
+ * and the written octave rides on the instrument: a bass or guitar part is engraved an octave
+ * above what it sounds, and a "staff" part is engraved at pitch. So switching Tab off dropped the
+ * whole notation an octave onto ledger lines, silently, with no other setting touched.
+ *
+ * The tuning is therefore chosen the same way whatever `tabMode` says, and 'off' is expressed
+ * where it belongs — `BuildSettings.tab: 'omit'`, which hides the staff and changes nothing else.
+ */
 function selectedNotationTuning(settings: AppSettings): TuningPreset | null {
-  if (settings.tabMode === 'off') return null;
+  if (settings.tabMode === 'off') {
+    // Whatever the part WAS. The remembered tuning is the last one the user chose, which is the
+    // only honest answer to "what instrument is this" while its tab is hidden.
+    const remembered = tuningById(settings.tuningId);
+    return remembered.midiLowToHigh.length >= 2 ? remembered : null;
+  }
   if (settings.tabMode === 'custom') {
     const custom = customTuning(settings.customTuningMidi);
     return custom.midiLowToHigh.length >= 2
@@ -132,9 +171,17 @@ function selectedNotationTuning(settings: AppSettings): TuningPreset | null {
 
 /** TAB choice + exact tuning -> the closest legacy metadata discriminator. */
 function instrumentKind(settings: AppSettings, tuningMidi: number[]): BuildSettings['instrument'] {
-  if (settings.tabMode === 'off') return 'staff';
+  // 'staff' means "this part has no strings", which is a statement about the INSTRUMENT. Only a
+  // part with no tuning at all earns it; hiding the tab does not (see selectedNotationTuning).
+  if (!tuningMidi.length) return 'staff';
+  const remembered = tuningById(settings.tuningId);
+  if (settings.tabMode === 'off') return remembered.instrument === 'guitar' ? 'guitar6' : bassKind(tuningMidi);
   if (settings.tabMode === 'guitar') return 'guitar6';
   if (settings.tabMode === 'custom' && Math.min(...tuningMidi) >= 35) return 'guitar6';
+  return bassKind(tuningMidi);
+}
+
+function bassKind(tuningMidi: number[]): BuildSettings['instrument'] {
   switch (tuningMidi.length) {
     case 5:
       return 'bass5';
@@ -205,6 +252,8 @@ export function toBuildSettings(settings: AppSettings, title?: string): BuildSet
     ...(settings.keyFifths !== undefined ? { keyFifths: settings.keyFifths } : {}),
     capo: settings.capo,
     showStaccato: true,
+    // VISIBILITY, not identity. The instrument above is unchanged by this line (X1).
+    ...(settings.tabMode === 'off' ? { tab: 'omit' as const } : {}),
     title: title ?? 'Riff'
   };
 }
@@ -279,8 +328,12 @@ export function buildRiffScore(request: BuildRequest, settings: AppSettings): Ri
     divisions: ir.divisions,
     durationSec: lastBeat + beatPeriod,
     beatTimesSec,
-    tuningLowToHigh: ir.instrument.tuningMidi,
-    stringCount: ir.instrument.stringCount,
+    // What the SCREEN has: with the tab hidden there is no fretboard on it, so the string letters,
+    // the tuning legend and every other tab affordance stay exactly as they were before X1's fix.
+    // The part still knows its own strings — `ir.instrument` — and that is what the notation's
+    // written octave reads.
+    tuningLowToHigh: ir.tab === 'omit' ? [] : ir.instrument.tuningMidi,
+    stringCount: ir.tab === 'omit' ? 0 : ir.instrument.stringCount,
     capo: ir.instrument.capo,
     diagnostics
   };

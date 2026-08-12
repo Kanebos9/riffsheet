@@ -178,6 +178,16 @@ export interface AlphaTabPart {
   program?: number;
   /** True for an imported part: it is engraved but never played. See `notationOnly` above. */
   notationOnly?: boolean;
+  /**
+   * Tab visibility for THIS export, overriding `ir.tab`. It used to reach MusicXML only, so a
+   * multi-part guitar showed a TAB staff on screen while the exported file had none (finding 8).
+   */
+  tab?: 'two-staves' | 'omit';
+  /**
+   * Written-octave request for THIS export, overriding the instrument convention, in the same
+   * words MusicXmlOptions uses. Same bug as `tab`: screen and file disagreed by an octave.
+   */
+  octaveTransposition?: 'conventional' | 'none';
 }
 
 export function toAlphaTabModelData(ir: RiffsheetIR): AlphaTabScoreData {
@@ -287,16 +297,25 @@ function buildTrack(part: AlphaTabPart): AlphaTabScoreData['tracks'][number] {
   }));
 
   const bars = makeBars();
-  const displayTranspositionPitch = ir.displayPitchOffset !== undefined
-    ? -ir.displayPitchOffset
-    : ir.instrument.stringCount > 0
-      ? -12
-      : 0;
+  // THE WRITTEN OCTAVE FOLLOWS THE INSTRUMENT, never the tab's visibility (X1). An explicit
+  // request from the caller wins, then the source's own statement, then the convention: a
+  // fretted part reads an octave above what it sounds, everything else reads at pitch.
+  const displayTranspositionPitch = part.octaveTransposition === 'conventional'
+    ? -12
+    : part.octaveTransposition === 'none'
+      ? 0
+      : ir.displayPitchOffset !== undefined
+        ? -ir.displayPitchOffset
+        : ir.instrument.stringCount > 0
+          ? -12
+          : 0;
   // THE FLAG IS NO LONGER CONDITIONAL ON THE PART HAVING NO STRINGS. It used to be
   // (`ir.grandStaff && isStaffOnly`), so a fretted instrument asked for a grand staff got one
   // silently-discarded flag and a single bass clef full of ledger lines. Strings now add a THIRD
   // staff instead of cancelling the first two.
+  // `hasStrings` is the part's IDENTITY; `showTab` is only whether that fretboard is drawn.
   const hasStrings = ir.instrument.stringCount > 0;
+  const showTab = hasStrings && (part.tab ?? ir.tab ?? 'two-staves') === 'two-staves';
   const [upperClef, lowerClef] = ir.grandStaffClefs ?? grandClefPair();
   const signOf = (sign: string): 'F4' | 'G2' => (sign === 'G' ? 'G2' : 'F4');
   // The split itself was decided in the IR (clef.ts `grandStaffSplitter`); this only reads it.
@@ -324,7 +343,7 @@ function buildTrack(part: AlphaTabPart): AlphaTabScoreData['tracks'][number] {
         // The tab staff shows the WHOLE part: tablature is one fretboard, and it is not split by
         // the notation's middle-C boundary. It shows no rests either — the two staves above it
         // already print every one of them (F2a).
-        ...(hasStrings
+        ...(showTab
           ? [
               {
                 showStandardNotation: false,
@@ -341,7 +360,7 @@ function buildTrack(part: AlphaTabPart): AlphaTabScoreData['tracks'][number] {
     : [
         {
           showStandardNotation: true,
-          showTablature: hasStrings,
+          showTablature: showTab,
           // One staff carrying both notation and tab: its rests are the notation's, printed
           // once, above the fret numbers. Nothing to suppress.
           showRests: true,

@@ -1,4 +1,6 @@
 #include <JuceHeader.h>
+#include <cstdio>
+#include <cstring>
 
 /**
     The C++ unit tests.
@@ -38,8 +40,59 @@ namespace
     };
 }
 
+namespace
+{
+    /*  THE CHATTY CHILD, and why the test binary is its own fixture.
+
+        ChildProcessSupervisorTests has to prove that a subprocess which writes
+        more than a pipe buffer's worth of output keeps running instead of
+        blocking inside its own `write()`. That needs a real process that really
+        talks - a mock cannot have the bug, because the bug is in the kernel's
+        pipe, not in our code.
+
+        Re-invoking this binary is how, rather than `/bin/sh -c 'while ...'`:
+        it needs no shell quoting, no `timeout` versus `sleep` difference, and
+        no "does this platform have that program" - the one program guaranteed
+        to exist is the one already running. `--emit <kilobytes> <linger-ms>`
+        writes that many KB across stdout and stderr as fast as it can, then
+        stays alive for `linger-ms` so the parent can catch it running.
+
+        It is checked before ANYTHING else in main() so that a child never
+        constructs a logger, a UnitTestRunner or a MessageManager. */
+    int runEmitMode (int kilobytes, int lingerMs)
+    {
+        // 64 printable characters plus a newline: one line is 65 bytes, so the
+        // arithmetic below is exact and a truncated read is visible as a short
+        // last line rather than as a plausible one.
+        const char* line = "riffsheet-chatty-child-0123456789abcdefghijklmnopqrstuvwxyz-emit\n";
+        const auto lineBytes = std::strlen (line);
+        const auto totalBytes = (size_t) juce::jmax (0, kilobytes) * 1024u;
+
+        for (size_t written = 0; written < totalBytes; written += lineBytes)
+        {
+            // Every tenth line to stderr, because JUCE points both pipes at the
+            // same place and a drain that only covered stdout would still wedge
+            // on a child that logs its errors.
+            auto* stream = ((written / lineBytes) % 10 == 9) ? stderr : stdout;
+            std::fwrite (line, 1, lineBytes, stream);
+        }
+
+        std::fflush (stdout);
+        std::fflush (stderr);
+
+        if (lingerMs > 0)
+            juce::Thread::sleep (lingerMs);
+
+        return 0;
+    }
+}
+
 int main (int argc, char* argv[])
 {
+    if (argc > 3 && juce::String (argv[1]) == "--emit")
+        return runEmitMode (juce::String (argv[2]).getIntValue(),
+                            juce::String (argv[3]).getIntValue());
+
     ConsoleLogger logger;
     juce::Logger::setCurrentLogger (&logger);
 

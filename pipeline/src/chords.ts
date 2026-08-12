@@ -22,6 +22,7 @@
 
 import type { InputNote } from './types.js';
 import { CHORD_WINDOW_FRACTION } from './rational.js';
+import { isSymbolic } from './guards.js';
 
 /** §4.3b: absolute floor for human motor slop; a strum is ~35 ms wide at any tempo. */
 export const CHORD_WINDOW_MIN_SEC = 0.035;
@@ -47,6 +48,28 @@ export function chordWindowSec(beatPeriodSec: number): number {
  * any note arriving in the last quarter of the current window pushes the window out by
  * another half-window.
  */
+/**
+ * Written position in QUARTER notes, for a note that carries one. Exact for every ppq that is a
+ * power of two (480, 960 and every other value a score editor emits), so two notes written on the
+ * same beat compare equal even when their sources declared different resolutions.
+ */
+function writtenQuarters(note: InputNote): number | null {
+  const timing = note.sourceTiming;
+  return timing && timing.ppq > 0 ? timing.startTick / timing.ppq : null;
+}
+
+/**
+ * Group near-simultaneous onsets into chords with MuseScore's adaptive fudge extension:
+ * any note arriving in the last quarter of the current window pushes the window out by
+ * another half-window.
+ *
+ * THE WINDOW IS A MODEL OF A HUMAN HAND, so it applies to a performance and to nothing else. A
+ * symbolic source already stated which notes are simultaneous, exactly, in written ticks; asking
+ * "did these arrive within 35 ms of each other" of a written score answers a question nobody
+ * posed and answers it wrongly at speed — at 140 BPM a written 64th is 27 ms, so consecutive
+ * 64ths fell inside one window and were fused into a chord that the source does not contain.
+ * A symbolic event therefore admits exactly the notes written on its own tick.
+ */
 export function collectChords(notes: InputNote[], beatPeriodSec: number): ChordEvent[] {
   const sorted = [...notes].sort((a, b) => a.startSec - b.startSec || a.midi - b.midi);
   const base = chordWindowSec(beatPeriodSec);
@@ -55,10 +78,18 @@ export function collectChords(notes: InputNote[], beatPeriodSec: number): ChordE
   let i = 0;
   while (i < sorted.length) {
     const first = sorted[i];
+    const exact = isSymbolic(first) ? writtenQuarters(first) : null;
     let window = base;
     const members: InputNote[] = [first];
     let j = i + 1;
     while (j < sorted.length) {
+      if (exact !== null) {
+        // Written simultaneity, not motor slop: same tick or a different event.
+        if (!isSymbolic(sorted[j]) || writtenQuarters(sorted[j]) !== exact) break;
+        members.push(sorted[j]);
+        j++;
+        continue;
+      }
       const delta = sorted[j].startSec - first.startSec;
       if (delta > window) break;
       members.push(sorted[j]);
@@ -66,12 +97,15 @@ export function collectChords(notes: InputNote[], beatPeriodSec: number): ChordE
       if (delta > window - base / 4) window += base / 2;
       j++;
     }
-    // A chord may not contain the same pitch twice — a duplicate is a detector artefact.
+    // A chord may not contain the same pitch twice — a duplicate is a detector artefact, and on
+    // a symbolic source it is a unison across voices that one editable voice cannot print.
     const seen = new Set<number>();
     const unique = members.filter((m) => (seen.has(m.midi) ? false : (seen.add(m.midi), true)));
+    let endSec = -Infinity;
+    for (const m of unique) if (m.endSec > endSec) endSec = m.endSec;
     out.push({
       onsetSec: first.startSec,
-      endSec: Math.max(...unique.map((m) => m.endSec)),
+      endSec,
       notes: unique.sort((a, b) => a.midi - b.midi)
     });
     i = j;
@@ -92,7 +126,9 @@ export function clampOverlaps(events: ChordEvent[], minSec = 0.02): ChordEvent[]
     for (const n of out[i].notes) {
       if (n.endSec > limit) n.endSec = Math.max(n.startSec + minSec, limit);
     }
-    out[i].endSec = Math.max(...out[i].notes.map((n) => n.endSec));
+    let longest = -Infinity;
+    for (const n of out[i].notes) if (n.endSec > longest) longest = n.endSec;
+    out[i].endSec = longest;
   }
   return out;
 }

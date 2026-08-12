@@ -173,14 +173,85 @@ public:
     };
 
     //== layout ================================================================
-    // <appSupport>/engines/<id>/            the installed engine
-    // <appSupport>/engines/<id>.incoming/   a half-built one; never resolvable
-    // <appSupport>/engines/.downloads/<id>/ partials, which survive a reboot
+    // <appSupport>/engines/<id>/                  the installed engine
+    // <appSupport>/engines/<id>.incoming-<uuid>/  a half-built one; never resolvable
+    // <appSupport>/engines/<id>.previous-<uuid>/  the old one, stepped aside during a commit
+    // <appSupport>/engines/.downloads/<id>/       partials, which survive a reboot
+    //
+    // THE UUIDs ARE NOT DECORATION. Every plugin instance and the standalone app
+    // share these paths, and install() deletes its staging tree recursively at a
+    // dozen points - on cancel, on a bad digest, on a failed unpack. Two windows
+    // installing at once therefore deleted each other's half-built engines
+    // mid-write, and the loser's install failed with something that read like a
+    // corrupt download. A per-attempt directory means the deletes can only ever
+    // reach our own bytes, whatever else is happening on this machine.
+    //
+    // The lock below is what stops it happening at all; the UUID is what makes
+    // the damage impossible even where the lock cannot be taken.
 
     static juce::File enginesRoot();
     static juce::File engineDirectory (const juce::String& id);
-    static juce::File incomingDirectory (const juce::String& id);
     static juce::File downloadsDirectory (const juce::String& id);
+
+    /** A staging directory nobody else is using: `<id>.incoming-<uuid>`. A fresh
+        path every call, so it is a factory rather than an accessor. */
+    static juce::File newIncomingDirectory (const juce::String& id);
+
+    /** The matching `<id>.previous-<uuid>`, for stepping an install aside. */
+    static juce::File newPreviousDirectory (const juce::String& id);
+
+    /** Deletes every `<id>.incoming-*` and `<id>.previous-*` left over from a run
+        that crashed, EXCEPT `keep`. Only safe with the lock below held - which
+        is the only place it is called from - because without it "left over" and
+        "another process is using it right now" look identical from here.
+        Returns how many trees it removed. */
+    static int sweepStaleStaging (const juce::String& id, const juce::File& keep);
+
+    /** THE RIGHT TO TOUCH ONE ENGINE'S DIRECTORIES, machine-wide.
+
+        install() and uninstall() move, delete and rebuild whole trees under
+        `<appSupport>/engines/<id>`. Nothing coordinated that: the plugin's
+        installer was bridge-local, so two windows - or the standalone app and a
+        plugin instance - could run it against the same paths simultaneously and
+        recursively delete each other's `.incoming`, `.downloads` and `.previous`
+        trees.
+
+        TWO MECHANISMS, for the reason EngineLock spells out at length: JUCE's
+        InterProcessLock is an fcntl() lock, POSIX record locks are owned by the
+        PROCESS, and a second thread in the same process sails straight through
+        one. So there is an in-process mutex per engine id as well, tried first.
+        Between them they cover the two shapes this actually takes: two plugin
+        instances inside one DAW, and the standalone app beside a DAW.
+
+        PER ENGINE, not global. Installing MuScriptor while Basic Pitch installs
+        is fine - they share nothing but the root directory - and one lock for
+        all of them would serialise them for no reason.
+
+        Non-blocking on purpose. An install is minutes long; queueing behind one
+        would leave a progress bar sitting at zero with nothing to say. The
+        caller reports `whoElse()` instead, which is a sentence a human can act
+        on. */
+    class ScopedInstallLock
+    {
+    public:
+        explicit ScopedInstallLock (const juce::String& engineId);
+        ~ScopedInstallLock();
+
+        /** True when this object holds the engine. False means somebody else
+            does, and nothing may be written. */
+        bool isHeld() const noexcept { return held; }
+
+        /** What to tell the user when it is not held. */
+        juce::String whoElse() const;
+
+    private:
+        juce::String id;
+        std::unique_ptr<juce::InterProcessLock> across;  // held only while `held`
+        bool inProcess = false;                          // we own this id's in-process mutex
+        bool held = false;
+
+        JUCE_DECLARE_NON_COPYABLE (ScopedInstallLock)
+    };
 
     /** Bytes under a directory, following nothing. 0 when it does not exist. */
     static juce::int64 bytesOnDisk (const juce::File& directory);

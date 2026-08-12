@@ -547,6 +547,33 @@ export class UndoStack {
     return result;
   }
 
+  /**
+   * ================= THE STACK IS THE AUTHORITY ON WHERE THE USER IS =================
+   *
+   * `ui/app.ts` keeps an `editLog` of the same edits as SPECS, because the mementos in here hold
+   * live alphaTab objects and cannot be serialised. That log used to MIRROR this stack by hand —
+   * every mutation of one written next to a mutation of the other — and the two disagreed for one
+   * reason nobody had noticed: this stack has a CAP and the log does not.
+   *
+   * After 201 edits the stack holds 200 and the log holds 201. Two hundred undos then walked the
+   * stack to empty while the log's cursor still had one to give, so the two hundred and first
+   * `⌘Z` decremented a persisted cursor against an `undo()` that did nothing: the screen kept the
+   * oldest edit and the saved document said it had been undone. Reopening the file changed the
+   * score.
+   *
+   * These two exist so the app can DERIVE that cursor instead of mirroring it — see
+   * `App.syncEditCursor()`. `depth` is how many actions survived the cap and `cursor` is where
+   * inside them the user is standing; the log's own extra entries are the oldest edits, which the
+   * cap has made permanent rather than lost.
+   */
+  get depth(): number {
+    return this.actions.length;
+  }
+
+  get cursor(): number {
+    return this.index;
+  }
+
   get canUndo(): boolean {
     return this.index >= 0;
   }

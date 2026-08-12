@@ -57,7 +57,17 @@ export function stringLettersFromBounds(
   lookup: alphaTab.rendering.BoundsLookup | null | undefined,
   tuningLowToHigh: ReadonlyArray<number>,
   gapPx = STRING_LETTER_GAP_PX,
-  columnX: number | null = null
+  columnX: number | null = null,
+  /**
+   * Which alphaTab track the legend is FOR, or null for "the first tab stave in the system".
+   *
+   * Null is right for every single-part score and wrong for every reordered multi-part one: the
+   * search below takes the first tablature it finds, and with an imported chart moved above the
+   * take that is the CHART'S tab. The legend then captions the take's staff with the tuning of a
+   * staff two systems away, in the same silent way `tuningLowToHighFromScore` used to. Both ends
+   * of that mistake are closed by naming the track once. See triview.ts §liveTrackIndex.
+   */
+  trackIndex: number | null = null
 ): StringLetter[] {
   const out: StringLetter[] = [];
   const strings = tuningLowToHigh.length;
@@ -69,7 +79,12 @@ export function stringLettersFromBounds(
     // right, and a letter is a legend for the line, not for the bar.
     let tab: { x: number; y: number; h: number } | null = null;
     for (const masterBar of staffSystem.bars) {
-      const bars = masterBar.bars ?? [];
+      const all = masterBar.bars ?? [];
+      const mine =
+        trackIndex === null ? all : all.filter((b) => b.bar?.staff?.track?.index === trackIndex);
+      // Never nothing: a legend that disappears because a back-reference went missing is a worse
+      // answer than the one this has always drawn.
+      const bars = mine.length > 0 ? mine : all;
       // One BarBounds per RENDERED stave, and which of them is the tablature is asked of the
       // staves themselves. It used to be index 1, which is the tab only when a single alphaTab
       // Staff shows notation and tab together. On a grand staff plus tab the tab is index 2 and
@@ -136,9 +151,16 @@ export function stringLettersFromBounds(
  * current preference instead would be captioning someone else's staff.
  */
 export function tuningLowToHighFromScore(
-  score: alphaTab.model.Score | null | undefined
+  score: alphaTab.model.Score | null | undefined,
+  trackIndex = 0
 ): number[] {
-  const staves = score?.tracks?.[0]?.staves ?? [];
+  // THE LIVE PART'S TRACK, NOT `tracks[0]` (Codex finding 8). Parts can be reordered, and an
+  // imported MusicXML part moved above the take becomes track 0 — after which the legend down the
+  // side of the TAKE'S tab reported the imported chart's tuning. It is captioning one staff with
+  // another instrument's strings, and it is silent about it, which is the worst shape a wrong
+  // number comes in. The caller knows which track is live; the default keeps every single-part
+  // caller exactly where it was.
+  const staves = score?.tracks?.[trackIndex]?.staves ?? score?.tracks?.[0]?.staves ?? [];
   // The TAB staff's tuning, not `staves[0]`'s. On a grand staff plus tab, staves[0] is the
   // treble clef and carries no tuning at all, so the letters silently disappeared — which
   // reads exactly like "this score has no tab" rather than like a bug. A notation staff that

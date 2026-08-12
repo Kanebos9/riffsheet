@@ -19,7 +19,8 @@ export type {
   PartRole,
   PartBuild,
   SharedBuildInput,
-  MultiPartBuildResult
+  MultiPartBuildResult,
+  ScoreNoteId
 } from './multipart.js';
 
 export type {
@@ -73,6 +74,15 @@ export type { SimplifyEvent, SimplifyResult } from './simplify.js';
 
 export { buildTimeSkeleton, compoundEvidence, DOWNBEAT_ANTICIPATION_SEC } from './timeSkeleton.js';
 export type { TimeSkeleton, BarSkeleton, CompoundEvidence } from './timeSkeleton.js';
+
+// ---- the tick <-> seconds map (see IR.md, "Tick/seconds conversion") -----------------------
+export { buildTickSecondsMap } from './tickSeconds.js';
+export type { TickSecondsMap, TempoSegment, TempoSource } from './tickSeconds.js';
+
+export { placeSymbolicEvents } from './symbolic.js';
+export type { SymbolicEvent, SymbolicPlacement } from './symbolic.js';
+
+export { validateIR, writtenTicks } from './validate.js';
 
 export { quantizeOnsets } from './quantize.js';
 export type { QuantNote, QuantResult, QuantTupletGroup } from './quantize.js';

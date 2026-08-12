@@ -605,6 +605,69 @@ assert(
 );
 
 // ---------------------------------------------------------------------------
+// 9e-bis. THE END OF THE TAKE (codex-critique §6.1)
+// ---------------------------------------------------------------------------
+//
+// THE BUG. Neither snap mode knew how long the recording was, and both round FORWARD as readily
+// as backward. A note played inside the last cell of a take therefore snapped onto the next line
+// — at or past `audioDurationSec` — and `pipeline/src/guards.ts` drops any note whose onset is at
+// or past the end of the audio. Switching Snap on deleted the last note of the take.
+//
+// It was invisible because the property test below used to hand the builder a take a whole second
+// longer than the notes it generated, so every note thrown past the end landed in a second of
+// tape that does not exist on a real recording. That padding is gone (see `takeDurationSec`), and
+// this is the same failure stated directly, as the smallest case that shows it.
+{
+  const END = 8.0; // a take of exactly four bars at 120 bpm
+  const endBeats: number[] = [];
+  for (let i = 0; i <= 16; i++) endBeats.push(i * BEAT);
+  // Played 40 ms before the end of the tape — nearer to the downbeat that does not exist than to
+  // the one that does, which is exactly what makes it round the wrong way.
+  const atTheEnd: InputNote[] = [
+    { id: 'e0', startSec: 0.02, endSec: 0.4, midi: 40 },
+    { id: 'e1', startSec: 7.51, endSec: 7.8, midi: 43 },
+    { id: 'e2', startSec: END - 0.04, endSec: END - 0.005, midi: 45 }
+  ];
+
+  for (const [label, snapped] of [
+    ['beat', snapPerformanceToBeat(atTheEnd, BEAT, rollSnapUnitSec('eighth', 120), 0, 120, END)],
+    ['grid', snapPerformanceToGrid(atTheEnd, rollSnapUnitSec('eighth', 120), 0, 120, END)]
+  ] as const) {
+    assert(snapped.length === atTheEnd.length, `${label}: the snap itself may not drop a note`);
+    for (const note of snapped) {
+      assert(
+        note.startSec < END,
+        `${label}: ${note.id} was snapped to ${note.startSec}, at or past the end of a ${END}s take`
+      );
+      // The roll sizes its own time axis off the longest note it is handed, so an end past the
+      // end of the tape stretches the picture of the performance as well.
+      assert(note.endSec <= END + 1e-9, `${label}: ${note.id} rings past the end of the take`);
+    }
+    const built = buildScore(
+      { notes: [...snapped], beats: endBeats, startOffsetSec: 0, audioDurationSec: END },
+      { grid: 'auto', instrument: 'staff', tuningMidi: [], fingeringStyle: 'low', clefMode: 'auto' }
+    );
+    const onPage = new Set<string>();
+    for (const bar of built.ir.bars) {
+      for (const voice of bar.voices) {
+        for (const beat of voice.beats) for (const note of beat.notes) onPage.add(note.id);
+      }
+    }
+    for (const note of atTheEnd) {
+      assert(onPage.has(note.id!), `${label}: ${note.id} must still reach the sheet at the boundary`);
+    }
+  }
+
+  // AND THE OLD BEHAVIOUR, so the check above is not a tautology: with no take length supplied
+  // the final attack still rounds onto the downbeat that is the end of the recording.
+  const unbounded = snapPerformanceToBeat(atTheEnd, BEAT, rollSnapUnitSec('eighth', 120), 0, 120);
+  assert(
+    unbounded.find((n) => n.id === 'e2')!.startSec >= END,
+    'without a take length the last attack still rounds off the end — the bound is what fixes it'
+  );
+}
+
+// ---------------------------------------------------------------------------
 // 9f. THE INVARIANT, AS A PROPERTY: every input note survives to the sheet
 // ---------------------------------------------------------------------------
 //
@@ -652,7 +715,13 @@ for (let trial = 0; trial < TRIALS; trial++) {
   const events = played.filter((n, i) => i === 0 || n.startSec - played[i - 1].startSec > 0.06);
   const ruler = RULERS[trial % RULERS.length];
   const cell = rollSnapUnitSec(ruler, 120);
-  const beatSnapped = snapPerformanceToBeat(events, BEAT, cell, 0, 120);
+  // THE TAKE ENDS WHERE THE MUSIC ENDS. This used to be handed a builder with a whole extra
+  // second on the end of it (`audioDurationSec: … + 1`) while the snap itself was given no length
+  // at all — so every attack the magnet threw past the last downbeat landed in that second of
+  // imaginary tape and engraved happily. Real recordings do not come with a spare second, and the
+  // bug the padding hid was the last note of a take disappearing the moment Snap was switched on.
+  const takeDurationSec = TRIAL_BARS * 4 * BEAT;
+  const beatSnapped = snapPerformanceToBeat(events, BEAT, cell, 0, 120, takeDurationSec);
 
   assert(beatSnapped.length === events.length, `trial ${trial}: the snap changed the note count`);
   const minStep = Math.min(cell > 0 ? cell : 0.125, BEAT / 4);
@@ -670,7 +739,7 @@ for (let trial = 0; trial < TRIALS; trial++) {
 
   // THE SHEET. Quantize on 'auto', because that is what the player is looking at.
   const built = buildScore(
-    { notes: beatSnapped, beats: trialBeats, startOffsetSec: 0, audioDurationSec: TRIAL_BARS * 4 * BEAT + 1 },
+    { notes: beatSnapped, beats: trialBeats, startOffsetSec: 0, audioDurationSec: takeDurationSec },
     {
       // A 1/32 ruler is an explicit request for a 1/32 lattice, and 'auto' has no word for one
       // (pipeline/src/quantize.ts §states). The player who asks the roll for 32nds is the player

@@ -45,6 +45,13 @@ import type { EngravedExtent } from './timeAxis';
 // over the ROLL have to be worth exactly the same amount, or the coupled pair pulls apart in the
 // hand. See `wheelZoomFactor`'s note on why it is exponential and clamped.
 import { wheelZoomFactor, WHEEL_ZOOM_MAX_STEP } from './pianoroll';
+import { PinchAccumulator } from './timeAxis';
+
+/**
+ * How long a pinch on one road blocks the other. See `PianoRoll`'s constant of the same name —
+ * one number, two surfaces, because it is a property of the trackpad and not of either pane.
+ */
+const PINCH_DEDUPE_MS = 250;
 import { countRendererCredits, stripRendererCredit } from './watermark';
 import { t, TIPS } from '../ui/tips';
 import type { RiffScore } from '../pipeline';
@@ -109,7 +116,6 @@ export interface TriViewOptions {
   showNames?: boolean;
   onNoteClick?: (hit: NoteHit) => void;
   onSeekRequest?: (tick: number) => void;
-  onRenderComplete?: (info: RenderInfo) => void;
   /**
    * Highest playable fret, for deciding whether a drag is possible at all. Same number as
    * `AppSettings.maxFret`; keep it in step with `setFretLimit()`.
@@ -124,8 +130,45 @@ export interface TriViewOptions {
    *
    * Fired on scroll (coalesced to one animation frame, so a fast drag cannot thrash) and
    * at the end of every overlay rebuild. Only fired when something actually changed.
+   *
+   * A REPAINT SIGNAL, NOT AN ALIGNMENT ONE, and that separation is finding 7's fix. This fires
+   * from partial renders, from mid-render overlay rebuilds and from before the scroll anchor has
+   * been restored — geometry that is true for an instant and then is not. `ui/app.ts` used to
+   * wire this straight into the coupling, so the roll could be handed incomplete-partial
+   * geometry, then final geometry at the old pixel scroll, then final geometry again after the
+   * anchor moved: three windows for one gesture, and the panes visibly walked through them.
+   * Use `onRenderSettled` for anything that decides where the other panes look.
    */
   onViewportChange?: (v: TriViewViewport) => void;
+  /**
+   * ONE SETTLED VIEWPORT PER RENDER, and nothing partial (finding 7).
+   *
+   * Fired exactly once at the very end of a render that has finished for real: after every
+   * corrective inset render, after the scroll anchor has been put back, with the geometry the
+   * player is actually looking at. A render that starts a correcting render does not fire this —
+   * the one that finishes the correction does.
+   */
+  onRenderSettled?: (v: TriViewViewport) => void;
+  /**
+   * THE PLAYER MOVED THE SHEET. One edge, in ticks, and nothing about how much is on screen.
+   *
+   * Fired only for a scroll this class did not cause: a trackpad swipe, a keyboard page, the
+   * browser's own scrollbar. Programmatic scrolls — `setScrollLeft`, the anchor restore, the
+   * app pushing the authoritative window back in — are silent, which is what stops a scroll the
+   * app just applied from arriving back as if a hand had made it.
+   *
+   * Null tick means the sheet cannot say yet (nothing engraved); the app leaves the window alone.
+   */
+  onSheetScroll?: (leftTick: number | null) => void;
+  /**
+   * A PINCH OVER THE SHEET. Multiplicative, with the pointer's client x so it can be anchored.
+   *
+   * The sheet does NOT zoom itself here, and that is the point of routing it out: sheet pinch and
+   * roll pinch are the same gesture about the same shared window, so they go through the same
+   * reducer and cannot come out feeling different (finding 10). What comes back is a scale, via
+   * `setZoom(scale, clientX)`.
+   */
+  onPinch?: (factor: number, clientX: number) => void;
   /**
    * CROSS-HIGHLIGHT (#30d), outward: the pointer is over this note's glyph, so the roll can
    * ring the matching rectangle. Null when it leaves the glyph, or the sheet entirely.
@@ -139,23 +182,20 @@ export interface TriViewOptions {
    */
   onNoteHover?: (noteId: string | null) => void;
   /**
-   * THE SHEET'S SCALE CHANGED, and the coupling has to be told which direction it came from.
+   * A PRINTED PART NAME WAS PRESSED. The alphaTab track it belongs to, and where it is on screen.
    *
-   * Fired by `setZoom` — so by a pinch over the sheet (`onSheetWheel`) and by nothing else that
-   * a player can do — BEFORE the re-engrave. It exists because the roll deliberately refuses to
-   * take a span from Align (`PianoRoll.holdSpan`): a window derived from the sheet's viewport
-   * changes span on every scroll, because the engraving is not proportional to time, so adopting
-   * it would make dragging the scrollbar re-zoom the roll. A sheet ZOOM is the one case where
-   * the new span IS the point, and only the sheet knows the difference.
-   *
-   * ONE LINE at the integrator, and the roll already has the method:
-   *
-   *     onZoomChange: () => this.pianoRoll?.adoptNextAlignSpan(),
-   *
-   * Without it a sheet pinch still zooms the sheet — it simply does not carry the roll's span
-   * with it, which is a partial coupling rather than a broken one.
+   * alphaTab engraves the track name sideways down the left of the system out of `track.name` /
+   * `track.shortName`, and no code in this app draws it — so it is found rather than published:
+   * see `syncPartLabelHits` for how a label is told apart from the music and matched to a track.
+   * The rect is in CLIENT coordinates, because what the app puts there is a field over the top
+   * of it and the sheet is about to be re-engraved underneath.
    */
-  onZoomChange?: (scale: number) => void;
+  onPartLabelClick?: (trackIndex: number, rect: { x: number; y: number; w: number; h: number }) => void;
+  // `onZoomChange` stood here and is gone (finding 14). It was documented as identifying
+  // SHEET-ORIGINATED zoom, and it could not: `ui/app.ts` also called `setZoom()` to carry a ROLL
+  // zoom onto the sheet, and this fired for that too. So the one caller — `adoptNextAlignSpan` —
+  // was armed by both directions of the coupling and told the roll to accept the next span
+  // whatever it was. Direction is a property of the command now, and commands carry their source.
 }
 
 export interface NoteHit {
@@ -359,6 +399,7 @@ export class TriView {
   readonly namesRow: HTMLElement;
   readonly tabMarksRow: HTMLElement;
   readonly stringLettersRow: HTMLElement;
+  readonly partLabelHits: HTMLElement;
   readonly overlay: SVGSVGElement;
 
   private index: ScoreIndex | null = null;
@@ -370,6 +411,8 @@ export class TriView {
   private tabMarks: NameLabel[] = [];
   /** The letters keep their y too: the pinned x is rewritten on scroll and needs the pair. */
   private stringLetters: Array<NameLabel & { y: number }> = [];
+  /** One transparent button per printed part name. See `syncPartLabelHits`. */
+  private partLabelButtons: HTMLButtonElement[] = [];
   /** noteId -> semitones the TAB position was folded by. Empty for anything in range. */
   private tabShifts = new Map<string, number>();
   private opts: TriViewOptions;
@@ -394,6 +437,8 @@ export class TriView {
    * there afterwards. `atStart` is kept separately: "I was at the very beginning" is a
    * stronger statement than "I was at tick 0" and should survive exactly.
    */
+  /** Where `setScrollLeft` last put us, until the scroll event it caused has been seen. */
+  private programmaticScrollTo: number | null = null;
   private scrollAnchorTick: number | null = null;
   /** ALIGN's pending anchor: the tick that must be at the music column's left edge (#30). */
   private alignAnchorTick: number | null = null;
@@ -479,6 +524,14 @@ export class TriView {
   /** Stale placeholders removed since this view was built. MUST stay 0 — see `trimSurface`. */
   private ghostsTrimmed = 0;
   /**
+   * The widest a render has had to grow `.at-surface` past the box alphaTab gave it, in px.
+   *
+   * Non-zero is NORMAL and is the repair working — see `growSurfaceToPartials`. It is published
+   * so the harness can assert that the repair is what keeps a zoomed-in sheet on screen, rather
+   * than assert that a screenshot has ink in it.
+   */
+  private surfaceGrownPx = 0;
+  /**
    * True from the moment a render is asked for until one finishes. See `renderPending`.
    *
    * A flag rather than a request/finish counter on purpose: alphaTab renders on its own account
@@ -528,6 +581,9 @@ export class TriView {
         <div class="triview-stack">
           <div class="at-host"></div>
           <div class="names-row" aria-hidden="true"></div>
+          <!-- Not aria-hidden, unlike the three decoration rows around it: the buttons in here
+               are the only control for the printed part names. See syncPartLabelHits(). -->
+          <div class="part-label-hits"></div>
           <div class="tabmarks-row" aria-hidden="true"></div>
           <div class="stringletters-row" aria-hidden="true"></div>
           <svg class="triview-overlay" xmlns="http://www.w3.org/2000/svg">
@@ -547,6 +603,7 @@ export class TriView {
     this.namesRow = opts.container.querySelector('.names-row')!;
     this.tabMarksRow = opts.container.querySelector('.tabmarks-row')!;
     this.stringLettersRow = opts.container.querySelector('.stringletters-row')!;
+    this.partLabelHits = opts.container.querySelector('.part-label-hits')!;
     this.overlay = opts.container.querySelector('.triview-overlay')!;
     this.playheadLine = this.overlay.querySelector('.playhead')!;
     this.selectionGroup = this.overlay.querySelector('.selection')!;
@@ -692,7 +749,12 @@ export class TriView {
    * clipping report was a photograph of.
    */
   private reserveLeftColumnFor(score: alphaTab.model.Score): void {
-    const staves = score.tracks[0]?.staves.length ?? 1;
+    // THE WIDEST TRACK, not `tracks[0]`. Both things this decides — the reserved left column and
+    // the staff-to-staff gap — are properties of the SYSTEM, and a system is as braced as its
+    // most braced part. Reading track 0 meant a grand-staff take with a one-stave import
+    // reordered above it reserved the single-staff column and engraved its brace into the
+    // clipping, which is the same reordering assumption as Codex finding 8.
+    const staves = score.tracks.reduce((most, t) => Math.max(most, t.staves.length), 0) || 1;
     // Same measurement, second consumer: a braced system is also the one whose staves need more
     // air between them (F2b). Recorded before the render so the first frame already has it.
     this.multiStaff = staves > 1;
@@ -765,12 +827,45 @@ export class TriView {
     const bySystem: string[][] = [];
     const letters = stringLettersFromBounds(
       this.api.renderer.boundsLookup,
-      tuningLowToHighFromScore(this.builtModel)
+      tuningLowToHighFromScore(this.builtModel, this.liveTrackIndex()),
+      STRING_LETTER_GAP_PX,
+      null,
+      this.liveTrackIndex()
     );
     for (const l of letters) {
       (bySystem[l.system] ??= []).push(l.text);
     }
     return bySystem.map((s) => s ?? []);
+  }
+
+  /**
+   * WHICH ALPHATAB TRACK IS THE TAKE (Codex finding 8). Not `0` — parts can be reordered.
+   *
+   * Everything this view draws BESIDE the music rather than on it — the tuning legend down the
+   * left of the tab, the note-name row between the staves — is about the player's own part and
+   * about nothing else. An imported MusicXML chart dragged above the take makes it track 0, and
+   * every one of those decorations then described the wrong instrument without saying so.
+   *
+   * The `parts` sidecar is the score's own answer (`score/parts.ts §ScorePartInfo`), so this is
+   * read rather than inferred. A single-part score has no sidecar and no ambiguity: 0.
+   */
+  private liveTrackIndex(): number {
+    const parts = (this.currentScore as { parts?: Array<{ role: string; trackIndex: number }> } | null)
+      ?.parts;
+    const live = parts?.find((p) => p.role === 'live');
+    return live ? live.trackIndex : 0;
+  }
+
+  /** The bar bounds belonging to the live part's staves. See `liveTrackIndex`. */
+  private liveBars(barBoundsList: alphaTab.rendering.BarBounds[]): alphaTab.rendering.BarBounds[] {
+    // A single-part score never filters: one track, and `bar.staff.track` is one indirection this
+    // does not need to trust on the overwhelmingly common path.
+    if ((this.builtModel?.tracks.length ?? 1) < 2) return barBoundsList;
+    const live = this.liveTrackIndex();
+    const mine = barBoundsList.filter((b) => b.bar?.staff?.track?.index === live);
+    // Never NOTHING. If a future alphaTab stops carrying the back-reference, a row that vanishes
+    // is a worse answer than the row this has always drawn.
+    return mine.length > 0 ? mine : barBoundsList;
   }
 
   get renderInfo(): RenderInfo | null {
@@ -834,16 +929,28 @@ export class TriView {
       beatCount: info.beatCount,
       hasStaffTabSplit: info.hasStaffTabSplit
     };
-    this.opts.onRenderComplete?.(this.lastRenderInfo);
+    // `onRenderComplete?.(info)` was called here, before the inset correction and before the
+    // scroll anchor — and `ui/app.ts` wired it straight to the coupling alongside
+    // `onViewportChange`, so the roll was handed the geometry of a render that was about to be
+    // replaced (finding 7). Nobody supplied it once that wiring moved to `onRenderSettled`, so
+    // it is gone rather than left as a second, earlier, wronger settled event. `renderInfo` is
+    // still readable as a property for anything that wants the timing.
     // If the left inset needs correcting, a second render is already on its way; let the
     // scroll anchor ride on THAT one, so the tick we restore is measured against the
-    // coordinates the user will actually see.
+    // coordinates the user will actually see. NO SETTLED EVENT FROM HERE: this render's
+    // geometry is about to be replaced, and publishing it is exactly the transient window
+    // finding 7 is about.
     if (this.tuneLeftInset()) return;
     this.restoreScrollAnchor();
     // Last, and unconditional: the scroll anchor may have just moved us, and anything
     // drawing against this ruler has to hear about the finished render even when the three
     // numbers happen to be unchanged.
     this.emitViewport(true);
+    // THE settled event. After the corrective renders, after the anchor. One per render that
+    // finished for real, and the only viewport this class publishes that anything is allowed to
+    // align against.
+    const v = this.viewport();
+    if (v) this.opts.onRenderSettled?.(v);
   }
 
   /**
@@ -874,10 +981,67 @@ export class TriView {
     }
   }
 
+  /**
+   * THE CLIPPED ENGRAVING, and it is the blank sheet — both reports of it, one cause.
+   *
+   * alphaTab's `.at-surface` is `overflow: hidden` (BrowserUiFacade sets it inline) and its box is
+   * written once per render from `RenderFinishedEventArgs.totalWidth`:
+   *
+   *     _onRenderFinished()   e.totalWidth = this.layout.width          // LAYOUT units
+   *     _appendRenderResult() this.canvasElement.width = result.totalWidth
+   *
+   * while every partial placeholder inside it is positioned by `registerPartial`, which multiplies
+   * `x`, `width` and `totalWidth` by `display.scale` first. So the box is in unscaled units and
+   * its contents are in scaled pixels, and the surface is short by exactly the scale factor.
+   * Measured on `?demo=triplet&bars=16`, surface width against the partials' own right edge:
+   *
+   *     scale 0.96 -> 4673 px box, 4434 px of ink   nothing clipped, and this is why it hid
+   *     scale 2.33 -> 4630 px box, 10774 px of ink  more than half the take gone
+   *     scale 3.00 -> 4623 px box, 13835 px of ink  scrolled to 7553, FOURTEEN glyphs on screen
+   *
+   * At an ordinary zoom the unscaled number is coincidentally the larger of the two and nothing is
+   * lost, which is why this only ever showed up zoomed in — as a sheet that went blank at a big
+   * zoom, and, when the engraving overhung the box by less than a bar, as the last bar or two
+   * coming out half drawn. Same clip, two descriptions.
+   *
+   * IT IS THE BOX THAT IS WRONG, NOT THE CLIPPING, so the box is what this repairs: the surface is
+   * GROWN to the union of the placeholders it already holds. Never shrunk — a box that is bigger
+   * than alphaTab thinks costs nothing (it clips nothing, and `.triview-stack` shrink-wraps to the
+   * ink either way), whereas shrinking one that is currently generous enough would be this bug
+   * with the sign flipped. `surfaceGrownPx` is published through `layoutProbe` so a harness can
+   * assert the repair fired rather than infer it from a picture.
+   */
+  private growSurfaceToPartials(): void {
+    const surface = this.host.querySelector<HTMLElement>('.at-surface');
+    if (!surface) return;
+    let right = 0;
+    let bottom = 0;
+    for (const child of Array.from(surface.children)) {
+      if (child.tagName !== 'DIV') continue;
+      const el = child as HTMLElement;
+      right = Math.max(right, (parseFloat(el.style.left) || 0) + (parseFloat(el.style.width) || 0));
+      bottom = Math.max(bottom, (parseFloat(el.style.top) || 0) + (parseFloat(el.style.height) || 0));
+    }
+    // Read off the inline style alphaTab wrote rather than `getBoundingClientRect`, so this
+    // compares like with like and does not creep by a sub-pixel every render.
+    const width = parseFloat(surface.style.width) || 0;
+    const height = parseFloat(surface.style.height) || 0;
+    if (right > width) {
+      this.surfaceGrownPx = Math.max(this.surfaceGrownPx, Math.round(right - width));
+      surface.style.width = `${right}px`;
+    }
+    if (bottom > height) surface.style.height = `${bottom}px`;
+  }
+
   private rebuildOverlays(): { beatCount: number; hasStaffTabSplit: boolean } {
     // Every x in the axis came from the bounds we are about to re-read, so it is stale by
     // definition. Thrown away rather than rebuilt: most renders are never asked for an x.
     this.axis = null;
+
+    // BEFORE the overlay is sized and before anything reads `scrollWidth`: a clipped surface is
+    // narrower than its own ink, so every measurement below would be taken against the clip
+    // rather than against the engraving. See `growSurfaceToPartials`.
+    this.growSurfaceToPartials();
 
     // #40: alphaTab's "rendered by alphaTab" credit, out of the emitted SVG. FIRST, before
     // anything below measures the host: the credit is centred over the score and its box would
@@ -909,7 +1073,13 @@ export class TriView {
 
     for (const system of lookup.staffSystems) {
       for (const masterBar of system.bars) {
-        const barBoundsList = masterBar.bars ?? [];
+        // THE LIVE PART'S STAVES ONLY (Codex finding 8). `masterBar.bars` is every rendered
+        // stave of every TRACK, so on a two-part score this list is the take's staves and the
+        // imported chart's, interleaved. Unfiltered, the note-name row labelled the imported
+        // part's notes as if they were the player's, and `namesYFor` placed the row against
+        // whichever pair of staves happened to come first — which, with the import reordered
+        // above the take, is a gap in somebody else's system. See `liveBars`.
+        const barBoundsList = this.liveBars(masterBar.bars ?? []);
         // With one staff showing both notation and tab, alphaTab produces one BarBounds
         // per rendered stave. Two entries => we know where the gap between them is.
         const split = barBoundsList.length >= 2;
@@ -1006,11 +1176,16 @@ export class TriView {
     this.syncStringLetters(
       stringLettersFromBounds(
         lookup,
-        tuningLowToHighFromScore(this.builtModel),
+        tuningLowToHighFromScore(this.builtModel, this.liveTrackIndex()),
         STRING_LETTER_GAP_PX,
-        this.stringLetterColumnX()
+        this.stringLetterColumnX(),
+        this.liveTrackIndex()
       )
     );
+    // The one thing in this sweep that is not drawn by this file: a target over a name alphaTab
+    // engraved. Same trigger as everything else here — the bounds it is matched against have
+    // just changed, so the targets have to move with them.
+    this.syncPartLabelHits(lookup);
     // The highlight rectangles were drawn against the OLD geometry. Redraw them from the
     // new bounds, or a zoom (or any edit) would leave the selection behind.
     this.drawSelection();
@@ -1160,6 +1335,8 @@ export class TriView {
     surfaceSvgs: number;
     partialsThisRender: number;
     ghostsTrimmed: number;
+    /** Px the surface had to be grown past alphaTab's box. See `growSurfaceToPartials`. */
+    surfaceGrownPx: number;
     /**
      * Where the first few notes are engraved, by id, in CONTENT and in SCREEN x.
      *
@@ -1206,7 +1383,11 @@ export class TriView {
     let tabTop = 0;
     for (const system of lookup.staffSystems) {
       for (const masterBar of system.bars) {
-        const bars = masterBar.bars ?? [];
+        // THE SAME STAVES `rebuildOverlays` PLACED THE ROW AGAINST, which on a multi-part score
+        // means the live part's and not whichever system came first. A probe that measured a
+        // different pair from the one the row was positioned by would report a collision the
+        // page does not have, or miss one it does. See `liveBars`.
+        const bars = this.liveBars(masterBar.bars ?? []);
         const pair = this.bandStaves(bars);
         const b = this.nameBand(bars);
         if (!pair || !b) continue;
@@ -1266,6 +1447,7 @@ export class TriView {
         surfaceSvgs,
         partialsThisRender: this.partialsThisRender,
         ghostsTrimmed: this.ghostsTrimmed,
+        surfaceGrownPx: this.surfaceGrownPx,
         noteXs,
         axis
       };
@@ -1344,6 +1526,7 @@ export class TriView {
       surfaceSvgs,
       partialsThisRender: this.partialsThisRender,
       ghostsTrimmed: this.ghostsTrimmed,
+      surfaceGrownPx: this.surfaceGrownPx,
       noteXs,
       axis
     };
@@ -1383,6 +1566,151 @@ export class TriView {
     const out: Array<{ noteId: string; contentX: number; screenX: number }> = [];
     for (let i = 0; i < limit; i++) out.push(all[Math.round((i * (all.length - 1)) / (limit - 1))]);
     return out;
+  }
+
+  /**
+   * A PER-BAR CENSUS OF THE ENGRAVING: what was laid out, against what was painted.
+   *
+   * Written for the blank-sheet reports, which `layoutProbe()` could not tell apart. Both of
+   * them look identical in totals — a plausible content width, a non-zero glyph count, bounds
+   * that answer for the visible range — and differ only in WHERE the ink is: bars alphaTab put
+   * in `boundsLookup` and then painted nothing into. So each master bar is reported with the
+   * content span it claims and the number of painted `<path>` nodes actually standing inside
+   * that span, plus the partial each one belongs to. A bar with `notes > 0` and `ink === 0` is
+   * the bug, by the numbers, and it names the bar.
+   */
+  sheetCensus(): {
+    scale: number;
+    contentWidth: number;
+    partials: Array<{ index: number; left: number; width: number; glyphs: number }>;
+    /** One row per master bar PER STAFF SYSTEM — see `ensureAxis`, which uses only system 0. */
+    bars: Array<{
+      system: number;
+      bar: number;
+      x: number;
+      w: number;
+      notes: number;
+      ink: number;
+      partial: number;
+    }>;
+    /** Bars that were laid out with notes in them and painted nothing. Empty is the claim. */
+    blankBars: number[];
+    totalGlyphs: number;
+    /**
+     * THE ONLY NUMBER THE EYE AGREES WITH: painted glyphs whose box intersects the pane.
+     *
+     * Everything else here is about the engraving as laid out, and the clipped-surface bug
+     * (`growSurfaceToPartials`) is invisible to all of it — every bar is laid out, every bar has
+     * ink, and the pane is blank. Counted last so the census can answer "is there anything to
+     * look at" as well as "was it drawn".
+     */
+    inkOnScreen: number;
+    /** `.at-surface`'s own box against the union of its partials — see `growSurfaceToPartials`. */
+    surfaceWidth: number;
+    partialsRight: number;
+  } | null {
+    const lookup = this.api.renderer.boundsLookup;
+    if (!lookup || lookup.staffSystems.length === 0) return null;
+    const stackLeft = this.stack.getBoundingClientRect().left;
+
+    const surface = this.host.querySelector('.at-surface');
+    const partialEls = surface
+      ? (Array.from(surface.children).filter((c) => c.tagName === 'DIV') as HTMLElement[])
+      : [];
+    const partials = partialEls.map((el, index) => ({
+      index,
+      left: Math.round(parseFloat(el.style.left) || 0),
+      width: Math.round(parseFloat(el.style.width) || 0),
+      glyphs: el.querySelectorAll('path,text').length
+    }));
+
+    // Every painted glyph, in CONTENT x. Read off the live boxes rather than the partial's
+    // declared offset, because a partial whose ink is drawn at the wrong offset is one of the
+    // things this is meant to be able to see.
+    //
+    // `stackLeft` ALREADY carries the scroll: `.triview-stack` is the scrolled content inside
+    // `.triview-scroll`, so it slides left as the pane scrolls and a screen x minus it is a
+    // content x with nothing further to add. Adding `scrollLeft` on top of that was the first
+    // version of this, and it reported every bar left of the scroll position as blank — a census
+    // that manufactures exactly the bug it is looking for.
+    const paneRect = this.scroller.getBoundingClientRect();
+    const inkXs: number[] = [];
+    let inkOnScreen = 0;
+    for (const glyph of this.host.querySelectorAll('svg.at-surface-svg path,svg.at-surface-svg text')) {
+      const r = glyph.getBoundingClientRect();
+      if (r.width === 0 && r.height === 0) continue;
+      inkXs.push(r.left - stackLeft + r.width / 2);
+      if (
+        r.right >= paneRect.left &&
+        r.left <= paneRect.right &&
+        r.bottom >= paneRect.top &&
+        r.top <= paneRect.bottom
+      ) {
+        inkOnScreen++;
+      }
+    }
+    inkXs.sort((a, b) => a - b);
+    const inkInSpan = (from: number, to: number): number => {
+      let lo = 0;
+      let hi = inkXs.length;
+      while (lo < hi) {
+        const mid = (lo + hi) >> 1;
+        if (inkXs[mid] < from) lo = mid + 1;
+        else hi = mid;
+      }
+      let n = 0;
+      for (let i = lo; i < inkXs.length && inkXs[i] < to; i++) n++;
+      return n;
+    };
+
+    const bars: Array<{
+      system: number;
+      bar: number;
+      x: number;
+      w: number;
+      notes: number;
+      ink: number;
+      partial: number;
+    }> = [];
+    const blankBars: number[] = [];
+    for (let s = 0; s < lookup.staffSystems.length; s++) {
+      const system = lookup.staffSystems[s];
+      for (const masterBar of system.bars) {
+        const b = masterBar.realBounds;
+        let notes = 0;
+        for (const beatBounds of dedupeBeats(masterBar.bars ?? [])) {
+          notes += beatBounds.beat.notes.length;
+        }
+        const ink = inkInSpan(b.x, b.x + b.w);
+        const partial = partials.findIndex((p) => b.x >= p.left && b.x < p.left + p.width);
+        bars.push({
+          system: s,
+          bar: masterBar.index,
+          x: Math.round(b.x),
+          w: Math.round(b.w),
+          notes,
+          ink,
+          partial
+        });
+        if (notes > 0 && ink === 0 && !blankBars.includes(masterBar.index)) {
+          blankBars.push(masterBar.index);
+        }
+      }
+    }
+
+    return {
+      scale: this.api.settings.display.scale,
+      contentWidth: Math.round(this.viewport()?.contentWidth ?? 0),
+      partials,
+      bars,
+      blankBars,
+      totalGlyphs: inkXs.length,
+      inkOnScreen,
+      surfaceWidth: Math.round(
+        parseFloat(this.host.querySelector<HTMLElement>('.at-surface')?.style.width ?? '0') || 0
+      ),
+      partialsRight: partials.reduce((max, p) => Math.max(max, p.left + p.width), 0)
+    };
   }
 
   // -------------------------------------------------------------------------
@@ -1583,11 +1911,20 @@ export class TriView {
     };
   }
 
-  /** Scroll the sheet, clamped to what actually exists. */
+  /**
+   * Scroll the sheet, clamped to what actually exists. SILENT: never reports a sheet scroll.
+   *
+   * Every programmatic route in goes through here — the app pushing the authoritative window
+   * back, the scroll anchor after a re-engrave, "bring this note into view" — and none of them
+   * is the player moving the page. Marking them is what lets `onScroll` tell a hand from an echo
+   * without a timer: the DOM's own scroll event arrives asynchronously, so a boolean set here
+   * and cleared on the next event is the whole mechanism.
+   */
   setScrollLeft(px: number): void {
     const max = Math.max(0, this.scroller.scrollWidth - this.scroller.clientWidth);
     const next = Math.min(max, Math.max(0, px));
     if (Math.abs(next - this.scroller.scrollLeft) < 0.5) return;
+    this.programmaticScrollTo = next;
     this.scroller.scrollLeft = next;
   }
 
@@ -1656,27 +1993,48 @@ export class TriView {
    * the tick's new x after the render is what makes zooming feel like leaning in rather
    * than being thrown somewhere else in the take.
    */
-  setZoom(scale: number): void {
+  setZoom(scale: number, anchorClientX: number | null = null): void {
     if (!Number.isFinite(scale)) return;
     const next = Math.min(MAX_ZOOM, Math.max(MIN_ZOOM, scale));
     if (Math.abs(next - this.api.settings.display.scale) < 0.001) {
       // Already there. Still write the exact value, so `getZoom()` reads back the number
       // that was asked for rather than something 0.0004 away from it — "Reset view" is
       // checked by comparing against 1.
+      //
+      // NOTHING IS OWED BY DROPPING THIS RENDER. The caller derives the scale ABSOLUTELY from
+      // the authoritative span (`timeAxis.absoluteSheetScale`), so a change too small to be
+      // worth re-engraving is simply asked for again, in full, on the next event — which is
+      // what makes a slow trackpad pinch move the sheet at all (finding 10). The old coupling
+      // scaled by a ratio against a remembered span, so a dropped step was lost for good.
       this.api.settings.display.scale = next;
       return;
     }
 
+    // THE ANCHOR IS WRITTEN BEFORE THE RENDER, and this is finding 6 (finding 6).
+    //
+    // `zoomAt` used to call `setZoom` first and write `scrollAnchorTick`/`scrollAnchorOffsetPx`
+    // afterwards, guarded by `renderPending()`. Renders here are SYNCHRONOUS, so by the time
+    // `setZoom` returned `onPostRender` had already run `restoreScrollAnchor()` and consumed the
+    // default left-edge anchor; `renderPending()` was false and the pointer anchor was never
+    // installed at all. A sheet pinch therefore anchored on the left edge of the pane while a
+    // roll pinch anchored under the fingers, which is most of why the two felt like different
+    // gestures. The pointer's tick and its offset now go in before `api.render` is ever called.
     const left = this.scroller.scrollLeft;
-    this.scrollAnchorAtStart = left <= 0;
-    this.scrollAnchorTick = this.scrollAnchorAtStart ? null : this.contentXToTick(left);
-    // The default anchor is the left edge. `zoomAt` overwrites this immediately afterwards.
-    this.scrollAnchorOffsetPx = 0;
+    const anchored = anchorClientX !== null && Number.isFinite(anchorClientX);
+    const rect = anchored ? this.scroller.getBoundingClientRect() : null;
+    const px = rect ? Math.max(0, Math.min(rect.width, (anchorClientX as number) - rect.left)) : 0;
+    const anchorTick = anchored ? this.contentXToTick(left + px) : null;
+    if (anchored && anchorTick !== null) {
+      this.scrollAnchorAtStart = false;
+      this.scrollAnchorTick = anchorTick;
+      this.scrollAnchorOffsetPx = px;
+    } else {
+      this.scrollAnchorAtStart = left <= 0;
+      this.scrollAnchorTick = this.scrollAnchorAtStart ? null : this.contentXToTick(left);
+      this.scrollAnchorOffsetPx = 0;
+    }
 
     this.api.settings.display.scale = next;
-    // Announced BEFORE the render, so the coupling is armed by the time the new viewport is
-    // published and the aligned window derived from it. See `TriViewOptions.onZoomChange`.
-    this.opts.onZoomChange?.(next);
     // The overhang scales with the engraving, so the padding has to be recomputed for the
     // new scale or the reserved column would come out wider or narrower than the roll's.
     setLeftPadding(this.api.settings, LEFT_INSET_PX + leftInkOverhangPerScale * next);
@@ -1697,30 +2055,11 @@ export class TriView {
     this.startRender(() => this.api.render({ reuseViewport: false }));
   }
 
-  /**
-   * Zoom about a point in the viewport, given in CLIENT x. The pinch's entry point.
-   *
-   * `setZoom` on its own keeps the music under the LEFT EDGE where it was, which is right for a
-   * zoom that came from a button and wrong for one that came from two fingers: a pinch is a
-   * statement about the thing under them. So the tick under the pointer is taken first and put
-   * back at the same distance from the left edge once the new engraving exists —
-   * `scrollAnchorOffsetPx` is that distance, and `restoreScrollAnchor` spends it.
-   *
-   * The pointer can legitimately be over the page padding past the last bar; `contentXToTick`
-   * extrapolates there on the engraving's own slope rather than pretending the last beat is
-   * under the fingers, which is what makes a pinch at the end of the take zoom about the end of
-   * the take. See its note.
-   */
-  zoomAt(factor: number, clientX: number): void {
-    if (!Number.isFinite(factor) || factor <= 0) return;
+  /** Where the pointer is, as a fraction of the music column. The anchor a `zoom` command wants. */
+  pinchFrac(clientX: number): number {
     const rect = this.scroller.getBoundingClientRect();
-    const px = Math.max(0, Math.min(rect.width, clientX - rect.left));
-    const tick = this.contentXToTick(this.scroller.scrollLeft + px);
-    this.setZoom(this.getZoom() * factor);
-    if (tick === null || !this.renderPending()) return;
-    this.scrollAnchorAtStart = false;
-    this.scrollAnchorTick = tick;
-    this.scrollAnchorOffsetPx = px;
+    const width = Math.max(1, rect.width - LEFT_INSET_PX);
+    return Math.max(0, Math.min(1, (clientX - rect.left - LEFT_INSET_PX) / width));
   }
 
   /**
@@ -1730,18 +2069,15 @@ export class TriView {
    *   Option (alt) + pinch   -> the PITCH axis, which only the roll has — swallowed here
    *   two fingers, any way   -> SCROLL, and nothing else, ever
    *
-   * Zooming from HERE and not through the integrator is the point: a new scale changes the
-   * viewport, `onViewportChange` fires, and ui/app.ts derives the shared window from it and hands
-   * it to the roll and the strip, so the coupling that already exists is what carries a sheet
-   * pinch to the other two panes.
+   * ZOOMING FROM HERE IS EXACTLY WHAT NO LONGER HAPPENS. The pinch leaves as a COMMAND and comes
+   * back as a scale, and that round trip is what makes a pinch over the sheet and a pinch over
+   * the roll the same gesture rather than two implementations of one idea.
    *
-   * IT NEEDS ONE LINE AT THE INTEGRATOR TO BITE, and this is measured rather than assumed. The
-   * roll refuses spans that arrive from Align (`PianoRoll.holdSpan`), so it answers a pinched
-   * window with its OWN span; ui/app.ts reads the difference as a zoom notch and puts the sheet
-   * back where it was. Live, six pinch events over the sheet move `display.scale` 1.269 -> 1.274
-   * — the gesture is inert, not wrong. Wiring `onZoomChange` (see `TriViewOptions`) to
-   * `PianoRoll.adoptNextAlignSpan` tells the roll that THIS span is the point, after which the
-   * echo guard matches and the pinch stands.
+   * The old note here described the sheet zooming itself and the roll refusing to follow unless
+   * `onZoomChange` armed `adoptNextAlignSpan` — "live, six pinch events move display.scale
+   * 1.269 -> 1.274; the gesture is inert, not wrong". That whole apparatus is deleted. The app
+   * reduces one `zoom` command against the shared window and hands the sheet the scale that span
+   * needs, so there is no direction to arm and nothing to refuse.
    *
    * A plain two-finger swipe is left to the browser, which is already correct — except on the
    * one axis the browser cannot guess: this pane is a horizontal strip, so fingers moving UP and
@@ -1756,7 +2092,9 @@ export class TriView {
       if (e.altKey) return;
       const d = e.deltaY || e.deltaX;
       if (d === 0) return;
-      this.zoomAt(wheelZoomFactor(d, e.deltaMode), e.clientX);
+      // One pinch, one zoom, whichever road WebKit sent it down. See `claimPinch`.
+      if (!this.claimPinch('wheel')) return;
+      this.opts.onPinch?.(wheelZoomFactor(d, e.deltaMode), e.clientX);
       return;
     }
     const lines = e.deltaMode === 1 ? 16 : e.deltaMode === 2 ? 400 : 1;
@@ -1771,10 +2109,26 @@ export class TriView {
 
   /** Safari/WKWebView's pinch. Same two rules; see `PianoRoll.onGestureChange` for the units. */
   private gestureScale = 1;
+  /** Sub-threshold ratios, kept rather than dropped — the same class the roll uses (finding 10). */
+  private pinch = new PinchAccumulator();
+  private lastPinchMs = 0;
+  private pinchRoad: 'wheel' | 'gesture' | null = null;
+
+  /** ONE PINCH, ONE ZOOM (finding 12). The roll's `claimPinch`, on this surface. */
+  private claimPinch(road: 'wheel' | 'gesture'): boolean {
+    const t = performance.now();
+    if (this.pinchRoad !== null && this.pinchRoad !== road && t - this.lastPinchMs < PINCH_DEDUPE_MS) {
+      return false;
+    }
+    this.pinchRoad = road;
+    this.lastPinchMs = t;
+    return true;
+  }
 
   private onGestureStart = (e: Event): void => {
     e.preventDefault();
     this.gestureScale = (e as Event & { scale?: number }).scale ?? 1;
+    this.pinch.reset();
   };
 
   private onGestureChange = (e: Event): void => {
@@ -1784,10 +2138,13 @@ export class TriView {
     e.preventDefault();
     const ratio = scale / (this.gestureScale > 0 ? this.gestureScale : 1);
     this.gestureScale = scale;
-    if (g.altKey || !Number.isFinite(ratio) || ratio <= 0 || Math.abs(ratio - 1) < 1e-4) return;
+    if (g.altKey) return;
+    const stepped = this.pinch.take(ratio);
+    if (stepped === null) return;
+    if (!this.claimPinch('gesture')) return;
     const rect = this.scroller.getBoundingClientRect();
-    this.zoomAt(
-      Math.min(WHEEL_ZOOM_MAX_STEP, Math.max(1 / WHEEL_ZOOM_MAX_STEP, ratio)),
+    this.opts.onPinch?.(
+      Math.min(WHEEL_ZOOM_MAX_STEP, Math.max(1 / WHEEL_ZOOM_MAX_STEP, stepped)),
       g.clientX ?? rect.left + rect.width / 2
     );
   };
@@ -1842,14 +2199,26 @@ export class TriView {
    * So: scroll now, always, because the geometry on screen is the current geometry. Arm only if
    * `renderPending()` says a re-engrave is still owed.
    */
-  alignScrollToTick(tick: number | null): void {
+  alignScrollToTick(tick: number | null): boolean {
     if (tick === null) {
       this.alignAnchorTick = null;
-      return;
+      return true;
     }
     const x = this.tickToContentX(tick);
-    if (x !== null) this.setScrollLeft(x - LEFT_INSET_PX);
+    if (x === null) return true;
+    const wanted = x - LEFT_INSET_PX;
+    this.setScrollLeft(wanted);
     this.alignAnchorTick = this.renderPending() ? tick : null;
+    // DID THE PAGE HAVE ANYWHERE TO GO? Returned rather than swallowed, because the one case
+    // where it does not is a real disagreement the caller has to hear about.
+    //
+    // A take with leading silence engraves its first attack in bar 1 — the pipeline anchors the
+    // music, not the tape — so the seconds before it have NO PAGE. Ask for a moment inside that
+    // silence and the scroll clamps at 0 while the shared window goes on claiming the pane's
+    // left edge is that moment; the roll then spends real pixels on time the sheet spends on a
+    // clef. False here lets `ui/app.ts` take the sheet's actual left edge instead, which settles
+    // in one step and is the only place the engraving is allowed to answer back.
+    return Math.abs(this.scroller.scrollLeft - Math.max(0, wanted)) < 1;
   }
 
   private restoreScrollAnchor(): void {
@@ -2075,6 +2444,114 @@ export class TriView {
     const axis = this.ensureAxis();
     if (!axis || axis.xs.length === 0) return null;
     return axis.xs[0] - STRING_LETTER_GAP_PX;
+  }
+
+  /**
+   * A PRESSABLE TARGET OVER EVERY PART NAME THE ENGRAVING PRINTS.
+   *
+   * THE NAME IS NOT OURS TO DRAW. alphaTab writes the track name sideways in the reserved column
+   * to the left of the system, out of `track.name` / `track.shortName`, as an ordinary SVG
+   * `<text>` — there is no bounds entry for it, no event about it, and nothing in this app puts
+   * it there. So it is FOUND, by the three properties that separate it from every other letter
+   * on the page, and a transparent button is laid over the box it was found in:
+   *
+   *   1. it is LETTERING, not music. The music font is a private-use codepage, so anything with
+   *      an ordinary character in it is text — the same test `pruneNames` makes, for the same
+   *      reason and against the same glyphs;
+   *   2. it is LEFT OF THE STAFF. Bar numbers, the tempo mark and the fret digits are all inside
+   *      the system's own x; the reserved column is the only place a name is printed;
+   *   3. it is PRINTED SIDEWAYS — taller than it is wide. A fret digit is 8x16 and passes (1)
+   *      and would pass (3), which is exactly why (2) is not optional.
+   *
+   * Which TRACK it belongs to is then decided by geometry rather than by matching the string:
+   * the label's centre falls inside one track's band of staves in that system, and two parts are
+   * perfectly entitled to be called the same thing. `bar.staff.track.index` is the same
+   * back-reference `liveBars` reads.
+   *
+   * A ONE-TRACK SCORE PRINTS NO NAME AT ALL — measured, not assumed: alphaTab omits it, and the
+   * lettered text in the left column of a single-part page is the bar number and the tempo mark
+   * and nothing else. So this produces nothing there, which is right: there would be no name
+   * under the target.
+   */
+  private syncPartLabelHits(lookup: alphaTab.rendering.BoundsLookup): void {
+    const wanted = this.opts.onPartLabelClick ? this.partLabelBoxes(lookup) : [];
+    while (this.partLabelButtons.length < wanted.length) {
+      const button = document.createElement('button');
+      button.type = 'button';
+      button.className = 'part-label-hit';
+      // Bound once and read from the element, so a reused button is never holding the track
+      // index it had two renders ago.
+      button.addEventListener('click', () => {
+        const index = Number(button.dataset.track);
+        if (!Number.isFinite(index)) return;
+        const r = button.getBoundingClientRect();
+        this.opts.onPartLabelClick?.(index, { x: r.left, y: r.top, w: r.width, h: r.height });
+      });
+      this.partLabelHits.appendChild(button);
+      this.partLabelButtons.push(button);
+    }
+    while (this.partLabelButtons.length > wanted.length) {
+      this.partLabelButtons.pop()!.remove();
+    }
+    for (let i = 0; i < wanted.length; i++) {
+      const w = wanted[i];
+      const button = this.partLabelButtons[i];
+      button.dataset.track = String(w.trackIndex);
+      button.style.transform = `translate(${w.x}px, ${w.y}px)`;
+      button.style.width = `${w.w}px`;
+      button.style.height = `${w.h}px`;
+      const label = `Part name: ${w.name}`;
+      if (button.getAttribute('aria-label') !== label) {
+        button.setAttribute('aria-label', label);
+        button.setAttribute('title', 'Click this name to rename the part');
+      }
+    }
+  }
+
+  /** The printed part names, in stack coordinates, with the track each one belongs to. */
+  private partLabelBoxes(
+    lookup: alphaTab.rendering.BoundsLookup
+  ): Array<{ trackIndex: number; x: number; y: number; w: number; h: number; name: string }> {
+    const found: Array<{ trackIndex: number; x: number; y: number; w: number; h: number; name: string }> = [];
+    const stack = this.stack.getBoundingClientRect();
+    const lettered: Array<{ x: number; y: number; w: number; h: number; text: string }> = [];
+    for (const glyph of this.host.querySelectorAll('svg text')) {
+      const text = (glyph.textContent ?? '').trim();
+      if (!text || ![...text].some((c) => c.charCodeAt(0) < 0xe000)) continue;
+      const r = glyph.getBoundingClientRect();
+      // Sideways, and only sideways. See (3) above.
+      if (r.width === 0 || r.height <= r.width) continue;
+      lettered.push({ x: r.left - stack.left, y: r.top - stack.top, w: r.width, h: r.height, text });
+    }
+    if (lettered.length === 0) return found;
+
+    for (const system of lookup.staffSystems) {
+      const first = system.bars[0];
+      if (!first) continue;
+      const bands = new Map<number, { top: number; bottom: number }>();
+      let staffLeft = Number.POSITIVE_INFINITY;
+      for (const bar of first.bars ?? []) {
+        const index = bar.bar?.staff?.track?.index;
+        if (index === undefined || index === null) continue;
+        const box = bar.realBounds ?? bar.visualBounds;
+        const band = bands.get(index);
+        bands.set(index, {
+          top: Math.min(band?.top ?? box.y, box.y),
+          bottom: Math.max(band?.bottom ?? box.y + box.h, box.y + box.h)
+        });
+        staffLeft = Math.min(staffLeft, bar.visualBounds.x);
+      }
+      if (!Number.isFinite(staffLeft)) continue;
+      for (const [trackIndex, band] of bands) {
+        const label = lettered.find((l) => {
+          const middle = l.y + l.h / 2;
+          return l.x + l.w <= staffLeft - 1 && middle >= band.top && middle <= band.bottom;
+        });
+        if (!label) continue;
+        found.push({ trackIndex, x: label.x, y: label.y, w: label.w, h: label.h, name: label.text });
+      }
+    }
+    return found;
   }
 
   /**
@@ -2878,6 +3355,10 @@ export class TriView {
    */
   private onPointerDown = (e: PointerEvent): void => {
     const target = e.target as HTMLElement;
+    // A press on a printed part name is a press on ITS control, not on the music behind it.
+    // Without this the press falls through to the seek below and the transport jumps to bar 1
+    // underneath the rename field that is opening. See `syncPartLabelHits`.
+    if (target.classList.contains('part-label-hit')) return;
     const hit = target.classList.contains('note-name')
       ? this.hitTestByX(e.clientX)
       : this.hitTest(e.clientX, e.clientY);
@@ -2912,6 +3393,13 @@ export class TriView {
     // Synchronously, not in the frame below: the letters are pinned to the viewport, so they
     // have to move WITH the scroll or they lag a frame behind it and visibly swim.
     this.placeStringLetters();
+    // WAS THIS OUR OWN SCROLL? A number rather than a flag, because the browser can coalesce
+    // several scroll events into one and a bare boolean would swallow a real gesture that
+    // happened to land in the same frame. Within half a pixel of where we put it, it is ours.
+    const target = this.programmaticScrollTo;
+    this.programmaticScrollTo = null;
+    const mine = target !== null && Math.abs(this.scroller.scrollLeft - target) < 0.5;
+    if (!mine) this.opts.onSheetScroll?.(this.contentXToTick(this.scroller.scrollLeft + LEFT_INSET_PX));
     if (this.viewportFrame) return;
     this.viewportFrame = requestAnimationFrame(() => {
       this.viewportFrame = 0;

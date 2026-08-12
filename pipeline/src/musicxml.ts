@@ -148,7 +148,8 @@ interface ResolvedPart {
 }
 
 function resolvePart(ir: RiffsheetIR, options: MusicXmlOptions, index: number): ResolvedPart {
-  const useTab = (options.tab ?? 'two-staves') === 'two-staves' && ir.instrument.stringCount > 0;
+  // The IR carries the part's own answer; a caller option overrides it for this export only.
+  const useTab = (options.tab ?? ir.tab ?? 'two-staves') === 'two-staves' && ir.instrument.stringCount > 0;
   const isStaffOnly = ir.instrument.stringCount === 0;
   const program = options.midiProgram ?? (isStaffOnly ? 0 : ir.instrument.kind.startsWith('bass') ? 33 : 27);
   const writtenShift = options.octaveTransposition === 'conventional'
@@ -351,6 +352,21 @@ function emitPart(L: string[], part: ResolvedPart, withTempoDirections: boolean)
       L.push('      </direction>');
     }
 
+    /**
+     * ONE ENGRAVED VOICE, and it is a stated contract rather than an accident of indexing.
+     *
+     * `IRBar.voices` is a list and always has been; `buildBars` produces exactly one entry, and
+     * phase 1 of symbolic import does not change that — a source with several voices is
+     * flattened into one and the flattening is COUNTED (`BuildDiagnostics.flattenedVoices`).
+     * What must never happen is this line quietly dropping voices 2..n if a later version starts
+     * producing them, so it says so out loud instead of taking `[0]` and hoping.
+     */
+    if (bar.voices.length > 1) {
+      throw new Error(
+        `musicxml: bar ${bar.number} carries ${bar.voices.length} voices; this emitter writes one ` +
+          '(the multi-voice model is a separate project — see BuildDiagnostics.flattenedVoices)'
+      );
+    }
     const voice = bar.voices[0] ?? { id: 1, beats: [] };
 
     /**

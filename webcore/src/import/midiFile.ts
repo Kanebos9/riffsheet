@@ -1,12 +1,31 @@
 /** Bounded Standard MIDI File reader used by desktop/drop import. */
 
 import type { InputNote } from '../pipeline';
+// Direct, not through the barrel — that pulls in the JUCE and mock bridges, and this module runs
+// headless in the test scripts.
+import { RIFFSHEET_LIMITS } from '../bridge/types';
 
-const MAX_FILE_BYTES = 128 * 1024 * 1024;
+/** "a MusicXML/MIDI/GP import" is named in `RIFFSHEET_LIMITS`' own doc — so it is read, not copied. */
+const MAX_FILE_BYTES = RIFFSHEET_LIMITS.containerBytes;
 const MAX_TRACKS = 1024;
 const MAX_TRACK_BYTES = 64 * 1024 * 1024;
 const MAX_EVENTS = 2_000_000;
-const MAX_NOTES = 1_000_000;
+/**
+ * A REALISTIC NOTE CAP (finding 12), and the number is a published promise, not a formality.
+ *
+ * One million was never openable. The pipeline spread whole note arrays into `Math.min/max`,
+ * which throws `RangeError` in JavaScriptCore — the engine the plugin's WebView runs — long
+ * before it computes anything, so the documented limit was unreachable by construction. Those
+ * spreads are gone, but the honest ceiling is still far lower than a million: 200k notes is
+ * already a densely-written orchestral hour, it is the point past which the quantizer's per-beat
+ * work and the WebView's memory stop being comfortable on the 8 GB machines this ships to, and a
+ * file above it is far more likely to be malformed or hostile than musical.
+ *
+ * Above the cap the import is REJECTED with a sentence the user can act on. It is never
+ * truncated: half a score is a wrong score, and silently dropping bar 400 onwards is worse than
+ * declining to open the file.
+ */
+const MAX_NOTES = 200_000;
 const MAX_ABSOLUTE_TICK = 0x7fffffff;
 
 export interface ParsedMidi {
@@ -235,7 +254,9 @@ export function parseMidi(bytes: ArrayBuffer): ParsedMidi {
     if (!started) continue;
     if (stack.length) open.set(key, stack);
     else open.delete(key);
-    if (notes.length >= MAX_NOTES) throw new Error('That MIDI file contains too many notes to open safely.');
+    if (notes.length >= MAX_NOTES) {
+      throw new Error(`That MIDI file has more than ${MAX_NOTES.toLocaleString('en-US')} notes, which is more than Riffsheet can open safely.`);
+    }
     const endTick = Math.max(started.tick + 1, event.tick);
     notes.push({
       startSec: tickToSec(started.tick),

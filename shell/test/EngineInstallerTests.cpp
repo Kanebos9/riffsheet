@@ -1114,6 +1114,126 @@ private:
         }
 
         root.deleteRecursively();
+
+        //== two windows installing at once ====================================
+        //
+        // Every plugin instance and the standalone app share
+        // <appSupport>/engines, and install() moves and recursively deletes
+        // whole trees under it. Nothing coordinated that: two installs of one
+        // engine deleted each other's staging directories mid-write, and the
+        // loser reported something that read like a corrupt download.
+        //
+        // The lock is deliberately TWO mechanisms. juce::InterProcessLock is an
+        // fcntl() record lock and POSIX record locks belong to the PROCESS, so a
+        // second object in the same process sails straight through one - which
+        // is precisely the two-plugin-instances-in-one-DAW case. The tests below
+        // exercise the in-process half, because that is the half a single test
+        // binary can observe; the cross-process half is the same mechanism
+        // EngineLock has shipped on since wave 5.
+
+        beginTest ("two installs of the same engine cannot run at once");
+        {
+            EngineInstaller::ScopedInstallLock first ("muscriptor");
+            expect (first.isHeld(), "the first caller must get the lock");
+
+            EngineInstaller::ScopedInstallLock second ("muscriptor");
+            expect (! second.isHeld(), "the second caller must be refused, not queued");
+
+            // Refused with something a human can act on, not a code.
+            expect (second.whoElse().isNotEmpty());
+            expect (second.whoElse().contains ("Riffsheet"));
+        }
+
+        beginTest ("the lock is per engine, so two different engines install in parallel");
+        {
+            EngineInstaller::ScopedInstallLock muscriptor ("muscriptor");
+            EngineInstaller::ScopedInstallLock bass ("bass-v2");
+
+            expect (muscriptor.isHeld());
+            expect (bass.isHeld(), "one engine's install must not block another's");
+        }
+
+        beginTest ("the lock is released when it goes out of scope");
+        {
+            {
+                EngineInstaller::ScopedInstallLock held ("muscriptor");
+                expect (held.isHeld());
+            }
+
+            // Including after a REFUSED attempt: a failed acquire that forgot to
+            // put back the in-process half would wedge the engine until restart.
+            {
+                EngineInstaller::ScopedInstallLock outer ("muscriptor");
+                EngineInstaller::ScopedInstallLock refused ("muscriptor");
+                expect (outer.isHeld());
+                expect (! refused.isHeld());
+            }
+
+            EngineInstaller::ScopedInstallLock again ("muscriptor");
+            expect (again.isHeld(), "the lock did not come back");
+        }
+
+        beginTest ("staging directories are unique per attempt and cannot contain each other");
+        {
+            const auto a = EngineInstaller::newIncomingDirectory ("muscriptor");
+            const auto b = EngineInstaller::newIncomingDirectory ("muscriptor");
+            const auto p = EngineInstaller::newPreviousDirectory ("muscriptor");
+
+            expect (a != b, "two attempts must not share a staging path");
+            expect (a != p);
+            expect (a.getParentDirectory() == EngineInstaller::enginesRoot());
+
+            // The shape matters as much as the uniqueness: the sweep matches on
+            // it, and the resolver must never mistake one for an install.
+            expect (a.getFileName().startsWith ("muscriptor.incoming-"));
+            expect (p.getFileName().startsWith ("muscriptor.previous-"));
+
+            // Neither is inside the other, so one attempt's recursive delete
+            // cannot reach the other's bytes. This is the whole property.
+            expect (! a.isAChildOf (b));
+            expect (! b.isAChildOf (a));
+            expect (a != EngineInstaller::engineDirectory ("muscriptor"));
+        }
+
+        beginTest ("the sweep clears what earlier runs left and keeps the live attempt");
+        {
+            // Named for an engine that does not exist, so nothing real is at
+            // risk if this test is interrupted.
+            const juce::String id { "riffsheet-sweep-fixture" };
+
+            EngineInstaller::enginesRoot().createDirectory();
+
+            const auto stale1 = EngineInstaller::newIncomingDirectory (id);
+            const auto stale2 = EngineInstaller::newPreviousDirectory (id);
+            const auto live   = EngineInstaller::newIncomingDirectory (id);
+
+            for (const auto& directory : { stale1, stale2, live })
+            {
+                directory.createDirectory();
+                directory.getChildFile ("half-built.txt").replaceWithText ("x");
+            }
+
+            // A neighbouring engine's staging, which must be untouched: sweeping
+            // by prefix and getting the prefix wrong would be the same bug in a
+            // new place.
+            const auto neighbour = EngineInstaller::newIncomingDirectory (id + "-other");
+            neighbour.createDirectory();
+
+            const auto removed = EngineInstaller::sweepStaleStaging (id, live);
+
+            expectEquals (removed, 2, "both leftovers should have gone");
+            expect (! stale1.exists());
+            expect (! stale2.exists());
+            expect (live.isDirectory(), "the live attempt must survive its own sweep");
+            expect (neighbour.isDirectory(), "another engine's staging is not ours to delete");
+
+            // ...and with nothing to keep, everything of ours goes.
+            expectEquals (EngineInstaller::sweepStaleStaging (id, juce::File()), 1);
+            expect (! live.exists());
+
+            neighbour.deleteRecursively();
+            expectEquals (EngineInstaller::sweepStaleStaging (id + "-other", juce::File()), 0);
+        }
     }
 
     //== a scratch directory this test owns ====================================
@@ -1238,8 +1358,12 @@ private:
         expect (result.bytesOnDisk > 0);
         expect (frames > 0, "an install must report progress");
         expect (EngineInstaller::engineDirectory (manifest.id).isDirectory());
-        expect (! EngineInstaller::incomingDirectory (manifest.id).exists(),
-                "the staging directory must not survive a successful install");
+
+        // Staging is now `<id>.incoming-<uuid>` - a fresh path per attempt, so
+        // there is no one directory to name. The invariant is unchanged and in
+        // fact stronger: NONE of them may survive a successful install.
+        expect (EngineInstaller::sweepStaleStaging (manifest.id, juce::File()) == 0,
+                "no staging directory may survive a successful install");
     }
 
     void doTranscribe (const EngineManifest& manifest)

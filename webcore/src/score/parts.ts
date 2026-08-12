@@ -60,7 +60,8 @@ export interface ImportedPart {
   id: string;
   name: string;
   notes: InputNote[];
-  /** The chip menu's ±ms box. Reaches the pipeline as `nudgeSec`. */
+  /** The chip menu's ±ms box. Reaches the pipeline as `nudgeSec`, in seconds and otherwise as
+   *  typed — the pipeline is what makes it a printable shift. */
   nudgeMs: number;
 }
 
@@ -170,17 +171,22 @@ export function importedPartName(trackName: string | undefined, fileName: string
 }
 
 /**
- * A NUDGE IS A PRINTED SHIFT, SO IT CAN ONLY BE A SHIFT THE PAGE CAN PRINT.
+ * A NUDGE IS A PRINTED SHIFT, SO IT CAN ONLY BE A SHIFT THE PAGE CAN PRINT — AND THE BUILD IS
+ * WHERE THAT IS DECIDED.
  *
  * An imported part is engraved from its own written ticks. Sliding it by an arbitrary number of
  * milliseconds slides those ticks off the lattice notation has words for, and the tail of the
  * last note in a bar comes out as a one- or two-tick crumb — which the MusicXML emitter refuses,
  * correctly, with "`<type>32nd</type>` is 3 ticks but `<duration>` is 1". Measured: at 96 BPM
- * every nudge that is not a whole 1/32 (78.125 ms there) throws, and every one that is prints.
+ * every nudge that is not a whole 1/32 (78.125 ms there) threw, and every one that is printed.
  *
- * So the number the player types is rounded to the finest unit the printable vocabulary has — a
- * 1/32, which is the same floor `grid: 'free'` works to. The UI rounds on the way in as well, so
- * the box shows the shift that was actually applied rather than the one that was asked for.
+ * `nudgeNote` (pipeline/multipart.ts) now rounds the shift to a whole 1/32 itself, in the WRITTEN
+ * domain and against the display tempo the build computed, so whatever number arrives comes out
+ * printable. Nothing on the build path in this file calls this any more.
+ *
+ * What is left for it is the chip menu, which rounds the typed number on the way IN so the box
+ * shows the shift that will be applied rather than the one that was asked for. That is a display
+ * courtesy and not a correctness requirement, and it is the only remaining caller.
  *
  * @param bpm the score's display tempo. A nudge in seconds is a nudge in ticks only through one.
  */
@@ -191,31 +197,14 @@ export function snapNudgeMs(ms: number, bpm: number): number {
   return Math.round(ms / thirtysecondMs) * thirtysecondMs;
 }
 
-/** One 1/32 in milliseconds — the nudge box's step, so its arrows move by a printable unit. */
+/**
+ * One 1/32 in milliseconds — the nudge box's `step`, so its arrows move the part by a whole unit
+ * of the printed vocabulary instead of by a round number of milliseconds that means nothing on a
+ * page. A 1/32 is the finest value the IR prints, and the same floor `grid: 'free'` works to.
+ */
 export function nudgeStepMs(bpm: number): number {
   const tempo = Number.isFinite(bpm) && bpm > 0 ? bpm : 120;
   return (60_000 / tempo) / 8;
-}
-
-/**
- * The tempo this build will come out at, near enough to convert a nudge with.
- *
- * The pipeline decides the real `displayBpm` from the notes, and cannot be asked before the
- * build — but a nudge has to be turned into ticks before the build, so this is the same answer
- * arrived at from the same two inputs the pipeline starts from: the take's own tempo when it has
- * one, and otherwise the median beat interval. Being a few BPM out costs nothing that matters:
- * the shift is applied to the part's ticks directly, so the PRINTED result is exactly the whole
- * number of 32nds it was rounded to either way.
- */
-function scoreBpm(request: BuildRequest, settings: AppSettings): number {
-  if (settings.tempoBpm && settings.tempoBpm > 0) return settings.tempoBpm;
-  const beats = request.beats;
-  if (beats && beats.length > 1) {
-    const gaps = beats.slice(1).map((b, i) => b - beats[i]).filter((g) => g > 0).sort((a, b) => a - b);
-    const median = gaps[Math.floor(gaps.length / 2)];
-    if (median > 0) return 60 / median;
-  }
-  return 120;
 }
 
 /**
@@ -234,33 +223,15 @@ function scoreBpm(request: BuildRequest, settings: AppSettings): number {
  *
  * Only the carrier notes are copied — one per track — so this is a shallow pass over the list
  * and not a duplicate of it.
+ *
+ * DROPPING THE CLOCK IS ALL THIS DOES. The nudge is not applied here; it travels to the pipeline
+ * as `ScorePart.nudgeSec` (see `buildPartedRiffScore`).
  */
-function referenceNotes(notes: ReadonlyArray<InputNote>, nudgeMs: number, bpm: number): InputNote[] {
-  // THE NUDGE IS APPLIED HERE, not handed to the pipeline as `nudgeSec`. Both do the same
-  // arithmetic; doing it here is what lets the shift be rounded to a whole 1/32 FIRST (see
-  // `snapNudgeMs`) and applied to the seconds and the written ticks as one exact number,
-  // instead of as a float that lands the part between two things notation can spell.
-  const snapped = snapNudgeMs(nudgeMs, bpm);
-  const shiftSec = snapped / 1000;
-  const shiftQuarters = (shiftSec * bpm) / 60;
-
+function referenceNotes(notes: ReadonlyArray<InputNote>): InputNote[] {
   return notes.map((note) => {
+    if (!note.sourceBars && !note.sourceTempoChanges) return note;
     const { sourceBars: _bars, sourceTempoChanges: _tempo, ...rest } = note;
-    if (!shiftSec) return note.sourceBars || note.sourceTempoChanges ? rest : note;
-    return {
-      ...rest,
-      startSec: rest.startSec + shiftSec,
-      endSec: rest.endSec + shiftSec,
-      ...(rest.sourceTiming
-        ? {
-            sourceTiming: {
-              ...rest.sourceTiming,
-              startTick: rest.sourceTiming.startTick + Math.round(shiftQuarters * rest.sourceTiming.ppq),
-              endTick: rest.sourceTiming.endTick + Math.round(shiftQuarters * rest.sourceTiming.ppq)
-            }
-          }
-        : {})
-    };
+    return rest;
   });
 }
 
@@ -313,16 +284,26 @@ export function buildPartedRiffScore(
   };
 
   const liveName = livePartName(settings);
-  const bpm = scoreBpm(request, settings);
   const parts: ScorePart[] = slots.map((slot) =>
     slot.kind === 'live'
       ? { notes: request.notes, role: 'live', name: liveName }
       : {
-          notes: referenceNotes(slot.part.notes, slot.part.nudgeMs || 0, bpm),
+          notes: referenceNotes(slot.part.notes),
           role: 'imported',
           name: slot.part.name,
-          // Zero, because the shift is already in the notes above — see `referenceNotes`.
-          nudgeSec: 0,
+          // THE SHIFT IS THE PIPELINE'S TO MAKE, and it is handed over in seconds exactly as the
+          // player typed it. The build moves the part's seconds before it derives the shared
+          // clock and its written ticks after, rounding the shift to a whole 1/32 against the
+          // `displayBpm` it just computed (`nudgeNote`, pipeline/multipart.ts).
+          //
+          // This side of the call cannot do that, because the tempo the shift has to be rounded
+          // against does not exist yet. The version this replaces applied the shift here and
+          // rounded it against `scoreBpm`, a GUESS at that tempo from the take's tempo box and
+          // the median beat gap; every time the guess and the real display tempo disagreed the
+          // whole-1/32 shift was a whole 1/32 of the wrong tempo, the part landed between two
+          // positions notation can spell, and the MusicXML emitter refused the leftover crumb
+          // with "`<type>32nd</type>` is 3 ticks but `<duration>` is 1".
+          nudgeSec: (slot.part.nudgeMs || 0) / 1000,
           // A plain notation staff. An imported chart is somebody else's engraving; inventing a
           // fretboard for it out of THIS take's tuning is the one thing the pipeline's imported
           // defaults exist to prevent, and asking for it explicitly says so on the page too.

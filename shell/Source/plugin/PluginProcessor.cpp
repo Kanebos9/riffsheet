@@ -1,5 +1,6 @@
 #include "PluginProcessor.h"
 #include "PluginEditor.h"
+#include "PlaybackResampler.h"
 #include "engines/ClientEngineAdapter.h"
 #include "engines/EngineCatalog.h"
 #include "engines/MuScriptorAdapter.h"
@@ -220,36 +221,31 @@ void RiffsheetAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer, ju
     const auto* src = playbackSamples;
 
     // The file's rate rarely matches the host's, so step through it with a
-    // fractional read index and interpolate linearly.
-    const auto step = playbackBufferRate > 0.0 ? playbackBufferRate / currentSampleRate : 1.0;
+    // fractional read index and interpolate linearly. THE PHASE IS FRACTIONAL
+    // AND STAYS FRACTIONAL: it used to be rounded down to a whole source frame
+    // at the end of every block, which threw away up to one frame per block and
+    // made playback speed depend on the host's buffer size (1.36% slow at 64
+    // frames, 0.085% at 512). See PlaybackResampler.h for the arithmetic and
+    // PlaybackResamplerTests for minutes of it at every common rate.
+    const auto step = riffsheet::playback::stepFor (playbackBufferRate, currentSampleRate);
 
-    auto pos = (double) playbackPositionSamples;
-    int i = 0;
+    const auto rendered = riffsheet::playback::render (
+        src, total, playbackPositionFrames, step, numSamples,
+        [this, &buffer, numOutChannels] (int i, float sample)
+        {
+            const auto g = smoothedGain.getNextValue();
 
-    for (; i < numSamples; ++i)
-    {
-        const auto index = (int64_t) pos;
+            for (int ch = 0; ch < numOutChannels; ++ch)
+                buffer.addSample (ch, i, sample * g);
+        });
 
-        if (index >= total - 1)
-            break;
+    playbackPositionFrames = rendered.position;
 
-        const auto frac = (float) (pos - (double) index);
-        const auto sample = src[index] + frac * (src[index + 1] - src[index]);
-        const auto g = smoothedGain.getNextValue();
-
-        for (int ch = 0; ch < numOutChannels; ++ch)
-            buffer.addSample (ch, i, sample * g);
-
-        pos += step;
-    }
-
-    playbackPositionSamples = (int64_t) pos;
-
-    if (i < numSamples)
+    if (rendered.hitEnd)
     {
         // Reached the end of the file.
         playing = false;
-        playbackPositionSamples = total;
+        playbackPositionFrames = (double) total;
     }
 }
 
@@ -283,7 +279,7 @@ void RiffsheetAudioProcessor::updateTransportSourceFor (std::shared_ptr<const Pc
         playbackSamples         = hasAudio ? loadedEntry->mono.getReadPointer (0) : nullptr;
         playbackNumSamples      = hasAudio ? (int64_t) loadedEntry->mono.getNumSamples() : 0;
         playbackBufferRate      = hasAudio ? loadedEntry->sampleRate : 0.0;
-        playbackPositionSamples = 0;
+        playbackPositionFrames  = 0.0;
     }
 
     // `displaced` dies here, on the caller's thread, outside the lock.
@@ -343,8 +339,8 @@ void RiffsheetAudioProcessor::playbackPlay()
     if (playbackNumSamples == 0)
         return;
 
-    if (playbackPositionSamples >= playbackNumSamples)
-        playbackPositionSamples = 0;
+    if (playbackPositionFrames >= (double) playbackNumSamples)
+        playbackPositionFrames = 0.0;
 
     playing = true;
 }
@@ -358,7 +354,7 @@ void RiffsheetAudioProcessor::playbackStop()
 {
     playing = false;
     const juce::ScopedLock sl (playbackLock);
-    playbackPositionSamples = 0;
+    playbackPositionFrames = 0.0;
 }
 
 void RiffsheetAudioProcessor::playbackSeek (double seconds)
@@ -368,8 +364,12 @@ void RiffsheetAudioProcessor::playbackSeek (double seconds)
     if (playbackBufferRate <= 0.0)
         return;
 
-    const auto target = (int64_t) std::llround (juce::jmax (0.0, seconds) * playbackBufferRate);
-    playbackPositionSamples = juce::jlimit ((int64_t) 0, playbackNumSamples, target);
+    // Kept fractional: a seek to 1.5 s in a 44.1 kHz file is 66150 frames on the
+    // nose, but a seek in a file whose rate is not a whole number of frames per
+    // millisecond is not, and rounding it here would put a (tiny, one-off) error
+    // back into the one place the phase is now exact.
+    const auto target = juce::jmax (0.0, seconds) * playbackBufferRate;
+    playbackPositionFrames = juce::jlimit (0.0, (double) playbackNumSamples, target);
 }
 
 void RiffsheetAudioProcessor::setPlaybackGain (float linearGain)
@@ -388,7 +388,7 @@ RiffsheetAudioProcessor::PlaybackStatus RiffsheetAudioProcessor::getPlaybackStat
     if (playbackBufferRate > 0.0 && playbackNumSamples > 0)
     {
         status.loaded = true;
-        status.positionSec = (double) playbackPositionSamples / playbackBufferRate;
+        status.positionSec = playbackPositionFrames / playbackBufferRate;
         status.lengthSec = (double) playbackNumSamples / playbackBufferRate;
     }
 

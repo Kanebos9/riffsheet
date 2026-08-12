@@ -187,7 +187,11 @@
 
 import type { TrimResult } from '../audio/trim';
 import type { OnsetResult } from '../audio/onsets';
-import { TIMELINE_GUTTER_PX, type SheetMap, type TimeAnchor } from '../view/pianoroll';
+import { TIMELINE_GUTTER_PX, wheelZoomFactor, WHEEL_ZOOM_MAX_STEP, type TimeAnchor } from '../view/pianoroll';
+import { PinchAccumulator, type ViewportCommand } from '../view/timeAxis';
+
+/** One pinch, one zoom, whichever road WebKit sends it down. See `PianoRoll`'s constant. */
+const PINCH_DEDUPE_MS = 250;
 
 /** A stretch of the RECORDING, in recording seconds. `fromSec` is always the earlier one. */
 export interface WaveformSelection {
@@ -201,17 +205,19 @@ export interface WaveformOptions {
   /** Fired while dragging and once on release; `commit` is true on release. */
   onBarOneChange: (sec: number, commit: boolean) => void;
   /**
-   * The player asked to look at a different part of the take: by sliding the overview
-   * bracket, or by clicking a part of the recording the sheet is not currently on.
-   * `centreSec` is where the middle of the visible span wants to be, on the RECORDING's
-   * clock. `commit` is true on release (and on a click), false for the live frames of a drag.
+   * THE STRIP'S HALF OF THE SHARED WINDOW. Same command type the roll and the sheet emit.
    *
-   * The strip does not move the sheet itself — it cannot; it does not know how the sheet is
-   * engraved. It reports, the integrator scrolls, and the answer comes back through
-   * `setViewportRange`. Leave this out and the bracket is a read-only indicator, which is a
-   * perfectly good thing for it to be.
+   * `onViewportScrub` stood here and is gone with the overview ribbon that produced it: the
+   * ribbon was drawn only when `map()` returned non-null, `map()` returned null forever, so the
+   * ribbon never appeared, its drag path was unreachable and this callback could not fire
+   * (findings 8 and 14). What the strip lacked was not a scrub callback but any wheel or gesture
+   * handler at all — so a ctrl-wheel over the waveform fell through to the browser and zoomed
+   * the whole plugin window, which inside a plugin cannot be got back from (finding 12).
+   *
+   * Wire this and a pinch or a two-finger swipe over the strip means here what it means over
+   * the roll, because it reaches the same reducer.
    */
-  onViewportScrub?: (centreSec: number, commit: boolean) => void;
+  onViewportCommand?: (cmd: ViewportCommand) => void;
   /**
    * The player pointed at a moment of the recording, or cleared the last one.
    *
@@ -226,15 +232,6 @@ export interface WaveformOptions {
    * is the only way to ask about silence.
    */
   onSelectionChange?: (sel: WaveformSelection | null, commit: boolean) => void;
-  /**
-   * The sheet's engraving, asked for fresh on every frame — the SAME accessor and the same
-   * `SheetMap` interface `view/pianoroll.ts` takes, deliberately not a second copy of it.
-   *
-   * Return null when the roll is unlinked. See section 2 of the header: this strip has no
-   * link switch of its own, so the accessor is the only thing keeping the two strips on one
-   * ruler. Called once per frame (not once per column), so it may measure the DOM, but it
-   * must never throw — a throw is caught and treated as "no map" for that frame.
-   */
 }
 
 /**
@@ -252,7 +249,7 @@ export interface WaveformOptions {
  * sweeps out a span. `select-from`/`select-to` are NOT back — an edge grab is this same kind
  * with the opposite edge pinned as the anchor, which is one state instead of three.
  */
-type DragKind = 'marker' | 'viewport' | 'select';
+type DragKind = 'marker' | 'select';
 
 export class WaveformStrip {
   private canvas: HTMLCanvasElement;
@@ -304,14 +301,6 @@ export class WaveformStrip {
   private pressSec = 0;
   /** True once a press has moved far enough to be a drag rather than a click. */
   private pressMoved = false;
-  /**
-   * Grabbing the bracket 20px right of its middle must keep the pointer 20px right of its
-   * middle for the whole drag — otherwise the bracket jumps under your finger on the first
-   * pixel of movement. Captured on press, in seconds so a resize mid-drag cannot break it.
-   */
-  private grabOffsetSec = 0;
-  /** The bracket's width at the moment of the grab. Sliding must not resize it. */
-  private grabSpanSec = 0;
   private colors = {
     bg: '#1e2128',
     gutter: '#16181d',
@@ -333,14 +322,6 @@ export class WaveformStrip {
   private attention: Array<{ fromSec: number; toSec: number }> = [];
 
   private static MARKER_HIT_PX = 7;
-  /**
-   * How far outside a bracket edge still counts as grabbing the bracket. A long take read at
-   * a big zoom can put the whole visible slice inside three pixels, and a three-pixel target
-   * is not a target. The grab band is also floored at `VIEWPORT_MIN_GRAB_PX` overall.
-   */
-  private static VIEWPORT_EDGE_HIT_PX = 5;
-  /** The smallest the grab band may be, however narrow the bracket itself is drawn. */
-  private static VIEWPORT_MIN_GRAB_PX = 13;
   /** Both edges have to be visible as edges, so the bracket is never drawn thinner than this. */
   private static VIEWPORT_MIN_DRAW_PX = 3;
   /**
@@ -349,8 +330,6 @@ export class WaveformStrip {
    * player.
    */
   private static DRAG_SLOP_PX = 3;
-  /** How much of the take that is NOT on screen below is knocked back. */
-  private static OUTSIDE_DIM = 0.52;
   /**
    * HOW MUCH OF THE RECORDING A CLICK ASKS ABOUT, in seconds. The one number that tunes this
    * feature — see section 1 of the header for the arithmetic behind 0.2 (three analysis
@@ -370,17 +349,6 @@ export class WaveformStrip {
    * here would steal presses meant for "start a new span in the middle of this one".
    */
   private static SELECT_EDGE_HIT_PX = 5;
-  /**
-   * The whole-take overview ribbon along the top, present ONLY while the body is engraved.
-   *
-   * Thirteen pixels out of seventy-two: enough for an envelope with a recognisable shape and
-   * a bracket with two visible edges, small enough that the body is still the picture.
-   */
-  private static OVERVIEW_PX = 13;
-  /** Never let the ribbon eat more than this share of a strip somebody has made short. */
-  private static OVERVIEW_MAX_FRACTION = 1 / 3;
-  /** Below this the ribbon stops being either legible or a target, so it never shrinks past it. */
-  private static OVERVIEW_MIN_PX = 7;
   /** So a probe window on a zoomed-out take still shows as a band rather than vanishing. */
   private static SELECTION_MIN_DRAW_PX = 2;
 
@@ -394,6 +362,11 @@ export class WaveformStrip {
     this.canvas.addEventListener('pointermove', this.onPointerMove);
     this.canvas.addEventListener('pointerup', this.onPointerUp);
     this.canvas.addEventListener('pointercancel', this.onPointerUp);
+    // Not passive: a pinch arrives as a ctrl-wheel and an unhandled one is the browser's page
+    // zoom, which inside a plugin window resizes the whole UI. See `onWheel`.
+    this.canvas.addEventListener('wheel', this.onWheel, { passive: false });
+    this.canvas.addEventListener('gesturestart', this.onGestureStart, { passive: false });
+    this.canvas.addEventListener('gesturechange', this.onGestureChange, { passive: false });
     window.addEventListener('resize', this.draw);
     window.addEventListener('keydown', this.onKeyDown);
   }
@@ -574,47 +547,21 @@ export class WaveformStrip {
     return Math.max(1, (this.canvas.clientWidth || 1) - this.gutterPx);
   }
 
-  /**
-   * The sheet's geometry for this frame, or null when the strip is on its own ruler.
-   *
-   * Null is a complete, supported mode and not a degraded one: it is the whole-take overview.
-   * A `sheetMap` that throws is treated as null for that frame and never specially again —
-   * the tri-view is another agent's file and this one must not be able to take the strip down
-   * with it.
-   *
-   * Resolve it ONCE per frame and pass it down. `app.ts`'s accessor measures the DOM, and
-   * asking it per column would be a thousand forced layouts a paint.
-   */
-  private map(): SheetMap | null {
-    // DELETED WITH THE ROLL'S COPY OF IT — see `view/pianoroll.ts` §map(). The strip drew on
-    // the sheet's x-axis when the chip was on, and the sheet's x-axis re-spaces itself
-    // whenever the engraving changes, so a note added anywhere moved the picture of the
-    // recording everywhere. A waveform that moves when you edit a note is a waveform that
-    // cannot be trusted as evidence, which is the strip's whole job.
-    //
-    // The chip survives as `alignViews` and moves the SHEET's scroll instead: nothing here has
-    // any geometry to change. The `m` parameters threaded through the drawing code below are
-    // kept — they are always null now, and they are the shape a future engraved-axis design
-    // would need if one is ever built that does not reflow.
-    return null;
-  }
-
-  /**
-   * How tall the overview ribbon is right now — 0 whenever the body is already the whole take.
-   *
-   * A fraction rather than a flat constant so that a strip somebody has made short still has a
-   * body to read; the ribbon is a means to an end and the body is the end.
-   */
-  private overviewHeight(linked: boolean): number {
-    if (!linked) return 0;
-    const h = this.canvas.clientHeight || 0;
-    if (h <= 0) return 0;
-    const cap = Math.floor(h * WaveformStrip.OVERVIEW_MAX_FRACTION);
-    return Math.max(
-      Math.min(WaveformStrip.OVERVIEW_MIN_PX, h),
-      Math.min(WaveformStrip.OVERVIEW_PX, cap)
-    );
-  }
+  // `map(): SheetMap | null` AND `overviewHeight()` STOOD HERE, and they are gone together
+  // (findings 8 and 14) because they were two halves of one dead mode.
+  //
+  // `map()` returned null forever — the engraved-axis mode was deleted for re-spacing the picture
+  // of a recording whenever a note was edited — and `overviewHeight(!!map())` was therefore always
+  // 0, so the whole-take overview ribbon was never drawn, its drag path was unreachable, and
+  // `onViewportScrub` was dead. Meanwhile `setTimeAnchors` went on zooming the BODY to the aligned
+  // window while `bracket()` computed its x's on the plain whole-take ruler and painted them over
+  // that zoomed body. On a 100 s take showing [40,60] the body mapped 40 s to its left edge and
+  // 60 s to its right, and the bracket was drawn from 40% to 60% of that — leaving roughly 48-52 s
+  // bright. Two rulers, one canvas, and neither the dimming nor the advertised drag worked.
+  //
+  // One ruler now: the body IS the authoritative window. `bracket()` survives on the body's own
+  // axis, where it agrees with the window by construction rather than by luck — which is the
+  // property the probe check asserts.
 
   /**
    * ALIGN: show exactly this stretch of the recording in the BODY. Null = the whole take.
@@ -712,68 +659,37 @@ export class WaveformStrip {
     return ((x - this.gutterPx) / this.plotWidth) * this.durationSec;
   }
 
-  /**
-   * RECORDING seconds -> x on whichever axis the BODY is using. THE mapping.
-   *
-   * NaN when the engraved axis cannot place the second (nothing engraved yet). Callers skip a
-   * NaN rather than drawing at 0 — an envelope column parked on the left edge looks like real
-   * audio at second zero, which is a lie. Same rule as the roll's `writtenToX`.
-   */
-  private secToX(sec: number, m: SheetMap | null = this.map()): number {
-    if (m) {
-      // RECORDING -> WRITTEN before the sheet is asked anything. §4.13.
-      const cx = m.writtenSecToContentX(sec - this.scoreOriginSec);
-      return cx === null || !Number.isFinite(cx) ? Number.NaN : cx - m.scrollLeft;
-    }
+  /** RECORDING seconds -> x. THE mapping, and now the only one: the window's two ends. */
+  private secToX(sec: number): number {
     return this.secToEvenX(sec);
   }
 
-  /** The exact inverse, in both modes. NaN when the engraved axis cannot answer. */
-  private xToSec(x: number, m: SheetMap | null = this.map()): number {
-    if (m) {
-      const written = m.contentXToWrittenSec(x + m.scrollLeft);
-      return written === null || !Number.isFinite(written)
-        ? Number.NaN
-        : written + this.scoreOriginSec;
-    }
+  /** The exact inverse. */
+  private xToSec(x: number): number {
     return this.evenXToSec(x);
   }
 
-  /** A pointer x turned into a second inside the recording. NaN when the axis cannot say. */
-  private secAt(x: number, m: SheetMap | null = this.map()): number {
-    const sec = this.xToSec(x, m);
+  /** A pointer x turned into a second inside the recording. */
+  private secAt(x: number): number {
+    const sec = this.xToSec(x);
     return Number.isFinite(sec) ? Math.max(0, Math.min(this.durationSec, sec)) : Number.NaN;
   }
 
-  /** The same, for the overview ribbon, which is always the WHOLE TAKE. */
-  private evenSecAt(x: number): number {
-    return Math.max(0, Math.min(this.durationSec, this.wholeTakeXToSec(x)));
-  }
-
-  /** The ribbon's own axis: the whole recording, always, whatever the body is showing. */
-  private wholeTakeSecToX(sec: number): number {
-    return this.durationSec > 0
-      ? this.gutterPx + (sec / this.durationSec) * this.plotWidth
-      : this.gutterPx;
-  }
-
-  private wholeTakeXToSec(x: number): number {
-    return ((x - this.gutterPx) / this.plotWidth) * this.durationSec;
-  }
-
   /**
-   * Where the viewport bracket is, ON THE EVEN RULER, or null when there is nothing worth
-   * bracketing.
+   * Where the visible window is ON THE BODY'S OWN AXIS, or null when there is nothing to point at.
    *
-   * ALWAYS the even ruler, because the bracket only ever appears somewhere that is showing the
-   * whole take: on the body when unlinked, in the ribbon when linked. One geometry, painted in
-   * two places, so the two can never drift.
+   * THE SAME AXIS THE BODY IS DRAWN ON, and that is finding 8's fix stated in one function call:
+   * `secToEvenX` goes through the anchors, so these two x's are the two edges of exactly the
+   * stretch of recording the envelope underneath them is showing. It used to go through
+   * `wholeTakeSecToX`, which ignores the anchors entirely, so the bracket described a window on
+   * a ruler the body was not using.
    *
-   * Null covers all of: no range set, no audio, and a range that already spans the whole take
-   * — that last one because dimming nothing while drawing two edges hard against the left and
-   * right walls looks like a bug, not like information.
+   * The consequence, now that the body and the window are the same thing, is that this reaches
+   * the two ends of the plot — which is correct and is why nothing dims. It is kept because it
+   * is the strip's own answer to "which seconds am I showing", asserted against the app's
+   * authoritative window by the scroll/zoom probe.
    *
-   * One function so `draw()`, the hit test and `probe()` cannot drift apart.
+   * Null covers: no range set, no audio, and a range that already spans the whole take.
    */
   private bracket(): { fromX: number; toX: number; fromSec: number; toSec: number } | null {
     const from = this.viewportFromSec;
@@ -789,8 +705,8 @@ export class WaveformStrip {
     // The whole take is on screen below: nothing to point at.
     if (lo <= 0.0005 && hi >= this.durationSec - 0.0005) return null;
 
-    let fromX = this.wholeTakeSecToX(lo);
-    let toX = this.wholeTakeSecToX(hi);
+    let fromX = this.secToEvenX(lo);
+    let toX = this.secToEvenX(hi);
     // Widen a hairline bracket around its own middle so both edges survive as edges. It lies
     // by a pixel or two about the range; a bracket you cannot see lies about all of it.
     const min = WaveformStrip.VIEWPORT_MIN_DRAW_PX;
@@ -815,9 +731,7 @@ export class WaveformStrip {
    * Where the probe window is on screen, or null when there is not one — or when it is off the
    * side of an engraved axis, which is a normal thing for a moment the sheet has scrolled past.
    */
-  private selectionBox(
-    m: SheetMap | null = this.map()
-  ): { fromX: number; toX: number; fromSec: number; toSec: number } | null {
+  private selectionBox(): { fromX: number; toX: number; fromSec: number; toSec: number } | null {
     const from = this.selectionFromSec;
     const to = this.selectionToSec;
     if (from === null || to === null || !(this.durationSec > 0)) return null;
@@ -827,8 +741,8 @@ export class WaveformStrip {
 
     const lo = Math.max(0, Math.min(from, this.durationSec));
     const hi = Math.max(lo, Math.min(to, this.durationSec));
-    let fromX = this.secToX(lo, m);
-    let toX = this.secToX(hi, m);
+    let fromX = this.secToX(lo);
+    let toX = this.secToX(hi);
     if (!Number.isFinite(fromX) || !Number.isFinite(toX)) return null;
     if (toX - fromX < WaveformStrip.SELECTION_MIN_DRAW_PX) {
       toX = fromX + WaveformStrip.SELECTION_MIN_DRAW_PX;
@@ -846,27 +760,12 @@ export class WaveformStrip {
    * column — so the hit test and what is actually drawn can never disagree. A handle you
    * cannot see but can still grab is worse than no handle.
    */
-  private overMarker(x: number, m: SheetMap | null): boolean {
-    const mx = this.secToX(this.barOneSec, m);
+  private overMarker(x: number): boolean {
+    const mx = this.secToX(this.barOneSec);
     if (!Number.isFinite(mx) || mx < this.gutterPx || mx > (this.canvas.clientWidth || 0)) {
       return false;
     }
     return Math.abs(x - mx) <= WaveformStrip.MARKER_HIT_PX;
-  }
-
-  /** True when x is close enough to the bracket to count as grabbing it. */
-  private overBracket(x: number): boolean {
-    const b = this.bracket();
-    if (!b) return false;
-    const slop = WaveformStrip.VIEWPORT_EDGE_HIT_PX;
-    let left = b.fromX - slop;
-    let right = b.toX + slop;
-    const short = WaveformStrip.VIEWPORT_MIN_GRAB_PX - (right - left);
-    if (short > 0) {
-      left -= short / 2;
-      right += short / 2;
-    }
-    return x >= left && x <= right;
   }
 
   // =========================================================================
@@ -915,24 +814,17 @@ export class WaveformStrip {
   private onPointerDown = (e: PointerEvent): void => {
     const rect = this.canvas.getBoundingClientRect();
     const x = e.clientX - rect.left;
-    const y = e.clientY - rect.top;
     this.pressX = x;
     this.pressMoved = false;
     this.pressing = false;
 
     if (x < this.gutterPx) return;
 
-    const m = this.map();
-    if (y < this.overviewHeight(!!m)) {
-      this.onRibbonPress(x, e.pointerId);
-      return;
-    }
-
-    const sec = this.secAt(x, m);
+    const sec = this.secAt(x);
     if (!Number.isFinite(sec)) return;
     this.pressSec = sec;
 
-    if (this.overMarker(x, m)) {
+    if (this.overMarker(x)) {
       this.dragging = 'marker';
       this.capture(e.pointerId);
       return;
@@ -945,7 +837,7 @@ export class WaveformStrip {
       // inside the old one — is what makes a selection feel un-adjustable. The anchor becomes
       // the OPPOSITE edge, so dragging the left handle past the right one simply turns the span
       // around rather than collapsing it.
-      const box = this.selectionBox(m);
+      const box = this.selectionBox();
       if (box) {
         const slop = WaveformStrip.SELECT_EDGE_HIT_PX;
         if (Math.abs(x - box.fromX) <= slop) {
@@ -978,56 +870,6 @@ export class WaveformStrip {
     this.setProbeWindow(sec, false);
     this.capture(e.pointerId);
   };
-
-  /**
-   * A press in the whole-take ribbon. Standard scrollbar behaviour, which is the one thing
-   * everybody already knows: land on the bracket and it slides from where you took hold; land
-   * anywhere else and it jumps to you first, then slides.
-   */
-  private onRibbonPress(x: number, pointerId: number): void {
-    if (!this.opts.onViewportScrub || !(this.durationSec > 0)) return;
-    const b = this.bracket();
-    const sec = this.evenSecAt(x);
-    this.grabSpanSec = b ? b.toSec - b.fromSec : 0;
-    this.dragging = 'viewport';
-    this.capture(pointerId);
-    this.canvas.style.cursor = 'grabbing';
-
-    if (b && this.overBracket(x)) {
-      this.grabOffsetSec = sec - (b.fromSec + this.grabSpanSec / 2);
-      return;
-    }
-    this.grabOffsetSec = 0;
-    this.moveBracketTo(this.centreFor(sec, this.grabSpanSec), true);
-  }
-
-  /**
-   * Where the middle of the visible span should sit if the player asked to look at `sec`, kept
-   * inside the recording so the last bar can still be reached but the bracket never hangs off
-   * either end. The span is passed in rather than read from state so that a drag keeps the
-   * width it was grabbed at.
-   */
-  private centreFor(sec: number, spanSec: number): number {
-    const half = Math.min(Math.max(0, spanSec), this.durationSec) / 2;
-    return Math.max(half, Math.min(this.durationSec - half, sec));
-  }
-
-  /**
-   * Report a new centre, and move the bracket locally on the way.
-   *
-   * The local move is not redundant: a navigator that lags its own drag by a frame feels
-   * broken. The integrator's reply through `setViewportRange` is still authoritative and
-   * overwrites this a moment later.
-   */
-  private moveBracketTo(centreSec: number, commit: boolean): void {
-    const span = Math.min(this.grabSpanSec, this.durationSec);
-    if (span > 0) {
-      this.viewportFromSec = Math.max(0, centreSec - span / 2);
-      this.viewportToSec = Math.min(this.durationSec, this.viewportFromSec + span);
-    }
-    this.opts.onViewportScrub?.(centreSec, commit);
-    this.draw();
-  }
 
   /**
    * Point at a moment: a window of exactly `PROBE_WINDOW_SEC` centred on it.
@@ -1101,7 +943,6 @@ export class WaveformStrip {
   private onPointerMove = (e: PointerEvent): void => {
     const rect = this.canvas.getBoundingClientRect();
     const x = e.clientX - rect.left;
-    const y = e.clientY - rect.top;
 
     if (this.dragging === 'marker') {
       if (!this.pressMoved && Math.abs(x - this.pressX) < WaveformStrip.DRAG_SLOP_PX) return;
@@ -1125,33 +966,19 @@ export class WaveformStrip {
       return;
     }
 
-    if (this.dragging === 'viewport') {
-      if (!this.pressMoved && Math.abs(x - this.pressX) < WaveformStrip.DRAG_SLOP_PX) return;
-      this.pressMoved = true;
-      this.moveBracketTo(
-        this.centreFor(this.wholeTakeXToSec(x) - this.grabOffsetSec, this.grabSpanSec),
-        false
-      );
-      return;
-    }
-
     // A body press has nothing to track: the window was decided on press and a click does not
     // grow. All that is left is the cursor.
-    if (!this.pressing) this.canvas.style.cursor = this.cursorFor(x, y);
+    if (!this.pressing) this.canvas.style.cursor = this.cursorFor(x);
   };
 
   /** What the pointer should look like here. One place, so the hit tests cannot lie. */
-  private cursorFor(x: number, y: number): string {
+  private cursorFor(x: number): string {
     if (x < this.gutterPx) return 'default';
-    const m = this.map();
-    if (y < this.overviewHeight(!!m)) {
-      return this.opts.onViewportScrub ? 'grab' : 'default';
-    }
-    if (this.overMarker(x, m)) return 'ew-resize';
+    if (this.overMarker(x)) return 'ew-resize';
     if (this.selectArmed) {
       // The two edges of an existing span are handles, and the cursor is the only thing that
       // says so — the band has no drawn grips (see `drawSelection`).
-      const box = this.selectionBox(m);
+      const box = this.selectionBox();
       if (
         box &&
         (Math.abs(x - box.fromX) <= WaveformStrip.SELECT_EDGE_HIT_PX ||
@@ -1216,23 +1043,108 @@ export class WaveformStrip {
       return;
     }
 
-    if (was === 'viewport') {
-      this.canvas.style.cursor = 'grab';
-      if (!this.pressMoved) return; // the press already committed where it landed
-      const rect = this.canvas.getBoundingClientRect();
-      const x = e.clientX - rect.left;
-      this.moveBracketTo(
-        this.centreFor(this.wholeTakeXToSec(x) - this.grabOffsetSec, this.grabSpanSec),
-        true
-      );
-      return;
-    }
-
     // A body click. The seek and the highlight happened on press; this is the commit that
     // actually asks the question, and it is deliberately the second the press landed on and
     // not wherever the finger drifted to before it came up.
     this.setProbeWindow(this.pressSec, true);
   };
+
+  /**
+   * THE STRIP'S HALF OF THE TRACKPAD CONTRACT, which it did not have at all until now.
+   *
+   *   pinch                  -> the shared TIME window, about the pointer
+   *   two fingers sideways   -> pan the shared TIME window
+   *   Option (alt) + pinch   -> the PITCH axis, which only the roll has — swallowed here
+   *
+   * THE BUG THIS FIXES IS NOT A MISSING FEATURE (finding 12). This strip had no wheel or gesture
+   * listener at all, so a ctrl-wheel over it — which is what macOS calls a trackpad pinch — fell
+   * through to the browser. Inside a plugin window the browser's page zoom resizes the entire UI
+   * and there is no way back from it. `preventDefault` is therefore unconditional on that path,
+   * exactly as it is over the sheet and the roll, whether or not the gesture is used.
+   */
+  private onWheel = (e: WheelEvent): void => {
+    if (e.ctrlKey || e.metaKey) {
+      e.preventDefault();
+      if (e.altKey) return;
+      const d = e.deltaY || e.deltaX;
+      if (d === 0) return;
+      if (!this.claimPinch('wheel')) return;
+      this.emitZoom(wheelZoomFactor(d, e.deltaMode), e.clientX);
+      return;
+    }
+    const lines = e.deltaMode === 1 ? 16 : e.deltaMode === 2 ? 400 : 1;
+    const dx = e.deltaX * lines;
+    if (dx === 0) return;
+    e.preventDefault();
+    const span = this.windowSpanSec();
+    if (!(span > 0)) return;
+    this.opts.onViewportCommand?.({
+      kind: 'pan',
+      deltaSec: (dx / Math.max(1, this.plotWidth)) * span,
+      source: 'waveform'
+    });
+  };
+
+  private gestureScale = 1;
+  private pinch = new PinchAccumulator();
+  private lastPinchMs = 0;
+  private pinchRoad: 'wheel' | 'gesture' | null = null;
+
+  /** ONE PINCH, ONE ZOOM. The same rule the roll and the sheet apply, on the third surface. */
+  private claimPinch(road: 'wheel' | 'gesture'): boolean {
+    const t = performance.now();
+    if (this.pinchRoad !== null && this.pinchRoad !== road && t - this.lastPinchMs < PINCH_DEDUPE_MS) {
+      return false;
+    }
+    this.pinchRoad = road;
+    this.lastPinchMs = t;
+    return true;
+  }
+
+  private onGestureStart = (e: Event): void => {
+    e.preventDefault();
+    this.gestureScale = (e as Event & { scale?: number }).scale ?? 1;
+    this.pinch.reset();
+  };
+
+  private onGestureChange = (e: Event): void => {
+    const g = e as Event & { scale?: number; altKey?: boolean; clientX?: number };
+    const scale = g.scale;
+    if (!scale || !Number.isFinite(scale) || scale <= 0) return;
+    e.preventDefault();
+    const ratio = scale / (this.gestureScale > 0 ? this.gestureScale : 1);
+    this.gestureScale = scale;
+    if (g.altKey) return;
+    const stepped = this.pinch.take(ratio);
+    if (stepped === null) return;
+    if (!this.claimPinch('gesture')) return;
+    const rect = this.canvas.getBoundingClientRect();
+    this.emitZoom(
+      Math.min(WHEEL_ZOOM_MAX_STEP, Math.max(1 / WHEEL_ZOOM_MAX_STEP, stepped)),
+      g.clientX ?? rect.left + rect.width / 2
+    );
+  };
+
+  /** A client x, as a fraction of the plot, as a zoom command. The gutter anchors at the edge. */
+  private emitZoom(factor: number, clientX: number): void {
+    const rect = this.canvas.getBoundingClientRect();
+    const frac = Math.max(
+      0,
+      Math.min(1, (clientX - rect.left - this.gutterPx) / Math.max(1, this.plotWidth))
+    );
+    this.opts.onViewportCommand?.({ kind: 'zoom', factor, anchorFrac: frac, source: 'waveform' });
+  }
+
+  /** What the body is showing, in seconds. The whole take when nothing has been pushed in. */
+  private windowSpanSec(): number {
+    const a = this.anchors;
+    if (a && a.length >= 2) {
+      const from = this.anchorSec(0);
+      const to = this.anchorSec(1);
+      if (from !== null && to !== null && to > from) return to - from;
+    }
+    return this.durationSec;
+  }
 
   /**
    * Escape clears the selection.
@@ -1270,10 +1182,11 @@ export class WaveformStrip {
     ctx.fillStyle = this.colors.bg;
     ctx.fillRect(0, 0, w, h);
 
-    // ONE map for the whole frame. See `map()` on why this is not asked for per column.
-    const m = this.map();
     const g = this.gutterPx;
-    const top = this.overviewHeight(!!m);
+    // The ribbon lane is gone, so the body starts at the top of the canvas. Kept as a named zero
+    // rather than deleted from every call below: it is the y the body begins at, and a future
+    // band along the top would be one assignment rather than a sweep through the painting code.
+    const top = 0;
 
     // The roll's label column, reserved and left empty, with the same edge the roll draws.
     if (g > 0) {
@@ -1285,17 +1198,15 @@ export class WaveformStrip {
 
     const hasAudio = !!this.peaksMin && !!this.peaksMax && this.durationSec > 0;
 
-    if (top > 0) this.drawOverview(ctx, w, g, top, hasAudio);
     // UNDER the envelope, so the audio stays the picture and the tint reads as something the
     // app has written on the background rather than as a change to the recording.
-    this.drawAttention(ctx, w, h, g, top, m);
-    if (hasAudio) this.drawWave(ctx, w, h, g, top, m);
-    this.drawOnsets(ctx, w, h, g, top, m);
-
-    // The bracket goes on the BODY only when the body is the whole take. When it is engraved,
-    // the body IS the bracket and the ribbon above carries the real one.
-    if (!m) this.drawBodyBracket(ctx, w, h, g, top);
-    this.drawSelection(ctx, h, top, m);
+    this.drawAttention(ctx, w, h, g, top);
+    if (hasAudio) this.drawWave(ctx, w, h, g, top);
+    this.drawOnsets(ctx, w, h, g, top);
+    // NO BRACKET IS DRAWN, and it is not an omission. The body is the window, so the bracket's
+    // two edges are the plot's two edges and there is nothing outside them to dim — see
+    // `bracket()`. `drawBodyBracket` was the wash between two rulers that no longer disagree.
+    this.drawSelection(ctx, h, top);
 
     // Bar-1 marker: a line the whole height of the body so you can see what it lands on, with
     // its flag at the top of the body. NaN means the sheet has scrolled past it — draw nothing
@@ -1303,7 +1214,7 @@ export class WaveformStrip {
     // the screen.
     // `>= g` and not `>= 0`: on an engraved axis bar 1 can land inside the roll's label column,
     // and canvas does not clip, so the flag would be painted over the labels.
-    const mx = this.secToX(this.barOneSec, m);
+    const mx = this.secToX(this.barOneSec);
     if (Number.isFinite(mx) && mx >= g && mx <= w) {
       ctx.fillStyle = this.colors.marker;
       ctx.fillRect(mx - 0.5, top, 1.5, h - top);
@@ -1323,7 +1234,7 @@ export class WaveformStrip {
     }
 
     // Playhead.
-    const px = this.secToX(this.positionSec, m);
+    const px = this.secToX(this.positionSec);
     if (Number.isFinite(px) && px >= g && px <= w) {
       ctx.fillStyle = this.colors.playhead;
       ctx.fillRect(px - 0.5, top, 1, h - top);
@@ -1401,8 +1312,7 @@ export class WaveformStrip {
     w: number,
     h: number,
     g: number,
-    top: number,
-    m: SheetMap | null
+    top: number
   ): void {
     const bodyH = Math.max(2, h - top);
     const mid = top + bodyH / 2;
@@ -1411,8 +1321,8 @@ export class WaveformStrip {
     const trimEnd = this.trim ? this.trim.endSec : this.durationSec;
 
     for (let x = g; x < w; x++) {
-      const a = this.xToSec(x, m);
-      const b = this.xToSec(x + 1, m);
+      const a = this.xToSec(x);
+      const b = this.xToSec(x + 1);
       if (!Number.isFinite(a) || !Number.isFinite(b)) continue;
       const p = this.columnPeak(Math.min(a, b), Math.max(a, b));
       if (!p) continue;
@@ -1440,8 +1350,7 @@ export class WaveformStrip {
     w: number,
     h: number,
     g: number,
-    top: number,
-    m: SheetMap | null
+    top: number
   ): void {
     if (this.attention.length === 0) return;
     const height = h - top;
@@ -1449,8 +1358,8 @@ export class WaveformStrip {
 
     ctx.save();
     for (const region of this.attention) {
-      const fromX = this.secToX(region.fromSec, m);
-      const toX = this.secToX(region.toSec, m);
+      const fromX = this.secToX(region.fromSec);
+      const toX = this.secToX(region.toSec);
       if (!Number.isFinite(fromX) || !Number.isFinite(toX)) continue;
       const left = Math.max(g, Math.min(fromX, toX));
       const right = Math.min(w, Math.max(fromX, toX));
@@ -1475,8 +1384,7 @@ export class WaveformStrip {
     w: number,
     h: number,
     g: number,
-    top: number,
-    m: SheetMap | null
+    top: number
   ): void {
     const result = this.onsetResult;
     if (!result || h - top < 8) return;
@@ -1491,7 +1399,7 @@ export class WaveformStrip {
       ctx.globalAlpha = 0.22;
       ctx.fillStyle = this.colors.onset;
       for (let x = g; x < w; x++) {
-        const sec = this.xToSec(x + 0.5, m);
+        const sec = this.xToSec(x + 0.5);
         if (!Number.isFinite(sec) || sec < 0) continue;
         const at = sec / hop;
         const i = Math.floor(at);
@@ -1506,115 +1414,21 @@ export class WaveformStrip {
 
     ctx.fillStyle = this.colors.onset;
     for (const onset of result.onsets) {
-      const x = this.secToX(onset.timeSec, m);
+      const x = this.secToX(onset.timeSec);
       if (!Number.isFinite(x) || x < g || x > w) continue;
       const tickH = 4 + Math.round(Math.max(0, Math.min(1, onset.strength)) * 6);
       ctx.fillRect(x - 0.75, h - tickH, 1.5, tickH);
     }
   }
 
-  /**
-   * THE WHOLE-TAKE RIBBON — only drawn while the body is engraved, because only then has the
-   * body stopped being the whole take.
-   *
-   * Everything in it is on the plain even ruler: a miniature envelope, the trimmed head and
-   * tail knocked back, the visible span as a bright bracket with the rest dimmed, and one-pixel
-   * ticks for bar 1 and the playhead so you can see where you are in the recording even when
-   * the sheet has scrolled miles from either.
-   */
-  private drawOverview(
-    ctx: CanvasRenderingContext2D,
-    w: number,
-    g: number,
-    ribbonH: number,
-    hasAudio: boolean
-  ): void {
-    ctx.fillStyle = this.colors.gutter;
-    ctx.fillRect(g, 0, w - g, ribbonH);
-
-    if (hasAudio) {
-      const mid = ribbonH / 2;
-      const scale = (ribbonH / 2) * 0.82;
-      const trimStart = this.trim ? this.trim.startOffsetSec : 0;
-      const trimEnd = this.trim ? this.trim.endSec : this.durationSec;
-      for (let x = g; x < w; x++) {
-        const a = this.wholeTakeXToSec(x);
-        const p = this.columnPeak(a, this.wholeTakeXToSec(x + 1));
-        if (!p) continue;
-        ctx.fillStyle = a < trimStart || a > trimEnd ? this.colors.waveDim : this.colors.wave;
-        ctx.fillRect(x, mid + p.lo * scale, 1, Math.max(1, (p.hi - p.lo) * scale));
-      }
-    }
-
-    const b = this.bracket();
-    if (b) {
-      // Knock the take back OUTSIDE the visible span, so the bright part of the ribbon and the
-      // engraved body below it are obviously the same music.
-      ctx.save();
-      ctx.globalAlpha = WaveformStrip.OUTSIDE_DIM;
-      ctx.fillStyle = this.colors.gutter;
-      if (b.fromX > g) ctx.fillRect(g, 0, b.fromX - g, ribbonH);
-      if (b.toX < w) ctx.fillRect(b.toX, 0, w - b.toX, ribbonH);
-      ctx.restore();
-
-      ctx.fillStyle = this.colors.viewport;
-      ctx.fillRect(b.fromX, 0, 1, ribbonH);
-      ctx.fillRect(b.toX - 1, 0, 1, ribbonH);
-      ctx.fillRect(b.fromX, 0, Math.max(2, b.toX - b.fromX), 1);
-      ctx.fillRect(b.fromX, ribbonH - 1, Math.max(2, b.toX - b.fromX), 1);
-    }
-
-    if (this.durationSec > 0) {
-      ctx.fillStyle = this.colors.marker;
-      ctx.fillRect(this.wholeTakeSecToX(this.barOneSec) - 0.5, 0, 1, ribbonH);
-      ctx.fillStyle = this.colors.playhead;
-      ctx.fillRect(this.wholeTakeSecToX(this.positionSec) - 0.5, 0, 1, ribbonH);
-    }
-
-    ctx.fillStyle = this.colors.line;
-    ctx.fillRect(g, ribbonH - 1, w - g, 1);
-  }
-
-  /**
-   * The bracket on the BODY, for the unlinked ruler only: what you are reading below stays
-   * bright and the rest of the take is knocked back.
-   *
-   * The wash is drawn over the finished waveform instead of by re-colouring the columns,
-   * because the columns already carry three meanings (trimmed, played, unplayed) and a fourth
-   * set of colours multiplied against those three is a palette nobody can read. A translucent
-   * coat of the strip's own background dims all three the same way.
-   *
-   * There is no rail to grab any more: with the drag-out-a-range gesture gone there is no
-   * fourth gesture to disambiguate, and a click outside the bracket already means "bring the
-   * sheet here" — one action instead of a small target to find and slide.
-   *
-   * AND NO EDGES EITHER (G16a). Two full-height 1px rails were drawn at `fromX` and `toX`, and
-   * they are the "vertical lines in the waveform" the player reported: they look exactly like
-   * bar lines or like cut seams, they move whenever the sheet is scrolled, and they mean
-   * something no other line in this strip means. The dim wash on either side says the same
-   * thing without competing with the envelope — it is the one mark here that cannot be
-   * mistaken for a musical one, because it is an absence of brightness rather than a stroke.
-   * The overview ribbon keeps its own bracket, rails and all: up there the rails ARE the
-   * control you grab.
-   */
-  private drawBodyBracket(
-    ctx: CanvasRenderingContext2D,
-    w: number,
-    h: number,
-    g: number,
-    top: number
-  ): void {
-    const b = this.bracket();
-    if (!b) return;
-
-    ctx.save();
-    ctx.globalAlpha = WaveformStrip.OUTSIDE_DIM;
-    ctx.fillStyle = this.colors.bg;
-    if (b.fromX > g) ctx.fillRect(g, top, b.fromX - g, h - top);
-    if (b.toX < w) ctx.fillRect(b.toX, top, w - b.toX, h - top);
-    ctx.restore();
-  }
-
+  // `drawOverview()` STOOD HERE — the whole-take ribbon, ~90 lines of miniature envelope,
+  // trimmed-head wash, bracket, rails and playhead tick. `overviewHeight()` gated it and returned
+  // 0 forever, so not one pixel of it was ever painted. Deleted rather than preserved (finding 14):
+  // it is the second half of a design whose first half — `map()` — was already gone, and keeping
+  // unreachable alternatives alive is what made the two rulers in this file possible.
+  // `drawBodyBracket()` STOOD HERE: the dim wash over the parts of the body outside the visible
+  // window. With the body drawn on the window's own axis there are no parts outside it, so this
+  // could only ever paint two zero-width rectangles. See `bracket()`.
   /**
    * The probe window.
    *
@@ -1626,13 +1440,8 @@ export class WaveformStrip {
    * No grips any more. They said "take hold of this edge", and there is nothing to take hold
    * of: the window is a fixed width and a new one is one click away.
    */
-  private drawSelection(
-    ctx: CanvasRenderingContext2D,
-    h: number,
-    top: number,
-    m: SheetMap | null
-  ): void {
-    const s = this.selectionBox(m);
+  private drawSelection(ctx: CanvasRenderingContext2D, h: number, top: number): void {
+    const s = this.selectionBox();
     if (!s) return;
     const height = h - top;
     if (height <= 0) return;
@@ -1714,11 +1523,12 @@ export class WaveformStrip {
     attentionRegions: number;
     attentionApplied: number;
   } {
-    const m = this.map();
     const b = this.bracket();
-    const s = this.selectionBox(m);
+    const s = this.selectionBox();
     const round = (v: number | null) => (v === null ? null : Number(v.toFixed(3)));
-    const ribbon = this.overviewHeight(!!m);
+    // Zero, permanently: the ribbon lane is deleted. Kept in the shape because callers use it as
+    // "where does the body start" when aiming a synthetic pointer.
+    const ribbon = 0;
     return {
       width: this.canvas.clientWidth,
       height: this.canvas.clientHeight,
@@ -1726,7 +1536,7 @@ export class WaveformStrip {
       plotWidth: Math.round(this.plotWidth),
       handleLanePx: ribbon,
       overviewPx: ribbon,
-      sheetLinked: !!m,
+      sheetLinked: false,
       windowFromSec: this.anchors ? Number((this.anchorSec(0) ?? 0).toFixed(4)) : null,
       windowToSec: this.anchors ? Number((this.anchorSec(1) ?? 0).toFixed(4)) : null,
       midPlotSec: Number(this.evenXToSec(this.gutterPx + this.plotWidth / 2).toFixed(4)),
@@ -1744,7 +1554,7 @@ export class WaveformStrip {
       hasViewport: !!b,
       viewportFromX: b ? Number(b.fromX.toFixed(2)) : null,
       viewportToX: b ? Number(b.toX.toFixed(2)) : null,
-      viewportDraggable: !!this.opts.onViewportScrub,
+      viewportDraggable: false,
       selectionFromSec: round(this.selectionFromSec),
       selectionToSec: round(this.selectionToSec),
       selectionFromX: s ? Number(s.fromX.toFixed(2)) : null,
@@ -1761,6 +1571,9 @@ export class WaveformStrip {
     this.canvas.removeEventListener('pointermove', this.onPointerMove);
     this.canvas.removeEventListener('pointerup', this.onPointerUp);
     this.canvas.removeEventListener('pointercancel', this.onPointerUp);
+    this.canvas.removeEventListener('wheel', this.onWheel);
+    this.canvas.removeEventListener('gesturestart', this.onGestureStart);
+    this.canvas.removeEventListener('gesturechange', this.onGestureChange);
     window.removeEventListener('resize', this.draw);
     window.removeEventListener('keydown', this.onKeyDown);
   }

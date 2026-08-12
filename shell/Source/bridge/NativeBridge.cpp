@@ -1,5 +1,6 @@
 #include "NativeBridge.h"
 #include "ScoreImageImporter.h"
+#include "TransferLimits.h"
 #include "PluginProcessor.h"
 #include "EngineLock.h"
 #include "ModelCatalog.h"
@@ -15,7 +16,11 @@
 
 namespace
 {
-    constexpr juce::int64 maxPickedByteFileBytes = 64 * 1024 * 1024;
+    /* The ONE import ceiling, shared with the page - see TransferLimits.h.
+       It used to be 64 MB here while the base64 door next to it allowed six
+       times that and webcore's document writer allowed eight, so which limit a
+       user met depended on which door they came through. */
+    constexpr juce::int64 maxPickedByteFileBytes = riffsheet::limits::containerBytes;
 
     /* ==== which audio files this user has actually chosen ====================
 
@@ -172,7 +177,8 @@ namespace
 
         if (size > maxPickedByteFileBytes)
         {
-            error = file.getFileName() + " is larger than the 64 MB import limit.";
+            error = file.getFileName() + " is larger than the "
+                  + riffsheet::limits::describe (maxPickedByteFileBytes) + " import limit.";
             return false;
         }
 
@@ -675,6 +681,9 @@ juce::var NativeBridge::describeEntry (const std::shared_ptr<const PcmStore::Ent
     // at the four call sites, so a fifth call site cannot forget.
     proc.noteHandedOut (entry);
 
+    // One stat, not a read. See the sourceUrl fields below.
+    const auto original = proc.getPcmStore().getOriginalInfo (entry->token);
+
     return makeObject ({
         { "ok", true },
         { "token",            entry->token },
@@ -688,7 +697,19 @@ juce::var NativeBridge::describeEntry (const std::shared_ptr<const PcmStore::Ent
         { "channels",         1 },
         // Fetch this for the samples themselves - see BRIDGE.md. Passing a few
         // million floats through the JSON bridge would be far slower.
-        { "pcmUrl",           "/native/pcm/" + entry->token + ".f32" } });
+        { "pcmUrl",           "/native/pcm/" + entry->token + ".f32" },
+
+        // ...and the ORIGINAL recording, described but NOT sent. `pcmUrl` above
+        // is the analysis buffer: mono, resampled to 44.1 kHz, which is the
+        // right thing to transcribe and the wrong thing to put in a document
+        // claiming to hold the imported file verbatim. These four fields let the
+        // page decide - it fetches `sourceUrl` only when it is actually saving,
+        // so a take nobody saves costs nothing here.
+        { "sourceUrl",        original.available ? "/native/source/" + entry->token + ".bin"
+                                                 : juce::String() },
+        { "sourceBytes",      original.bytes },
+        { "sourceName",       original.name },
+        { "sourceIsOriginal", original.available && original.verbatim } });
 }
 
 void NativeBridge::decodeAndReply (const juce::File& file, double targetRate, Completion completion,
@@ -3439,9 +3460,11 @@ void NativeBridge::stageBytesAndReply (const juce::String& displayName, const ju
                     {
                         // The hard ceiling, checked before a single byte is
                         // allocated. Base64 spends 4 characters per 3 bytes, so
-                        // this also bounds the decoded audio at ~412 MB and the
-                        // transient peak (payload + decode buffer) at ~1 GB.
-                        constexpr size_t maxPayloadBytes = 550ull * 1024ull * 1024ull;
+                        // this bounds the decoded payload at exactly the same
+                        // 128 MB the picker and the page's own document reader
+                        // enforce - see TransferLimits.h for why the three
+                        // numbers are one number now.
+                        constexpr size_t maxPayloadBytes = (size_t) riffsheet::limits::base64PayloadBytes;
                         const size_t payloadBytes = (size_t) base64.getNumBytesAsUTF8();
 
                         if (payloadBytes > maxPayloadBytes)
@@ -3481,6 +3504,21 @@ void NativeBridge::stageBytesAndReply (const juce::String& displayName, const ju
                         if (decoded.getData() == nullptr)
                         {
                             reply (makeError ("not enough memory to decode that file"));
+                            return;
+                        }
+
+                        // Belt and braces on the character count above: what the
+                        // rest of the shell is allowed to touch is DECODED bytes,
+                        // so that is what the ceiling is stated in. The two can
+                        // only disagree if base64PayloadBytes is edited without
+                        // its comment being read.
+                        if ((juce::int64) decoded.getDataSize() > riffsheet::limits::containerBytes)
+                        {
+                            reply (makeError ("that file is too large to import: "
+                                              + riffsheet::limits::describe ((juce::int64) decoded.getDataSize())
+                                              + ", and the limit is "
+                                              + riffsheet::limits::describe (riffsheet::limits::containerBytes)
+                                              + ". Use Open to load it from disk instead."));
                             return;
                         }
 

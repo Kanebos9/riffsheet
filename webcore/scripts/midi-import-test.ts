@@ -320,4 +320,20 @@ rejects(badLength.buffer as ArrayBuffer, 'too large');
 
 rejects(file([], 0), 'ticks-per-quarter');
 
+// ---- the published note cap is a real limit, and it REJECTS rather than truncating ----------
+// One million was never openable: the pipeline spread whole note arrays into `Math.min/max`,
+// which throws `RangeError` in JavaScriptCore before computing anything, so the documented limit
+// could not be reached. The spreads are gone and the number is now an honest one. What must
+// never happen is a silent truncation — half a score is a wrong score.
+const justOverCap: number[] = [];
+for (let i = 0; i < 200_001; i++) justOverCap.push(0, 0x90, 60, 100, 1, 0x80, 60, 0);
+justOverCap.push(0, 0xff, 0x2f, 0);
+rejects(file(justOverCap), 'more than 200,000 notes');
+
+// ...and a file just under it still opens, with every note present.
+const underCap: number[] = [];
+for (let i = 0; i < 1_000; i++) underCap.push(0, 0x90, 60, 100, 1, 0x80, 60, 0);
+underCap.push(0, 0xff, 0x2f, 0);
+assert(parseMidi(file(underCap)).notes.length === 1_000, 'a file under the cap must import in full');
+
 globalThis.console?.log('midi-import-test: passed');

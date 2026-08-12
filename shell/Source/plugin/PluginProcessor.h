@@ -325,7 +325,11 @@ private:
     const float* playbackSamples = nullptr;           // into loadedEntry->mono, published under the lock
     int64_t playbackNumSamples = 0;
     double playbackBufferRate = 0.0;
-    int64_t playbackPositionSamples = 0;              // in the entry's own rate
+    // FRACTIONAL, and it matters. This was an int64 count of whole source
+    // frames, re-truncated at the end of every processBlock, which lost up to
+    // one frame per block and made playback run measurably slow in a way that
+    // changed with the host's buffer size. See PlaybackResampler.h.
+    double playbackPositionFrames = 0.0;              // in the entry's own rate
     std::atomic<bool> playing { false };
     std::atomic<float> playbackGain { 1.0f };
     // Audio-thread only (relaxed): see PlaybackDiagnostics.

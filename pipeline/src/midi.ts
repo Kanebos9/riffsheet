@@ -95,7 +95,10 @@ function conductorEvents(ir: RiffsheetIR, quantized: boolean): MidiEvent[] {
   const events: MidiEvent[] = [];
   const scale = MIDI_PPQ / ir.divisions;
   for (const change of ir.tempo.changes ?? []) {
+    // Tick zero belongs to the header meta run, which now writes the SOURCE tempo rather than
+    // `displayBpm`; emitting it again here would be a duplicate set-tempo at delta 0.
     if (change.tick <= 0) continue;
+    if (!Number.isFinite(change.bpm) || change.bpm <= 0) continue;
     const us = Math.max(1, Math.min(0xffffff, Math.round(60_000_000 / change.bpm)));
     events.push({
       tick: Math.round(change.tick * scale),
@@ -130,9 +133,70 @@ function headerMeta(ir: RiffsheetIR, bpm: number): number[] {
   return out;
 }
 
+/**
+ * UTF-8, not `charCodeAt(0) & 0x7f`.
+ *
+ * The old encoding took the low seven bits of each UTF-16 code unit, so "Bas Gitar" survived and
+ * "Bağlama" did not: ğ (U+011F) became 0x1f, a control character, and every non-Latin name came
+ * out as mojibake or worse. SMF meta text has no declared charset, but UTF-8 is what every DAW
+ * and every notation program written this century reads and writes, and it is the only encoding
+ * that can carry the names Riffsheet's users actually type. Surrogate pairs are joined before
+ * encoding (`[...name]` iterates code POINTS), so astral characters emit four bytes rather than
+ * two broken three-byte sequences.
+ */
+export function utf8Bytes(text: string): number[] {
+  const out: number[] = [];
+  for (const character of text) {
+    const code = character.codePointAt(0)!;
+    if (code < 0x80) {
+      out.push(code);
+    } else if (code < 0x800) {
+      out.push(0xc0 | (code >> 6), 0x80 | (code & 0x3f));
+    } else if (code < 0x10000) {
+      out.push(0xe0 | (code >> 12), 0x80 | ((code >> 6) & 0x3f), 0x80 | (code & 0x3f));
+    } else {
+      out.push(
+        0xf0 | (code >> 18),
+        0x80 | ((code >> 12) & 0x3f),
+        0x80 | ((code >> 6) & 0x3f),
+        0x80 | (code & 0x3f)
+      );
+    }
+  }
+  return out;
+}
+
 function trackNameMeta(name: string): number[] {
-  const bytes = [...name].map((c) => c.charCodeAt(0) & 0x7f);
+  const bytes = utf8Bytes(name);
   return [...vlq(0), 0xff, 0x03, ...vlq(bytes.length), ...bytes];
+}
+
+/**
+ * The tempo the file OPENS at.
+ *
+ * A symbolic source that declares its tempo at tick zero is stating the score's opening tempo,
+ * and it is the authority on it; `displayBpm` is a derived summary of the whole take and was
+ * being written in its place, so a file whose first bar said 90 exported as its own average.
+ * The conductor track then skipped the tick-zero change (`change.tick <= 0`) because the header
+ * was assumed to have covered it, which left no statement of the opening tempo anywhere.
+ *
+ * The AS-PLAYED variant is a different file with a different contract: its ticks are seconds
+ * scaled by `displayBpm`, so its header must declare `displayBpm` or the wall clock is wrong.
+ */
+function headerBpm(ir: RiffsheetIR, quantized: boolean): number {
+  const fallback = ir.tempo.displayBpm > 0 ? ir.tempo.displayBpm : 120;
+  if (!quantized) return fallback;
+  const atZero = (ir.tempo.changes ?? [])
+    .filter((change) => change.tick <= 0 && Number.isFinite(change.bpm) && change.bpm > 0)
+    .sort((a, b) => a.tick - b.tick)
+    .pop();
+  return atZero ? atZero.bpm : fallback;
+}
+
+/** MIDI data bytes are seven-bit. A caller-supplied program above 127 would become a status byte. */
+function programByte(value: number | undefined, fallback: number): number {
+  const candidate = Number.isFinite(value) ? Math.round(value as number) : fallback;
+  return Math.max(0, Math.min(127, candidate));
 }
 
 /** Delta-encode a sorted event list onto a track and close it with end-of-track. */
@@ -160,7 +224,7 @@ export function toMidi(
   sourceNotes: InputNote[],
   quantized: boolean
 ): Uint8Array {
-  const bpm = ir.tempo.displayBpm > 0 ? ir.tempo.displayBpm : 120;
+  const bpm = headerBpm(ir, quantized);
   const events = [
     ...performanceEvents(ir, skel, sourceNotes, quantized, 0),
     ...conductorEvents(ir, quantized)
@@ -170,7 +234,7 @@ export function toMidi(
     ...headerMeta(ir, bpm),
     ...trackNameMeta(`Riffsheet ${quantized ? 'quantized' : 'as played'}`),
     // program change
-    ...vlq(0), 0xc0, defaultProgram(ir)
+    ...vlq(0), 0xc0, programByte(undefined, defaultProgram(ir))
   ];
   writeEvents(track, events);
 
@@ -215,7 +279,7 @@ export function toMultiPartMidi(parts: MidiPart[], quantized: boolean): Uint8Arr
   if (parts.length === 1) return toMidi(parts[0].ir, parts[0].skeleton, parts[0].notes, quantized);
 
   const lead = parts[0].ir;
-  const bpm = lead.tempo.displayBpm > 0 ? lead.tempo.displayBpm : 120;
+  const bpm = headerBpm(lead, quantized);
 
   const conductor: number[] = [
     ...headerMeta(lead, bpm),
@@ -229,7 +293,7 @@ export function toMultiPartMidi(parts: MidiPart[], quantized: boolean): Uint8Arr
     const channel = index >= 9 ? index + 1 : index;
     const track: number[] = [
       ...trackNameMeta(part.name ?? `Part ${index + 1}`),
-      ...vlq(0), 0xc0 | channel, part.program ?? defaultProgram(part.ir)
+      ...vlq(0), 0xc0 | channel, programByte(part.program, defaultProgram(part.ir))
     ];
     writeEvents(track, performanceEvents(part.ir, part.skeleton, part.notes, quantized, channel));
     trackChunks.push(chunk(track));

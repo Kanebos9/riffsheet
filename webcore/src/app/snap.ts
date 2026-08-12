@@ -96,26 +96,81 @@ export function snapPerformanceToGrid(
   notes: ReadonlyArray<InputNote>,
   unitSec: number,
   originSec: number,
-  tempoBpm: number
+  tempoBpm: number,
+  takeDurationSec?: number
 ): InputNote[] {
   if (!(unitSec > 0) || notes.length === 0) return notes as InputNote[];
+  // THE END OF THE TAPE. See `lastLineBefore`: without it a note played inside the last cell of a
+  // take rounds forward onto a line at or past `audioDurationSec`, and `applyGuards` then drops
+  // it outright — the snap makes a note the player can hear disappear from the sheet.
+  const lastLine = lastLineBefore(takeDurationSec, originSec, unitSec);
   const out = notes.map((n) => {
     const rawStart = originSec + Math.round((n.startSec - originSec) / unitSec) * unitSec;
     // Clamped before the length is measured off it, so a note snapped backwards past the top of
-    // the file cannot end up describing a negative span.
-    const startSec = Math.max(0, rawStart);
+    // the file cannot end up describing a negative span, and never past the last line that is
+    // still inside the recording.
+    const startSec = Math.max(0, lastLine === null ? rawStart : Math.min(rawStart, lastLine));
     // The END, on the same lines as the start, then floored at one whole cell. `Math.round` on
     // the end rather than `Math.ceil`: a note played a hair past a line belongs on that line,
     // exactly as its start does, and ceiling would lengthen every note in the take by up to a
     // cell for no reason anybody could see.
     const rawEnd = originSec + Math.round((n.endSec - originSec) / unitSec) * unitSec;
-    const endSec = Math.max(startSec + unitSec, rawEnd);
+    const endSec = boundEnd(Math.max(startSec + unitSec, rawEnd), startSec, takeDurationSec);
     return restate(n, startSec, endSec, tempoBpm);
   });
   // Snapping can legitimately reorder two notes that were played a hair apart and landed on
   // different lines. Everything downstream reads a performance in time order.
   out.sort((a, b) => a.startSec - b.startSec || a.midi - b.midi);
   return out;
+}
+
+/**
+ * ===================== THE END OF THE TAPE, AND WHY IT IS A PARAMETER =====================
+ *
+ * Both snap modes round attacks FORWARD as readily as backward, and neither of them used to know
+ * how long the recording was. A note played 30 ms before the end of a take therefore rounded onto
+ * the next line — which is at or past `audioDurationSec` — and `pipeline/src/guards.ts` drops any
+ * note whose onset is at or past the end of the audio. The last note of a take vanished from the
+ * sheet, silently, because a VIEW LAYER moved it off the end of the recording it is a view of.
+ *
+ * The randomized property test hid this for as long as it existed by handing the builder a take
+ * one second longer than the notes it generated (`scripts/roll-snap-test.ts`), which is exactly
+ * the padding a real recording does not have.
+ *
+ * `takeDurationSec` is optional because both functions are also used to answer "where would this
+ * land", with no take behind the question; when it is absent nothing below does anything.
+ */
+const END_EPS = 1e-6;
+
+/**
+ * The last lattice line strictly inside the take, or null when there is no take to be inside of.
+ *
+ * STRICTLY inside: `guards.ts` drops `startSec >= audioDurationSec`, so a line exactly at the end
+ * is not a place a note may stand.
+ */
+function lastLineBefore(
+  takeDurationSec: number | undefined,
+  originSec: number,
+  stepSec: number
+): number | null {
+  if (!(takeDurationSec !== undefined && takeDurationSec > 0 && stepSec > 0)) return null;
+  const steps = Math.floor((takeDurationSec - END_EPS - originSec) / stepSec);
+  const line = originSec + steps * stepSec;
+  // A take shorter than the distance from the origin to its first line has no usable line at all;
+  // the caller's own `Math.max(0, …)` is then the only bound, which is the pre-existing behaviour.
+  return line >= 0 ? line : null;
+}
+
+/**
+ * A release, never past the end of the recording.
+ *
+ * The pipeline clamps `endSec` to the take's length anyway, so this changes nothing on the page —
+ * but the ROLL sizes its own time axis from the longest note it is given (`setPerformanceNotes`),
+ * so a snapped end hanging past the end of the tape stretches the picture of the performance.
+ */
+function boundEnd(endSec: number, startSec: number, takeDurationSec: number | undefined): number {
+  if (!(takeDurationSec !== undefined && takeDurationSec > startSec)) return endSec;
+  return Math.min(endSec, takeDurationSec);
 }
 
 /**
@@ -262,7 +317,8 @@ export function snapPerformanceToBeat(
   beatSec: number,
   subdivisionSec: number,
   originSec: number,
-  tempoBpm: number
+  tempoBpm: number,
+  takeDurationSec?: number
 ): InputNote[] {
   if (!(beatSec > 0) || notes.length === 0) return notes as InputNote[];
   const quarterSec = 60 / (tempoBpm || 100);
@@ -301,9 +357,15 @@ export function snapPerformanceToBeat(
   // onto the same second at the head of the take, which is what a bare `Math.max(0, …)` on the
   // position would do to a note played before written second 0.
   const minIdx = Math.ceil((0 - originSec) / beatSec - EPS);
+  // …and the LAST beat that is still inside the recording. Rounding to the nearest beat is what
+  // pushed the final attack of a take onto the downbeat after the end of the tape, where the
+  // pipeline's guards drop it. `null` means no take length was supplied, and then this is exactly
+  // the function it always was. See §"the end of the tape".
+  const lastLine = lastLineBefore(takeDurationSec, originSec, beatSec);
+  const maxIdx = lastLine === null ? Number.POSITIVE_INFINITY : Math.round((lastLine - originSec) / beatSec);
   const buckets = new Map<number, number[]>();
   for (let e = 0; e < events.length; e++) {
-    const idx = Math.max(minIdx, Math.round((events[e].rawStart - originSec) / beatSec));
+    const idx = Math.min(maxIdx, Math.max(minIdx, Math.round((events[e].rawStart - originSec) / beatSec)));
     const at = buckets.get(idx);
     if (at) at.push(e);
     else buckets.set(idx, [e]);
@@ -318,26 +380,70 @@ export function snapPerformanceToBeat(
   let spilled: number[] = [];
   // EVERY beat from the first occupied one onward, not only the occupied ones: a spill goes to
   // the beat AFTER the one that was full, and an empty beat is exactly where it should land.
+  // The furthest position handed out so far, so a group the end of the take pushes backwards can
+  // never be placed on top of the beat before it.
+  let lastPos = Number.NEGATIVE_INFINITY;
   for (let idx = indices[0]; idx <= lastIdx || spilled.length; idx++) {
     const own = buckets.get(idx);
     const here = spilled.length ? [...spilled, ...(own ?? [])] : (own ?? []);
     spilled = [];
     if (!here.length) continue;
     const beatStart = originSec + idx * beatSec;
+    // HOW MUCH OF THIS BEAT IS ACTUALLY THERE. A whole beat for every one of them except the
+    // last, which is as long as whatever is left of the recording — a take does not politely end
+    // on a downbeat, and a cascade laid out across a beat that is half past the end of the tape
+    // puts its own notes where the pipeline's guards will drop them.
+    const room =
+      lastLine === null ? beatSec : Math.min(beatSec, Math.max(0, (takeDurationSec as number) - END_EPS - beatStart));
     // HALVE THE RULER'S CELL UNTIL THEY FIT. The last note of the group has to stand strictly
-    // inside this beat, so `(count - 1) * step` must be shorter than the beat itself.
+    // inside the room this beat has, so `(count - 1) * step` must be shorter than that.
     let step = cell;
-    while ((here.length - 1) * step >= beatSec - EPS && step / 2 >= finest - EPS) step /= 2;
+    while ((here.length - 1) * step >= room - EPS && step / 2 >= finest - EPS) step /= 2;
+    // THE LAST BEAT HAS NOWHERE TO HAND ANYTHING TO — the beat after it is off the end of the
+    // recording — so it takes the one step the halving loop cannot reach. Halving is right while
+    // spilling is available: it keeps the cascade on lines that are multiples of the ruler's own
+    // cell. It is also why a TRIPLET ruler gets stuck at exactly the wrong place, since half a
+    // triplet cell is finer than `finestStepSec` allows and the loop therefore refuses to move at
+    // all; four events then "fit" a beat that holds three, and the fourth is placed at the top of
+    // the next beat, which is the end of the tape. Dropping straight to the finest step the sheet
+    // can read back is the answer the whole cascade is already built on.
+    const atLastBeat = idx >= maxIdx;
+    if (atLastBeat && (here.length - 1) * step >= room - EPS && finest < step) step = finest;
     // How many the beat can hold at the step it settled on. Anything past that is handed to the
     // next beat, which will subdivide for them in turn.
-    const capacity = Math.max(1, Math.floor((beatSec - EPS) / step) + 1);
-    if (here.length > capacity) spilled = here.slice(capacity);
-    for (let j = 0; j < Math.min(here.length, capacity); j++) {
-      const pos = beatStart + j * step;
+    const capacity = Math.max(1, Math.floor((room - EPS) / step) + 1);
+    if (here.length > capacity && !atLastBeat) spilled = here.slice(capacity);
+    const placed = atLastBeat ? here.length : Math.min(here.length, capacity);
+    // WHERE THE GROUP STARTS. The beat itself, unless its last member would then stand past the
+    // end of the take — in which case the whole group keeps its step and its order and moves back
+    // just far enough to fit. Notes arriving a little early is a picture of the performance being
+    // slightly wrong at the very end of the tape; notes past the end are a picture with a hole in
+    // it, because `applyGuards` deletes them.
+    //
+    // BACK BY WHOLE STEPS, which is the difference between this working and looking like it does.
+    // Moving back by the exact overshoot puts the group on a lattice of its own — positions like
+    // 15.999999 — and the pipeline then QUANTIZES that onto the nearest line it can print, which
+    // is 16.0, which is past the last bar, which drops the note this whole clause exists to save.
+    // A whole step back keeps every position on the beat's own lattice, where the quantizer finds
+    // them already where it would have put them.
+    let base = beatStart;
+    const overshoot = (placed - 1) * step - room;
+    if (overshoot > 0) base = Math.max(0, beatStart - Math.ceil(overshoot / step) * step);
+    // Separation wins over the end bound in the one case where they disagree — a take that ends a
+    // few milliseconds into a crowded beat. Two events on one position are ONE event to the
+    // engraver, so that trade loses a note as surely as running off the end does, and this way
+    // the overshoot is at most one step.
+    if (base <= lastPos) base = lastPos + step;
+    for (let j = 0; j < placed; j++) {
+      const pos = base + j * step;
+      lastPos = pos;
       for (const m of events[here[j]].members) {
         positions[m] = pos;
         stepOf[m] = step;
-        anchorOf[m] = beatStart;
+        // The lattice the note is ACTUALLY standing on, which is `beatStart` in every case but
+        // the pulled-back last beat. Releases round onto it (step 3), and rounding them onto a
+        // lattice the attacks are not on would put an end between two starts.
+        anchorOf[m] = base;
       }
     }
   }
@@ -365,7 +471,7 @@ export function snapPerformanceToBeat(
       if (n.endSec <= next.n.startSec + EPS) endSec = Math.max(startSec + step, Math.min(endSec, positions[next.i]));
       break;
     }
-    out[k] = restate(n, startSec, endSec, tempoBpm);
+    out[k] = restate(n, startSec, boundEnd(endSec, startSec, takeDurationSec), tempoBpm);
   }
 
   // Everything downstream reads a performance in time order, and `order` is already in it;

@@ -292,6 +292,12 @@ export const TIPS = {
    */
   rollSnap:
     'Off shows your recording exactly as played. Grid lines every note up with the columns; Beat moves each note to its nearest beat, which gives the cleanest sheet. Your recording is kept underneath either way, so Off puts every note straight back.',
+  /**
+   * The Part box on the notation bar. It is both a chooser and a menu, so the tip has to say
+   * that out loud — the first half of the list picks the part, the second half acts on it.
+   */
+  parts:
+    'Which part of the sheet you are working on, and what to do with it. The one marked ● is your own take — it is always on the page and always the one you hear. Add part reads a MusicXML file and prints it as an extra staff, up to four; imported parts are engraved but never played.',
   clef:
     'Auto picks one stable clef for the whole part. Treble and Bass force one; Grand stacks both, for music that really needs the range.',
   fingering:

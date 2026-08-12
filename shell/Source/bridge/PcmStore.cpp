@@ -1,5 +1,6 @@
 #include "PcmStore.h"
 #include "SystemProbe.h"
+#include "TransferLimits.h"
 #include <limits>
 
 namespace
@@ -262,6 +263,13 @@ std::shared_ptr<const PcmStore::Entry> PcmStore::decodeAndStore (const juce::Fil
 
         auto entry = std::make_shared<Entry>();
         entry->sourceFile       = file;
+        // The bytes we decoded ARE the original, whatever happens to
+        // `sourceFile` later. See the field's comment: persistTake() is allowed
+        // to repoint sourceFile at a take of our own making, and before this
+        // line existed that was the moment the user's real recording became
+        // unreachable to everything above.
+        entry->originalFile     = file;
+        entry->originalIsVerbatim = true;
         entry->sourceFileIsTemp = takeOwnershipOfFile;
         if (takeOwnershipOfFile)
             entry->ownedTempFiles.addIfNotAlreadyThere (file);
@@ -466,6 +474,62 @@ juce::File PcmStore::persistTake (const juce::String& token,
     // UUID rather than getNonexistentChildFile(): multiple plugin instances can
     // stop captures simultaneously, and check-then-create is a race.
     const auto id = juce::Uuid().toString();
+
+    // ---- the verbatim route -------------------------------------------------
+    //
+    // COPY THE USER'S FILE, DO NOT RE-ENCODE IT. This branch is what makes the
+    // takes folder hold the recording rather than a photocopy of the analysis
+    // buffer. The old code always wrote `entry->mono` - already folded to mono
+    // and already resampled to 44.1 kHz - as a 24-bit WAV and pointed
+    // `sourceFile` at it, so a 24-bit/96 kHz stereo file was downgraded on the
+    // way in and everything downstream (the document's embedded audio, the
+    // "Original" side of the A/B fader, Export ▸ Audio) inherited the downgrade.
+    //
+    // The bytes are copied rather than merely referenced for the reason
+    // forceOwnedCopy exists at all: what gets persisted into a DAW project must
+    // be a path this application owns, so restoring a shared project never needs
+    // authority over an arbitrary place on the filesystem.
+    //
+    // Size-bounded, and the fallback below is not a failure: a source bigger
+    // than the shared import ceiling keeps the old re-encode, keeps
+    // `originalFile` pointing at wherever the user's own file is, and lets
+    // getOriginalInfo() report `available = false` so the page says what it did
+    // instead of claiming a fidelity it has not got.
+    if (forceOwnedCopy
+        && entry->originalIsVerbatim
+        && entry->originalFile.existsAsFile()
+        && ! entry->originalFile.isAChildOf (directory)
+        && entry->originalFile.getSize() > 0
+        && entry->originalFile.getSize() <= riffsheet::limits::containerBytes)
+    {
+        auto extension = entry->originalFile.getFileExtension();
+
+        if (extension.isEmpty())
+            extension = ".wav";
+
+        const auto verbatimTarget = directory.getChildFile (stem + "-" + stamp + "-" + id + extension);
+        const auto verbatimPartial = directory.getChildFile ("." + verbatimTarget.getFileName() + ".partial");
+
+        verbatimPartial.deleteFile();
+
+        // Copy-then-rename, the same crash rule the WAV writer below follows: a
+        // half-copied file must never appear at the path a project records.
+        if (entry->originalFile.copyFileTo (verbatimPartial)
+            && verbatimPartial.moveFileTo (verbatimTarget))
+        {
+            const juce::ScopedLock sl (lock);
+            entry->sourceFile = verbatimTarget;
+            entry->sourceFileIsTemp = false;
+            entry->originalFile = verbatimTarget;
+            entry->originalIsVerbatim = true;
+            return verbatimTarget;
+        }
+
+        verbatimPartial.deleteFile();
+        // Fall through and re-encode. A copy that failed on disk space is still
+        // better answered with a smaller derived take than with an error.
+    }
+
     const auto target = directory.getChildFile (stem + "-" + stamp + "-" + id + ".wav");
     const auto partial = directory.getChildFile ("." + target.getFileName() + ".partial");
 
@@ -519,6 +583,18 @@ juce::File PcmStore::persistTake (const juce::String& token,
         // Durable takes may be referenced by saved projects months later. They
         // are user data, never scratch owned by the in-memory entry.
         entry->sourceFileIsTemp = false;
+
+        // A take that never had a file of its own - a track capture - has no
+        // earlier original to preserve, so THIS is its original: the recorded
+        // buffer written out whole, at 24 bits, neither downmixed nor resampled
+        // on the way. An entry that DOES have an original keeps pointing at it;
+        // this WAV is derived from the analysis buffer and must never be
+        // presented as the recording.
+        if (entry->originalFile == juce::File())
+        {
+            entry->originalFile = target;
+            entry->originalIsVerbatim = (bitsPerSample >= 24);
+        }
     }
 
     return target;
@@ -570,6 +646,75 @@ std::optional<std::vector<std::byte>> PcmStore::getRawFloatBytes (const juce::St
     {
         // Resource providers cannot surface an exception safely into a DAW.
         // A missing response lets the page report a normal PCM fetch failure.
+        return std::nullopt;
+    }
+}
+
+PcmStore::OriginalInfo PcmStore::getOriginalInfo (const juce::String& token) const
+{
+    OriginalInfo info;
+    const auto entry = get (token);
+
+    if (entry == nullptr)
+        return info;
+
+    const auto file = entry->originalFile;
+
+    if (! file.existsAsFile())
+        return info;
+
+    info.bytes = file.getSize();
+    info.name = file.getFileName();
+    info.verbatim = entry->originalIsVerbatim;
+    // Reported even when it is too big to hand over, because "there is a
+    // 400 MB original and it will not fit in a document" is a different
+    // sentence from "there is no original", and the page has to be able to say
+    // the right one.
+    info.available = info.bytes > 0 && info.bytes <= riffsheet::limits::containerBytes;
+    return info;
+}
+
+std::optional<std::vector<std::byte>> PcmStore::getOriginalFileBytes (const juce::String& token) const
+{
+    // get() hands back a strong reference, which is what stops ~Entry deleting a
+    // staged temp file out from under the read below.
+    const auto entry = get (token);
+
+    if (entry == nullptr)
+        return std::nullopt;
+
+    const auto file = entry->originalFile;
+
+    if (! file.existsAsFile())
+        return std::nullopt;
+
+    const auto size = file.getSize();
+
+    // The shared ceiling, checked before anything is allocated. Same constant
+    // the picker and the page's document reader use - see TransferLimits.h.
+    if (size <= 0 || size > riffsheet::limits::containerBytes)
+        return std::nullopt;
+
+    juce::FileInputStream stream (file);
+
+    if (! stream.openedOk())
+        return std::nullopt;
+
+    try
+    {
+        std::vector<std::byte> bytes ((size_t) size);
+        const auto read = stream.read (bytes.data(), (int) size);
+
+        // A file that changed underneath us is not the original any more.
+        if (read != (int) size)
+            return std::nullopt;
+
+        return bytes;
+    }
+    catch (const std::bad_alloc&)
+    {
+        // Resource providers cannot surface an exception safely into a DAW; a
+        // missing response is a fetch failure the page already handles.
         return std::nullopt;
     }
 }

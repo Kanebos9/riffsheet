@@ -63,6 +63,8 @@ interface BuildSettings {
   anchorFret?: number;                // anchor for 'aroundFret'; default 5
   clefMode?: 'auto' | 'treble' | 'bass' | 'grand';
   keyFifths?: number;                 // authoritative override, clamped to -7..7
+  tab?: 'two-staves' | 'omit';        // whether the TAB staff is printed; default 'two-staves'
+  displayPitchOffset?: number;        // written-staff offset from sounding pitch, in semitones
 }
 ```
 
@@ -74,6 +76,17 @@ first for a future editing surface to set by hand, the other two pinned at 0.
 
 `instrument` here describes engraving only. The transcription-engine constraint is a separate
 webcore setting. Enabling TAB or changing tuning must never alter staff pitches or clefs.
+
+**`tab` is visibility, `instrument` is identity, and they are not the same field.** `tab: 'omit'`
+hides the tablature staff and changes nothing else — same instrument, same tuning, same string
+count, same written octave — and it reaches `RiffsheetIR.tab`, which both emitters honour.
+Hiding the tab by rebuilding as `instrument: 'staff'` with an empty tuning is the bug this field
+replaces: the conventional 8va engraving of a fretted part rides on the instrument, so that
+route dropped the whole notation an octave onto ledger lines.
+
+`displayPitchOffset` states the part's written octave directly (+12 = the staff reads an octave
+above what sounds). A symbolic import that declares its own written octave still wins: its notes
+carry the offset and the source is the authority on how it was engraved.
 
 ## Canonical IR invariants
 
@@ -269,6 +282,38 @@ The emit-level primitives are exported too, for a caller that already holds buil
 quantized)`, plus `defaultPartName(ir)` and `alignPartBars(irs)`. `buildScore` gained an optional
 third argument, `BuildOptions`, whose only field is `sharedNotes` — the score's notes, from which
 the clock and the key are derived. It is the one hook multi-part needed inside the pipeline.
+
+## Tick/seconds conversion
+
+`buildTickSecondsMap(ir)` (also accepts `{ divisions, tempo }` on its own) returns the
+authoritative bidirectional map between the IR's tick domain and wall-clock seconds. It is built
+from `ir.tempo` and nothing else.
+
+```ts
+const map = buildTickSecondsMap(ir);
+map.tickToSec(48);        // seconds from tick 0
+map.secToTick(1.5);       // the exact inverse
+map.bpmAt(48);            // quarter-notes per minute in force at that tick
+map.segments;             // piecewise-constant tempo segments, ascending, starting at tick 0
+```
+
+- **Segments** are half-open `[tick, nextTick)`, so a tempo change lands on exactly one of them.
+  Inside a segment the relation is affine (`sec = seg.sec + (tick - seg.tick) * seg.secPerTick`),
+  which makes `secToTick(tickToSec(t)) === t` to floating point for every tick, and the same the
+  other way round for every second in the score.
+- **`ir.tempo.changes` is authoritative when present, INCLUDING a change at tick zero** — the one
+  entry every other reader of this data historically skipped. When there is no change at or
+  before tick 0, `tempo.displayBpm` seeds the opening segment; when there is no usable tempo at
+  all, 120 BPM does.
+- **Monotonic by construction**: a non-finite or non-positive BPM is dropped rather than clamped,
+  so seconds increase strictly with ticks and the inverse is a function. A repeated tempo is
+  folded into the previous segment, so `segments` is a minimal description.
+- Outside the score the map extrapolates linearly from the first/last segment rather than
+  clamping, so a playhead slightly past the end still has a defined position.
+
+`bpm` is always QUARTER notes per minute — the universal convention — regardless of the meter's
+beat unit. In this wave the map is FOUNDATION: nothing in webcore is rewired to it yet, and the
+consumers that still multiply by one `displayBpm` are listed in the wave plan as the next step.
 
 ## Safety limits
 

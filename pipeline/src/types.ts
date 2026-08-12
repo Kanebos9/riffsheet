@@ -161,6 +161,27 @@ export interface BuildSettings {
    * future editing surface; the pipeline never sets it.
    */
   showStaccato?: boolean;
+  /**
+   * WHETHER THE TABLATURE STAFF IS PRINTED. 'two-staves' (the default) adds one under the
+   * notation when the part has strings; 'omit' hides it and changes nothing else.
+   *
+   * IT IS NOT AN INSTRUMENT. Hiding the tab used to be expressed by asking for `instrument:
+   * 'staff'` with an empty tuning, which is a different PART, not a different view of the same
+   * one: a bass so described lost its string count, and with it the conventional written octave
+   * every bass chart is engraved in, so switching Tab off dropped the notation an octave onto
+   * ledger lines (X1). Visibility and identity are now separate words.
+   */
+  tab?: 'two-staves' | 'omit';
+  /**
+   * WRITTEN-STAFF OFFSET FROM SOUNDING PITCH, in whole octaves, for the whole part.
+   *
+   * +12 is the conventional guitar/bass engraving: the staff reads an octave above what sounds.
+   * Absent, the part follows the instrument's own convention (fretted parts are written 8va,
+   * everything else at pitch), which is what every build did before this existed. A symbolic
+   * import that declared its own written octave still wins — its notes carry the offset and the
+   * source is the authority on how it was engraved.
+   */
+  displayPitchOffset?: number;
   /** Score/part titles for the emitters. */
   title?: string;
   composer?: string;

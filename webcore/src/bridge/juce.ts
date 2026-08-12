@@ -36,6 +36,7 @@ import type {
   GuideStep,
   HostInfo,
   NativeBridge,
+  OriginalAudio,
   PickedInputFile,
   PlaybackState,
   TranscribeOptions,
@@ -159,6 +160,17 @@ interface ShellAudioRef {
   numFrames: number;
   durationSec: number;
   pcmUrl: string;
+  /**
+   * The ORIGINAL recording, described but not sent. `pcmUrl` is the analysis buffer — mono,
+   * 44.1 kHz — and these say where the user's own bytes are, how many there are and whether
+   * they really are the user's (see `getOriginalAudio`). Empty `sourceUrl` means there is no
+   * original to fetch: a capture that was never rendered, a file that moved, or one over the
+   * shared import ceiling. Absent entirely on shells older than this.
+   */
+  sourceUrl?: string;
+  sourceBytes?: number;
+  sourceName?: string;
+  sourceIsOriginal?: boolean;
 }
 
 interface ShellPickedBytes {
@@ -522,8 +534,42 @@ interface ShellTranscribeProgress {
 // Helpers
 // ---------------------------------------------------------------------------
 
+/**
+ * Where the original recording behind each live token is, remembered as takes go past.
+ *
+ * The shell reports it on every AudioRef, but `AudioFileRef` deliberately does not carry it:
+ * that object gets persisted into documents and DAW projects, and a `/native/source/...` URL
+ * names a decode inside one process and is a lie anywhere else — the same reason `token` and
+ * `pcmUrl` are stripped on the way out. So it is kept here instead, and `getOriginalAudio()`
+ * looks it up by token.
+ *
+ * Bounded: a session can open take after take, and this is the kind of map that quietly
+ * becomes a leak. Only the most recent handful can still be of interest — the page asks about
+ * the take it is saving — so the oldest entries are dropped.
+ */
+const originalSources = new Map<string, { url: string; name: string; verbatim: boolean }>();
+const maxRememberedSources = 8;
+
+function rememberOriginalSource(ref: ShellAudioRef): void {
+  if (!ref.token || !ref.sourceUrl) return;
+  // Re-inserting moves it to the end of the Map's iteration order, which is what makes the
+  // eviction below least-recently-seen rather than arbitrary.
+  originalSources.delete(ref.token);
+  originalSources.set(ref.token, {
+    url: ref.sourceUrl,
+    name: ref.sourceName || ref.name,
+    verbatim: ref.sourceIsOriginal === true
+  });
+  while (originalSources.size > maxRememberedSources) {
+    const oldest = originalSources.keys().next();
+    if (oldest.done) break;
+    originalSources.delete(oldest.value);
+  }
+}
+
 /** AudioRef -> webcore's AudioFileRef, carrying the token/pcmUrl instead of bytes. */
 function toAudioFileRef(ref: ShellAudioRef): AudioFileRef {
+  rememberOriginalSource(ref);
   return {
     path: ref.path,
     name: ref.name,
@@ -804,6 +850,32 @@ export function createJuceBridge(): NativeBridge {
         }
       : undefined,
 
+    /**
+     * The recording as the user handed it over, fetched from the shell ON DEMAND.
+     *
+     * Not a native function call: the bytes come down the same binary route the samples do
+     * (`/native/source/<token>.bin`), because the JSON bridge would have to base64 them and
+     * that is the 3.5x amplification the document format was redesigned to remove.
+     *
+     * Null whenever the shell has nothing to give — no entry for this token, a shell older
+     * than the route, a file that moved, or one over the import ceiling — and the caller
+     * falls back to embedding the decoded samples. A failed fetch is that same "no", not an
+     * error to show anybody: the document still gets written, just with re-encoded audio.
+     */
+    async getOriginalAudio(token: string): Promise<OriginalAudio | null> {
+      const source = token ? originalSources.get(token) : undefined;
+      if (!source) return null;
+      try {
+        const response = await fetch(source.url);
+        if (!response.ok) return null;
+        const bytes = new Uint8Array(await response.arrayBuffer());
+        if (bytes.byteLength === 0) return null;
+        return { bytes, name: source.name, verbatim: source.verbatim };
+      } catch {
+        return null;
+      }
+    },
+
     authorizeRecentPaths: hasNativeFunction('authorizeRecentPaths')
       ? async (paths: string[]): Promise<number> => {
           const result = await call<{ authorized: number }>('authorizeRecentPaths', paths);
@@ -961,6 +1033,9 @@ export function createJuceBridge(): NativeBridge {
       const ref = await call<ShellAudioRef & { captureContext?: ShellCaptureContext }>('captureStop');
       if (!ref) throw new Error('Capture was cancelled.');
       const pcm = new Float32Array(await (await fetch(ref.pcmUrl)).arrayBuffer());
+      // A finished capture has a durable 24-bit WAV behind it, and that WAV is the recording
+      // — so a saved document can carry it instead of a 16-bit re-encode of these samples.
+      rememberOriginalSource(ref);
       return {
         pcm,
         sampleRate: ref.sampleRate,

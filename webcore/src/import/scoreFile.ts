@@ -9,15 +9,26 @@
 
 import * as alphaTab from '@coderline/alphatab';
 import type { InputNote } from '../pipeline';
+// Straight from `bridge/types`, not the barrel — that one pulls in the JUCE and mock bridges and
+// this module is loaded headless by the test scripts.
+import { RIFFSHEET_LIMITS } from '../bridge/types';
 
 const TICKS_PER_QUARTER = 960; // alphaTab MidiUtils.QuarterTime (not publicly exported)
-const MAX_SCORE_FILE_BYTES = 128 * 1024 * 1024;
+/** "a MusicXML/MIDI/GP import" is named in `RIFFSHEET_LIMITS`' own doc — so it is read, not copied. */
+const MAX_SCORE_FILE_BYTES = RIFFSHEET_LIMITS.containerBytes;
 const MAX_SCORE_TRACKS = 1024;
 const MAX_SCORE_BARS = 100_000;
-const MAX_SCORE_NOTES = 1_000_000;
+/** The same realistic ceiling the MIDI reader enforces, and for the same reasons — see there. */
+const MAX_SCORE_NOTES = 200_000;
 const MAX_ARCHIVE_ENTRIES = 100_000;
-const MAX_ARCHIVE_ENTRY_BYTES = 128 * 1024 * 1024;
-const MAX_ARCHIVE_EXPANDED_BYTES = 256 * 1024 * 1024;
+const MAX_ARCHIVE_ENTRY_BYTES = RIFFSHEET_LIMITS.containerBytes;
+/**
+ * The SUM of a `.mxl`'s declared entry sizes — deliberately two containers' worth rather than one.
+ *
+ * An `.mxl` is a score plus its own media, so the honest budget is more than a single entry may
+ * be; it is written against the shared constant so that raising the family raises this with it.
+ */
+const MAX_ARCHIVE_EXPANDED_BYTES = 2 * RIFFSHEET_LIMITS.containerBytes;
 
 export const SCORE_FILE_EXTENSIONS = ['gp', 'gp3', 'gp4', 'gp5', 'gpx', 'gp7', 'musicxml', 'mxl', 'xml'] as const;
 
@@ -216,10 +227,18 @@ export function scoreToInputNotes(
               const startTick = beat.absolutePlaybackStart;
               const endTick = endNote.beat.absolutePlaybackStart + endNote.beat.playbackDuration;
               const midi = soundingMidi(note, track);
-              // Different MusicXML voices/staves can still expose the same sounding note twice.
-              // A single editable Riffsheet part cannot express two identical unison noteheads,
-              // so keeping both only manufactures polyphony and doubles playback level.
-              const flattenedKey = `${track.index}:${startTick}:${endTick}:${midi}`;
+              // THE SAME EVENT WRITTEN TWICE, versus TWO EVENTS THAT HAPPEN TO AGREE.
+              //
+              // MusicXML commonly represents one performance as a notation staff and a TAB staff
+              // holding the same events; that is one note written twice and the second copy is
+              // duplication, which is what this key removes. A unison in two different VOICES is
+              // not that. It is two independent lines that meet, and dropping one used to delete
+              // the fact that the source was polyphonic at all — the importer knew and nothing
+              // downstream could find out. The voice therefore stays in the key: the identity
+              // survives the import, and the single engraved voice is a decision the pipeline
+              // makes in one place and COUNTS (`BuildDiagnostics.flattenedVoices`), rather than
+              // an erasure spread across two modules.
+              const flattenedKey = `${track.index}:${voice.index}:${startTick}:${endTick}:${midi}`;
               if (seenFlattenedNotes.has(flattenedKey)) continue;
               seenFlattenedNotes.add(flattenedKey);
               minStartTick = Math.min(minStartTick, startTick);
@@ -228,7 +247,9 @@ export function scoreToInputNotes(
               const id = `${idPrefix}-t${track.index}-s${staff.index}-b${bar.index}-v${voice.index}-e${beat.index}-n${note.index}`;
 
               if (notes.length >= MAX_SCORE_NOTES) {
-                throw new Error('That score contains too many notes to open safely.');
+                throw new Error(
+                  `That score has more than ${MAX_SCORE_NOTES.toLocaleString('en-US')} notes, which is more than Riffsheet can open safely.`
+                );
               }
 
               notes.push({
@@ -305,10 +326,11 @@ export function scoreToInputNotes(
   }));
   const finalMasterBar = score.masterBars[score.masterBars.length - 1];
   const durationTicks = finalMasterBar ? finalMasterBar.start + finalMasterBar.calculateDuration() : 0;
-  const durationSec = Math.max(
-    tickToSec(durationTicks) + secondsShift,
-    notes.length ? Math.max(...notes.map((note) => note.endSec)) : 0
-  );
+  // Iterative, never `Math.max(...notes)`: a 200k-note spread throws `RangeError` in
+  // JavaScriptCore — the engine the plugin's WebView runs — before it computes anything.
+  let lastNoteEndSec = 0;
+  for (const note of notes) if (note.endSec > lastNoteEndSec) lastNoteEndSec = note.endSec;
+  const durationSec = Math.max(tickToSec(durationTicks) + secondsShift, lastNoteEndSec);
 
   const selectedTrackIndexes = selected ?? new Set(score.tracks.map((track) => track.index));
   const primaryStaff = tracks

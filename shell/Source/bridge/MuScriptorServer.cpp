@@ -691,9 +691,13 @@ bool MuScriptorServer::spawn (juce::String& error)
                              "--host", c.host,
                              "--port", juce::String (c.port) };
 
-    child = std::make_unique<juce::ChildProcess>();
+    // The supervisor attaches both pipes AND starts reading them on its own
+    // thread before this function returns. See ChildProcessSupervisor.h: the
+    // server prints enough during a model load to fill the kernel's pipe buffer,
+    // and a full pipe stops the writer dead rather than dropping the line.
+    child = std::make_unique<ChildProcessSupervisor> ("muscriptor-io");
 
-    if (! child->start (args, juce::ChildProcess::wantStdOut | juce::ChildProcess::wantStdErr))
+    if (! child->start (args))
     {
         child.reset();
         error = "could not launch: " + args.joinIntoString (" ");
@@ -782,18 +786,56 @@ bool MuScriptorServer::ensureRunning (std::function<void (const juce::String&)> 
         }
     }
 
+    /*  THE THING THAT WAS MISSING FROM EVERY EXIT BELOW.
+
+        A startup that is cancelled or times out used to just `return false`,
+        leaving a Python process loading a ~1 GB model with no handle anywhere
+        that would ever end it. It was not even reachable: `stopAfterJob()`
+        refuses unless the server got to `ready`, and this one by definition did
+        not, so the only thing that eventually cleaned it up was the user
+        noticing their machine was slow.
+
+        Nothing here is optional or conditional. If we spawned it and it is not
+        going to become our server, it dies now. */
+    const auto abandonChild = [this]
+    {
+        // `startLock` is already held by this function, and juce::CriticalSection
+        // is recursive, so there is deliberately no second lock here.
+        if (child != nullptr)
+        {
+            // Whatever it managed to say before we gave up on it. Harvested
+            // BEFORE the kill, because the kill takes the supervisor - and its
+            // captured output - with it.
+            startupLog = child->getOutput();
+            child->kill();          // kills, joins the drain thread, reaps
+            child.reset();
+        }
+    };
+
     const auto deadline = juce::Time::getMillisecondCounter() + (juce::uint32) c.startupTimeoutMs;
     int ticks = 0;
 
     while (juce::Time::getMillisecondCounter() < deadline)
     {
         if (shouldCancel && shouldCancel())
+        {
+            abandonChild();
+            // `starting` was the other half of the leak: a state nothing cleans
+            // up after. Say what actually happened.
+            state = State::stopped;
+            report ("Cancelled starting the transcription server");
             return false;
+        }
 
         if (child != nullptr && ! child->isRunning())
         {
-            startupLog += child->readAllProcessOutput();
+            // The drain thread has been reading this all along, so the output is
+            // already here - there is no read-it-now, which is what the old
+            // `readAllProcessOutput()` was, and which could only ever return the
+            // last pipe-buffer's worth of a child that died with a full pipe.
+            startupLog = child->getOutput();
             setError ("the server exited while starting. Output:\n" + startupLog.substring (0, 2000));
+            child.reset();          // reaped by the supervisor's destructor
             state = State::failed;
             report ("The transcription server quit unexpectedly");
             return false;
@@ -829,8 +871,16 @@ bool MuScriptorServer::ensureRunning (std::function<void (const juce::String&)> 
             report ("Loading the " + c.model + " model... (" + juce::String (ticks / 2) + "s)");
     }
 
+    // Timed out. The child is still in there loading, and it is not going to
+    // become our server - so it goes, for the same reason the cancel path above
+    // kills it. Leaving it was how a failed start cost a gigabyte until reboot.
+    const auto tail = child != nullptr ? child->getOutput() : startupLog;
+    abandonChild();
+
     setError ("timed out after " + juce::String (c.startupTimeoutMs / 1000) + "s waiting for port "
-              + juce::String (c.port));
+              + juce::String (c.port)
+              + (tail.isNotEmpty() ? ". The server's last output was:\n" + tail.substring (juce::jmax (0, tail.length() - 2000))
+                                   : juce::String()));
     state = State::failed;
     report ("The transcription server took too long to start");
     return false;
@@ -1085,12 +1135,13 @@ void MuScriptorServer::stop()
 
     if (child != nullptr)
     {
-        if (child->isRunning())
-        {
-            child->kill();
-            child->waitForProcessToFinish (5000);
-        }
-
+        // One call, and it is unconditional. The `isRunning()` guard that used
+        // to wrap this was the reason a child in any state but "running right
+        // now" - one exiting, one that had just been killed, one that never got
+        // past its imports - could be dropped without ever being reaped, and the
+        // supervisor's drain thread would then be joined by its destructor
+        // against a pipe nobody was going to close.
+        child->kill();
         child.reset();
     }
 
@@ -1277,6 +1328,34 @@ MuScriptorServer::StopOutcome MuScriptorServer::stopIfAllowed (const juce::Strin
 MuScriptorServer::StopOutcome MuScriptorServer::stopAfterJob()
 {
     StopOutcome outcome;
+
+    // ---- THE CHILD THAT NEVER GOT TO `ready` -------------------------------
+    //
+    // Checked before anything else, because the guard below used to send it
+    // straight out of the door. `weStartedTheServer()` is a statement about a
+    // PID, and the pid is only written down once /health has answered; a child
+    // that is still importing torch, or that has wedged, or whose startup was
+    // cancelled a moment ago, has no pid recorded and is not in state `ready`.
+    // It therefore failed both halves of the test and cleanup replied "Riffsheet
+    // did not start the transcription server" about a process Riffsheet had, at
+    // that moment, running - which is how a gigabyte of half-loaded model
+    // survived every shutdown path in the application.
+    //
+    // We hold the handle. That is the only ownership proof needed, and it is a
+    // better one than the pid: there is no possibility of a recycled pid or a
+    // stranger's process at the other end of a ChildProcess we spawned.
+    if (haveLiveChild() && state.load() != State::ready)
+    {
+        // No EngineLock dance and no idle test: an unfinished startup is not
+        // serving anybody, so there is nobody to be polite to. stop() kills,
+        // joins the drain thread, reaps, and clears the bookkeeping.
+        stop();
+
+        outcome.stopped = true;
+        outcome.reason = "Closed the transcription server that was still starting up when the job ended.";
+        juce::Logger::writeToLog ("Riffsheet/MuScriptor: " + outcome.reason);
+        return outcome;
+    }
 
     // Cheap first, and this is the path most windows take: one that adopted the
     // user's own server, or never had one, must not pay for two health probes on

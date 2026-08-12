@@ -205,15 +205,13 @@ import {
   MIN_WINDOW_SEC,
   TIME_ZOOM_IN_FACTOR,
   TIME_ZOOM_OUT_FACTOR,
-  panWindow,
   secPerPx,
-  windowShowing,
-  zoomWindowAt,
-  zoomWindowCentred,
+  PinchAccumulator,
   type BarSpan,
   type GridMark,
   type TimeLimits,
-  type TimeWindow
+  type TimeWindow,
+  type ViewportCommand
 } from './timeAxis';
 
 /**
@@ -256,6 +254,8 @@ function blankBarGrid(durationSec: number, originSec: number): BarSpan[] {
       timeSig: [BLANK_GRID_BEATS, 4] as const
     });
   }
+  // No `tempoChanges`: this grid is laid down at one constant tempo by construction — there is no
+  // score behind it to change tempo — so the scalar branch of `barGrid` is the whole truth here.
   return barGrid({ tempoBpm: BLANK_GRID_BPM, divisions: BLANK_GRID_DIVISIONS, bars }, originSec);
 }
 
@@ -497,33 +497,24 @@ export interface PianoRollOptions {
    */
   onVerticalViewChange?: (view: RollVerticalView, commit: boolean) => void;
 
-  // --- alignment with the sheet (invariant 1) --------------------------------
-  //
-  // `sheetMap` used to live here. It is gone, with the mode it fed — see `map()`. The type is
-  // still exported because `view/triview.ts` produces one and `ui/app.ts` uses it to place the
-  // waveform's viewport bracket, which is a read of the sheet rather than a rewrite of a roll.
-  /** Pan: the roll asks, the integrator scrolls the sheet, the sheet's scroll comes back. */
-  onScrollRequest?: (contentLeft: number) => void;
-  /** Zoom: MULTIPLICATIVE, e.g. 1.1 to zoom in and 0.9 to zoom out. */
-  onZoomRequest?: (factor: number) => void;
-  /** "Back to normal size" — the roll has no zoom of its own, the sheet does. */
-  onResetView?: () => void;
-
   // --- the time axis (#29 / #30) ---------------------------------------------
   /**
-   * The stretch of recording on screen changed — a time zoom, a time pan, or Align.
+   * THE ROLL ASKS; IT DOES NOT DECIDE. One command per gesture, to the app's one reducer.
    *
-   * WIRE THIS OR THE WAVEFORM GOES OUT OF STEP. The strip above the roll draws the same
-   * seconds and has no way of knowing the roll zoomed; forward the window to it with
-   * `waveform.setTimeAnchors(timeWindowAnchors(win))` and the two share an axis by construction.
-   * With Align on, this is also where the sheet is scrolled and scaled to match.
+   * THREE OPTIONS STOOD HERE AND ARE GONE: `onScrollRequest`, `onZoomRequest` and
+   * `onResetView` (finding 14). `ui/app.ts` supplied none of them, `resetView()` fired two of
+   * them into nothing, and a comment in app.ts claimed roll scrolling was routed through
+   * `onScrollRequest` while this file's own comments admitted it had never been wired. A fourth,
+   * `onTimeWindowChange`, has gone with them and is the important one: it published every window
+   * the roll APPLIED, including the ones the app had just pushed in, so a sheet scroll came back
+   * 250 ms later looking exactly like a roll zoom (finding 2). Programmatic setters are silent
+   * now — see `setViewport` — and there is nothing left to mistake for a gesture.
    *
-   * `commit` marks the end of a gesture, exactly like `onHeightChange` and
-   * `onVerticalViewChange`: a wheel has no release, so it is a trailing pause. Do the cheap
-   * thing (redraw the strip) on every call and the expensive one (re-engrave the sheet at a new
-   * scale) on `commit` only.
+   * Wire this and the roll's wheel, pinch, drag-pan and zoom buttons become commands the app
+   * reduces against ONE authoritative viewport, which it then hands back through `setViewport`.
+   * The round trip is synchronous, so the picture still moves inside the same event.
    */
-  onTimeWindowChange?: (win: TimeWindow, commit: boolean) => void;
+  onViewportCommand?: (cmd: ViewportCommand) => void;
 
   /**
    * The pointer moved onto a note, or off one (`null`).
@@ -711,15 +702,18 @@ const WHEEL_ZOOM_PER_PX = 0.0015;
  */
 export const WHEEL_ZOOM_MAX_STEP = 1.06;
 
-/**
- * How long a zoom made HERE owns the span, in ms. See `PianoRoll.holdSpan`.
- *
- * Long enough to cover the whole round trip — this roll reports the window, the app re-engraves
- * the sheet at a matching `display.scale`, the sheet's render publishes a new viewport, and the
- * app derives a window from it and hands it back — including the trailing commit that follows a
- * wheel by `VIEW_COMMIT_MS`. Short enough that the next deliberate scroll is a scroll.
- */
-const OWN_ZOOM_ECHO_MS = 700;
+// `OWN_ZOOM_ECHO_MS` stood here (700 ms) and is gone with `holdSpan` and `adoptNextAlignSpan`.
+// It was a clock trying to answer "was this window my own zoom coming back?", which is a question
+// about ORIGIN that a duration cannot answer: every `source === 'user'` request armed it,
+// including a plain horizontal pan, so for 700 ms after any pan the roll would accept whatever
+// span the sheet's engraving happened to produce and a pan became a zoom (finding 4). Commands
+// carry their own typed source now, and programmatic setters are silent, so there is no echo.
+//
+// How long a pinch and its dedupe partner are treated as one gesture. WebKit emits BOTH a
+// ctrl-wheel and a legacy `gesturechange` for a single trackpad pinch on some builds, and both
+// used to be applied — one pinch, zoomed twice (finding 12). Whichever arrives first wins the
+// gesture and the other road is ignored until this has elapsed with nothing on it.
+const PINCH_DEDUPE_MS = 250;
 
 /**
  * One wheel event's worth of zoom. Negative delta (up, or left) zooms IN, matching every notch
@@ -1138,16 +1132,14 @@ export class PianoRoll {
    * disappears. See `setTimeWindow` and view/timeAxis.ts.
    */
   private timeWindow: TimeWindow | null = null;
-  /** A window that arrived from ALIGN mid-gesture, waiting for the pointer to come up. Boxed so
-   *  that a deferred `null` (Align switched off during a drag) differs from "nothing arrived". */
+  /** A window that arrived from the app mid-gesture, waiting for the pointer to come up. Boxed so
+   *  that a deferred `null` (the whole take) differs from "nothing arrived". */
   private deferredWindow: { value: TimeWindow | null } | null = null;
-  /**
-   * Until when a span change arriving from Align is the echo of this roll's own zoom. See
-   * `holdSpan`.
-   */
-  private ownZoomUntilMs = 0;
-  /** Trailing "the gesture has stopped" timer for `onTimeWindowChange`. */
-  private timeCommitTimer: number | null = null;
+  /** Sub-threshold pinch ratios, kept rather than dropped. See `timeAxis.PinchAccumulator`. */
+  private pinch = new PinchAccumulator();
+  /** When the last pinch reached the reducer, and which road it came in on. `PINCH_DEDUPE_MS`. */
+  private lastPinchMs = 0;
+  private pinchRoad: 'wheel' | 'gesture' | null = null;
   /** The note the pointer is over, for the sheet to ring. Null when it is over nothing. */
   private hoverNoteId: string | null = null;
   /** Notes the SHEET says the pointer is over. Drawn like a light selection — see `setHover`. */
@@ -1420,6 +1412,11 @@ export class PianoRoll {
       {
         tempoBpm: score.tempoBpm,
         divisions: score.ir.divisions,
+        // THE TEMPO TRACK, not just its average. `tempoBpm` is one number for the whole score, so
+        // on an imported MIDI with a tempo change every bar line after it was drawn at the wrong
+        // second and the error accumulated. `barGrid` falls back to the scalar when this is empty
+        // or describes a single tempo, so a detected-from-audio take is unchanged.
+        ...(score.ir.tempo.changes?.length ? { tempoChanges: score.ir.tempo.changes } : {}),
         bars: score.ir.bars.map((b) => ({
           index: b.index,
           number: b.number,
@@ -1458,67 +1455,36 @@ export class PianoRoll {
    * gesture is remembered and applied when the gesture ends. Re-sync on commit, never live.
    */
   setTimeAnchors(anchors: ReadonlyArray<TimeAnchor> | null): void {
-    this.applyWindowRequest(this.holdSpan(windowFromAnchors(anchors)), 'align');
+    this.setViewport(windowFromAnchors(anchors));
   }
 
   /**
-   * A WINDOW ARRIVING FROM ALIGN IS A PAN, NOT A ZOOM (G16).
+   * THE CONTROLLED SETTER, AND IT IS SILENT. `null` = the whole take.
    *
-   * The bug, root-caused rather than described: the horizontal scrollbar writes ONE number,
-   * `TriView.setScrollLeft`. `syncViewports` then re-derives the aligned window by asking the
-   * ENGRAVING which second sits at each end of the sheet's viewport — and the engraving is not
-   * proportional to time, so the same pane width covers a different NUMBER OF SECONDS in a dense
-   * bar than in a sparse one. The span therefore changed on every scroll, and a changing span is
-   * a zoom: dragging the scrollbar visibly re-scaled the roll. Measured at ~20% across this
-   * fixture, and worse at the ends, where `clampXToEngraving` pins one edge while the other goes
-   * on moving — at scroll 0 the first 177 px of travel are pure zoom-out.
+   * Silence is the whole of finding 2's fix and it is worth being explicit about what it means:
+   * nothing on this path calls back out. The app owns one authoritative viewport; this is the
+   * app writing it into the roll. A setter that announced what it had just been told would let
+   * the app's own value come back as if a player had produced it — which is precisely what
+   * `applyTimeWindow` -> `reportTimeWindow` did, on a 250 ms trailing timer, so that a sheet
+   * scroll arrived at `onTimeWindowChange` looking like a roll zoom and re-scaled the sheet a
+   * quarter-second after the hand had stopped. That was the "breathing".
    *
-   * So the span is HELD and only the position is taken. The exception is the one case where a
-   * new span is the point: a zoom the player made HERE (a wheel, a pinch, a zoom button), whose
-   * echo comes back through this same method after the sheet has been re-engraved to match.
-   * `ownZoomUntilMs` is that window, and it is a clock rather than a flag because the echo
-   * arrives partly synchronously (inside `reportTimeWindow`) and partly on the sheet's trailing
-   * render.
+   * `holdSpan()` used to defend against the same loop from the other side, by refusing spans
+   * that arrived from Align unless a 700 ms clock said this roll had zoomed recently. It is gone
+   * too, and nothing replaced it: the span in an authoritative window is authoritative, because
+   * the only thing that can change a span is a `zoom` command through the one reducer.
    *
-   * The FIRST window is applied whole: with no span of its own yet the roll has nothing to hold.
+   * FROZEN DURING A GESTURE, which survives unchanged. A window arriving while the player has
+   * the pointer down on a note is remembered and applied when they let go — moving every other
+   * rectangle out from under a hand mid-edit is the failure the old linked mode was deleted for.
    */
-  private holdSpan(next: TimeWindow | null): TimeWindow | null {
-    const current = this.timeWindow;
-    if (!next || !current) return next;
-    if (now() < this.ownZoomUntilMs) return next;
-    const span = current.toSec - current.fromSec;
-    if (!(span > 0)) return next;
-    return { fromSec: next.fromSec, toSec: next.fromSec + span };
-  }
-
-  /**
-   * THE OTHER PANE JUST RE-SCALED: take the next Align window's SPAN, not just its position.
-   *
-   * `holdSpan` above refuses spans that arrive from Align, and it has to — the sheet's derived
-   * span moves on every scroll, because the engraving is not proportional to time, so adopting
-   * it would turn a scrollbar drag into a zoom (G16). A pinch over the SHEET is the one gesture
-   * where the new span is exactly what is being asked for, and the sheet is the only thing that
-   * can tell the two apart, so it says so. Same clock and same duration as a zoom made here,
-   * because it is the same round trip in the other direction.
-   *
-   * Wired as `TriViewOptions.onZoomChange`.
-   */
-  adoptNextAlignSpan(): void {
-    this.ownZoomUntilMs = now() + OWN_ZOOM_ECHO_MS;
-  }
-
-  /**
-   * THE TIME AXIS, set directly. `null` = the whole take.
-   *
-   * The window is now the roll's OWN state rather than something Align lends it: the time zoom
-   * (#29) is a window the player drives with the wheel and the buttons, and Align (#30) is the
-   * same window being kept in step with the sheet's viewport. One piece of state, two ways of
-   * moving it, so the two features cannot disagree about what is on screen.
-   *
-   * `source` says who is asking, and it only matters for one thing — see `applyWindowRequest`.
-   */
-  setTimeWindow(win: TimeWindow | null): void {
-    this.applyWindowRequest(win, 'align');
+  setViewport(win: TimeWindow | null): void {
+    if (this.gesture) {
+      this.deferredWindow = { value: win };
+      return;
+    }
+    this.deferredWindow = null;
+    this.applyTimeWindow(win);
   }
 
   /** The stretch of RECORDING on screen. Never null: with no window set, it is the whole take. */
@@ -1543,32 +1509,6 @@ export class PianoRoll {
     return this.score?.durationSec && this.score.durationSec > 0 ? this.score.durationSec : 1;
   }
 
-  /**
-   * Every route into the window goes through here, and there is exactly one reason for that:
-   *
-   * FROZEN DURING A GESTURE. A drag or a double-click ends in a re-engrave, which can change the
-   * sheet's content width and therefore the window Align derives from it. Applying that while
-   * the player still has the pointer down would move every rectangle out from under their hand
-   * mid-edit — the exact failure the old linked mode was deleted for. So a window arriving from
-   * ALIGN during a gesture is remembered and applied when the gesture ends.
-   *
-   * A window the player is asking for HERE ('user' — a wheel over the ruler, a zoom button) is
-   * applied immediately even mid-gesture, because it is their own hand doing it and a zoom that
-   * waited for them to let go would simply look broken.
-   */
-  private applyWindowRequest(next: TimeWindow | null, source: 'align' | 'user'): void {
-    // A span the player asked for HERE is theirs until the echo has come back round. See
-    // `holdSpan` — without this, the coupled zoom's own return trip would be mistaken for a
-    // scroll and the zoom would be undone the instant it was made.
-    if (source === 'user') this.ownZoomUntilMs = now() + OWN_ZOOM_ECHO_MS;
-    if (source === 'align' && this.gesture) {
-      this.deferredWindow = { value: next };
-      return;
-    }
-    this.deferredWindow = null;
-    this.applyTimeWindow(next);
-  }
-
   private applyTimeWindow(next: TimeWindow | null): void {
     const clamped = next ? clampWindow(next, this.timeLimits()) : null;
     const now = this.timeWindow;
@@ -1581,7 +1521,30 @@ export class PianoRoll {
     if (same) return;
     this.timeWindow = clamped;
     this.draw();
-    this.reportTimeWindow(false);
+  }
+
+  /** One line, so every gesture below reaches the app's reducer by the same road. */
+  private command(cmd: ViewportCommand): void {
+    this.opts.onViewportCommand?.(cmd);
+  }
+
+  /**
+   * ONE PINCH, ONE ZOOM (finding 12). Returns false for the other road's copy of this gesture.
+   *
+   * macOS delivers a trackpad pinch as a ctrl-wheel; WKWebView ALSO delivers the legacy
+   * `gesturestart`/`gesturechange` pair, and on the builds that emit both, both handlers used to
+   * fire and the pinch was applied twice. Whichever road speaks first owns the gesture, and the
+   * other is refused until `PINCH_DEDUPE_MS` has passed with nothing on it. Same road again is
+   * always allowed — that is just the next event of the same pinch.
+   */
+  private claimPinch(road: 'wheel' | 'gesture'): boolean {
+    const t = now();
+    if (this.pinchRoad !== null && this.pinchRoad !== road && t - this.lastPinchMs < PINCH_DEDUPE_MS) {
+      return false;
+    }
+    this.pinchRoad = road;
+    this.lastPinchMs = t;
+    return true;
   }
 
   /** Whatever arrived while the pointer was down. Called from the one place a gesture ends. */
@@ -1592,37 +1555,14 @@ export class PianoRoll {
     this.applyTimeWindow(deferred.value);
   }
 
-  /**
-   * Tell the integrator the time axis moved, so it can carry it to the WAVEFORM and (with Align
-   * on) to the sheet.
-   *
-   * The waveform is not optional and not a nicety: it sits directly above the roll drawing the
-   * same seconds, and a zoom that moved one and not the other would put a rectangle over the
-   * wrong sound — which is the single most misleading thing either strip can do. It is a
-   * callback rather than a direct call because this file does not know the waveform exists;
-   * `timeWindowAnchors()` exists so the hand-off is one line and cannot be got wrong.
-   */
-  private reportTimeWindow(commit: boolean): void {
-    this.opts.onTimeWindowChange?.(this.getTimeWindow(), commit);
-    if (commit) {
-      this.clearTimeCommitTimer();
-      return;
-    }
-    // A wheel has no "end", so the end is a pause — the same trick the pitch axis uses.
-    this.clearTimeCommitTimer();
-    this.timeCommitTimer = setTimeout(() => {
-      this.timeCommitTimer = null;
-      this.opts.onTimeWindowChange?.(this.getTimeWindow(), true);
-    }, VIEW_COMMIT_MS) as unknown as number;
-  }
-
-  private clearTimeCommitTimer(): void {
-    if (this.timeCommitTimer === null) return;
-    clearTimeout(this.timeCommitTimer);
-    this.timeCommitTimer = null;
-  }
-
-  // --- the public time-zoom API (#29) ----------------------------------------
+  // --- the public time-zoom API (#29): COMMANDS, not mutations ----------------
+  //
+  // `reportTimeWindow` and its `VIEW_COMMIT_MS` trailing timer stood here. The timer was the
+  // "the gesture has stopped" signal the app used to decide when to re-engrave the sheet, and it
+  // was also the thing that made finding 2 a DELAYED bug rather than an obvious one: the window
+  // the app had pushed in came back a quarter of a second after the hand stopped, which is long
+  // enough to read as the picture moving by itself. The app no longer needs to be told when a
+  // gesture ends, because it is the one applying every gesture.
 
   /**
    * Zoom the time axis about a point on the plot, given in canvas x.
@@ -1632,12 +1572,12 @@ export class PianoRoll {
    */
   zoomTimeAt(factor: number, x: number): void {
     const frac = Math.max(0, Math.min(1, (x - this.gutterPx) / this.plotWidth));
-    this.applyWindowRequest(zoomWindowAt(this.getTimeWindow(), factor, frac, this.timeLimits()), 'user');
+    this.command({ kind: 'zoom', factor, anchorFrac: frac, source: 'roll' });
   }
 
   /** Zoom about the middle of the view — what the buttons do. */
   zoomTime(factor: number): void {
-    this.applyWindowRequest(zoomWindowCentred(this.getTimeWindow(), factor, this.timeLimits()), 'user');
+    this.command({ kind: 'zoom', factor, anchorFrac: 0.5, source: 'roll' });
   }
 
   zoomTimeIn(): void {
@@ -1650,12 +1590,12 @@ export class PianoRoll {
 
   /** Back to the whole take. */
   fitTime(): void {
-    this.applyWindowRequest(null, 'user');
+    this.command({ kind: 'fit', source: 'roll' });
   }
 
   /** Slide the window without changing how much of the take is on screen. */
   panTimeBy(deltaSec: number): void {
-    this.applyWindowRequest(panWindow(this.getTimeWindow(), deltaSec, this.timeLimits()), 'user');
+    this.command({ kind: 'pan', deltaSec, source: 'roll' });
   }
 
   /**
@@ -1952,14 +1892,13 @@ export class PianoRoll {
   /**
    * "Back to the default size."
    *
-   * The TIME axis is the sheet's, so that half is a message. The PITCH axis is the roll's own
-   * since v1.3, so this now really does reset something here: the default row height, placed
-   * back over the music. Reset means reset — a button that puts back one of the two axes is
-   * the kind of half-measure somebody spends ten minutes not understanding.
+   * Both axes, and both for real. The two lines that stood at the top of this method fired
+   * `onResetView` and `onScrollRequest` — options `ui/app.ts` has never supplied, so the TIME
+   * half of "reset" went nowhere at all (finding 14). It is a `fit` command now, through the
+   * same reducer every other gesture uses, so the sheet and the strip come back with it.
    */
   resetView(): void {
-    this.opts.onResetView?.();
-    this.opts.onScrollRequest?.(0);
+    this.command({ kind: 'fit', source: 'roll' });
     this.pxPerSemitone = DEFAULT_PX_PER_SEMITONE;
     this.fitLocked = false;
     this.lastUserVerticalMs = now();
@@ -2070,43 +2009,68 @@ export class PianoRoll {
   // Geometry — invariant 1 lives here
   // -------------------------------------------------------------------------
 
-  /** Written second 0, expressed on the recording's clock. See pipeline/scoreOriginSec. */
+  /**
+   * ==================== WRITTEN SECOND 0, AND WHO GETS TO DECIDE IT ====================
+   *
+   * The recording-clock second that the score calls 0. Every conversion in this file goes through
+   * it, and so does the app's own — which is the whole problem it used to have.
+   *
+   * THE DIVERGENCE (codex-critique §7). The app moved its canonical origin to a FIRST-ATTACK
+   * alignment (`App.originSec`, ui/app.ts §F13) because `scoreOriginSec` derives the answer from
+   * `barOneSec`, which is 0 unless somebody has dragged the marker — so a take with four seconds
+   * of leading silence claimed bar 1 was at second 0 while the roll and the strip drew that first
+   * attack where it was actually played. This getter went on computing the OLD answer. Double-
+   * clicking to add a note then emitted a written second measured against this origin, and
+   * `edit/rollPerformance.ts` added the app's DIFFERENT origin back on: the note landed exactly
+   * one leading silence away from where it was clicked.
+   *
+   * ONE AUTHORITY. The app owns the origin and pushes it in (`setOriginSec`). This file no longer
+   * has an opinion; it only has a fallback, for the case that has to keep working — a roll
+   * standing on its own with a score and no integrator, which is what `scoreOriginSec` always
+   * answered and still does.
+   */
+  private appOriginSec: number | null = null;
+
   private get originSec(): number {
+    if (this.appOriginSec !== null) return this.appOriginSec;
     return this.score ? scoreOriginSec(this.score, this.barOneSec) : this.barOneSec;
   }
 
   /**
-   * The sheet's geometry for this frame, or null when the roll is on its own.
+   * The app's written second 0, which from here on is the only one.
    *
-   * Null means free mode, and free mode is a complete, supported view — not a degraded one.
-   * Always null now. The branches that ask are kept; the supplier is gone.
+   * Pass `null` to hand the question back to the fallback above. Everything derived from the
+   * origin — the bar grid, and the performed rectangles that are stored on the recording's clock
+   * — is rebuilt here for the same reason `setBarOne` rebuilds them: moving the origin moves
+   * every bar line, and it must not slide them out from under a performance that has not moved.
    */
-  private map(): SheetMap | null {
-    // ==========================================================================
-    // DELETED, DELIBERATELY, AND NOT COMING BACK. Read this before restoring it.
-    // ==========================================================================
-    //
-    // This used to return the SHEET's geometry when a chip was on, and everything below drew
-    // against it: a notehead and its rectangle sat in the same column, and the two panes
-    // scrolled as one. It looked right in a screenshot and was wrong to use.
-    //
-    // alphaTab deliberately gives a rhythmically dense bar more pixels than a sparse one. A
-    // roll drawn on that axis therefore RE-SPACES ITSELF whenever the engraving changes — and
-    // the engraving changes every time a note is added, moved or lengthened. Adding one note
-    // moved the notes either side of it, which is the one thing a picture of a performance
-    // must never do: it is the player's record of what they played, and it moved because they
-    // edited a different part of it.
-    //
-    // The chip survives, as `alignViews`, meaning something the geometry cannot break: point
-    // at a moment in one view and the others go to it. The x-axis here is linear recording
-    // time, always, for everybody, with no setting attached — which is what makes "the same x
-    // means the same second" true across the strip, the roll and the transport.
-    //
-    // The branches below that ask `if (m)` are the honest shape of a function that CAN answer
-    // null; they are kept rather than flattened so a future engraved-axis design (a real one,
-    // that does not reflow) has somewhere to land.
-    return null;
+  setOriginSec(sec: number | null): void {
+    const next = sec !== null && Number.isFinite(sec) ? sec : null;
+    if (next === this.appOriginSec) return;
+    this.appOriginSec = next;
+    this.rebuildBars();
+    if (this.performance) this.rebuildNotes();
+    this.draw();
   }
+
+  // ==========================================================================
+  // `map(): SheetMap | null` STOOD HERE, RETURNING NULL FOREVER. Read this before restoring it.
+  // ==========================================================================
+  //
+  // It used to return the SHEET's geometry when a chip was on, and everything below drew against
+  // it: a notehead and its rectangle in the same column, the two panes scrolling as one. It
+  // looked right in a screenshot and was wrong to use. alphaTab deliberately gives a rhythmically
+  // dense bar more pixels than a sparse one, so a roll drawn on that axis RE-SPACES ITSELF
+  // whenever the engraving changes — and the engraving changes every time a note is added, moved
+  // or lengthened. Adding one note moved the notes either side of it, which is the one thing a
+  // picture of a performance must never do.
+  //
+  // The supplier was deleted; the `if (m)` branches were kept "so a future engraved-axis design
+  // has somewhere to land". They are gone now too (finding 14). A permanently-false branch is not
+  // a landing site, it is a second version of every mapping in this file that nobody can run, and
+  // the live coupling bugs came out of exactly this habit of keeping two generations alive. The
+  // axis here is linear recording time, always, which is what makes "the same x means the same
+  // second" true across the strip, the roll and the transport.
 
   /**
    * The label column, in px — 0 when the pane is too narrow to spare it.
@@ -2141,33 +2105,20 @@ export class PianoRoll {
   }
 
   /**
-   * WRITTEN seconds -> screen x. THE mapping.
+   * WRITTEN seconds -> screen x. THE mapping, and there is now only one of it.
    *
-   * NaN when linked mode cannot place the second (before anything is engraved, or past the
-   * end of the engraving). Callers skip a NaN rather than drawing at 0 — a rectangle parked
-   * on the left edge looks like a real note at second zero, which is a lie.
+   * The window's two ends and a straight line between them. Still a ruler made of TIMES — adding
+   * a note changes no other note's time, so no other rectangle can move. See `setViewport`.
    */
   private writtenToX(sec: number): number {
-    const m = this.map();
-    if (m) {
-      const cx = m.writtenSecToContentX(sec);
-      return cx === null || !Number.isFinite(cx) ? Number.NaN : cx - m.scrollLeft;
-    }
-    // ALIGN: the sheet's own ruler, beat by beat. Still a ruler made of TIMES — adding a note
-    // changes no other note's time, so no other rectangle can move. See `setTimeAnchors`.
     const frac = this.anchorFrac(sec + this.originSec);
     if (frac !== null) return this.gutterPx + frac * this.plotWidth;
     if (this.durationSec <= 0) return this.gutterPx;
     return this.gutterPx + ((sec + this.originSec) / this.durationSec) * this.plotWidth;
   }
 
-  /** The exact inverse, in every mode. NaN when linked mode cannot answer. */
+  /** The exact inverse. */
   private xToWritten(x: number): number {
-    const m = this.map();
-    if (m) {
-      const sec = m.contentXToWrittenSec(x + m.scrollLeft);
-      return sec === null || !Number.isFinite(sec) ? Number.NaN : sec;
-    }
     const sec = this.anchorSec((x - this.gutterPx) / this.plotWidth);
     if (sec !== null) return sec - this.originSec;
     if (this.durationSec <= 0) return 0;
@@ -2859,10 +2810,10 @@ export class PianoRoll {
       pointerId,
       startX: x,
       startY: y,
-      startScroll: this.map()?.scrollLeft ?? 0,
+      startScroll: 0,
       startFromSec: win.fromSec,
-      // Frozen at the press: the gearing must not change while the hand is moving, and the
-      // window's span is what the sheet may be re-scaling underneath us with Align on.
+      // Frozen at the press: the gearing must not change while the hand is moving, and a
+      // re-engrave underneath a drag must not change how far the hand moves the picture.
       startSecPerPx: (win.toSec - win.fromSec) / Math.max(1, this.plotWidth),
       startTopMidi: this.scrollTopMidi,
       vertical,
@@ -3073,13 +3024,13 @@ export class PianoRoll {
       g.moved = true;
       this.canvas.style.cursor = 'grabbing';
       // Dragging the picture LEFT means moving further into the take, so the window goes up.
-      // This is the roll's own axis now; it used to ask the integrator to scroll the SHEET
-      // through `onScrollRequest`, which was never wired and could not fire in any case, so the
-      // gesture invariant 9 documents ("left drag on background -> pan TIME") did nothing at all.
-      this.applyWindowRequest(
-        windowShowing(g.startFromSec - dx * g.startSecPerPx, 0, g.startSecPerPx * this.plotWidth, this.timeLimits()),
-        'user'
-      );
+      //
+      // ABSOLUTE FROM THE PRESS, expressed as a pan from where the window is NOW. The gearing
+      // was frozen at pointer-down (`startSecPerPx`) so a re-engrave mid-drag cannot change how
+      // far the hand moves the picture; the delta is recomputed against the live window each
+      // move, so the reducer's own clamping at an edge is not fought by a stale absolute.
+      const wantedFrom = g.startFromSec - dx * g.startSecPerPx;
+      this.command({ kind: 'pan', deltaSec: wantedFrom - this.getTimeWindow().fromSec, source: 'roll' });
       if (g.vertical) {
         // The picture follows the hand: drag DOWN and the higher pitches come into view from
         // above, so the pitch at the top edge goes UP.
@@ -3341,6 +3292,10 @@ export class PianoRoll {
       this.emit({ kind: 'delete', noteId: hit.note.noteId });
       return;
     }
+    // WRITTEN SECONDS, ON THE APP'S ORIGIN AND NO OTHER. `edit/rollPerformance.ts` adds the app's
+    // origin straight back onto this number, so the two have to be the same origin or a take with
+    // leading silence puts the new note exactly one silence away from the pointer. They are the
+    // same one now — see `originSec` above, which no longer computes its own (codex-critique §7).
     const written = this.xToWritten(x);
     if (!Number.isFinite(written)) return;
     e.preventDefault();
@@ -3419,8 +3374,13 @@ export class PianoRoll {
       e.preventDefault();
       // Option picks the other axis. Alt on its own (no pinch) is kept as the pitch zoom a
       // plain MOUSE has always had here — a mouse cannot pinch, and it was shipped.
-      if (e.altKey) this.zoomVerticalAt(zoom(d), this.localPoint(e).y);
-      else this.zoomTimeAt(zoom(d), this.canvasPoint(e).x);
+      if (e.altKey) {
+        this.zoomVerticalAt(zoom(d), this.localPoint(e).y);
+        return;
+      }
+      // One pinch, one zoom, whichever road WebKit chose to send it down. See `claimPinch`.
+      if (pinch && !this.claimPinch('wheel')) return;
+      this.zoomTimeAt(zoom(d), this.canvasPoint(e).x);
       return;
     }
 
@@ -3492,6 +3452,7 @@ export class PianoRoll {
   private onGestureStart = (e: Event): void => {
     e.preventDefault();
     this.gestureScale = (e as Event & { scale?: number }).scale ?? 1;
+    this.pinch.reset();
   };
 
   private onGestureChange = (e: Event): void => {
@@ -3501,9 +3462,14 @@ export class PianoRoll {
     e.preventDefault();
     const ratio = scale / (this.gestureScale > 0 ? this.gestureScale : 1);
     this.gestureScale = scale;
-    if (!Number.isFinite(ratio) || ratio <= 0 || Math.abs(ratio - 1) < 1e-4) return;
+    // ACCUMULATED, NOT DROPPED (finding 10). The baseline advances on every event whether or not
+    // the ratio was big enough to use, so a discarded fraction used to be gone for good; folded
+    // in, it simply arrives one event later.
+    const stepped = this.pinch.take(ratio);
+    if (stepped === null) return;
+    if (!this.claimPinch('gesture')) return;
     // Clamped by the same anti-jump step a wheel gets, so one violent pinch cannot throw the view.
-    const factor = Math.min(WHEEL_ZOOM_MAX_STEP, Math.max(1 / WHEEL_ZOOM_MAX_STEP, ratio));
+    const factor = Math.min(WHEEL_ZOOM_MAX_STEP, Math.max(1 / WHEEL_ZOOM_MAX_STEP, stepped));
     const rect = this.canvas.getBoundingClientRect();
     const at = {
       clientX: g.clientX ?? rect.left + rect.width / 2,
@@ -3748,8 +3714,9 @@ export class PianoRoll {
     anchorCount: number;
     /** What the middle of the plot means, in RECORDING seconds. The ruler, stated as a number. */
     midPlotSec: number;
+    /** Kept as a permanent false: the sheet-geometry mode is deleted, not switched off. */
     hasSheetMap: boolean;
-    /** The sheet's content width at the current zoom. Null in free mode. */
+    /** Both permanently null, for the same reason. */
     zoomedContentWidth: number | null;
     sheetScrollLeft: number | null;
     /** The ids currently highlighted. */
@@ -3860,7 +3827,6 @@ export class PianoRoll {
   } {
     const first = this.notes[0] ?? null;
     const geo = this.geometry();
-    const m = this.map();
     const firstX = first ? this.writtenToX(first.startSec) : Number.NaN;
     const marks = this.gridMarks();
     return {
@@ -3889,7 +3855,8 @@ export class PianoRoll {
       maxHeight: clampRollHeight(Number.MAX_SAFE_INTEGER),
 
       linked: false,
-      linkedActive: m !== null,
+      // Permanently false, and now structurally so: the roll has no second axis to draw on.
+      linkedActive: false,
       windowFromSec: this.timeWindow ? Number(this.timeWindow.fromSec.toFixed(4)) : null,
       windowToSec: this.timeWindow ? Number(this.timeWindow.toSec.toFixed(4)) : null,
       // A window IS two anchors — its two ends — which is all `ui/app.ts` has ever sent. Kept
@@ -3897,8 +3864,8 @@ export class PianoRoll {
       anchorCount: this.timeWindow ? 2 : 0,
       midPlotSec: Number(this.xToSec(this.gutterPx + this.plotWidth / 2).toFixed(4)),
       hasSheetMap: false,
-      zoomedContentWidth: m ? Math.round(m.contentWidth) : null,
-      sheetScrollLeft: m ? Math.round(m.scrollLeft) : null,
+      zoomedContentWidth: null,
+      sheetScrollLeft: null,
       selection: [...this.selection],
       selectionCount: this.selection.size,
       bandActive: this.gesture?.kind === 'band',
@@ -4244,10 +4211,18 @@ export class PianoRoll {
   /**
    * The pitch scrollbar down the right-hand edge — drawn only when there is somewhere to go.
    *
-   * It measures the union of the take's range and what is on screen, not the whole 128-note
-   * keyboard: a thumb that is 13% of the track because a bass riff occupies a seventh of a piano
-   * tells the player nothing about the take they are actually looking at. Scrolling out past the
-   * notes (which is allowed, so a note can be ADDED out there) simply grows the track.
+   * THE SAME RANGE THE WHEEL HAS, and that is a fix rather than a preference (finding 13).
+   *
+   * It used to measure the union of the take's range and what is on screen, which sounds like
+   * the more informative choice and is a trap: the union has no track beyond the thumb, so when
+   * the thumb reached the lowest note there was nothing left to drag into, while the WHEEL went
+   * on scrolling down into empty keyboard quite happily (`applyScrollTop` clamps against the
+   * whole 0..127, on purpose, so a note can be ADDED out there). Only after the wheel had moved
+   * into that space did the bar's range grow to include it. Two controls, two navigable spaces,
+   * and the smaller one was the one that looked like the map.
+   *
+   * The cost is a smaller thumb on a bass take. That is honest: the take really is a seventh of
+   * a piano, and where the notes are is said by the notes.
    *
    * Hidden when everything fits, because a scrollbar that cannot move is furniture.
    */
@@ -4258,9 +4233,8 @@ export class PianoRoll {
     if (ph <= 0 || this.notes.length === 0) return;
 
     const top = this.scrollTopMidi;
-    const bottom = top - rows;
-    const lo = Math.min(this.contentLowMidi, bottom);
-    const hi = Math.max(this.contentHighMidi + 1, top);
+    const lo = 0;
+    const hi = MIDI_TOP;
     const span = hi - lo;
     // Everything is on screen, so there is nothing a scrollbar could do.
     if (!(span > rows + 0.01)) return;
@@ -4726,7 +4700,6 @@ export class PianoRoll {
   }
 
   destroy(): void {
-    this.clearTimeCommitTimer();
     this.canvas.removeEventListener('pointerdown', this.onPointerDown);
     this.canvas.removeEventListener('pointermove', this.onPointerMove);
     this.canvas.removeEventListener('pointerleave', this.onPointerLeave);

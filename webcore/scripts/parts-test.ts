@@ -23,7 +23,6 @@ import {
   LIVE_PART_ID,
   nudgeStepMs,
   orderedPartSlots,
-  snapNudgeMs,
   type ImportedPart
 } from '../src/score/parts';
 import { parseScoreFile } from '../src/import/scoreFile';
@@ -188,16 +187,73 @@ assert(
   'nudging a part moves it'
 );
 
-// A nudge is rounded to the finest unit notation can spell — see `snapNudgeMs`. At 96 BPM a
-// 1/32 is 78.125 ms, so 60 ms is a 1/32 and 10 ms is nothing at all.
-assert(Math.abs(snapNudgeMs(60, 96) - 78.125) < 1e-9, 'a nudge rounds to a whole 32nd');
-assert(snapNudgeMs(10, 96) === 0 && snapNudgeMs(0, 96) === 0, 'a nudge under half a 32nd is no nudge');
-assert(Math.abs(nudgeStepMs(96) - 78.125) < 1e-9, 'and the box steps by exactly that');
+// A NUDGE IS STILL ROUNDED TO THE FINEST UNIT NOTATION CAN SPELL — the PIPELINE does it now
+// (`nudgeNote`, pipeline/multipart.ts), in the written domain and against the `displayBpm` that
+// build actually computed. So it is asserted on what comes out of a build rather than on a
+// rounding helper: the helper that used to do it (`snapNudgeMs`) is off the build path, and a
+// test of it would no longer be a test of the page.
+//
+// The box's arrows still step by a 1/32, which at 96 BPM is 78.125 ms.
+assert(Math.abs(nudgeStepMs(96) - 78.125) < 1e-9, 'the nudge box steps by exactly a 32nd');
+assert(liveFirst.tempoBpm === 96, `the fixture builds at 96 BPM, which the numbers below are of (${liveFirst.tempoBpm})`);
+
+// THE ROUNDING, SEEN FROM OUTSIDE: the shift lands on a whole 1/32 or it does not happen. Half a
+// 1/32 is 39.0625 ms here, so 39 ms leaves the imported part's engraving byte-identical and 40 ms
+// moves it. That threshold is the signature of a round-to-NEAREST-32nd, and it sits at half a
+// 1/32 of THIS score's display tempo — the number only the build knows, which is why the rounding
+// is the build's to do.
+const halfThirtysecond = nudgeStepMs(liveFirst.tempoBpm) / 2;
+const printedPart = (ms: number): string =>
+  JSON.stringify(
+    buildPartedRiffScore(request, settings, orderedPartSlots([{ ...guitar, nudgeMs: ms }], [LIVE_PART_ID, 'imp1']))
+      .data.tracks[1]
+  );
+const unnudgedPart = JSON.stringify(liveFirst.data.tracks[1]);
+assert(printedPart(Math.floor(halfThirtysecond)) === unnudgedPart, 'a nudge under half a 32nd does not move the printed part');
+assert(printedPart(Math.ceil(halfThirtysecond)) !== unnudgedPart, 'a nudge over half a 32nd moves it by one');
+
+// AND WHAT IT LOOKS LIKE ON THE PAGE: every `<duration>` in the moved part is a whole number of
+// 32nds — `duration / divisions` quarters is a multiple of 1/8. That is the invariant a printable
+// shift preserves and an arbitrary one breaks: a part that lands between two printable positions
+// leaves the tail of a bar as a one- or two-tick crumb, which the emitter refuses outright. The
+// export therefore has to survive as well as satisfy the arithmetic, so both are asserted.
+const importedDurations = (score: typeof liveFirst): { divisions: number; durations: number[] } => {
+  const xml = score.musicxml();
+  const cut = xml.indexOf('<part id="P2"');
+  const body = cut >= 0 ? xml.slice(cut) : '';
+  const divisions = Number((body.match(/<divisions>(\d+)<\/divisions>/) ?? xml.match(/<divisions>(\d+)<\/divisions>/))?.[1] ?? 0);
+  return { divisions, durations: [...body.matchAll(/<duration>(\d+)<\/duration>/g)].map((m) => Number(m[1])) };
+};
+
+// One typed value far under a 1/32 and one that is a whole 1/32 at this tempo — the two ends the
+// rounding has to handle, and the box only ever stores whole milliseconds.
+for (const ms of [10, Math.round(nudgeStepMs(liveFirst.tempoBpm))]) {
+  const built = buildPartedRiffScore(request, settings, orderedPartSlots([{ ...guitar, nudgeMs: ms }], [LIVE_PART_ID, 'imp1']));
+  let printed: { divisions: number; durations: number[] } = { divisions: 0, durations: [] };
+  let threw = false;
+  try {
+    printed = importedDurations(built);
+    built.midi(true);
+    built.midi(false);
+  } catch {
+    threw = true;
+  }
+  assert(!threw, `a ${ms} ms nudge exports without the emitter refusing it`);
+  assert(printed.durations.length > 0, `a ${ms} ms nudge still prints the imported part`);
+  assert(
+    printed.divisions > 0 && printed.durations.every((d) => (d * 8) % printed.divisions === 0),
+    `a ${ms} ms nudge leaves every printed value a whole 32nd (divisions ${printed.divisions})`
+  );
+}
 
 // THE SWEEP, and it is the reason the rounding exists. An unrounded nudge slides the part's
 // written ticks off the printable lattice and the last note in a bar comes out as a one-tick
 // crumb, which the MusicXML emitter refuses outright ("<type>32nd</type> is 3 ticks but
 // <duration> is 1"). Measured before the fix: every value here except 0 and ±10 ms threw.
+//
+// These are raw typed milliseconds, none of them a whole 1/32 of anything — which is the point.
+// The app hands them to the pipeline exactly as it got them, so what this sweeps now is the snap
+// in `nudgeNote`, against the tempo the build really chose rather than one the caller guessed.
 let sweepFailures = 0;
 for (let ms = -400; ms <= 400; ms += 13) {
   for (const order of [[LIVE_PART_ID, 'imp1'], ['imp1', LIVE_PART_ID]]) {

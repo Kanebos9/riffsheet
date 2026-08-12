@@ -135,20 +135,56 @@ export interface PartBuild {
   diagnostics: BuildDiagnostics;
 }
 
+/**
+ * A note's real identity in a multi-part score: WHICH PART, and its id INSIDE that part.
+ *
+ * The flat string is a transport format — one id space, one prefix per part — and it is what the
+ * IR and both emitters carry, because that is what alphaTab and MusicXML can hold. It is not the
+ * identity itself, and code that treated it as one is how `p2-n0` came to mean two different
+ * notes. Resolve it here rather than by splitting on '-': part prefixes are chosen at build time
+ * and only the build knows them.
+ */
+export interface ScoreNoteId {
+  /** `P1`, `P2`, ... — the same id `PartBuild.id` carries. */
+  partId: string;
+  /** 0-based printed order. */
+  partIndex: number;
+  /** The id the caller passed in for this note, with no namespace on it. */
+  noteId: string;
+}
+
 export interface MultiPartBuildResult {
   parts: PartBuild[];
   /** Index of the live take — the only part the app plays. -1 if the caller declared none. */
   liveIndex: number;
+  /** Flat score-wide note id -> {part, note}. Null when no part claims it. */
+  resolveNoteId(id: string): ScoreNoteId | null;
   toMusicXML(): string;
   toMidi(quantized: boolean): Uint8Array;
   toAlphaTabModelData(): AlphaTabScoreData;
 }
 
-function nudgeNote(note: InputNote, nudgeSec: number, tickShiftPerPpq: number): InputNote {
+/**
+ * MOVE A WRITTEN NOTE BY A WRITTEN AMOUNT.
+ *
+ * `quartersShift` is the nudge expressed in quarter notes, and it is a real number: it comes from
+ * the user's seconds and a rounded display tempo, so it lands wherever it lands. Rounding it
+ * straight into the SOURCE's resolution — `Math.round(quarters * 960)` — moves a part to a tick
+ * that is not a written position at all: at 960 ppq the result is exact to a 1/960th of a quarter,
+ * which is a number no notation vocabulary contains, so a nudged import came back covered in
+ * pointless ties and the app grew a caller-side "snap the nudge to a 1/32" workaround to hide it.
+ *
+ * The snap belongs here, and it belongs in the WRITTEN domain: the shift is rounded to the finest
+ * value the IR can print — a 1/32, an eighth of a quarter — and only then converted into each
+ * source's own ppq. Every ppq a score editor emits is a multiple of 8, so that conversion is
+ * exact and the nudged material lands back on the same lattice it came from.
+ */
+function nudgeNote(note: InputNote, nudgeSec: number, quartersShift: number): InputNote {
   if (nudgeSec === 0) return note;
   const moved: InputNote = { ...note, startSec: note.startSec + nudgeSec, endSec: note.endSec + nudgeSec };
   if (note.sourceTiming) {
-    const shift = Math.round(tickShiftPerPpq * note.sourceTiming.ppq);
+    const thirtySeconds = Math.round(quartersShift * 8);
+    const shift = Math.round((thirtySeconds * note.sourceTiming.ppq) / 8);
     moved.sourceTiming = {
       ...note.sourceTiming,
       startTick: note.sourceTiming.startTick + shift,
@@ -256,9 +292,28 @@ export function buildMultiPartScore(
   const roles: PartRole[] = parts.map((part, index) => part.role ?? (index === 0 ? 'live' : 'imported'));
 
   // ---- identity: one id space for the whole score -------------------------------------------
-  const prefixes = parts.map((_, index) => (index === 0 ? '' : `p${index + 1}-`));
+  // THE PREFIX IS A NAMESPACE, SO IT HAS TO BEHAVE LIKE ONE. `p2-` was prepended to every part
+  // after the first and the first part's ids were left bare, which is not a namespace at all: a
+  // live-part note actually named `p2-n0` — and score import names notes after their source
+  // coordinates, so strings of exactly that shape occur — is the same STRING as part two's
+  // generated `p2-n0`. Two different notes then shared one identity, and webcore's selection,
+  // undo and click-to-edit all key on it.
+  //
+  // The first part still keeps its ids untouched (that is what makes a single-part build
+  // byte-identical, and webcore relies on the live part's ids surviving a re-run), so the fix is
+  // to LENGTHEN the marker until the collision is gone rather than to prefix everything.
+  const ownIds = parts.map((part) => part.notes.map((note, i) => note.id ?? `n${i}`));
+  const taken = new Set<string>(ownIds[0]);
+  const prefixes: string[] = [''];
+  for (let index = 1; index < parts.length; index++) {
+    let prefix = `p${index + 1}-`;
+    let guard = 0;
+    while (ownIds[index].some((id) => taken.has(`${prefix}${id}`)) && guard++ < 64) prefix = `${prefix}-`;
+    prefixes.push(prefix);
+    for (const id of ownIds[index]) taken.add(`${prefix}${id}`);
+  }
   const identified = parts.map((part, index) =>
-    part.notes.map((note, i) => ({ ...note, id: `${prefixes[index]}${note.id ?? `n${i}`}` }))
+    part.notes.map((note, i) => ({ ...note, id: `${prefixes[index]}${ownIds[index][i]}` }))
   );
 
   // ---- the shared clock ----------------------------------------------------------------------
@@ -337,9 +392,26 @@ export function buildMultiPartScore(
     ...(parts[index].octaveTransposition !== undefined ? { octaveTransposition: parts[index].octaveTransposition } : {})
   });
 
+  // Longest prefix first, and the unprefixed live part last: an id that a longer namespace claims
+  // belongs to that part, never to the bare one it happens to look like.
+  const byPrefix = built
+    .map((part) => ({ part, ids: new Set(identified[part.index].map((note) => note.id!)) }))
+    .sort((a, b) => b.part.idPrefix.length - a.part.idPrefix.length);
+
   return {
     parts: built,
     liveIndex: roles.indexOf('live'),
+    resolveNoteId: (id: string): ScoreNoteId | null => {
+      for (const entry of byPrefix) {
+        if (!entry.ids.has(id)) continue;
+        return {
+          partId: entry.part.id,
+          partIndex: entry.part.index,
+          noteId: id.slice(entry.part.idPrefix.length)
+        };
+      }
+      return null;
+    },
     toMusicXML: () =>
       toMultiPartMusicXML(builds.map((build, index) => ({ ir: build.ir, options: xmlOptions(index) }))),
     toMidi: (quantized: boolean) =>
@@ -359,6 +431,13 @@ export function buildMultiPartScore(
           ir: build.ir,
           ...(parts[index].name !== undefined ? { name: parts[index].name } : {}),
           ...(parts[index].midiProgram !== undefined ? { program: parts[index].midiProgram } : {}),
+          // SCREEN AND FILE SAY THE SAME THING. These two reached MusicXML only, so a guitar part
+          // exported without a TAB staff and without its -12 displacement went on showing both on
+          // screen — the app displayed a part it was not exporting (finding 8).
+          ...(parts[index].tab !== undefined ? { tab: parts[index].tab } : {}),
+          ...(parts[index].octaveTransposition !== undefined
+            ? { octaveTransposition: parts[index].octaveTransposition }
+            : {}),
           ...(roles[index] === 'imported' ? { notationOnly: true } : {})
         }))
       )

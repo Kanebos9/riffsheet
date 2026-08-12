@@ -84,8 +84,13 @@ export interface ExportBarOptions {
    * A `.riffsheet` has carried the recording since v2 and there was no way to get it back out
    * again — the document could be opened but the audio inside it could not be reached. Same owner
    * and same reasoning as `saveDocument`: ui/app.ts holds the bytes, this bar holds the menu.
+   *
+   * MAY BE ASYNC. After a NATIVE open the page holds decoded samples and no file bytes, and the
+   * original is a fetch away from the shell (`ui/app.ts §ensureOriginalBytes`) — so the honest
+   * answer to "give me the recording" is not always available synchronously. Awaited below;
+   * a synchronous implementation is still perfectly valid.
    */
-  getAudio?: () => ExportPayload | null;
+  getAudio?: () => ExportPayload | null | Promise<ExportPayload | null>;
 }
 
 interface MidiChoice {
@@ -579,7 +584,7 @@ export class ExportBar {
   private async exportAudio(): Promise<void> {
     let file: ExportPayload | null;
     try {
-      file = this.opts.getAudio?.() ?? null;
+      file = (await this.opts.getAudio?.()) ?? null;
     } catch (e) {
       return this.opts.toast('danger', 'Audio', (e as Error).message);
     }

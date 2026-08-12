@@ -34,14 +34,37 @@ import {
   type TranscribeOptions,
   type TranscribeResult
 } from '../bridge';
-import { buildRiffScore, scoreOriginSec, type InputNote, type RiffScore } from '@pipeline';
+import {
+  buildRiffScore,
+  buildTickSecondsMap,
+  scoreOriginSec,
+  type InputNote,
+  type RiffScore,
+  type TickSecondsMap
+} from '@pipeline';
 import { TriView, MIN_ZOOM, MAX_ZOOM, type NoteHit } from '../view/triview';
-import { alignOriginSec, coupledSheetScale } from '../view/timeAxis';
+import {
+  absoluteSheetScale,
+  alignOriginSec,
+  engravedPxPerSec,
+  fullViewport,
+  intersectLimits,
+  reduceViewport,
+  sheetSpanLimits,
+  viewportSaturation,
+  viewportSpan,
+  viewportWindow,
+  MIN_WINDOW_SEC,
+  TIME_ZOOM_IN_FACTOR,
+  TIME_ZOOM_OUT_FACTOR,
+  type TimeLimits,
+  type TimelineViewport,
+  type ViewportCommand
+} from '../view/timeAxis';
 import {
   PianoRoll,
   rollEditNoteIds,
   setTransientReserve,
-  timeWindowAnchors,
   type RollVerticalView,
   TIMELINE_GUTTER_PX,
   type PianoRollLiveModel,
@@ -77,6 +100,7 @@ import { WaveformStrip } from './waveform';
 import { Tuner } from './tuner';
 import { selfTest as pitchSelfTest } from '../audio/pitch';
 import { detectOnsets, type OnsetResult } from '../audio/onsets';
+import { EngineHost, isEngineCancelled, type EngineJobHandle } from '../audio/engineHost';
 import { soundingMidi } from '../score/fromPipeline';
 import {
   buildPartedRiffScore,
@@ -95,7 +119,16 @@ import {
 } from '../score/parts';
 import { accidentalsForKey, midiToName } from '../score/notes';
 import { TUNING_PRESETS, customTuning, parseTuning, tuningById, tuningLabel } from '../score/tuning';
-import { transcribeRiffsheet } from '../audio/riffsheetEngine';
+import { transcribeRiffsheet, type RiffsheetResult } from '../audio/riffsheetEngine';
+
+/**
+ * The message a cancelled local transcription throws.
+ *
+ * A sentinel, not a sentence: the player pressed "Stop waiting", so there is nothing to tell
+ * them that they do not already know, and `runTranscription` recognises it and stays quiet
+ * rather than raising "Transcription failed" over a decision they made themselves.
+ */
+const TRANSCRIPTION_CANCELLED = 'riffsheet-transcription-cancelled';
 import { RIFFSHEET_ENGINE_ID } from '../bridge/types';
 import { SettingsPanel, chipGroup, soundPicker } from './settings';
 import { findTrim, computePeaks } from '../audio/trim';
@@ -279,6 +312,21 @@ const OPEN_FILE_ACCEPT = [
  * door and are not offered here. `.mxl` is the zipped flavour, which `parseScoreFile` reads
  * already — it is the same importer, pointed at a part instead of at the document.
  */
+/**
+ * The room a notation-bar `<select>` keeps for its drop-down arrow, in px.
+ *
+ * NOT AN ESTIMATE ANY MORE, which is the whole point of it having a name. It used to be a floor
+ * under a measurement of the PLATFORM arrow taken off the control's own intrinsic width, and that
+ * measurement could not be right: the engine reserves an arrow region of its own choosing and
+ * does not shrink it in step with the `zoom` this bar is drawn at, so at the 390px floor a box
+ * sized with 23 px of allowance had about 14 visual px of it and clipped the end of its text.
+ *
+ * `ui/styles.css §.notation-toolbar select` now draws the chevron itself behind exactly this much
+ * `padding-right`, so the reserve is known rather than inferred. THE TWO NUMBERS MUST MOVE
+ * TOGETHER; this one is here so `notationBarClipped` can assert the rule the stylesheet sets.
+ */
+const NOTATION_ARROW_PX = 20;
+
 const MUSICXML_ACCEPT = '.xml,.musicxml,.mxl';
 const MUSICXML_NAME = /\.(musicxml|mxl|xml)$/i;
 
@@ -331,18 +379,14 @@ const FINGERING_LABELS: Record<AppSettings["fingering"], string> = {
   "around-fret": "Around fret N"
 };
 
-/**
- * How long the aligned window is held after a rebuild, in ms.
- *
- * Long enough to cover the re-engrave and the two or three viewport events it fires, short
- * enough that the player's next deliberate scroll is never the one that gets swallowed. It is a
- * quiet period, not a lock: nothing happens when it expires, and the window simply starts
- * following the sheet again on the next scroll.
- */
-const ALIGN_HOLD_MS = 1500;
-
-/** How much the sheet may move during a rebuild before it counts as the player scrolling. */
-const ALIGN_HOLD_SLOP_PX = 8;
+// `ALIGN_HOLD_MS` (1500) and `ALIGN_HOLD_SLOP_PX` (8) stood here and are gone (finding 11).
+//
+// They held the shared window still across a rebuild, and they were needed only because the
+// window was re-read from the engraving on every viewport event. The hold was described as a
+// quiet period rather than a lock — but nothing ran when it expired, so a rebuild whose render
+// callbacks all landed inside it, with the restored scroll inside the 8 px slop, left the roll
+// and the strip on the OLD window indefinitely. The window is authoritative now; a rebuild
+// cannot change it, so there is nothing to hold.
 
 /**
  * The ArrayBuffer behind some bytes, without copying them when that can be helped.
@@ -366,14 +410,56 @@ class App {
   private runtime: Store<RuntimeState>;
   private transport: Transport;
   private undoStack = new UndoStack();
-  /** ALIGN: the stretch of recording the roll and the strip are showing. Null = whole take. */
-  private alignedWindow: { fromSec: number; toSec: number } | null = null;
-  /** While `performance.now()` is under this, the window is a memory. See §syncViewports. */
-  private alignHoldUntil = 0;
-  /** The ruler those two numbers came out as. Held with them, and pushed to both panes. */
-  private alignedAnchors: TimeAnchor[] | null = null;
-  /** Where the sheet was when the hold opened, so a real scroll can end it early. */
-  private alignHoldScrollLeft = 0;
+  /**
+   * THE ONE AUTHORITATIVE VIEWPORT. Which seconds every pane is showing, and a revision.
+   *
+   * Null before anything has been engraved — there is no take to have a window onto yet. From
+   * the first settled render onwards this is the only answer to "what is on screen", and the
+   * three panes are told it rather than asked for it.
+   *
+   * FOUR FIELDS STOOD HERE: `alignedWindow`, `alignHoldUntil`, `alignedAnchors` and
+   * `alignHoldScrollLeft`. The last three were the machinery for holding a derived window still
+   * across a rebuild, which was necessary only because the window was DERIVED — re-read from the
+   * engraving on every viewport event, so a re-engrave silently changed it and every rectangle
+   * on the roll moved under the hand that had just added one note. A 1500 ms hold papered over
+   * it, badly: nothing ran when the hold expired, so if every render callback landed inside it
+   * and the restored scroll stayed within 8 px of slop, the roll kept the OLD window
+   * indefinitely rather than for a second and a half (finding 11).
+   *
+   * Nothing derives the window now, so nothing has to be held.
+   */
+  private viewport: TimelineViewport | null = null;
+  /**
+   * What the sheet was doing at the last settled render: how many content pixels it spends on a
+   * second, and at what `display.scale`. The ONE thing the engraving is still asked for.
+   *
+   * It is a CALIBRATION, not a window. It says how the sheet magnifies, which is what turns an
+   * authoritative span into a `display.scale` (`absoluteSheetScale`) and what fixes the two ends
+   * of the sheet's achievable span band (`sheetSpanLimits`). Measured across the whole engraved
+   * extent rather than across the viewport, so scrolling into a denser bar does not change it —
+   * a calibration that moved when you scrolled is how a scroll became a zoom.
+   */
+  private sheetRef: { pxPerSec: number; scale: number } | null = null;
+  /** True while `applyViewport` is writing the window into the panes. Guards re-entry. */
+  private applyingViewport = false;
+  /** Every command that reached the reducer, in order. Read by `__RIFFSHEET_VIEWPORT__`. */
+  private viewportLog: Array<{
+    rev: number;
+    kind: string;
+    source: string;
+    from: number;
+    to: number;
+    applied: boolean;
+  }> = [];
+  /**
+   * The client x of the pinch that raised the command being applied, or null.
+   *
+   * Carried for exactly the length of one dispatch, so `TriView.setZoom` can install the pointer
+   * anchor BEFORE the render consumes it (finding 6). A sheet pinch anchored on the pane's left
+   * edge instead of under the fingers, which is most of why the sheet's pinch and the roll's felt
+   * like different gestures — the roll had always anchored on the pointer.
+   */
+  private pinchAnchorClientX: number | null = null;
 
   private triview: TriView | null = null;
   private waveform: WaveformStrip | null = null;
@@ -392,15 +478,31 @@ class App {
   // --- session persistence (see app/persist.ts) ------------------------------
   private session: SessionStore;
   /**
-   * The user's edits, written down, mirroring `undoStack` exactly.
+   * The user's edits, written down. `undoStack` is the AUTHORITY on where inside them the user is
+   * standing; this is the serialisable record of what they were.
    *
-   * The stack itself cannot be serialised — its mementos hold live alphaTab objects — but
-   * every action IS its spec plus a stable note id, so the log replays. Mirrored rather
-   * than derived because the stack does not publish its cursor; every mutation of one is
-   * next to a mutation of the other in this file, and nothing else may touch `undoStack`.
+   * The stack itself cannot be serialised — its mementos hold live alphaTab objects — but every
+   * action IS its spec plus a stable note id, so the log replays.
+   *
+   * IT USED TO MIRROR THE STACK BY HAND, and the two disagreed. `UndoStack` caps at 200 actions
+   * and this log has no cap at all, so after 201 edits and 200 undos the stack was empty while
+   * this cursor still had one to give: the 201st ⌘Z decremented a cursor that gets SAVED against
+   * an `undo()` that did nothing, and the reopened document had lost an edit the screen still
+   * showed. `editCursor` is now derived from the stack (`syncEditCursor`) and never assigned
+   * except through it — the log keeps its oldest entries because an edit older than the cap is
+   * PERMANENT, not lost, and a restore still has to replay it.
    */
   private editLog: EditSpec[] = [];
   private editCursor = -1;
+  /**
+   * Edits a replay could not put back, since the last rebuild. Diagnostic only.
+   *
+   * `replayEdits` can legitimately refuse an edit — a nudge into a beat a re-quantize has filled,
+   * a pitch off the end of the neck — and it used to drop those SILENTLY. A snap-mode change that
+   * quietly discards a correction the player made is indistinguishable from a bug in the edit
+   * itself, so the count is reported here and on `sessionProbe()`, and each one is logged.
+   */
+  private droppedReplays = 0;
   /** How the take can be found again. Written on ingest, read on save. */
   private audioRef: PersistedAudio | null = null;
   /** Exact original playback for symbolic imports; used by the As played MIDI export. */
@@ -442,6 +544,19 @@ class App {
   private pcmRate = 0;
   private onsetResult: OnsetResult | null = null;
   private onsetGeneration = 0;
+  /**
+   * THE ENGINE, ON ITS OWN THREAD (codex-critique §11).
+   *
+   * Both of this app's local analysis passes — the attack detector `setPcm` runs when a take
+   * lands, and the whole in-house transcription — are synchronous FFT loops over the entire
+   * recording. They used to run HERE, on the page's thread, inside a plugin, which means inside
+   * the DAW's UI thread: `async` on the calling function offloads nothing when the function it
+   * awaits never yields. See `audio/engineHost.ts` for the lanes, the progress protocol and why
+   * cancellation has to be `terminate()` rather than a flag.
+   */
+  private engineHost = new EngineHost();
+  /** The transcription in flight, so Cancel has something to cancel. */
+  private engineJob: EngineJobHandle<unknown> | null = null;
   /**
    * How the original recording was reopened after the editor was rebuilt, or why it was not.
    *
@@ -558,7 +673,13 @@ class App {
       // back out. Two calls rather than one: the menu asks the cheap question every time it
       // opens, and only builds the file when the item is actually picked.
       hasAudio: () => this.hasExportableAudio(),
-      getAudio: () => this.audioExportPayload()
+      // Async for the same reason `saveRiffsheetDocument` is: after a native open the original
+      // file's bytes live in the shell, and "the recording exactly as Riffsheet has it" is a
+      // 16-bit mono re-encode until they have been fetched. See `ensureOriginalBytes`.
+      getAudio: async () => {
+        await this.ensureOriginalBytes();
+        return this.audioExportPayload();
+      }
     });
   }
 
@@ -1786,6 +1907,30 @@ class App {
   }
 
   /**
+   * The original recording's own bytes, fetched from the shell once, before anything writes them.
+   *
+   * The native picker hands the page samples and no bytes — mono, 44.1 kHz, right for the
+   * transcriber and wrong for a document that says it carries the imported file — so saving fell
+   * back to `encodeWavPcm16` and a 24-bit/96 kHz stereo master became 16-bit/44.1 kHz mono.
+   * Fetched here rather than at import so a take nobody saves is never read.
+   */
+  private async ensureOriginalBytes(): Promise<void> {
+    if (this.audioBytes && this.audioBytes.byteLength > 0) return; // browser open, or already fetched
+    if (this.audioRef?.kind === 'midi') return;
+    const token = this.audioRef?.token;
+    if (!token || !this.bridge.getOriginalAudio) return; // older shell: fall back as before
+    try {
+      const original = await this.bridge.getOriginalAudio(token);
+      if (!original || original.bytes.byteLength === 0) return;
+      // Embedded even when `verbatim` is false: a 24-bit render of a capture still beats a
+      // 16-bit mono re-encode of the analysis buffer. Only the WORDING should check `verbatim`.
+      this.rememberAudioBytes(original.bytes, original.name);
+    } catch {
+      // Never fatal — `embeddedAudio()` re-encodes the decoded samples exactly as it always did.
+    }
+  }
+
+  /**
    * The recording, ready to go inside the document (#34).
    *
    * Two sources, in order of honesty:
@@ -1898,13 +2043,18 @@ class App {
    * otherwise be told a lie it can check.
    */
   private async saveRiffsheetDocument(): Promise<void> {
+    // Before `buildRiffsheetDocument`, because it is what makes `embeddedAudio()`'s first branch
+    // — the imported file, byte for byte — available at all after a NATIVE open. See
+    // `ensureOriginalBytes`.
+    await this.ensureOriginalBytes();
     const document = this.buildRiffsheetDocument();
     if (!document) return;
     try {
       const outcome = await this.bridge.exportFile(
         `${this.baseName() || 'Untitled'}.riffsheet`,
-        // Throws, with a sentence, for a take over the 512 MB ceiling — caught below like any
-        // other failure rather than left to die inside the allocator.
+        // Throws, with a sentence, for a take over the 128 MB ceiling
+        // (`RIFFSHEET_LIMITS.containerBytes`, and `persist.MAX_DOCUMENT_AUDIO_BYTES` with it) —
+        // caught below like any other failure rather than left to die inside the allocator.
         writeRiffsheetDocument(document),
         'application/x-riffsheet+zip'
       );
@@ -2702,22 +2852,29 @@ class App {
       return;
     }
 
-    // Let the decoded waveform paint first. The detector is fast for ordinary
-    // riffs, but it is synchronous and a long take must not delay the first frame.
-    window.setTimeout(() => {
-      if (generation !== this.onsetGeneration) return;
-      try {
-        const result = detectOnsets(samples, sampleRate);
+    // OFF THIS THREAD (codex-critique §11). This used to be `setTimeout(…, 0)` around a
+    // synchronous FFT pass over the whole recording, which does not "let the waveform paint
+    // first" so much as move the freeze one frame later: the page was still locked for the whole
+    // pass, and a long take locked it for seconds, inside a DAW. The pass now runs in a worker
+    // (`audio/engineHost.ts`) and this thread only handles the reply.
+    //
+    // `generation` still guards the result rather than the lane's own cancellation, because a
+    // second take may arrive from a path that never comes back here — the check is cheap and it
+    // is the one that has always been correct.
+    this.engineHost
+      .detectOnsets(samples, sampleRate)
+      .promise.then((result) => {
         if (generation !== this.onsetGeneration) return;
         this.onsetResult = result;
         this.waveform?.setOnsets(result);
         // The other half of the race: the attacks are what the pass reasons with, and they
         // arrive here rather than with the transcription.
         this.maybeRunAutoEditPass();
-      } catch (e) {
-        console.warn('[onsets] analysis failed', e);
-      }
-    }, 0);
+      })
+      .catch((e) => {
+        // A cancelled pass is a take that was replaced, which is not a failure of anything.
+        if (!isEngineCancelled(e)) console.warn('[onsets] analysis failed', e);
+      });
   }
 
   /**
@@ -3193,7 +3350,11 @@ class App {
       this.acceptTranscription(result);
     } catch (e) {
       this.runtime.set({ progress: null, progressEtaSec: null, progressQueuePosition: 0 });
-      this.toast('danger', 'Transcription failed', (e as Error).message);
+      // The player stopped it. Clearing the overlay is the whole of the response — a red
+      // "Transcription failed" over somebody's own Cancel is the app arguing with them.
+      if ((e as Error).message !== TRANSCRIPTION_CANCELLED) {
+        this.toast('danger', 'Transcription failed', (e as Error).message);
+      }
       this.renderMain();
     } finally {
       // One take, one fallback. Leaving it set would silently pin every later transcription to
@@ -3294,14 +3455,51 @@ class App {
     }
 
     const s = this.settings.get();
-    const pass = transcribeRiffsheet(pcm, rate, {
-      // The plausible-range prior, from what the player said they are holding. Empty when TAB
-      // is off, and that is the point: nobody has told us what instrument this is, and an
-      // invented range would be worse than no range — see the octave guard's own comment.
-      tuningLowToHigh: this.engineTuningMidi(),
-      maxFret: s.maxFret,
-      durationSec: durationSec > 0 ? durationSec : undefined
-    });
+    // OFF THIS THREAD, WITH PROGRESS AND A WAY OUT (codex-critique §11). This was a plain call
+    // to `transcribeRiffsheet`, which is a synchronous FFT pass over the whole recording — the
+    // `async` on this method offloaded exactly nothing, and the page (inside a plugin, the DAW's
+    // UI thread) stood still for the length of it, with a progress overlay on screen that could
+    // not repaint. See `audio/engineHost.ts`.
+    const startedAt = performance.now();
+    const job = this.engineHost.transcribe(
+      pcm,
+      rate,
+      {
+        // The plausible-range prior, from what the player said they are holding. Empty when TAB
+        // is off, and that is the point: nobody has told us what instrument this is, and an
+        // invented range would be worse than no range — see the octave guard's own comment.
+        tuningLowToHigh: this.engineTuningMidi(),
+        maxFret: s.maxFret,
+        durationSec: durationSec > 0 ? durationSec : undefined
+      },
+      (fraction) => {
+        // The same ETA arithmetic the bridge path uses, on the engine's own reported fraction,
+        // so the overlay reads identically whichever engine is listening.
+        const elapsed = (performance.now() - startedAt) / 1000;
+        this.runtime.set({
+          progress: fraction,
+          progressStage: 'listening',
+          progressEtaSec: fraction > 0.03 ? Math.max(0, elapsed / fraction - elapsed) : null,
+          progressQueuePosition: 0
+        });
+        this.updateProgressUi();
+      }
+    );
+    // Held so "Stop waiting" has something to stop. `terminate()` is what makes that real: a
+    // synchronous pass cannot be asked to stop, only killed.
+    this.engineJob = job as EngineJobHandle<unknown>;
+    this.refreshProgressCancel();
+    let pass: RiffsheetResult;
+    try {
+      pass = await job.promise;
+    } catch (e) {
+      // A cancelled pass is the player's own decision and must not become a fallback to some
+      // other engine's opinion of their take; it ends the transcription outright.
+      if (isEngineCancelled(e)) throw new Error(TRANSCRIPTION_CANCELLED);
+      throw e;
+    } finally {
+      this.engineJob = null;
+    }
 
     if (!pass.ok) {
       const nextId = this.engineList?.nativeFallbackEngine ?? '';
@@ -3385,6 +3583,12 @@ class App {
   private setSource(source: SourceAudio): void {
     this.selection = null;
     this.tunerSelection = null;
+    // A NEW TAKE IS A NEW TIMELINE. The window names seconds of the last recording and the
+    // calibration describes the last engraving; both are meaningless here. Cleared to null so
+    // that the first settled render SEEDS from the new sheet — the one place a span is allowed
+    // to come from the engraving. A rebuild of the SAME take deliberately does not do this.
+    this.viewport = null;
+    this.sheetRef = null;
     // A new take is a new question for the cut gesture too (G8): a span swept out of the last
     // recording names seconds this one does not have.
     this.cutArmed = false;
@@ -3658,28 +3862,64 @@ class App {
   }
 
   /**
+   * ONE AUTHORITY FOR THE CURSOR.
+   *
+   * `editCursor` is `undoStack`'s own index, shifted by however many of the OLDEST edits the
+   * stack's 200-action cap has retired. Those edits are not lost — they are in `editLog`, they
+   * are on the screen, and a restore replays them — they simply cannot be walked back any more,
+   * so the cursor may not walk past them either. See `editLog` above for the exact divergence
+   * this replaces, and `edit/actions.ts` §"the stack is the authority".
+   */
+  private syncEditCursor(): void {
+    const retired = Math.max(0, this.editLog.length - this.undoStack.depth);
+    this.editCursor = this.undoStack.cursor + retired;
+  }
+
+  /**
    * Re-apply the user's edits over a freshly built score.
    *
-   * The redo tail beyond the cursor is dropped on purpose: redo needs actions that have
-   * been performed and undone, and re-performing them just to undo them again would be
-   * theatre the user could see.
+   * `keepRedoTail` REBUILDS THE WHOLE LOG, INCLUDING WHAT THE PLAYER HAD UNDONE. Redo needs
+   * actions that have been performed and undone, and the mementos that make them undoable point
+   * at alphaTab objects a rebuild has just replaced — so the only way to have a redo after a
+   * rebuild is to perform the tail again and walk straight back off it. That used to be rejected
+   * as "theatre the user could see", and it is not: this runs before `rerenderAfterEdit()`, so
+   * nothing is on screen for any of it. What the player COULD see was the other behaviour —
+   * changing the Snap menu silently emptied their redo stack, which is `codex-critique §6.2`.
+   *
+   * A session RESTORE still drops the tail (`keepRedoTail` false): it is a new process, the
+   * player has not undone anything in it yet, and re-performing edits from a file just to undo
+   * them costs the restore its speed for a redo nobody has asked for.
    */
-  private replayEdits(edits: EditSpec[], cursor: number): void {
-    const upTo = Math.min(cursor, edits.length - 1);
+  private replayEdits(edits: EditSpec[], cursor: number, keepRedoTail = false): void {
+    const upTo = keepRedoTail ? edits.length - 1 : Math.min(cursor, edits.length - 1);
     if (upTo < 0) return;
 
     const ctx = this.editContext();
     if (!ctx) return;
 
+    // How many of the replayed edits are DONE at the player's cursor, as opposed to sitting in
+    // the redo tail. Counted rather than derived from `cursor`, because an edit that refuses to
+    // replay is not in the new log at all and everything after it shifts down by one.
+    let done = 0;
     for (let i = 0; i <= upTo; i++) {
       const action = createEditAction(edits[i]);
-      if (!action) continue;
-      const result = this.undoStack.perform(action, ctx);
+      const result = action ? this.undoStack.perform(action, ctx) : null;
       // An action that refused (a pitch off the end of the neck, a nudge into an occupied
       // beat) is not on the stack, so it must not be in the log either.
-      if (result.requiresRerender || result.requiresMidiUpdate) this.editLog.push(edits[i]);
+      if (result && (result.requiresRerender || result.requiresMidiUpdate)) {
+        this.editLog.push(edits[i]);
+        if (i <= cursor) done++;
+        continue;
+      }
+      // SAID OUT LOUD (codex-critique §6.2). This used to be a silent `continue`, so an edit the
+      // player made and could still see a moment ago vanished with no event of any kind.
+      this.droppedReplays++;
+      console.warn('[riffsheet] an edit could not be replayed onto the rebuilt sheet', edits[i]);
     }
-    this.editCursor = this.editLog.length - 1;
+    // …and back off the tail, so the score on screen is the one the player was looking at. The
+    // stack keeps the actions, which is the whole point: `canRedo` is true again.
+    for (let i = this.editLog.length; i > done; i--) this.undoStack.undo(ctx);
+    this.syncEditCursor();
     this.reconcileHistory();
     this.refreshUndoRedo();
     if (this.editCursor < 0) return;
@@ -3738,6 +3978,17 @@ class App {
       noteCount: rows.length,
       edits: this.editCursor + 1,
       editKinds: this.editLog.slice(0, this.editCursor + 1).map((e) => e.kind),
+      // --- the undo layers, as numbers -------------------------------------------------
+      // The 201-edit divergence (codex-critique §7) is invisible to every other field here: the
+      // score is right, the notes are right, and only the relationship between the cursor that
+      // gets SAVED and the stack that can actually walk back is wrong. So it is reported.
+      editLogLength: this.editLog.length,
+      undoDepth: this.undoStack.depth,
+      undoCursor: this.undoStack.cursor,
+      canUndoNow: this.canUndo(),
+      canRedoNow: this.canRedo(),
+      /** Edits a rebuild could not put back. Never zero silently — see `replayEdits`. */
+      droppedReplays: this.droppedReplays,
       blend: r3(this.transport.blend),
       // --- the original recording, and whether it came back --------------------------
       // The reported bug is "I closed the plugin window and it forgot the original sound".
@@ -4220,6 +4471,106 @@ class App {
       return { mono: describe(take(false)), chord: describe(take(true)) };
     };
     /**
+     * THE PAGE, WHILE THE ENGINE IS LISTENING (codex-critique §11).
+     *
+     * The claim is not "there is a worker file in the bundle" — it is that a thirty-second take
+     * can be transcribed without the page stopping, that the pass says how far along it is, and
+     * that it can be stopped. All three are unprovable by inspection and none of them survive a
+     * screenshot, so they are measured:
+     *
+     *   ALIVE.    A timer ticks every 16 ms for the length of the pass and the LARGEST GAP
+     *             between ticks is reported. On the old inline path that gap is the whole pass;
+     *             a thread that keeps servicing timers cannot have been inside an FFT loop.
+     *   PROGRESS. Every fraction the worker posted, and whether they increase.
+     *   CANCEL.   A second pass, killed while it is running, is expected to reject fast — a
+     *             `terminate()` does not wait for the loop it interrupts.
+     *
+     * Thirty seconds of audio at 44.1 kHz, built here rather than fetched, so the probe carries
+     * no fixture and cannot pass because a file was missing.
+     */
+    (window as unknown as Record<string, unknown>).__RIFFSHEET_WORKERPROBE__ = async () => {
+      const rate = 44100;
+      const seconds = 30;
+      const pcm = new Float32Array(rate * seconds);
+      // A pluck every 250 ms across the whole take: real work for the detector (a lot of onsets)
+      // and real work for the pitch read (a lot of segments), which is what makes the pass long
+      // enough for "the page kept moving" to mean anything.
+      let seed = 987654321;
+      for (let i = 0; i < pcm.length; i++) {
+        seed = (seed * 1103515245 + 12345) & 0x7fffffff;
+        pcm[i] = ((seed / 0x7fffffff) * 2 - 1) * 0.002;
+      }
+      for (let k = 0; k * 0.25 < seconds - 0.5; k++) {
+        const midi = 40 + (k % 12);
+        const hz = 440 * Math.pow(2, (midi - 69) / 12);
+        const from = Math.round(k * 0.25 * rate);
+        for (let j = 0; j + from < pcm.length && j < rate * 0.24; j++) {
+          const t = j / rate;
+          const env = Math.exp(-t * 5) * (1 - Math.exp(-t * 400));
+          pcm[from + j] += 0.4 * env * Math.sin(2 * Math.PI * hz * t);
+        }
+      }
+
+      /** Largest gap between 16 ms ticks while `run` is outstanding. See the header. */
+      const watch = async <T>(run: Promise<T>): Promise<{ value: T | null; error: string | null; maxGapMs: number; ticks: number; elapsedMs: number }> => {
+        let last = performance.now();
+        let maxGapMs = 0;
+        let ticks = 0;
+        const timer = window.setInterval(() => {
+          const now = performance.now();
+          maxGapMs = Math.max(maxGapMs, now - last);
+          last = now;
+          ticks++;
+        }, 16);
+        const startedAt = performance.now();
+        let value: T | null = null;
+        let error: string | null = null;
+        try {
+          value = await run;
+        } catch (e) {
+          error = (e as Error).message;
+        }
+        window.clearInterval(timer);
+        return { value, error, maxGapMs, ticks, elapsedMs: performance.now() - startedAt };
+      };
+
+      const progress: number[] = [];
+      const job = this.engineHost.transcribe(pcm, rate, { tuningLowToHigh: [28, 33, 38, 43] }, (f) =>
+        progress.push(Number(f.toFixed(3)))
+      );
+      const ran = await watch(job.promise);
+
+      // …and again, stopped halfway. A separate pass rather than a second handle on the first:
+      // cancelling a job that has already answered proves nothing.
+      const second = this.engineHost.transcribe(pcm, rate, { tuningLowToHigh: [28, 33, 38, 43] });
+      const cancelledAt = performance.now();
+      window.setTimeout(() => second.cancel(), 60);
+      let cancelMessage: string | null = null;
+      try {
+        await second.promise;
+      } catch (e) {
+        cancelMessage = (e as Error).message;
+      }
+      const cancelMs = performance.now() - cancelledAt;
+
+      const result = ran.value as RiffsheetResult | null;
+      return {
+        ...this.engineHost.probe(),
+        seconds,
+        elapsedMs: Math.round(ran.elapsedMs),
+        maxGapMs: Math.round(ran.maxGapMs),
+        ticks: ran.ticks,
+        error: ran.error,
+        ok: result ? result.ok : null,
+        notes: result && result.ok ? result.notes.length : 0,
+        progressCount: progress.length,
+        progressMonotonic: progress.every((f, i) => i === 0 || f > progress[i - 1]),
+        progressLast: progress.length ? progress[progress.length - 1] : null,
+        cancelMessage,
+        cancelMs: Math.round(cancelMs)
+      };
+    };
+    /**
      * One real transcription call, made the way the app makes it, reported both ways.
      *
      * Two things this proves that nothing else can. First, that the options the player's
@@ -4503,6 +4854,113 @@ class App {
     // report re-checkable from inside the plugin.
     (window as unknown as Record<string, unknown>).__RIFFSHEET_TUNER__ = () => this.tuner?.probe() ?? null;
     (window as unknown as Record<string, unknown>).__RIFFSHEET_WAVE__ = () => this.waveform?.probe() ?? null;
+
+    /**
+     * THE ONE AUTHORITATIVE VIEWPORT, its limits, and every command that has moved it.
+     *
+     * The whole coupling architecture, made assertable. Before this rewrite the equivalent state
+     * was spread across `alignedWindow`, the roll's own `timeWindow`, two timeout clocks and the
+     * sheet's scroll position, and a probe could only ever measure the CONSEQUENCES of them
+     * disagreeing (a span that changed during a scroll, a pane that moved 250 ms after the hand
+     * stopped). `scripts/scrollzoom-probe.mjs` reads this and asserts the mechanism.
+     */
+    (window as unknown as Record<string, unknown>).__RIFFSHEET_VIEWPORT__ = () => {
+      const v = this.viewport;
+      const limits = this.viewportLimits();
+      const track = this.root.querySelector<HTMLElement>('[data-role="hscroll"]');
+      const thumb = track?.querySelector<HTMLElement>('.hscroll-thumb');
+      const t = track?.getBoundingClientRect() ?? null;
+      const th = thumb?.getBoundingClientRect() ?? null;
+      const r4 = (n: number) => Number(n.toFixed(4));
+      return {
+        viewport: v ? { fromSec: r4(v.fromSec), toSec: r4(v.toSec), revision: v.revision } : null,
+        spanSec: v ? r4(viewportSpan(v)) : null,
+        limits: {
+          durationSec: r4(limits.durationSec),
+          minSpanSec: r4(limits.minSpanSec),
+          maxSpanSec: limits.maxSpanSec === undefined ? null : r4(limits.maxSpanSec)
+        },
+        saturation: v ? viewportSaturation(v, limits) : null,
+        sheetScale: this.triview?.getZoom() ?? null,
+        // THE PINNING POINT, published so a harness can assert it rather than infer it. The two
+        // rulers are pinned at the sheet's left MUSIC edge and nowhere else — everything to the
+        // right of it drifts by the engraving's own unevenness, which is what the roll staying
+        // linear in time costs and what it buys (view/pianoroll.ts §1).
+        sheetLeftEdgeSec: (() => {
+          const tv = this.triview;
+          const score = this.runtime.get().score;
+          const view = tv?.viewport();
+          if (!tv || !score || !view) return null;
+          const tick = tv.contentXToTick(view.scrollLeft + TIMELINE_GUTTER_PX);
+          return tick === null ? null : r4(tickToSeconds(score, tick, this.originSec(score)));
+        })(),
+        sheetScrollLeft: this.triview?.viewport()?.scrollLeft ?? null,
+        sheetRef: this.sheetRef ? { pxPerSec: r4(this.sheetRef.pxPerSec), scale: r4(this.sheetRef.scale) } : null,
+        // Both halves of the scrollbar's arithmetic, so `press-identity` can be checked without
+        // guessing which pixels the thumb owns (finding 1).
+        scrollbar:
+          track && t && th
+            ? {
+                visible: track.style.display !== 'none',
+                trackLeft: r4(t.left),
+                trackWidth: r4(t.width),
+                thumbLeft: r4(th.left),
+                thumbWidth: r4(th.width),
+                travelPx: r4(Math.max(1, t.width - th.width))
+              }
+            : null,
+        log: this.viewportLog.slice(-40)
+      };
+    };
+    (window as unknown as Record<string, unknown>).__RIFFSHEET_VIEWPORTLOGRESET__ = () => {
+      this.viewportLog = [];
+      return true;
+    };
+
+    /**
+     * Zoom until the sheet is engraved at a wanted `display.scale`, then report what it DREW.
+     *
+     * Added for the blank-sheet reports, which are about a scale rather than about a gesture, and
+     * shaped by the first attempt at this getting it wrong: calling `triview.setZoom(3)` directly
+     * does re-engrave at 3, and then the very next `applyViewport` derives the scale absolutely
+     * from the authoritative span and puts it straight back. The scale is NOT this hook's to set —
+     * `§applyViewportToSheet` owns it — so this asks for it the only way anything may, by zooming
+     * the shared viewport, and stops when the sheet has arrived or the reducer has saturated.
+     *
+     * What comes back is `sheetCensus()`: the per-bar layout-against-ink census, which is what can
+     * say "bar 9 was laid out with ten notes in it and has no ink" as opposed to "the page looks
+     * wrong". Called with no argument it just re-reads the engraving as it stands.
+     */
+    (window as unknown as Record<string, unknown>).__RIFFSHEET_SHEETSCALE__ = async (
+      wanted?: number
+    ) => {
+      const tv = this.triview;
+      if (!tv) return null;
+      if (typeof wanted === 'number' && Number.isFinite(wanted)) {
+        const frame = () => new Promise<void>((done) => requestAnimationFrame(() => done()));
+        // Bounded: the shared range is at most a couple of decades wide and each step is 1.25x,
+        // so forty steps reaches either end of it twice over. A loop with no bound here would
+        // hang the harness on a take whose limits never let the sheet arrive.
+        for (let i = 0; i < 40; i++) {
+          const at = tv.getZoom();
+          if (Math.abs(at - wanted) < 0.01) break;
+          const before = this.viewport?.revision ?? -1;
+          this.dispatchViewport({
+            kind: 'zoom',
+            factor: at < wanted ? TIME_ZOOM_IN_FACTOR : TIME_ZOOM_OUT_FACTOR,
+            anchorFrac: 0,
+            source: 'system'
+          });
+          // Saturated: the reducer returned identity, so no amount of asking moves it further.
+          if ((this.viewport?.revision ?? -1) === before) break;
+          await frame();
+        }
+        // Past the left-inset correction, which re-renders from its own frame, and past the
+        // overlay rebuild that follows it.
+        await new Promise<void>((done) => requestAnimationFrame(() => requestAnimationFrame(() => done())));
+      }
+      return tv.sheetCensus();
+    };
 
     /**
      * Tied notes — one note, several noteheads, one id.
@@ -5104,6 +5562,241 @@ class App {
       };
     };
     /**
+     * ============ THE 201ST EDIT (codex-critique §7) ============
+     *
+     * `UndoStack` keeps 200 actions. `editLog` — the serialisable record that gets SAVED — had
+     * no cap and used to be walked by hand alongside the stack, so after 201 edits the two
+     * disagreed by exactly one: two hundred ⌘Z walked the stack to empty, and the two hundred
+     * and FIRST decremented the saved cursor against an `undo()` that did nothing. The screen
+     * kept the oldest edit, the document said it had been undone, and reopening the file changed
+     * the score.
+     *
+     * Nothing about that is visible in the notes, the sheet or the roll — only in the
+     * relationship between three numbers — so this probe reports all of them together with the
+     * one thing that can arbitrate: WHAT IS ACTUALLY APPLIED. Every edit is ±1 semitone on one
+     * note, alternating, so the pitch offset after all the undos says exactly how many edits are
+     * still in force, and `editCursor + 1` must equal it.
+     *
+     * DESTRUCTIVE. It leaves the score edited on purpose — undoing back is the very operation
+     * under test — so the harness runs it last.
+     */
+    (window as unknown as Record<string, unknown>).__RIFFSHEET_UNDOCAP__ = (edits = 201) => {
+      const ctx = this.editContext();
+      if (!ctx) return { error: 'no score' };
+      // A note that will accept both directions, so no edit in the run can be refused for a
+      // reason that has nothing to do with the cap.
+      let id: string | null = null;
+      for (const candidate of [...ctx.index.idToNote.keys()].slice(0, 12)) {
+        const before = this.midiOfNote(candidate);
+        if (before === null) continue;
+        this.perform(new ChangePitchAction(candidate, 1), null, 'notation');
+        if (this.midiOfNote(candidate) === before + 1) {
+          this.undo();
+          if (this.midiOfNote(candidate) === before) {
+            id = candidate;
+            break;
+          }
+        }
+      }
+      if (!id) return { error: 'no note could be transposed both ways' };
+
+      // FROM EMPTY. Whatever the harness did before this — and by the time it gets here it has
+      // done a great deal — is history this probe would otherwise have to subtract out of every
+      // number it reports. The claim is about the relationship between the log, the stack and
+      // the page, and it is only legible from a known start.
+      this.undoStack.clear();
+      this.editLog = [];
+      this.editCursor = -1;
+      this.resetHistories();
+
+      const startMidi = this.midiOfNote(id) as number;
+      const logBefore = this.editLog.length;
+      // `layer: 'notation'` on purpose: a bare pitch change would be routed to the PERFORMANCE
+      // layer (F7), which has a different stack and is not the one with the cap on it.
+      for (let i = 0; i < edits; i++) {
+        this.perform(new ChangePitchAction(id, i % 2 === 0 ? 1 : -1), null, 'notation');
+      }
+      const performed = this.editLog.length - logBefore;
+      const midiAfterEdits = this.midiOfNote(id);
+
+      // …and all the way back. One more ⌘Z than there were edits, because the extra one is
+      // precisely the press that used to move the saved cursor with nothing behind it.
+      for (let i = 0; i <= edits; i++) this.undo();
+
+      const midiAfterUndo = this.midiOfNote(id);
+      return {
+        requested: edits,
+        performed,
+        startMidi,
+        midiAfterEdits,
+        midiAfterUndo,
+        /** How many edits are still in force, read off the note rather than off a counter. */
+        appliedAfterUndo: midiAfterUndo === null ? null : midiAfterUndo - startMidi,
+        editLogLength: this.editLog.length,
+        editCursor: this.editCursor,
+        undoDepth: this.undoStack.depth,
+        undoCursor: this.undoStack.cursor,
+        canUndoNow: this.canUndo(),
+        canRedoNow: this.canRedo()
+      };
+    };
+
+    /**
+     * ============ CHANGING THE SNAP MENU IS NOT AN EDIT (codex-critique §6.2) ============
+     *
+     * A snap-mode change rebuilds the sheet, and a rebuild replaces every alphaTab object the
+     * undo mementos point at. The old answer was to CLEAR the stack: the player's whole history
+     * — undo and redo alike — was destroyed by a view control, silently.
+     *
+     * The history is re-derived now (`replayEdits`, `keepRedoTail`). This drives the real path
+     * with a real redo tail in place and reports the depth, the cursor and both buttons on
+     * either side of the change; an edit that genuinely cannot be replayed is counted rather
+     * than dropped in silence, so `droppedReplays` is here too.
+     */
+    (window as unknown as Record<string, unknown>).__RIFFSHEET_SNAPUNDO__ = () => {
+      const ctx = this.editContext();
+      if (!ctx) return { error: 'no score' };
+      const original = this.settings.get().rollSnap;
+      const shape = () => ({
+        editLogLength: this.editLog.length,
+        editCursor: this.editCursor,
+        undoDepth: this.undoStack.depth,
+        undoCursor: this.undoStack.cursor,
+        canUndo: this.canUndo(),
+        canRedo: this.canRedo()
+      });
+
+      let id: string | null = null;
+      for (const candidate of [...ctx.index.idToNote.keys()].slice(0, 12)) {
+        const before = this.midiOfNote(candidate);
+        if (before === null) continue;
+        this.perform(new ChangePitchAction(candidate, 1), null, 'notation');
+        if (this.midiOfNote(candidate) === before + 1) {
+          id = candidate;
+          break;
+        }
+      }
+      if (!id) return { error: 'no note could be transposed' };
+      this.perform(new ChangePitchAction(id, 1), null, 'notation');
+      this.perform(new ChangePitchAction(id, -1), null, 'notation');
+      // One step back, so there is a REDO tail to lose. The old behaviour lost it.
+      this.undo();
+      const before = shape();
+      const droppedBefore = this.droppedReplays;
+
+      this.settings.set({ rollSnap: original === 'off' ? 'grid' : 'off' });
+      this.rebuildNotation({ keepEdits: true });
+      const after = shape();
+
+      // Put the menu back where the player left it; the harness has more to do after this.
+      this.settings.set({ rollSnap: original });
+      this.rebuildNotation({ keepEdits: true });
+      return { before, after, droppedReplays: this.droppedReplays - droppedBefore };
+    };
+
+    /**
+     * ============ A NOTE LANDS WHERE IT WAS CLICKED (codex-critique §7) ============
+     *
+     * The roll used to compute its own written second 0 (`scoreOriginSec`, which is 0 unless the
+     * bar-1 marker has been dragged) while the app had moved to a first-attack origin. A
+     * double-click emitted a written second on the roll's origin and `edit/rollPerformance.ts`
+     * added the APP's origin back on, so on a take with leading silence a new note appeared one
+     * whole silence away from the pointer. With both origins zero — which is every take that
+     * starts immediately — the two mistakes cancel and nothing is visible.
+     *
+     * So this probe MANUFACTURES the leading silence: the take is shifted late, the sheet is
+     * rebuilt, a real `dblclick` is dispatched at a known x on an empty pitch row, and the
+     * rectangle that comes back is compared against the x that was clicked. Then the original
+     * take is put back, whatever happened.
+     */
+    (window as unknown as Record<string, unknown>).__RIFFSHEET_ORIGINPROBE__ = async (
+      silenceSec = 1.5
+    ) => {
+      const roll = this.pianoRoll;
+      const before = this.runtime.get().source;
+      if (!roll || !before?.detected) return { error: 'no take' };
+
+      const restore = () => {
+        this.runtime.set({ source: before });
+        this.rebuildNotation({ keepEdits: true });
+      };
+      try {
+        // LEADING SILENCE, made rather than found. Beats and duration move with the notes, or
+        // the pipeline is being handed a grid that describes a different recording.
+        const shift = (t: number) => Number((t + silenceSec).toFixed(6));
+        this.runtime.set({
+          source: {
+            ...before,
+            durationSec: (before.durationSec ?? 0) + silenceSec,
+            detected: {
+              ...before.detected,
+              notes: before.detected.notes.map((n) => ({
+                ...n,
+                startSec: shift(n.startSec),
+                endSec: shift(n.endSec)
+              })),
+              beats: before.detected.beats?.map(shift),
+              downbeats: before.detected.downbeats?.map(shift)
+            }
+          }
+        });
+        this.rebuildNotation({ keepEdits: true });
+        await new Promise((r) => setTimeout(r, 60));
+
+        const score = this.runtime.get().score;
+        if (!score) return { error: 'no score after the shift' };
+        const appOrigin = this.originSec(score);
+        const rollProbe = roll.probe();
+        const rects = roll.paintedRects().filter((r) => r.noteId !== null);
+        if (rects.length < 2) return { error: 'not enough painted notes', appOrigin };
+
+        // The roll is linear in time by construction, so two rectangles fix the ruler exactly.
+        // Deriving it from what was PAINTED rather than from the roll's own conversion is the
+        // point: a probe that asks the roll where it would put a second is comparing a number
+        // with itself.
+        const [a, b] = [rects[0], rects[rects.length - 1]];
+        const pxPerSec = (b.x - a.x) / (b.startSec - a.startSec);
+        if (!Number.isFinite(pxPerSec) || pxPerSec === 0) return { error: 'degenerate ruler', appOrigin };
+        const targetWrittenSec = Number(((a.startSec + b.startSec) / 2).toFixed(4));
+        const targetX = a.x + (targetWrittenSec - a.startSec) * pxPerSec;
+        const emptyY = rollProbe.emptyRowY;
+        if (emptyY === null || emptyY === undefined) return { error: 'no empty pitch row', appOrigin };
+
+        const canvas = this.root.querySelector<HTMLCanvasElement>('canvas.pianoroll');
+        if (!canvas) return { error: 'no roll canvas', appOrigin };
+        const box = canvas.getBoundingClientRect();
+        const idsBefore = new Set(rects.map((r) => r.noteId));
+        canvas.dispatchEvent(
+          new MouseEvent('dblclick', {
+            bubbles: true,
+            clientX: box.left + targetX,
+            clientY: box.top + emptyY
+          })
+        );
+        await new Promise((r) => setTimeout(r, 120));
+
+        const added = roll.paintedRects().find((r) => r.noteId !== null && !idsBefore.has(r.noteId));
+        return {
+          appOrigin: Number(appOrigin.toFixed(4)),
+          rollOrigin: Number((rollProbe.originSec ?? 0).toFixed(4)),
+          silenceSec,
+          pxPerSec: Number(pxPerSec.toFixed(3)),
+          clickedX: Number(targetX.toFixed(2)),
+          clickedWrittenSec: targetWrittenSec,
+          addedNoteId: added?.noteId ?? null,
+          addedX: added ? added.x : null,
+          addedWrittenSec: added ? added.startSec : null,
+          /** The whole claim, in pixels: a note has to appear where the pointer was. */
+          errorPx: added ? Number(Math.abs(added.x - targetX).toFixed(2)) : null,
+          /** …and the same error in seconds, which is what the origin bug was measured in. */
+          errorSec: added ? Number(Math.abs(added.startSec - targetWrittenSec).toFixed(4)) : null
+        };
+      } finally {
+        restore();
+      }
+    };
+
+    /**
      * The two voices, actually rendered.
      *
      * `__RIFFSHEET_SOUND__` proves the sample set decoded; it does not prove the sampler is
@@ -5296,7 +5989,7 @@ class App {
             deltaPx: Math.round(Math.abs(sheetX - r.x))
           });
         }
-        const window = this.alignedWindow;
+        const window = this.viewport;
         // WHAT THE ROLL IS ACTUALLY SHOWING, next to what Align asked it to show. The two are
         // the same claim in on-mode and must differ in off-mode: "the panes are independent"
         // means the roll went back to the whole take. Reported because the off-mode failure
@@ -5348,7 +6041,7 @@ class App {
         this.pianoRoll?.fitVertical();
         await settle(250);
         // Put the sheet at the top, then point at a moment well into the take.
-        this.triview?.setScrollLeft(0);
+        this.dispatchViewport({ kind: 'pan', deltaSec: -1e9, source: 'system' });
         await settle(300);
         const before = this.triview?.viewport()?.scrollLeft ?? 0;
         const targetSec = notes[Math.min(notes.length - 1, Math.floor(notes.length * 0.75))].startSec;
@@ -5396,7 +6089,19 @@ class App {
         // is", and only the first of those is a bug. `targetOnScreen` is the claim that survives
         // the clamp: wherever it landed, the moment being pointed at is visible.
         const maxScrollLeft = view ? Math.max(0, view.contentWidth - view.viewportWidth) : null;
-        const clampedAtEnd = maxScrollLeft !== null && after >= maxScrollLeft - 1;
+        // WHICH CLAMP ACTUALLY STOPPED IT, and it is no longer the sheet's scroll. The shared
+        // window runs out of take before the sheet runs out of page: at `fromSec = duration -
+        // span` the window's right edge is the last engraved moment, while the sheet can still
+        // scroll on into the trailing page padding past the final bar. Measuring the sheet's
+        // scrollLeft therefore reported "not clamped" for a request the app had quite correctly
+        // refused to centre, and `sheetErrorPx` — which is a distance from the PANE's middle —
+        // was then read as a miss rather than as the end of the recording.
+        const vpNow = this.viewport;
+        const takeSec = this.viewportLimits().durationSec;
+        const clampedAtEnd =
+          (maxScrollLeft !== null && after >= maxScrollLeft - 1) ||
+          (vpNow !== null && vpNow.toSec >= takeSec - 1e-3) ||
+          (vpNow !== null && vpNow.fromSec <= 1e-3);
         const targetOnScreen =
           wantedX === null || !view ? null : wantedX >= after - 1 && wantedX <= after + view.viewportWidth + 1;
 
@@ -5437,8 +6142,8 @@ class App {
         const noteAdded = (this.runtime.get().source?.detected?.notes ?? []).length > notesBefore;
         // Read BEFORE the undo below re-engraves: the window is what this measurement produced,
         // and a rebuild re-derives it from a sheet that has just changed under it.
-        const alignedWindowSec = this.alignedWindow
-          ? Number((this.alignedWindow.toSec - this.alignedWindow.fromSec).toFixed(3))
+        const alignedWindowSec = this.viewport
+          ? Number(viewportSpan(this.viewport).toFixed(3))
           : null;
         this.undo();
         await settle(500);
@@ -5470,7 +6175,7 @@ class App {
           alignedWindowSec,
           // How many beats the shared ruler is pinned to. Two is the fallback (the plain
           // window); more means it is following the engraving beat by beat.
-          alignAnchors: this.alignedAnchors?.length ?? 0,
+          alignAnchors: this.viewport ? 2 : 0,
           selectionCrossed,
           noteAdded,
           // Rounded to whole pixels: the roll re-derives its own layout, so a sub-pixel
@@ -6524,17 +7229,26 @@ class App {
      * one part to two, two to a different order, four to a refusal — and a probe that set up
      * each state by hand would be checking its own arrangement rather than the app's.
      *
+     * IT DRIVES THE MENU, NOT THE MODEL. Every verb below is performed by putting a value into
+     * the `[data-role="part-view"]` box and firing the `change` a mouse fires — the same door a
+     * hand uses — so a control that is disabled, missing or wired to the wrong call fails this,
+     * and the underlying `setParts` cannot pass it on the control's behalf. It replaces the
+     * chip-row scenario one for one: the pill row is gone, the drag with it.
+     *
      * WHAT IT ASSERTS BY MEASURING, in order:
-     *   1. the row exists on a single-part take, with the live chip marked and nothing else;
-     *   2. `[+]` takes a MusicXML file through `parseScoreFile` and it becomes a PART — a
-     *      second chip, a second alphaTab track, a second `<part-name>` in the export;
+     *   1. the box exists on a single-part take, reading "Part: ● <take>", with Remove and
+     *      Rename refused on it and nothing else in the list;
+     *   2. Add part takes a MusicXML file through `parseScoreFile` and it becomes a PART — a
+     *      second entry in the box, a second alphaTab track, a second `<part-name>` in the
+     *      export;
      *   3. PLAYBACK IS UNTOUCHED. The synth schedule with the guitar on the page is compared
      *      byte for byte against the one-part schedule taken before it was added. This is the
      *      contract: an imported part is engraved and never played;
-     *   4. dragging the guitar chip left of the bass chip changes the EMITTED order, on the
-     *      sheet and in the MusicXML part list — driven with the same pointer events a hand
-     *      sends, not by calling the reorder directly;
-     *   5. at four parts the plus is disabled and says why.
+     *   4. Move up changes the EMITTED order, on the sheet and in the MusicXML part list;
+     *   5. Rename, from the menu and again from the NAME PRINTED ON THE SHEET, and both times
+     *      the box, the page and the export are read back to see that all three agree;
+     *   6. the nudge is still there behind Rename, still rounds to a printable unit;
+     *   7. at four parts Add is disabled and says why, and a fifth is refused.
      *
      * It ENDS at the two-part state, guitar above bass, because that is the state the harness
      * photographs. `__RIFFSHEET_PARTSRESET__` puts the take back to one part afterwards.
@@ -6542,36 +7256,43 @@ class App {
     (window as unknown as Record<string, unknown>).__RIFFSHEET_PARTS__ = async () => {
       const settle = (ms: number) => new Promise((ok) => setTimeout(ok, ms));
       const bytes = () => new TextEncoder().encode(GUITAR_PART_MUSICXML);
+      const control = () => this.root.querySelector<HTMLSelectElement>('[data-role="part-view"]');
 
-      /** The row as somebody looking at it would describe it. */
-      const row = () => {
-        const node = this.root.querySelector<HTMLElement>('[data-role="part-chips"]');
+      /** The one control, as somebody looking at it would describe it. */
+      const box = () => {
+        const node = control();
         if (!node) return null;
-        const chips = [...node.querySelectorAll<HTMLElement>('[data-role="part-chip"]')].map((chip) => {
-          const box = chip.getBoundingClientRect();
-          return {
-            key: chip.getAttribute('data-part'),
-            text: (chip.textContent ?? '').trim(),
-            live: chip.classList.contains('live'),
-            dot: !!chip.querySelector('.part-dot'),
-            title: chip.getAttribute('title') ?? '',
-            box: { left: box.left, right: box.right, top: box.top, bottom: box.bottom }
-          };
-        });
-        const add = node.querySelector<HTMLButtonElement>('[data-role="part-add"]');
-        const box = node.getBoundingClientRect();
-        const sheet = this.root.querySelector<HTMLElement>('.triview')?.getBoundingClientRect() ?? null;
+        const rect = node.getBoundingClientRect();
+        const bar = this.root.querySelector<HTMLElement>('[data-role="notation-toolbar"]');
+        const barRect = bar?.getBoundingClientRect() ?? null;
+        const options = [...node.options].map((option) => ({
+          value: option.value,
+          text: option.text,
+          disabled: option.disabled,
+          title: option.getAttribute('title') ?? '',
+          group: (option.parentElement as HTMLElement).getAttribute('label') ?? ''
+        }));
         return {
-          chips,
-          addPresent: !!add,
-          addDisabled: !!add?.disabled,
-          addTitle: add?.getAttribute('title') ?? '',
-          // "No new ellipsis anywhere in the row": neither the character nor three dots.
-          ellipsis: /…|\.\.\./.test(node.textContent ?? ''),
-          height: box.height,
-          // Directly above the sheet, and clear of it.
-          aboveSheet: !!sheet && box.bottom <= sheet.top + 1,
-          overlapping: chips.some((chip, i) => i > 0 && chip.box.left < chips[i - 1].box.right - 0.5)
+          value: node.value,
+          // What the closed box READS, which is the whole of the control on screen.
+          shown: node.options[node.selectedIndex]?.text ?? '',
+          options,
+          parts: options.filter((o) => o.value.startsWith('part:')),
+          verbs: options.filter((o) => o.value.startsWith('do:')),
+          // NO ELLIPSIS ANYWHERE IN THE BAR: neither the character nor three dots, and no box
+          // narrower than the words in it (which is the other way one appears).
+          ellipsis: /…|\.\.\./.test(bar?.textContent ?? '') || this.notationBarClipped(),
+          width: Math.round(rect.width),
+          // ON THE NOTATION BAR, on its line — not a row of its own.
+          onBar: !!barRect && rect.top >= barRect.top - 1 && rect.bottom <= barRect.bottom + 1,
+          barRows: bar
+            ? new Set(
+                [...bar.children].map((child) => {
+                  const b = child.getBoundingClientRect();
+                  return Math.round((b.top + b.height / 2) / 4);
+                })
+              ).size
+            : 0
         };
       };
 
@@ -6593,14 +7314,18 @@ class App {
         return [...score.musicxml().matchAll(/<part-name>([^<]*)<\/part-name>/g)].map((m) => m[1]);
       };
 
+      /** The names alphaTab was actually given to print down the left of the systems. */
+      const printedNames = () => (this.triview?.model?.tracks ?? []).map((track) => track.name);
+
       const shape = () => {
         const score = this.runtime.get().score;
         return {
-          row: row(),
+          box: box(),
           tracks: score?.data.tracks.length ?? 0,
           notationOnly: (score?.data.tracks ?? []).map((track) => track.notationOnly === true),
           parts: scoreParts(score).map((part) => `${part.role}:${part.name}`),
           partNames: partNames(),
+          printedNames: printedNames(),
           // What the SHEET actually engraved: alphaTab renders one staff system per track it
           // was given, so this is the count a screenshot would show.
           renderedTracks: this.triview?.api.tracks?.length ?? 0,
@@ -6608,21 +7333,21 @@ class App {
         };
       };
 
-      const dragChip = (key: string, toX: number) => {
-        const chip = this.root.querySelector<HTMLElement>(`[data-part="${key}"]`);
-        if (!chip) return false;
-        const box = chip.getBoundingClientRect();
-        const base = {
-          bubbles: true,
-          button: 0,
-          buttons: 1,
-          pointerId: 7,
-          pointerType: 'mouse',
-          clientY: box.top + box.height / 2
-        };
-        chip.dispatchEvent(new PointerEvent('pointerdown', { ...base, clientX: box.left + box.width / 2 }));
-        chip.dispatchEvent(new PointerEvent('pointermove', { ...base, clientX: toX }));
-        chip.dispatchEvent(new PointerEvent('pointerup', { ...base, clientX: toX }));
+      /** Choose an entry the way a mouse chooses one: set the value, fire `change`. */
+      const choose = (value: string) => {
+        const node = control();
+        if (!node) return false;
+        const option = [...node.options].find((o) => o.value === value);
+        if (!option || option.disabled) return false;
+        node.value = value;
+        node.dispatchEvent(new Event('change', { bubbles: true }));
+        return true;
+      };
+      const typeInto = (role: string, value: string) => {
+        const input = document.querySelector<HTMLInputElement>(`[data-role="${role}"]`);
+        if (!input) return false;
+        input.value = value;
+        input.dispatchEvent(new Event('change', { bubbles: true }));
         return true;
       };
 
@@ -6630,78 +7355,89 @@ class App {
         if (!this.runtime.get().score) return { error: 'no score' };
         const single = { ...shape(), schedule: schedule() };
 
+        // (2) A file becomes a part. Through `addPartFromMusicXml` rather than the Add item,
+        // because the item ends in a native file picker no script may answer; the item's own
+        // presence, state and reason are measured in `box()` instead.
         await this.addPartFromMusicXml('Guitar demo.musicxml', bytes());
         await settle(30);
         const two = { ...shape(), schedule: schedule() };
 
-        // Guitar above bass: drop it to the left of the live chip's left edge.
-        const liveBox = two.row?.chips.find((chip) => chip.key === 'live')?.box;
-        const dragged = dragChip('imp1', (liveBox?.left ?? 40) - 20);
+        // (4) Guitar above bass, through the menu: select the guitar, then Move up.
+        const selected = choose('part:imp1');
+        const movedUp = choose('do:move-up');
         await settle(30);
         const reordered = { ...shape(), schedule: schedule() };
+        // …and the same verb is refused once it is already at the top.
+        const movedUpAgain = choose('do:move-up');
 
-        // --- the chip's own menu: rename, nudge, remove -----------------------------------
-        // Opened the way a finger opens it: press and release on the chip without moving.
-        const clickChip = (key: string) => {
-          const chip = this.root.querySelector<HTMLElement>(`[data-part="${key}"]`);
-          if (!chip) return null;
-          const box = chip.getBoundingClientRect();
-          const at = {
-            bubbles: true,
-            button: 0,
-            buttons: 1,
-            pointerId: 8,
-            pointerType: 'mouse',
-            clientX: box.left + box.width / 2,
-            clientY: box.top + box.height / 2
-          };
-          chip.dispatchEvent(new PointerEvent('pointerdown', at));
-          chip.dispatchEvent(new PointerEvent('pointerup', at));
-          return document.querySelector<HTMLElement>('[data-role="part-menu"]');
-        };
-        const typeInto = (role: string, value: string) => {
-          const input = document.querySelector<HTMLInputElement>(`[data-role="${role}"]`);
-          if (!input) return false;
-          input.value = value;
-          input.dispatchEvent(new Event('change', { bubbles: true }));
-          return true;
-        };
-
-        const menu = clickChip('imp1');
+        // (5) Rename, from the menu.
+        const menu = choose('do:rename') ? document.querySelector<HTMLElement>('[data-role="part-menu"]') : null;
         const menuShape = menu
           ? {
               open: true,
               hasRename: !!menu.querySelector('[data-role="part-rename"]'),
               hasNudge: !!menu.querySelector('[data-role="part-nudge"]'),
-              hasRemove: !!menu.querySelector('[data-role="part-remove"]'),
               nudgeStart: menu.querySelector<HTMLInputElement>('[data-role="part-nudge"]')?.value ?? null
             }
           : { open: false };
         const renamed = typeInto('part-rename', 'Rhythm gtr');
         await settle(30);
         const afterRename = shape();
-        clickChip('imp1');
+        this.closePartMenu();
+
+        // (5b) …AND FROM THE SHEET. The name alphaTab printed down the left of the system is
+        // pressed, the field that opens over it is typed into, and the box, the page and the
+        // export are read back — the three that must never disagree about a part's name.
+        const labelHit = () => {
+          const parts = scoreParts(this.runtime.get().score);
+          const imported = parts.find((part) => part.role === 'imported');
+          const hits = [...document.querySelectorAll<HTMLElement>('.part-label-hit')];
+          return imported
+            ? hits.find((hit) => Number(hit.dataset.track) === imported.trackIndex) ?? null
+            : null;
+        };
+        const hit = labelHit();
+        hit?.click();
+        const inlineOpen = !!document.querySelector('[data-role="part-label-rename"]');
+        const inlineTyped = (() => {
+          const input = document.querySelector<HTMLInputElement>('[data-role="part-label-rename"]');
+          if (!input) return false;
+          input.value = 'Lead gtr';
+          input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }));
+          return true;
+        })();
+        await settle(60);
+        const afterLabelRename = shape();
+
+        // (6) The nudge, still one press behind Rename.
+        choose('part:imp1');
+        choose('do:rename');
         const nudged = typeInto('part-nudge', '60');
         await settle(30);
         const afterNudge = shape();
+        // RE-OPENED, and this is the claim: the number the player is left looking at is the one
+        // that was APPLIED. 60 ms is typed, a whole 1/32 at this tempo is 78, and 78 is what the
+        // box reads afterwards. It used to be read off the chip's `±Nms` badge, which went with
+        // the chips; the box the number was typed into is the more direct witness anyway.
+        choose('do:rename');
+        const nudgeShown = document.querySelector<HTMLInputElement>('[data-role="part-nudge"]')?.value ?? null;
         // …and back, so what follows is the fixture the rest of the run expects.
-        clickChip('imp1');
         typeInto('part-nudge', '0');
         await settle(20);
-        clickChip('imp1');
+        choose('do:rename');
         typeInto('part-rename', 'Guitar');
         await settle(20);
+        this.closePartMenu();
 
         // Remove, from the menu, and then put it back — the removal is the claim, the re-add is
         // the scenario continuing.
-        clickChip('imp1');
-        document.querySelector<HTMLElement>('[data-role="part-remove"]')?.click();
+        const removed = choose('do:remove');
         await settle(30);
         const afterRemove = shape();
         await this.addPartFromMusicXml('Guitar demo.musicxml', bytes());
         await settle(30);
 
-        // Fill to the cap. Three more would be five, so two more is exactly four.
+        // (7) Fill to the cap. Three more would be five, so two more is exactly four.
         await this.addPartFromMusicXml('Second.musicxml', bytes());
         await this.addPartFromMusicXml('Third.musicxml', bytes());
         await settle(30);
@@ -6726,13 +7462,21 @@ class App {
         return {
           single,
           two,
-          dragged,
+          selected,
+          movedUp,
+          movedUpAgain,
           reordered,
           menuShape,
           renamed,
           afterRename,
+          labelHits: [...document.querySelectorAll('.part-label-hit')].length,
+          inlineOpen,
+          inlineTyped,
+          afterLabelRename,
           nudged,
+          nudgeShown,
           afterNudge,
+          removed,
           afterRemove,
           full,
           refusedFifth: refusedFifth || afterFifth.tracks === 4,
@@ -6755,6 +7499,98 @@ class App {
         return { tracks: score?.data.tracks.length ?? 0, parts: scoreParts(score).length };
       } catch (e) {
         return { error: String(e) };
+      }
+    };
+
+    /**
+     * Put the parts in a stated order, so a harness can photograph BOTH orders.
+     *
+     * Codex finding 8 is about what the decorations BESIDE the music say once an imported part is
+     * moved above the take: the tuning legend down the side of the tab and the note-name row both
+     * read whichever track came first, which is the take only by luck of ordering. Proving that is
+     * fixed needs the score in each order in turn, and the gestures that reorder it are the same
+     * menu the screenshot is trying to show. This drives `setParts` exactly as Move up and Move
+     * down do; it invents no ordering rule of its own.
+     */
+    (window as unknown as Record<string, unknown>).__RIFFSHEET_PARTSORDER__ = (order: string[]) => {
+      try {
+        const imported = this.partSlots()
+          .filter((slot): slot is { kind: 'imported'; part: ImportedPart } => slot.kind === 'imported')
+          .map((slot) => slot.part);
+        this.setParts(imported, order);
+        const score = this.runtime.get().score;
+        return { order, parts: scoreParts(score).map((p) => `${p.role}:${p.name}`) };
+      } catch (e) {
+        return { error: String(e) };
+      }
+    };
+
+    /**
+     * THE NATIVE PICKER'S DOCUMENT: does a save carry the file, or a re-encode of the analysis?
+     *
+     * The state this reproduces cannot be reached by clicking in a browser, which is exactly why
+     * the bug lived so long. A NATIVE open hands the page decoded samples and no file bytes, so
+     * `this.audioBytes` is null while `audioRef.token` names a recording the shell is still
+     * holding; `embeddedAudio()` then fell through to `encodeWavPcm16` and a 24-bit 96 kHz stereo
+     * master was written into the document as 16-bit mono. `ensureOriginalBytes()` is what closes
+     * that, and this stages the same three facts: the shell holds the bytes, the page does not,
+     * and the ref carries the token.
+     *
+     * `bridge.loadAudioBytes` is the staging door in BOTH hosts (the mock keeps the bytes under a
+     * synthetic path and answers `getOriginalAudio` for its token), so nothing here is a stub
+     * standing in for the bridge — it is the bridge.
+     */
+    (window as unknown as Record<string, unknown>).__RIFFSHEET_ORIGINALAUDIO__ = async () => {
+      const original = this.audioBytes;
+      if (!original || original.byteLength === 0) return { error: 'no take bytes to stage' };
+      if (!this.bridge.loadAudioBytes || !this.bridge.getOriginalAudio) {
+        return { error: 'bridge has no original-audio door' };
+      }
+      // Copied before anything below can forget it: this is the answer every claim is checked
+      // against, and `forgetAudioBytes()` drops the app's only other reference to it.
+      const wanted = original.slice();
+      const beforeRef = this.audioRef;
+      const beforeMime = this.audioMime;
+      try {
+        const staged = await this.bridge.loadAudioBytes('original-take.wav', wanted);
+        if (!staged?.token) return { error: 'bridge staged nothing' };
+        this.audioRef = {
+          kind: 'file',
+          name: staged.name,
+          path: staged.path,
+          token: staged.token,
+          durationSec: this.runtime.get().source?.durationSec ?? 0
+        };
+        // THE NATIVE PICKER STATE, in one line: samples decoded, file bytes never seen.
+        this.forgetAudioBytes();
+        const fellBack = this.embeddedAudio();
+        const same = (a: Uint8Array | null | undefined, b: Uint8Array): boolean =>
+          !!a && a.byteLength === b.byteLength && a.every((v, i) => v === b[i]);
+
+        await this.ensureOriginalBytes();
+        const fetched = this.embeddedAudio();
+        // And the real road: the document `saveRiffsheetDocument` would write. Built rather than
+        // saved, so the harness is not made to answer a file dialog.
+        const doc = this.buildRiffsheetDocument();
+
+        return {
+          stagedToken: staged.token,
+          wantedBytes: wanted.byteLength,
+          // Before the fetch: a re-encode of the decoded samples, which is the bug.
+          fallbackBytes: fellBack?.bytes.byteLength ?? 0,
+          fallbackWasOriginal: same(fellBack?.bytes, wanted),
+          // After it: the shell's own bytes, under the original filename.
+          fetchedBytes: fetched?.bytes.byteLength ?? 0,
+          fetchedIsOriginal: same(fetched?.bytes, wanted),
+          fetchedName: fetched?.name ?? null,
+          documentIsOriginal: same(doc?.audioData?.bytes, wanted)
+        };
+      } catch (e) {
+        return { error: String((e as Error).stack ?? e) };
+      } finally {
+        this.audioRef = beforeRef;
+        this.audioBytes = wanted;
+        this.audioMime = beforeMime;
       }
     };
   }
@@ -7096,9 +7932,14 @@ class App {
     const basis = this.snapBasis(source, raw);
     if (!basis) return raw;
     const unitSec = rollSnapUnitSec(s.rollGrid, basis.tempoBpm);
+    // THE LENGTH OF THE TAKE, into both modes (codex-critique §6). The EDITED take's length, from
+    // the same `source` the notes came out of, so a cut take is bounded by the tape that is
+    // actually on screen. Without it an attack inside the last cell rounds forward onto a line at
+    // or past the end of the recording and `pipeline/src/guards.ts` drops it: turning the snap on
+    // deleted the last note of the take from the sheet. See `snap.ts` §"the end of the tape".
     return s.rollSnap === 'beat'
-      ? snapPerformanceToBeat(raw, basis.beatSec, unitSec, basis.originSec, basis.tempoBpm)
-      : snapPerformanceToGrid(raw, unitSec, basis.originSec, basis.tempoBpm);
+      ? snapPerformanceToBeat(raw, basis.beatSec, unitSec, basis.originSec, basis.tempoBpm, source.durationSec)
+      : snapPerformanceToGrid(raw, unitSec, basis.originSec, basis.tempoBpm, source.durationSec);
   }
 
   /**
@@ -7134,7 +7975,9 @@ class App {
       this.runtime.set({ score, selection: [] });
 
       // The undo stack keys on note ids, but the alphaTab objects those ids resolved to have
-      // just been replaced wholesale, so the stack itself cannot survive a rebuild.
+      // just been replaced wholesale, so the stack's MEMENTOS cannot survive a rebuild — which is
+      // not the same thing as the history not surviving. It is RE-DERIVED below, tail and all,
+      // from the log this takes a copy of here (codex-critique §6.2).
       const log = this.editLog;
       const cursor = this.editCursor;
       this.undoStack.clear();
@@ -7156,7 +7999,13 @@ class App {
       // quietly dropped from the log rather than half-applied.
       //
       // `keepEdits: false` is for a genuinely new performance, where the old ids mean nothing.
-      if (options?.keepEdits !== false && log.length > 0) this.replayEdits(log, cursor);
+      //
+      // THE TAIL COMES BACK TOO. Changing the Snap menu, nudging bar 1 or re-quantizing rebuilds
+      // the sheet, and every one of those used to empty the player's REDO stack on the way past —
+      // a view control silently destroying history, which is exactly the claim `codex-critique
+      // §6.2` refuses to let the Snap control make. An edit that genuinely cannot be put back is
+      // reported rather than dropped in silence; see `replayEdits`.
+      if (options?.keepEdits !== false && log.length > 0) this.replayEdits(log, cursor, true);
       else if (options?.keepEdits === false) this.resetHistories();
 
       // A new sheet is the biggest change there is; this is the save that matters most.
@@ -7246,12 +8095,14 @@ class App {
     if (!tv || !score) return null;
     const view = tv.viewport();
     if (!view) return null;
-    const ticksPerSec = (score.tempoBpm / 60) * ALPHATAB_QUARTER_TICKS;
+    // THE SAME CONVERSION the cursor, the seek and the loop use, at origin 0 because this axis is
+    // in WRITTEN seconds. A scalar here names the wrong tick after a tempo change, which puts a
+    // roll rectangle beside its own notehead — see `secondsToTick`.
     return {
-      writtenSecToContentX: (sec) => tv.tickToContentX(sec * ticksPerSec),
+      writtenSecToContentX: (sec) => tv.tickToContentX(secondsToTick(score, sec, 0)),
       contentXToWrittenSec: (x) => {
         const tick = tv.contentXToTick(x);
-        return tick === null ? null : tick / ticksPerSec;
+        return tick === null ? null : tickToSeconds(score, tick, 0);
       },
       scrollLeft: view.scrollLeft,
       viewportWidth: view.viewportWidth,
@@ -7273,98 +8124,270 @@ class App {
    * quietly go stale after a zoom. Nothing here polls.
    */
   private syncViewports(): void {
-    // The strip is on the sheet's axis too now. `setViewportRange` early-returns when the span is
-    // unchanged, so a zoom that happens to preserve the span would leave the envelope stale.
+    // A REPAINT, AND NOTHING ELSE. It used to derive the shared window from the sheet's
+    // viewport and push it to the other two panes, and it was wired to BOTH `onViewportChange`
+    // and `onRenderComplete` — so a single sheet pinch drove the roll through incomplete-partial
+    // geometry, then final geometry at the old pixel scroll, then final geometry after the
+    // anchor restore (finding 7). The window lives in `this.viewport` now; this only asks the
+    // two canvases to paint themselves again against a content width that may have changed.
+    // RE-ASSERTED, NOT RE-DERIVED, and the difference is the whole architecture. Nothing is read
+    // off the engraving here; the authoritative window is simply written into the two canvases
+    // again. It is idempotent — both setters early-return when the window is unchanged — and it
+    // is what makes a pane that has just been CONSTRUCTED correct on its first frame:
+    // `renderMain()` builds a fresh roll and a fresh strip, and a new object knows nothing, so
+    // without this it would draw the whole take until the next command arrived and then jump.
+    // It also converges the one case where the roll can legitimately lag: a window that arrived
+    // while the player had the pointer down on a note is deferred to the end of that gesture
+    // (`PianoRoll.setViewport`), and this is what puts the strip and the roll back in step
+    // afterwards without either of them reporting anything.
+    this.pushWindowToStrips();
     this.waveform?.draw();
-    this.updateScrollbar();
-    const tv = this.triview;
-    const score = this.runtime.get().score;
-    if (!tv) return;
-    // The roll has a stable recording-time axis; it only needs to be told to paint again.
     this.pianoRoll?.draw();
-
-    if (!this.waveform || !score) return;
-    const view = tv.viewport();
-    if (!view) {
-      this.waveform.setViewportRange(null, null);
-      this.setAlignedWindow(null);
-      return;
-    }
-    // The waveform is the whole-take overview and speaks RECORDING seconds, so the bracket
-    // has to come back across the bar-1 origin — the sheet's clock starts at bar 1 and the
-    // recording's starts at the top of the file (§4.13). Getting this wrong would put the
-    // bracket a count-in adrift of the music it claims to be showing.
-    const map = this.sheetMap();
-    const origin = this.originSec(score);
-    const from = map?.contentXToWrittenSec(view.scrollLeft);
-    const to = map?.contentXToWrittenSec(view.scrollLeft + view.viewportWidth);
-    this.waveform.setViewportRange(
-      from === null || from === undefined ? null : from + origin,
-      to === null || to === undefined ? null : to + origin
-    );
-    // The ALIGNED window is measured between the same two x's the roll and the strip put their
-    // PLOT between, not between the viewport's own edges: both panes spend their first
-    // TIMELINE_GUTTER_PX on pitch labels, and the sheet spends exactly the same column on page
-    // padding (view/triview.ts §D). Measuring edge-to-edge would hand the roll a span it draws
-    // 34px narrower than the sheet does, and every note would sit a little left of its notehead.
-    const plotFrom = map?.contentXToWrittenSec(view.scrollLeft + TIMELINE_GUTTER_PX);
-    const plotTo = to;
-    const fromSec = plotFrom === null || plotFrom === undefined ? null : plotFrom + origin;
-    const toSec = plotTo === null || plotTo === undefined ? null : plotTo + origin;
-    // THE WHOLE OF ALIGN'S GEOMETRY, and it is two numbers.
-    //
-    // The sheet's visible span, mapped back through alphaTab's own bounds, handed to the roll
-    // and the strip so all three panes draw the same seconds across the same pixels. What is
-    // NOT handed over is the sheet's x-axis: inside the window each pane stays linear in time,
-    // which is what keeps the picture of a performance honest and what makes adding a note
-    // unable to move any other note. See view/pianoroll.ts §setTimeWindow.
-    // HELD ACROSS A REBUILD, and this is the hard rule rather than an optimisation.
-    //
-    // A roll edit re-runs the pipeline and re-engraves, which moves the sheet's own geometry:
-    // the same scroll position now shows slightly different music, so a window re-derived from
-    // it would be a slightly different window — and every rectangle on the roll would shift
-    // under the hand that had just added one note. That is precisely the reflow the old linked
-    // mode was deleted for, arriving through a different door.
-    //
-    // So the window is a memory, not a live read. It follows the sheet when the PLAYER moves
-    // the sheet, and it is left exactly where it was through a rebuild. applyScoreToViews()
-    // opens the hold; the next scroll after it expires picks the sheet up again.
-    // The hold covers a REBUILD, not a scroll. `restoreScrollAnchor` puts the sheet back within
-    // a pixel or two of where it was, so a few pixels of drift is the rebuild; anything more is
-    // the player moving the page, and that must pick the ruler up again immediately or the roll
-    // would sit at a stale offset for a second and a half.
-    const scrolled = Math.abs(view.scrollLeft - this.alignHoldScrollLeft) > ALIGN_HOLD_SLOP_PX;
-    const holding =
-      this.alignedWindow !== null && performance.now() < this.alignHoldUntil && !scrolled;
-    if (!holding) {
-      // Unconditional (G11): the only question left is whether the sheet has a span to give.
-      this.setAlignedWindow(
-        fromSec !== null && toSec !== null && toSec > fromSec ? { fromSec, toSec } : null
-      );
-    } else {
-      // Held — but still PUSHED. `renderMain()` builds a fresh roll and a fresh strip, and a
-      // pane that has just been constructed knows nothing; without this it would draw the whole
-      // take for as long as the hold lasted and then jump. Idempotent on both sides.
-      this.setAlignedWindow(this.alignedWindow);
-    }
+    this.updateScrollbar();
   }
 
-  /** One writer for both panes, so they cannot end up looking at different moments. */
-  private setAlignedWindow(w: { fromSec: number; toSec: number } | null): void {
-    this.alignedWindow = w;
-    const anchors = w ? this.alignAnchors(w) : null;
-    this.alignedAnchors = anchors;
-    this.pianoRoll?.setTimeAnchors(anchors);
-    // THE STRIP TAKES THE ROLL'S WINDOW, not the sheet's, and the difference is a clamp.
+  /** The window into the two canvases. Silent, idempotent, and never near the sheet. */
+  private pushWindowToStrips(): void {
+    const v = this.viewport;
+    if (!v) return;
+    const win = viewportWindow(v);
+    this.pianoRoll?.setViewport(win);
+    // THE STRIP TAKES THE ROLL'S APPLIED WINDOW, and this is a mirror rather than a derivation.
     //
-    // The window derived from the sheet can start before the recording does — a count-in puts
-    // written second 0 a tenth of a second into the file, so the sheet's left edge maps to a
-    // NEGATIVE audio second. The roll refuses that (`clampWindow`, against the take's own
-    // length); the strip, handed the raw anchors, did not, and the two ended up drawing rulers
-    // 0.1 s apart while both believed they were aligned. Reading back what the roll actually
-    // applied is what makes "all three panes show the same seconds" true rather than intended.
-    const applied = anchors && this.pianoRoll ? timeWindowAnchors(this.pianoRoll.getTimeWindow()) : anchors;
-    this.waveform?.setTimeAnchors(applied);
+    // The two are stacked edge to edge drawing the same seconds across the same pixels, so a
+    // frame in which they disagree puts a rectangle over the wrong sound — the single most
+    // misleading thing either pane can do. They can disagree for exactly one reason: the roll
+    // FREEZES its window while the player has the pointer down on a note (`setViewport`), so
+    // that a re-engrave cannot move every other rectangle out from under a hand mid-edit. The
+    // strip has no such gesture and would otherwise move alone.
+    //
+    // Reading the roll back is not the old `syncViewports` read-back in disguise: what is read
+    // is the roll's own state, never the ENGRAVING, and it cannot change the authoritative
+    // window — nothing here writes `this.viewport`. When the gesture ends the roll flushes and
+    // the next repaint puts both on the authoritative window again.
+    const applied = this.pianoRoll?.getTimeWindow() ?? win;
+    this.waveform?.setTimeAnchors(this.alignAnchors(applied));
+    this.waveform?.setViewportRange(applied.fromSec, applied.toSec);
+  }
+
+  /**
+   * THE ONE ROAD IN. A view stated an intent; reduce it and write the answer to all three panes.
+   *
+   * Every gesture in the app that changes which seconds are on screen arrives here: the roll's
+   * wheel, pinch, drag-pan and zoom buttons; the sheet's pinch and its scrollbar; the waveform's
+   * wheel and pinch; the horizontal scrollbar under the sheet. There is no other writer, which
+   * is what makes "the three panes agree" a property of the code rather than a thing to test for.
+   */
+  private dispatchViewport(cmd: ViewportCommand): void {
+    // Re-entry is not a race to be tolerated, it is a bug: a command raised while the previous
+    // one is still being written into the panes would be reducing against a state that is half
+    // applied. The only way it can happen is a pane reporting during a programmatic write, which
+    // is exactly what the silent setters are there to prevent — so this is a belt, and it is
+    // also the assertion that they work.
+    if (this.applyingViewport) return;
+    const limits = this.viewportLimits();
+    const current = this.viewport ?? fullViewport(limits);
+    const next = reduceViewport(current, cmd, limits);
+    // SATURATION IS AN IDENTITY (finding 9). At a zoom limit the reducer returns the same object
+    // and the revision does not move, so nothing re-renders, nothing snaps back, and the panes
+    // simply stop together at the deepest zoom the SHEET can follow.
+    if (next === this.viewport) {
+      this.viewportLog.push({ rev: current.revision, kind: cmd.kind, source: cmd.source, from: current.fromSec, to: current.toSec, applied: false });
+      if (this.viewportLog.length > 400) this.viewportLog.shift();
+      return;
+    }
+    this.viewport = next;
+    // EVERY MOVE OF THE ONE STATE, IN ORDER. `__RIFFSHEET_VIEWPORT__` publishes it, and the
+    // scroll/zoom probe asserts things no screenshot can: that one pinch produces exactly ONE
+    // revision (finding 7 — the panes used to walk through three windows per gesture), that a
+    // scrollbar drag produces only `pan`s, and that a gesture at a zoom limit produces none.
+    this.viewportLog.push({ rev: next.revision, kind: cmd.kind, source: cmd.source, from: next.fromSec, to: next.toSec, applied: true });
+    if (this.viewportLog.length > 400) this.viewportLog.shift();
+    this.applyViewport();
+  }
+
+  /**
+   * THE SHARED LIMITS: the intersection of what the roll can draw and what the sheet can engrave.
+   *
+   * The roll would happily show 50 ms; the sheet is clamped to `display.scale` in [0.6, 3], which
+   * is a band of achievable spans and nothing outside it. Alignment is mandatory here, so the
+   * shared range is the overlap — the roll cannot zoom past what the sheet can follow. Before the
+   * sheet has been measured there is nothing to intersect with and the roll's own limits stand.
+   */
+  private viewportLimits(): TimeLimits {
+    const base: TimeLimits = {
+      durationSec: Math.max(
+        0.001,
+        this.runtime.get().source?.durationSec ?? this.runtime.get().score?.durationSec ?? 0
+      ),
+      minSpanSec: MIN_WINDOW_SEC
+    };
+    const ref = this.sheetRef;
+    const view = this.triview?.viewport();
+    if (!ref || !view || !(ref.pxPerSec > 0)) return base;
+    // The music column, not the element: both panes spend their first `TIMELINE_GUTTER_PX` on
+    // the pitch labels and the sheet is padded by the same column (view/triview.ts §D).
+    const plotWidth = Math.max(1, view.viewportWidth - TIMELINE_GUTTER_PX);
+    return intersectLimits(
+      base,
+      sheetSpanLimits(plotWidth / ref.pxPerSec, ref.scale, MIN_ZOOM, MAX_ZOOM)
+    );
+  }
+
+  /**
+   * Write the authoritative window into the three panes. SILENT in every direction.
+   *
+   * The roll and the strip take a window and redraw; neither reports it back, which is the whole
+   * of finding 2's fix. The sheet takes two instructions — a `display.scale` derived ABSOLUTELY
+   * from the span, and a tick to put at the left edge of the music column — because the sheet
+   * cannot be handed a window: its x-axis is an engraving, not a clock.
+   */
+  private applyViewport(): void {
+    const v = this.viewport;
+    if (!v) return;
+    let landed = true;
+    this.applyingViewport = true;
+    try {
+      const win = viewportWindow(v);
+      this.pushWindowToStrips();
+      landed = this.applyViewportToSheet(win);
+      this.updateScrollbar();
+    } finally {
+      this.applyingViewport = false;
+    }
+    // THE ONE PLACE THE SHEET IS ALLOWED TO ANSWER BACK, and it is a correction rather than a
+    // derivation: the page had nowhere to go, so where it actually is becomes the left edge.
+    //
+    // It happens at exactly one boundary — a take with leading silence, with the window parked
+    // hard against second 0. The pipeline engraves the first attack in bar 1, so the silence
+    // before it has no page at all; the sheet's left edge is a clef, and asking it to show a
+    // moment inside that silence clamps the scroll at 0. Without this the roll spends a hundred
+    // real pixels on time the sheet spends on a key signature, and the first note — the one
+    // place the two rulers are pinned exactly — drifts by a quarter of the prefix.
+    //
+    // It settles in ONE step and cannot loop: the second reported is the second the sheet's own
+    // left edge is showing, so the scroll it asks for next is the scroll it already has, and a
+    // second failure would report the same number and the reducer would return identity.
+    if (!landed) this.reportSheetLeftEdge();
+  }
+
+  /** The second at the sheet's left MUSIC edge, back into the reducer as a plain sheet scroll. */
+  private reportSheetLeftEdge(): void {
+    const tv = this.triview;
+    const score = this.runtime.get().score;
+    const view = tv?.viewport();
+    if (!tv || !score || !view) return;
+    const tick = tv.contentXToTick(view.scrollLeft + TIMELINE_GUTTER_PX);
+    if (tick === null) return;
+    this.dispatchViewport({
+      kind: 'sheetScroll',
+      fromSec: tickToSeconds(score, tick, this.originSec(score)),
+      source: 'sheet'
+    });
+  }
+
+  /**
+   * The sheet's half: a scale that makes the pane show `span` seconds, and a tick at its edge.
+   *
+   * ORDER MATTERS AND IS NOT ARBITRARY. The scale goes first because a re-engrave moves every
+   * content x, so a scroll computed against the old engraving would land somewhere else;
+   * `alignScrollToTick` then scrolls against the geometry that now exists, and re-arms itself
+   * across a render that is still owed.
+   *
+   * A scale too close to the current one starts no render at all, and that is not a dropped
+   * step: the next event asks for the full absolute scale again, because nothing here is
+   * incremental (see `timeAxis.absoluteSheetScale`).
+   */
+  private applyViewportToSheet(win: { fromSec: number; toSec: number }): boolean {
+    const tv = this.triview;
+    const score = this.runtime.get().score;
+    if (!tv || !score) return true;
+    const ref = this.sheetRef;
+    const view = tv.viewport();
+    const span = win.toSec - win.fromSec;
+    if (ref && view && ref.pxPerSec > 0 && span > 0) {
+      tv.setZoom(
+        absoluteSheetScale(
+          tv.getZoom(),
+          // The calibration was measured at `ref.scale`; the sheet may have moved since.
+          ref.pxPerSec * (tv.getZoom() / ref.scale),
+          Math.max(1, view.viewportWidth - TIMELINE_GUTTER_PX),
+          span,
+          MIN_ZOOM,
+          MAX_ZOOM
+        ),
+        this.pinchAnchorClientX
+      );
+    }
+    return tv.alignScrollToTick(secondsToTick(score, win.fromSec, this.originSec(score)));
+  }
+
+  /**
+   * THE SHEET HAS SETTLED: recalibrate, seed the first window, and put the window back on it.
+   *
+   * Called from `TriViewOptions.onRenderSettled` — once per render that finished for real, after
+   * every corrective inset pass and after the scroll anchor has been restored (finding 7). It is
+   * deliberately NOT wired to `onViewportChange`: that fires for partial renders and mid-render
+   * overlay rebuilds, and aligning against those is how the panes came to walk through three
+   * different windows during one sheet pinch.
+   *
+   * Three jobs, in order:
+   *
+   *   1. RECALIBRATE. Ask the new engraving how many pixels it spends on a second. This is the
+   *      only measurement of the engraving anything still makes, and it is a slope rather than a
+   *      position, so it cannot move the window.
+   *   2. SEED, once. A score that has just loaded has no window yet; the sheet's own first
+   *      screenful is the honest starting view, so it is taken — exactly once, through the same
+   *      reducer as everything else. This is the ONLY place a span comes from the engraving.
+   *   3. RE-ASSERT. A re-engrave moves every content x, so the tick that was at the left edge is
+   *      somewhere else now. Scroll back to the authoritative `fromSec`. Nothing about the
+   *      window changes here, which is what makes an edit unable to move the picture: the old
+   *      controller re-derived the window from the moved engraving instead, and needed a 1500 ms
+   *      hold (finding 11) to survive its own rebuild.
+   */
+  private onSheetRenderSettled(): void {
+    const tv = this.triview;
+    const score = this.runtime.get().score;
+    if (!tv || !score) return;
+    const view = tv.viewport();
+    if (!view) return;
+
+    const origin = this.originSec(score);
+    const secAtX = (x: number): number | null => {
+      const tick = tv.contentXToTick(x);
+      // Through the shared conversion, so the calibration measures the take's REAL length. A
+      // scalar here is wrong by the ratio between the two tempi, and `pxPerSec` is the slope
+      // every later `absoluteSheetScale` decision is derived from — so it would be wrong once
+      // and then wrong everywhere. `pxPerSec` itself stays ONE average over the whole engraved
+      // extent on purpose (see `engravedPxPerSec`): it is a zoom calibration, not a clock.
+      return tick === null ? null : tickToSeconds(score, tick, origin);
+    };
+    const pxPerSec = engravedPxPerSec(tv.engravedExtent(), secAtX);
+    if (pxPerSec !== null && pxPerSec > 0) this.sheetRef = { pxPerSec, scale: tv.getZoom() };
+
+    // THIS RENDER IS OURS. `applyViewportToSheet` called `setZoom`, alphaTab renders
+    // synchronously, and we are inside that call — the scroll half of the write has not run yet
+    // and is about to. Recalibrating was worth doing (the scale it measures is the new one);
+    // writing the window again from in here would be applying a half-applied state to itself.
+    if (this.applyingViewport) {
+      this.syncViewports();
+      return;
+    }
+
+    if (this.viewport === null) {
+      // THE SEED. Both edges of the music column, once, so the app opens on what the sheet is
+      // already showing rather than snapping to the whole take.
+      const from = secAtX(view.scrollLeft + TIMELINE_GUTTER_PX);
+      const to = secAtX(view.scrollLeft + view.viewportWidth);
+      const limits = this.viewportLimits();
+      if (from !== null && to !== null && to > from) {
+        this.viewport = reduceViewport(fullViewport(limits), { kind: 'showSpan', fromSec: from, toSec: to, source: 'system' }, limits);
+      } else {
+        this.viewport = fullViewport(limits);
+      }
+    }
+    this.applyViewport();
+    this.syncViewports();
   }
 
   /**
@@ -7397,33 +8420,62 @@ class App {
     ];
   }
 
-  /** Centre the sheet (and therefore the roll) on a moment in the RECORDING. */
   /**
-   * Point at a moment in one view; take the sheet there too.
+   * Point at a moment in one view; take all three there.
    *
-   * The whole of what the Align chip does. It moves ONLY the sheet's horizontal scroll — the
-   * roll and the strip already show the whole take, so there is nothing of theirs to move, and
-   * that asymmetry is the point rather than an omission: the sheet is the only view that can
-   * be looking somewhere else.
+   * A PAN COMMAND, not a scroll. It used to write `TriView.setScrollLeft` and leave the other
+   * two panes to catch up through the derived window — which is the same road a scrollbar drag
+   * took, and it changed the span for the same reason (finding 2). Centring is a position, so
+   * it is expressed as a delta on `fromSec` and the span rides through untouched.
    *
-   * Nothing here touches geometry. The predecessor of this chip did, and adding one note to
-   * the roll re-spaced its neighbours as a result. This cannot: it is a scroll position.
+   * At the ends of the take the reducer's clamp does the right thing on its own: the window
+   * slides up against the wall rather than being centred past it.
    */
   private followSeek(audioSec: number): boolean {
-    // Always. There is no longer a setting that could refuse — see AppSettings.alignViews.
     this.scrollSheetToAudioSec(audioSec);
     return true;
   }
 
   private scrollSheetToAudioSec(audioSec: number): void {
+    const v = this.viewport;
+    if (!v || !Number.isFinite(audioSec)) return;
+    const span = viewportSpan(v);
+    // CENTRED ON THE PAGE, NOT ON THE CLOCK, and the difference is the whole reason this asks
+    // the engraving anything at all.
+    //
+    // Putting the moment in the middle of the WINDOW puts it in the middle of the roll and the
+    // strip — both linear in time — and somewhere else entirely on the sheet, because alphaTab
+    // spaces a dense bar wider than a sparse one. Measured: 191 px off centre on the demo take.
+    // "Point at a moment and the sheet comes to it" is a claim about the READING SURFACE, so the
+    // sheet's own geometry is what decides where to stop.
+    //
+    // This is a DISCRETE navigation request, not the coupling: it reads the engraving once, to
+    // choose one number, and what it emits is an ordinary `sheetScroll` — one edge, with the
+    // span supplied by the reducer exactly as for any other scroll. Nothing here can change how
+    // much is on screen, which is the property the whole rewrite rests on.
     const tv = this.triview;
     const score = this.runtime.get().score;
-    const map = this.sheetMap();
     const view = tv?.viewport();
-    if (!tv || !score || !map || !view) return;
-    const x = map.writtenSecToContentX(audioSec - this.originSec(score));
-    if (x === null) return;
-    tv.setScrollLeft(Math.max(0, x - view.viewportWidth / 2));
+    if (tv && score && view) {
+      const origin = this.originSec(score);
+      // The page x of a MOMENT, so it needs that moment's real tick. The return leg below already
+      // goes through `tickToSeconds` and follows the map on its own, so a scalar here would only
+      // hand it a wrong tick to convert faithfully.
+      const x = tv.tickToContentX(secondsToTick(score, audioSec, origin));
+      if (x !== null) {
+        const tick = tv.contentXToTick(Math.max(0, x - view.viewportWidth / 2) + TIMELINE_GUTTER_PX);
+        if (tick !== null) {
+          this.dispatchViewport({
+            kind: 'sheetScroll',
+            fromSec: tickToSeconds(score, tick, origin),
+            source: 'transport'
+          });
+          return;
+        }
+      }
+    }
+    // Nothing engraved to aim at: centre it on the clock, which is the honest fallback.
+    this.dispatchViewport({ kind: 'pan', deltaSec: audioSec - span / 2 - v.fromSec, source: 'transport' });
   }
 
   private liveSheet(): PianoRollLiveModel | null {
@@ -7518,15 +8570,26 @@ class App {
   }
 
   private applyScoreToViews(score: RiffScore): void {
-    // See §syncViewports: the aligned window must survive this rebuild unchanged, or adding one
-    // note re-spaces the picture of the performance around it.
-    if (this.alignedWindow) {
-      this.alignHoldUntil = performance.now() + ALIGN_HOLD_MS;
-      this.alignHoldScrollLeft = this.triview?.viewport()?.scrollLeft ?? this.alignHoldScrollLeft;
-    }
+    // NO HOLD OPENS HERE ANY MORE (finding 11). A 1500 ms quiet period used to be armed on every
+    // rebuild so that the window — which was re-derived from the engraving on every viewport
+    // event — would not change while the engraving moved under it. Nothing derives the window
+    // now, so a rebuild cannot move it and there is nothing to protect it from. `onRenderSettled`
+    // simply scrolls the sheet back to the authoritative `fromSec` once the new engraving exists.
     this.refreshTempoBox();
     this.triview?.load(score);
     this.renderEveryPart();
+    // ONE ORIGIN, PUSHED BEFORE ANYTHING THAT READS IT (codex-critique §7).
+    //
+    // `originSec()` is the app's canonical written second 0 — the first-attack alignment, §F13 —
+    // and it is now the roll's as well. It goes FIRST because `setBarOne` and `setScore` both
+    // rebuild the bar grid off the origin, and rebuilding it against the roll's old self-computed
+    // one would draw a frame of bar lines in the wrong place before the correct one arrived.
+    //
+    // The bug this closes: the roll went on deriving `scoreOriginSec(score, barOneSec)`, which is
+    // 0 on a take nobody has dragged the marker on, so a double-click-add on a take with leading
+    // silence emitted a written second measured from second 0 while `edit/rollPerformance.ts`
+    // added the app's first-attack origin back on. The note landed one leading silence late.
+    this.pianoRoll?.setOriginSec(this.originSec(score));
     // Bar 1 is the roll's time origin — without it a count-in slides the whole roll off
     // the waveform above it. See view/pianoroll.ts.
     this.pianoRoll?.setBarOne(this.runtime.get().source?.barOneSec ?? 0);
@@ -7572,6 +8635,10 @@ class App {
     const chosen = this.runtime.get().source?.keyFifths;
     const value = chosen === undefined ? 'auto' : String(chosen);
     if (select.value !== value) select.value = value;
+    // The words in the box just changed and the box is cut to its words, so it has to be cut
+    // again. Measured without this: the Key box kept the 97px it was given for "Key: Auto" and
+    // then showed "Key: Auto — C major" — 123px of text — clipped inside it.
+    this.fitSelects([select]);
   }
 
   // =========================================================================
@@ -7838,15 +8905,40 @@ class App {
   private buildScrollbar(): HTMLElement {
     const track = el('div', { class: 'hscroll', 'data-role': 'hscroll' }, el('i', { class: 'hscroll-thumb' }));
 
+    /**
+     * THE TRUE INVERSE OF `updateScrollbar` (finding 1), and a pan command rather than a scroll.
+     *
+     * The thumb is placed over its LEGAL TRAVEL — `frac * (trackWidth - thumbWidth)` — and this
+     * used to read it back by dividing by the whole track width. Pressing an already-positioned
+     * thumb was therefore not the identity: a thumb 30% of the track sitting at 50% mapped to
+     * 35% on pointer-down, so the sheet jumped left the instant you touched it, and the far
+     * right edge could not be reached without dragging the pointer past the end of the track.
+     * Dividing by the same `trackWidth - thumbWidth` the thumb was placed over makes press,
+     * drag and release all agree.
+     *
+     * And it goes through `dispatchViewport` rather than writing `tv.setScrollLeft` directly.
+     * Writing the sheet's scroll is how a scrollbar drag became a zoom: the window was then
+     * re-derived from the sheet's two engraved endpoints, which cover a different number of
+     * seconds in a dense bar than in a sparse one (finding 2). A pan moves one edge and cannot
+     * touch the span.
+     */
     const seekTo = (clientX: number, fromThumb: number) => {
-      const tv = this.triview;
-      const v = tv?.viewport();
-      if (!tv || !v || v.contentWidth <= v.viewportWidth) return;
+      const v = this.viewport;
+      const limits = this.viewportLimits();
+      const duration = Math.max(limits.minSpanSec, limits.durationSec);
+      if (!v) return;
+      const span = viewportSpan(v);
+      const travelSec = duration - span;
+      if (!(travelSec > 0)) return;
+      const thumb = track.querySelector<HTMLElement>('.hscroll-thumb');
       const rect = track.getBoundingClientRect();
-      const usable = Math.max(1, rect.width);
-      const frac = Math.min(1, Math.max(0, (clientX - rect.left - fromThumb) / usable));
-      tv.setScrollLeft(frac * (v.contentWidth - v.viewportWidth));
-      this.syncViewports();
+      const travelPx = Math.max(1, rect.width - (thumb?.getBoundingClientRect().width ?? 0));
+      const frac = Math.min(1, Math.max(0, (clientX - rect.left - fromThumb) / travelPx));
+      this.dispatchViewport({
+        kind: 'pan',
+        deltaSec: frac * travelSec - v.fromSec,
+        source: 'scrollbar'
+      });
     };
 
     track.addEventListener('pointerdown', (e: PointerEvent) => {
@@ -7869,182 +8961,248 @@ class App {
     return track;
   }
 
-  /** Size and place the thumb from the sheet's own viewport. Called from `syncViewports`. */
+  /**
+   * Size and place the thumb from the AUTHORITATIVE WINDOW, not from the sheet's scroll.
+   *
+   * The bar governs all three panes, so it has to describe the thing all three are showing. It
+   * used to be drawn from `contentWidth`/`scrollLeft` — the sheet's own pixels — which made it
+   * a picture of the engraving rather than of the take, and meant its two directions were
+   * measured against two different rulers (see `seekTo`).
+   */
   private updateScrollbar(): void {
     const bar = this.root.querySelector<HTMLElement>('[data-role="hscroll"]');
     if (!bar) return;
-    const v = this.triview?.viewport();
-    const scrollable = !!v && v.contentWidth > v.viewportWidth + 1;
+    const v = this.viewport;
+    const limits = this.viewportLimits();
+    const duration = Math.max(limits.minSpanSec, limits.durationSec);
+    const span = v ? viewportSpan(v) : duration;
+    const scrollable = !!v && duration - span > 1e-4;
     bar.style.display = scrollable ? '' : 'none';
     if (!scrollable || !v) return;
     const thumb = bar.querySelector<HTMLElement>('.hscroll-thumb');
     if (!thumb) return;
-    const frac = v.viewportWidth / v.contentWidth;
-    const maxScroll = Math.max(1, v.contentWidth - v.viewportWidth);
-    thumb.style.width = `${Math.max(6, frac * 100)}%`;
-    thumb.style.left = `${(v.scrollLeft / maxScroll) * (100 - Math.max(6, frac * 100))}%`;
+    const widthPct = Math.max(6, (span / duration) * 100);
+    thumb.style.width = `${widthPct}%`;
+    thumb.style.left = `${(v.fromSec / (duration - span)) * (100 - widthPct)}%`;
   }
 
   // =========================================================================
-  // The part chips — one thin row, directly above the sheet
+  // The part control — one dropdown, on the notation bar
   // =========================================================================
 
   /**
-   * `[● Bass] [Guitar] [+]`, and on a take that has never had a part added, `[● Bass] [+]`.
+   * `Part: ● Bass ▾`, and everything a part can be told to do, in one box on the bar the sheet
+   * already has.
    *
-   * IT IS DELIBERATELY ALMOST NOTHING. This app is already more chrome than music, and the row
-   * has to earn a strip of the page on a take that will never use it — so it is one line of small
-   * pills with no heading, no border and no label, and the whole of it on a single-part take is
-   * the name of the instrument and a plus.
+   * WHAT THIS REPLACES, AND WHY IT IS GONE. Parts used to have a strip of their own directly
+   * above the sheet — a pill per part, a `+` at the end, drag to reorder — and the strip cost a
+   * whole row of a plugin window on every take, including the very many that will only ever have
+   * one part. A row that says "Bass" and nothing else is a row of chrome about nothing, and this
+   * window is already more chrome than music. So the row is deleted and the parts live here, in
+   * the bar that was already on screen, as one control the width of its own name.
    *
-   * THE DOT IS THE POINT. The live part — the take this plugin recorded, the one the roll draws
-   * and the one you hear — is permanently accent-filled and carries a dot, whether or not it is
-   * the chip you last clicked and wherever in the order it has been dragged. Everything else on
-   * this screen is about that part, and a row where you cannot tell which chip that is would be
-   * worse than no row.
+   * ONE `<select>` WITH TWO SECTIONS, which is the same idiom the Tab menu on this bar already
+   * uses (see the note on `data-role="tab-view"`): the first section is the PARTS and selecting
+   * one makes it active, the second is the VERBS and choosing one does it and springs back. A
+   * verb is not a state, so nothing in the second group is ever left showing in the closed box —
+   * `onPartControlChange` puts the active part's name back before it acts.
+   *
+   * THE DOT SURVIVED THE ROW. The live part — the take this plugin recorded, the one the roll
+   * draws and the one you hear — is marked `●` wherever it has been moved to, because everything
+   * else on this screen is about that part and a menu you cannot tell it from would be worse than
+   * no menu. It is also the one part with no Remove: the take IS the document.
+   *
+   * RENAME IS OFFERED FOR IMPORTED PARTS ONLY. The live part's printed name is not stored
+   * anywhere to change — it is derived from the instrument on every build (`score/parts.ts
+   * §livePartName`), so a box that appeared to rename it would be overwritten by the next
+   * re-engrave. The item is disabled and says so rather than lying.
    */
-  private buildPartChips(): HTMLElement {
-    const slots = this.partSlots();
-    const full = slots.length >= MAX_SCORE_PARTS;
-    const liveName = livePartName(this.settings.get());
-
-    const chips = slots.map((slot) => {
-      const live = slot.kind === 'live';
-      const key = live ? LIVE_PART_ID : slot.part.id;
-      const name = live ? liveName : slot.part.name;
-      const nudged = !live && slot.part.nudgeMs !== 0;
-      const chip = el(
-        'button',
-        {
-          class: `chip part-chip${live ? ' live on' : ''}${this.activePartKey === key ? ' selected' : ''}`,
-          'data-role': 'part-chip',
-          'data-part': key,
-          'aria-pressed': String(this.activePartKey === key),
-          title: live
-            ? 'Live — transcribed from this track'
-            : `${name} — imported notation. Click for rename, nudge and remove.`,
-          onContextMenu: (e: MouseEvent) => {
-            if (live) return;
-            e.preventDefault();
-            this.activePartKey = key;
-            this.openPartMenu(chip, slot.part);
-          },
-          onPointerDown: (e: PointerEvent) => this.beginPartDrag(e, key)
-        },
-        live ? el('span', { class: 'part-dot', 'aria-hidden': 'true', text: '●' }) : null,
-        el('span', { class: 'part-name', text: name }),
-        nudged
-          ? el('span', {
-              class: 'part-nudge',
-              text: `${slot.part.nudgeMs > 0 ? '+' : ''}${Math.round(slot.part.nudgeMs)}ms`
-            })
-          : null
-      );
-      return chip;
-    });
-
+  private buildPartControl(): HTMLSelectElement {
     return el(
-      'div',
-      { class: 'part-chips', 'data-role': 'part-chips', role: 'toolbar', 'aria-label': 'Parts' },
-      ...chips,
-      el('button', {
-        class: 'chip part-add',
-        'data-role': 'part-add',
-        text: '+',
-        disabled: full,
-        'aria-label': 'Add a part',
-        title: full
-          ? `A sheet holds at most ${MAX_SCORE_PARTS} parts`
-          : 'Add a part from a MusicXML file',
-        onClick: () => void this.addPartFromPicker()
-      })
+      'select',
+      {
+        class: 'part-select',
+        'data-role': 'part-view',
+        'aria-label': 'Part',
+        title: t(TIPS.parts),
+        onChange: (e: Event) => this.onPartControlChange(e.target as HTMLSelectElement)
+      },
+      ...this.partMenuGroups()
     );
   }
 
   /**
-   * DRAG A CHIP, MOVE THE PART DOWN THE PAGE. Pointer events, not HTML5 drag-and-drop.
+   * The two `<optgroup>`s, built from the document rather than patched.
    *
-   * The row is four pills wide at most, so there is nothing to auto-scroll and nothing to drop
-   * onto; what is wanted is "the thing under my finger goes where I let go of it", which is a
-   * pointer gesture. It also keeps the gesture drivable — the harness reorders the parts by
-   * sending the same three events a hand does, rather than through a back door that would prove
-   * only that the back door works.
-   *
-   * Under the threshold it is a CLICK: the live chip simply becomes active, an imported chip
-   * becomes active and opens its menu.
+   * Rebuilt whole on every change because every entry in it depends on which part is active:
+   * Move up is unavailable at the top, Move down at the bottom, Rename and Remove on the take,
+   * Add at the cap. A menu that keeps a stale disabled state offers an action that does nothing.
    */
-  private partDrag: { key: string; startX: number; moved: boolean; mids: Array<{ key: string; mid: number }> } | null =
-    null;
-
-  private beginPartDrag(e: PointerEvent, key: string): void {
-    if (e.button !== 0) return;
-    const chip = e.currentTarget as HTMLElement;
-    const row = chip.parentElement;
-    if (!row) return;
-    const mids = [...row.querySelectorAll<HTMLElement>('[data-role="part-chip"]')].map((node) => {
-      const box = node.getBoundingClientRect();
-      return { key: node.getAttribute('data-part') ?? '', mid: box.left + box.width / 2 };
-    });
-    this.partDrag = { key, startX: e.clientX, moved: false, mids };
-    try {
-      // A synthetic PointerEvent carries an id no capture exists for, and the throw would abort
-      // the gesture before it started. The capture is a nicety; the listeners below are the drag.
-      chip.setPointerCapture?.(e.pointerId);
-    } catch {
-      /* nothing captured; pointermove/up are bound to the chip itself */
-    }
-
-    const move = (ev: PointerEvent) => {
-      const drag = this.partDrag;
-      if (!drag) return;
-      if (!drag.moved && Math.abs(ev.clientX - drag.startX) > 4) {
-        drag.moved = true;
-        chip.classList.add('dragging');
-      }
-    };
-    const up = (ev: PointerEvent) => {
-      chip.removeEventListener('pointermove', move);
-      chip.removeEventListener('pointerup', up);
-      chip.removeEventListener('pointercancel', up);
-      chip.classList.remove('dragging');
-      const drag = this.partDrag;
-      this.partDrag = null;
-      if (!drag) return;
-      if (!drag.moved) {
-        this.activePartKey = key;
-        // In place, not a re-render: the chip under the finger is about to be this menu's
-        // anchor, and replacing the row would detach it mid-gesture.
-        this.syncPartChipSelection();
-        const slot = this.partSlots().find((s) => s.kind === 'imported' && s.part.id === key);
-        if (slot && slot.kind === 'imported') this.openPartMenu(chip, slot.part);
-        return;
-      }
-      this.dropPartAt(drag, ev.clientX);
-    };
-    chip.addEventListener('pointermove', move);
-    chip.addEventListener('pointerup', up);
-    chip.addEventListener('pointercancel', up);
-  }
-
-  private dropPartAt(drag: { key: string; mids: Array<{ key: string; mid: number }> }, clientX: number): void {
+  private partMenuGroups(): HTMLElement[] {
     const slots = this.partSlots();
     const order = partOrderOf(slots);
-    const others = order.filter((k) => k !== drag.key);
-    let to = 0;
-    for (const entry of drag.mids) {
-      if (entry.key === drag.key) continue;
-      if (clientX > entry.mid) to++;
-    }
-    others.splice(Math.max(0, Math.min(others.length, to)), 0, drag.key);
-    if (others.length === order.length && others.every((k, i) => k === order[i])) {
-      this.renderMain();
-      return;
-    }
-    const imported = slots.flatMap((slot) => (slot.kind === 'imported' ? [slot.part] : []));
-    this.setParts(imported, others);
+    const liveName = livePartName(this.settings.get());
+    // Fall back to the take when the active key names a part that has just been removed.
+    const at = Math.max(0, order.indexOf(this.activePartKey));
+    const active = slots[at];
+    const live = !active || active.kind === 'live';
+    const name = active && active.kind === 'imported' ? active.part.name : liveName;
+    const full = slots.length >= MAX_SCORE_PARTS;
+
+    return [
+      el(
+        'optgroup',
+        { label: 'Part' },
+        ...slots.map((slot, i) =>
+          el('option', {
+            value: `part:${slot.kind === 'live' ? LIVE_PART_ID : slot.part.id}`,
+            // The take carries its dot into the closed box, which is where it is read most.
+            text: slot.kind === 'live' ? `Part: ● ${liveName}` : `Part: ${slot.part.name}`,
+            selected: i === at
+          })
+        )
+      ),
+      el(
+        'optgroup',
+        { label: 'Edit' },
+        el('option', {
+          value: 'do:rename',
+          text: 'Rename',
+          disabled: live,
+          title: live
+            ? 'The take is named after its instrument and follows it'
+            : `Rename ${name}`
+        }),
+        el('option', {
+          value: 'do:move-up',
+          text: 'Move up',
+          disabled: at === 0,
+          title: 'Print this part one staff higher'
+        }),
+        el('option', {
+          value: 'do:move-down',
+          text: 'Move down',
+          disabled: at >= slots.length - 1,
+          title: 'Print this part one staff lower'
+        }),
+        el('option', {
+          value: 'do:remove',
+          text: 'Remove',
+          disabled: live,
+          title: live ? 'The take is always on the sheet' : `Take ${name} off the sheet`
+        }),
+        // NO TRAILING ELLIPSIS, here or anywhere else in this bar. The convention that a verb
+        // opening a dialog wears "…" is not worth a character nobody can read at this size, and
+        // the parenthesis already says a file is coming.
+        el('option', {
+          value: 'do:add',
+          text: 'Add part (MusicXML)',
+          disabled: full,
+          title: full
+            ? `A sheet holds at most ${MAX_SCORE_PARTS} parts`
+            : 'Add a part from a MusicXML file'
+        })
+      )
+    ];
   }
 
-  /** Rename, Nudge, Remove — everything an imported part can be told to do. */
+  /**
+   * Move the selection, and nothing else.
+   *
+   * `renderMain()` replaces the whole screen, which throws away the tri-view and re-engraves —
+   * far too much for "a different part is named in the box", and it would detach the control the
+   * hand is still on. The same rule the number boxes on this bar follow (G10).
+   */
+  private syncPartSelect(): void {
+    const select = this.root.querySelector<HTMLSelectElement>('[data-role="part-view"]');
+    if (!select) return;
+    replace(select, ...this.partMenuGroups());
+    // The name in the box just changed, and the box is only as wide as the name it shows.
+    // See `fitNotationBar`.
+    this.fitNotationBar();
+  }
+
+  private onPartControlChange(select: HTMLSelectElement): void {
+    const raw = select.value;
+    if (raw.startsWith('part:')) {
+      this.activePartKey = raw.slice(5);
+      this.syncPartSelect();
+      return;
+    }
+    // FIRST, before the verb runs. Rename opens a popover and Add opens a file picker, and
+    // neither of them re-renders this bar — so without this the control would sit there reading
+    // "Rename" while the popover it opened is still on screen.
+    this.syncPartSelect();
+    switch (raw) {
+      case 'do:rename': {
+        const slot = this.partSlots().find((s) => s.kind === 'imported' && s.part.id === this.activePartKey);
+        if (slot?.kind === 'imported') this.openPartMenu(select, slot.part);
+        return;
+      }
+      case 'do:move-up':
+        this.movePart(-1);
+        return;
+      case 'do:move-down':
+        this.movePart(1);
+        return;
+      case 'do:remove':
+        this.removeActivePart();
+        return;
+      case 'do:add':
+        void this.addPartFromPicker();
+        return;
+      default:
+        return;
+    }
+  }
+
+  /**
+   * One place up or down the page. This is what the chip drag was.
+   *
+   * Dragging a pill left and right was a gesture about a ROW, and there is no row any more; two
+   * verbs in a menu say the same thing about the printed page, work by keyboard, and cannot be
+   * done by accident while reaching for the menu.
+   */
+  private movePart(delta: number): void {
+    const slots = this.partSlots();
+    const order = partOrderOf(slots);
+    const from = order.indexOf(this.activePartKey);
+    const to = from + delta;
+    if (from < 0 || to < 0 || to >= order.length) return;
+    const next = order.slice();
+    next.splice(to, 0, ...next.splice(from, 1));
+    this.setParts(
+      slots.flatMap((slot) => (slot.kind === 'imported' ? [slot.part] : [])),
+      next
+    );
+  }
+
+  /** Take the active part off the sheet. Never the live one — see `partMenuGroups`. */
+  private removeActivePart(): void {
+    const key = this.activePartKey;
+    if (key === LIVE_PART_ID) return;
+    const slots = this.partSlots();
+    const imported = slots.flatMap((slot) =>
+      slot.kind === 'imported' && slot.part.id !== key ? [slot.part] : []
+    );
+    this.activePartKey = LIVE_PART_ID;
+    this.setParts(
+      imported,
+      partOrderOf(slots).filter((k) => k !== key)
+    );
+  }
+
+  /**
+   * Rename and nudge, in a popover anchored to the control that asked for them.
+   *
+   * THE NUDGE IS HERE BECAUSE IT HAS ALWAYS BEEN HERE. It is the ±ms box that slides an imported
+   * chart against the take, it is a shipped feature, and the menu on the bar is a list of verbs
+   * with no room for a number box — so it stays where it was, one press behind the same Rename
+   * that opens the name field. Removing it was never on the table.
+   *
+   * Remove is NOT here any more: it is an item on the part menu, beside Move up and Move down,
+   * which is where the rest of the verbs went.
+   */
   private openPartMenu(anchor: HTMLElement, part: ImportedPart): void {
     this.closePartMenu();
     const commitName = (value: string) => {
@@ -8097,24 +9255,7 @@ class App {
         el('span', { text: 'Nudge' }),
         nudgeBox,
         el('span', { class: 'dim', text: 'ms' })
-      ),
-      el('button', {
-        class: 'part-menu-remove',
-        'data-role': 'part-remove',
-        text: 'Remove part',
-        onClick: () => {
-          this.closePartMenu();
-          const slots = this.partSlots();
-          const imported = slots.flatMap((slot) =>
-            slot.kind === 'imported' && slot.part.id !== part.id ? [slot.part] : []
-          );
-          this.activePartKey = LIVE_PART_ID;
-          this.setParts(
-            imported,
-            partOrderOf(slots).filter((key) => key !== part.id)
-          );
-        }
-      })
+      )
     );
     document.body.appendChild(popover);
     this.partMenu = popover;
@@ -8127,14 +9268,13 @@ class App {
     }px`;
     nameBox.focus();
     nameBox.select?.();
-    this.syncPartChipSelection();
 
     this.partMenuDismiss = (e: Event) => {
       const target = e.target as Node;
       if (popover.contains(target) || anchor.contains(target)) return;
       this.closePartMenu();
     };
-    // Deferred a frame: the pointerup that opened this menu is still on its way back up.
+    // Deferred a frame: the event that opened this menu is still on its way back up.
     setTimeout(() => document.addEventListener('pointerdown', this.partMenuDismiss!, true), 0);
   }
 
@@ -8149,18 +9289,88 @@ class App {
   }
 
   /**
-   * Move the active ring, and nothing else.
+   * THE NAME PRINTED DOWN THE LEFT OF THE SYSTEM IS THE CONTROL FOR THAT NAME.
    *
-   * `renderMain()` replaces the whole screen, which throws away the tri-view and re-engraves —
-   * far too much for "a different chip is lit", and it would detach the chip a menu is anchored
-   * to while the finger is still on it.
+   * The sheet says "Guitar" beside the staff it belongs to; that is the sentence a player wants
+   * to correct, and until now the only way to correct it was a different word in a different
+   * row. The tri-view puts a transparent hit target over each printed label and reports which
+   * TRACK was pressed (`view/triview.ts §syncPartLabelHits`); this turns that back into a part.
+   *
+   * It goes through `updatePart` — the same call the menu's Rename makes — so the box on the
+   * bar, the name on the page, the MusicXML `<part-name>` and the saved document cannot come out
+   * of the rename disagreeing: there is one write and they are all four downstream of it.
+   *
+   * The take's own label selects and does not offer a rename, for the reason in
+   * `buildPartControl`: its printed name is derived from the instrument on every build.
    */
-  private syncPartChipSelection(): void {
-    for (const chip of this.root.querySelectorAll<HTMLElement>('[data-role="part-chip"]')) {
-      const on = chip.getAttribute('data-part') === this.activePartKey;
-      chip.classList.toggle('selected', on);
-      chip.setAttribute('aria-pressed', String(on));
+  private onPartLabelClick(trackIndex: number, rect: { x: number; y: number; w: number; h: number }): void {
+    const info = scoreParts(this.runtime.get().score).find((part) => part.trackIndex === trackIndex);
+    // A single-part take carries no sidecar, and the only label on that page is the take's own.
+    const key = info?.key ?? LIVE_PART_ID;
+    if (key !== this.activePartKey) {
+      this.activePartKey = key;
+      this.syncPartSelect();
     }
+    const slot = this.partSlots().find((s) => s.kind === 'imported' && s.part.id === key);
+    if (slot?.kind === 'imported') this.renamePartInline(slot.part, rect);
+  }
+
+  private partLabelEdit: HTMLInputElement | null = null;
+
+  /**
+   * The rename, where the name is: one field over the printed label.
+   *
+   * Fixed-positioned against the label's SCREEN box rather than parented into the sheet, because
+   * the commit re-engraves and the engraving is replaced under it — a field living inside the
+   * thing it is about would be destroyed by its own success. It is horizontal even though the
+   * label it covers is printed sideways: this is a word being typed, not a word being read.
+   */
+  private renamePartInline(part: ImportedPart, rect: { x: number; y: number; w: number; h: number }): void {
+    this.closePartLabelEdit();
+    let done = false;
+    const finish = (commit: boolean, value: string) => {
+      if (done) return;
+      done = true;
+      const name = value.trim().slice(0, 40);
+      this.closePartLabelEdit();
+      if (!commit || !name || name === part.name) return;
+      this.updatePart(part.id, (p) => ({ ...p, name }));
+    };
+    const input = el('input', {
+      type: 'text',
+      class: 'part-label-edit',
+      'data-role': 'part-label-rename',
+      value: part.name,
+      spellcheck: 'false',
+      'aria-label': 'Part name',
+      onKeyDown: (e: KeyboardEvent) => {
+        if (e.key === 'Enter') {
+          e.preventDefault();
+          finish(true, (e.target as HTMLInputElement).value);
+        } else if (e.key === 'Escape') {
+          e.preventDefault();
+          finish(false, '');
+        }
+      },
+      // Clicking elsewhere is a commit, not a cancel: the field was opened by pressing the name
+      // itself, so the player is editing rather than being asked a question they can decline.
+      onBlur: (e: Event) => finish(true, (e.target as HTMLInputElement).value)
+    });
+    document.body.appendChild(input);
+    const own = input.getBoundingClientRect();
+    input.style.left = `${Math.max(4, Math.min(rect.x, window.innerWidth - own.width - 4))}px`;
+    input.style.top = `${Math.max(
+      4,
+      Math.min(rect.y + rect.h / 2 - own.height / 2, window.innerHeight - own.height - 4)
+    )}px`;
+    input.focus();
+    input.select();
+    this.partLabelEdit = input;
+  }
+
+  private closePartLabelEdit(): void {
+    this.partLabelEdit?.remove();
+    this.partLabelEdit = null;
   }
 
   private updatePart(id: string, change: (part: ImportedPart) => ImportedPart): void {
@@ -8309,6 +9519,10 @@ class App {
       'div',
       { class: 'notation-toolbar', 'data-role': 'notation-toolbar' },
       el('span', { class: 'toolbar-label', text: 'Notation' }),
+      // THE PARTS, and they are the first control on the bar because they say WHOSE page the
+      // rest of it is about. Only where there is a document to have parts — see
+      // `buildPartControl` for the row this replaced.
+      source && this.buildPartControl(),
       el(
         'select',
         {
@@ -8593,6 +9807,130 @@ class App {
   }
 
   /**
+   * EVERY DROPDOWN ON THE BAR AS WIDE AS THE WORDS IN IT, AND NOT ONE PIXEL WIDER.
+   *
+   * THE BUG, photographed by the owner: a row of boxes each half-empty, and — the same fault
+   * from the other end — every one of them cut off at the plugin's floor. Both come from one
+   * property of `<select>`: its intrinsic width is its LONGEST OPTION, not the option it is
+   * showing. Measured on this bar at 1440x900, in CSS px of text against px of box:
+   *
+   *     Key        184 wide, showing "Key: Auto — C major"  (123)   61 empty
+   *     Tuning     213 wide, showing "Bass 4 — E A D G"     (105)  108 empty
+   *     Quantize   173 wide, showing "Quantize: Auto"        (89)   84 empty
+   *     Tab        156 wide, showing "Tab: Bass"             (58)   98 empty
+   *
+   * — about 330px of reserved nothing on a bar that then had to shrink to fit. And shrink is
+   * what it did: at 390px the same four boxes were 120, 139, 114 and 103 wide with 123, 105, 89
+   * and 58px of text in them, all ellipsised, and the bar was on two rows anyway.
+   *
+   * So the width is SET from the text that is actually on show. The bar's natural width falls
+   * from about 1310px to about 990, which is what buys the extra controls a single row at the
+   * widths people work at, and no box is ever narrower than its own words — which is what makes
+   * `text-overflow: ellipsis` removable from this bar (ui/styles.css §notation-toolbar).
+   *
+   * THE DROPDOWN ARROW IS KNOWN, NOT GUESSED — and it took two goes to get there. It was first
+   * derived from the control itself: put the box back to its intrinsic width, take off the
+   * longest option, the padding and the border, and whatever is left is the platform's arrow.
+   * That is true at zoom 1 and false everywhere else, because the intrinsic width comes back
+   * through `getBoundingClientRect()` as a VISUAL size while the padding and the text are CSS
+   * ones — measured at the 390px floor, where this bar is drawn at about 0.62, a box sized with
+   * 23px of allowance had about 14 of it and clipped "Key: Auto — C majo" with no ellipsis to
+   * announce it. The stylesheet draws the chevron itself now, inside a `padding-right` of
+   * exactly `NOTATION_ARROW_PX` (ui/styles.css §.notation-toolbar select), so the reserve is part
+   * of the frame and there is nothing left to estimate.
+   *
+   * Two passes over the list rather than one, deliberately: every width is cleared, then every
+   * width is read, then every width is written. Interleaving them is one forced layout per
+   * control instead of one for the bar.
+   */
+  private fitNotationBar(): void {
+    const bar = this.root.querySelector<HTMLElement>('[data-role="notation-toolbar"]');
+    if (!bar) return;
+    this.fitSelects([...bar.querySelectorAll('select')]);
+  }
+
+  /** The measurement itself. See `fitNotationBar` for what it is for and why it is a measurement. */
+  private fitSelects(boxes: HTMLSelectElement[]): void {
+    const ctx = (this.textMeasure ??= document.createElement('canvas').getContext('2d'));
+    if (!ctx) return;
+    for (const select of boxes) select.style.width = '';
+    const wanted = boxes.map((select) => {
+      const cs = getComputedStyle(select);
+      ctx.font = cs.font || `${cs.fontSize} ${cs.fontFamily}`;
+      const width = (text: string) => ctx.measureText(text).width;
+      // THE FRAME IS THE WHOLE ANSWER NOW. `padding-right` already holds the arrow (styles.css
+      // draws it there, NOTATION_ARROW_PX wide), so there is nothing left to estimate: the box is
+      // its text plus its own box model. The version this replaces derived the arrow by
+      // subtracting the longest option from the control's intrinsic width, which mixed a ZOOMED
+      // rect with UNZOOMED text and clipped at the 390px floor.
+      const frame =
+        parseFloat(cs.paddingLeft) +
+        parseFloat(cs.paddingRight) +
+        parseFloat(cs.borderLeftWidth) +
+        parseFloat(cs.borderRightWidth);
+      const shown = select.options[select.selectedIndex]?.text ?? '';
+      // The two-pixel allowance is for the difference between a canvas measurement and the
+      // engine's own layout of the same string; with no ellipsis to fall back on, a box one
+      // pixel short does not truncate politely, it clips.
+      return Math.ceil(width(shown) + frame) + 2;
+    });
+    boxes.forEach((select, i) => {
+      select.style.width = `${wanted[i]}px`;
+    });
+  }
+
+  private textMeasure: CanvasRenderingContext2D | null = null;
+
+  /**
+   * TRUE WHEN ANYTHING ON THE NOTATION BAR IS NARROWER THAN THE WORDS IN IT.
+   *
+   * The no-ellipsis rule is about what a person can read, so it is MEASURED rather than inferred
+   * from the absence of a CSS property: a box loses its text to `overflow: hidden` just as
+   * completely without one, and that is how three of the four controls were truncated at 390px.
+   *
+   * `scrollWidth > clientWidth` is the ordinary test and it is the one used for everything here
+   * except the drop-downs. A `<select>` is not a scroller and reports those two as equal however
+   * little of its text fits, so for those the shown text is measured against the room left inside
+   * the box once its own padding and border are taken off — the padding is where the chevron is
+   * drawn, so nothing further needs allowing for. Read by `__RIFFSHEET_PARTS__`, which is what
+   * puts the rule in the harness.
+   *
+   * MEASURED IN UNZOOMED CSS PIXELS THROUGHOUT, and that is not a detail: this bar carries a
+   * `zoom`, under which `getBoundingClientRect()` reports the VISUAL size while `getComputedStyle`
+   * reports the CSS one. Comparing the two said "22 px of room" where there were 14, which is how
+   * the clip at the 390px floor passed this check. `style.width` is what `fitSelects` wrote, in
+   * the same space as the padding and the font, so it is what gets compared.
+   */
+  private notationBarClipped(): boolean {
+    const bar = this.root.querySelector<HTMLElement>('[data-role="notation-toolbar"]');
+    if (!bar) return false;
+    const ctx = (this.textMeasure ??= document.createElement('canvas').getContext('2d'));
+    for (const node of bar.querySelectorAll<HTMLElement>('*')) {
+      if (node instanceof HTMLSelectElement) {
+        if (!ctx) continue;
+        const cs = getComputedStyle(node);
+        ctx.font = cs.font || `${cs.fontSize} ${cs.fontFamily}`;
+        const box = parseFloat(node.style.width) || node.getBoundingClientRect().width;
+        // THE STYLESHEET'S HALF OF THE BARGAIN, asserted rather than assumed. The chevron is
+        // painted inside `padding-right`; if that padding ever falls below the arrow it is drawn
+        // at, the arrow is on top of the last word and the text is unreadable without a single
+        // pixel of overflow to show for it. Counted as a clip, because that is what it is.
+        if (parseFloat(cs.paddingRight) + 0.5 < NOTATION_ARROW_PX) return true;
+        const room =
+          box -
+          parseFloat(cs.paddingLeft) -
+          parseFloat(cs.paddingRight) -
+          parseFloat(cs.borderLeftWidth) -
+          parseFloat(cs.borderRightWidth);
+        if (ctx.measureText(node.options[node.selectedIndex]?.text ?? '').width > room + 0.5) return true;
+        continue;
+      }
+      if (node.scrollWidth > node.clientWidth + 1) return true;
+    }
+    return false;
+  }
+
+  /**
    * Set — or stop setting — the key this take is written in.
    *
    * On the SOURCE and not on the settings, exactly like the tempo and the meter: those three
@@ -8811,14 +10149,17 @@ class App {
       rollPane,
       this.buildScrollbar(),
       this.buildTransport(),
+      // The parts used to have a row of their own directly under this bar. It is gone, and they
+      // are a control ON this bar now — see `buildPartControl`.
       this.buildNotationToolbar(),
-      // DIRECTLY ABOVE THE SHEET, because it is about the sheet: the chips say what is printed
-      // on the page below them and in what order, and a row that said so from the header would
-      // be a row about nothing you can see.
-      this.buildPartChips(),
       sheet,
       this.toastLayer()
     );
+
+    // The bar is in the document at last, so its boxes can be measured and cut to their words.
+    // Here rather than inside `buildNotationToolbar`, which builds an unmounted tree that has no
+    // computed style to read (§fitNotationBar).
+    this.fitNotationBar();
 
     if (focusRole) {
       const again = this.root.querySelector<HTMLElement>(`[data-role="${focusRole}"]`);
@@ -8852,9 +10193,9 @@ class App {
           this.followSeek(sec);
         },
         onBarOneChange: (sec, commit) => this.onBarOneChange(sec, commit),
-        // The strip is now the whole-take overview: it shows the entire recording and brackets
-        // the slice the sheet and the roll are looking at. Dragging that bracket scrolls them.
-        onViewportScrub: (centreSec) => this.scrollSheetToAudioSec(centreSec),
+        // The third surface on the shared window. It had no wheel or gesture handler at all,
+        // so a pinch over it fell through to the browser's page zoom (finding 12).
+        onViewportCommand: (cmd) => this.dispatchViewport(cmd),
         // Drag out a stretch and ask what is really in it. Only the committed gesture opens the
         // tuner — analysing on every frame of a drag would be a pitch track per mousemove.
         onSelectionChange: (sel, commit) => {
@@ -8990,46 +10331,21 @@ class App {
         // PREVIOUS span (`this.alignedWindow`), which is why the new window is remembered here:
         // without a previous span there is no ratio to apply, and the sheet would jump to an
         // absolute guess instead of tracking the notch the player just turned.
-        onTimeWindowChange: (win, commit) => {
-          this.waveform?.setTimeAnchors(timeWindowAnchors(win));
-          if (!commit) return;
-          const tv = this.triview;
-          if (!tv) return;
-          const prev = this.alignedWindow;
-          // THE ECHO GUARD, and without it Align eats itself.
-          //
-          // The sheet writes the roll's window (`setAlignedWindow`) and the roll reports every
-          // window it applies — including that one, on the trailing commit. Answering that
-          // report by scrolling and re-scaling the SHEET closes the circle: the sheet moves,
-          // `syncViewports` derives a slightly different window from its new scroll, hands it
-          // back to the roll, and every rectangle shifts. Measured, before this line: adding
-          // one note moved its five neighbours by 555 px with Align on — the exact reflow the
-          // old linked mode was deleted for, arriving through the new door.
-          //
-          // The test is "is this window already the sheet's?", because if it is there is
-          // nothing to drive. A zoom notch changes the span by a fifth (see TIME_ZOOM_*), so
-          // 2% separates a real gesture from the sheet's own value coming back with a little
-          // clamping on it.
-          if (prev && sameTimeWindow(prev, win)) return;
-          if (prev) {
-            tv.setZoom(
-              coupledSheetScale(
-                tv.getZoom(),
-                prev.toSec - prev.fromSec,
-                win.toSec - win.fromSec,
-                MIN_ZOOM,
-                MAX_ZOOM
-              )
-            );
-          }
-          // `secondsToTick` is the app's own helper and takes the score and the recording
-          // origin explicitly — see its note on the two clocks.
-          const score = this.runtime.get().score;
-          tv.alignScrollToTick(
-            score ? secondsToTick(score, win.fromSec, this.originSec(score)) : null
-          );
-          this.alignedWindow = { ...win };
-        }
+        /*
+         * #29/#30: THE ROLL ASKS, THE APP DECIDES, AND THE ROLL IS TOLD.
+         *
+         * `onTimeWindowChange` stood here with sixty lines of echo guard beneath it, and the
+         * guard is the thing this rewrite is about. The roll reported every window it APPLIED,
+         * including the ones this app had just pushed into it, so the app had to decide from a
+         * 2% comparison (`sameTimeWindow`, deleted) and a 250 ms trailing timer whether a report
+         * was a player's gesture or its own value coming back. It got it wrong in both
+         * directions: a sheet scroll re-appeared as a roll zoom and re-scaled the sheet a
+         * quarter-second later (finding 2), and any genuine pan under a fiftieth of the span —
+         * about 20 px of careful trackpad movement — was discarded as an echo (finding 5).
+         *
+         * There is no report. There is a command, it is typed, and it goes to the one reducer.
+         */
+        onViewportCommand: (cmd) => this.dispatchViewport(cmd)
       });
       // LITERALS, NOT SETTINGS. Naming every row and being editable are what the roll IS —
       // both switches were taken out of the settings panel (#39) because neither was a question
@@ -9042,6 +10358,9 @@ class App {
       this.pianoRoll.setShowAllNames(true);
       this.pianoRoll.setEditable(true);
       this.pianoRoll.setDuration(rt.source?.durationSec ?? rt.score?.durationSec ?? 0);
+      // Before the score, for the reason given in `applyScoreToViews`: the origin decides where
+      // the bar grid is drawn, and this roll is brand new and has never been told one.
+      this.pianoRoll.setOriginSec(rt.score ? this.originSec(rt.score) : null);
       this.pianoRoll.setBarOne(rt.source?.barOneSec ?? 0);
       if (rt.score) this.pianoRoll.setScore(rt.score);
     }
@@ -9072,22 +10391,52 @@ class App {
       // Scroll and zoom both land here, and so does the end of every render — a re-engrave
       // changes the content width, and a roll that only watched scrolls would go stale after
       // a zoom without ever looking wrong enough to notice.
+      // A REPAINT SIGNAL ONLY. Partial renders and mid-render rebuilds land here, and nothing
+      // that decides where the other panes look may (finding 7).
       onViewportChange: () => this.syncViewports(),
-      onRenderComplete: () => this.syncViewports(),
+      // THE settled one: after the corrective renders and the scroll anchor, once per render.
+      onRenderSettled: () => this.onSheetRenderSettled(),
       /*
-       * A PINCH OVER THE SHEET CARRIES THE ROLL'S SPAN WITH IT.
+       * THE PLAYER MOVED THE SHEET: one edge, and the reducer supplies the span.
        *
-       * The roll refuses spans that arrive from Align on purpose (`PianoRoll.holdSpan`): the
-       * sheet's derived window changes span on every scroll, because the engraving is not
-       * proportional to time, so adopting it would turn a scrollbar drag into a zoom (G16).
-       * A sheet ZOOM is the one case where the new span IS what is being asked for, and the
-       * sheet is the only thing that can tell the two apart — so it says so here, just before
-       * the re-engrave, and the roll takes the next Align window whole.
-       *
-       * Without this line the gesture is half-wired rather than broken: the sheet zooms and the
-       * roll stays where it was. See `TriViewOptions.onZoomChange` in view/triview.ts.
+       * The whole of finding 2 in one line. A sheet scroll used to become a WINDOW — both
+       * engraved endpoints turned into seconds — and because the engraving is not proportional
+       * to time, the same pane covers a different number of seconds in a dense bar than in a
+       * sparse one, so the span changed on every scroll and the roll visibly re-scaled. It
+       * changes `fromSec` and only `fromSec`.
        */
-      onZoomChange: () => this.pianoRoll?.adoptNextAlignSpan(),
+      onSheetScroll: (tick) => {
+        const score = this.runtime.get().score;
+        if (tick === null || !score) return;
+        this.dispatchViewport({
+          kind: 'sheetScroll',
+          fromSec: tickToSeconds(score, tick, this.originSec(score)),
+          source: 'sheet'
+        });
+      },
+      /*
+       * A PINCH OVER THE SHEET IS THE SAME GESTURE AS A PINCH OVER THE ROLL.
+       *
+       * Same command, same reducer, same anchor semantics — which is the answer to "the sheet's
+       * pinch feels weaker" (finding 10). The client x is carried across the dispatch so that
+       * `applyViewportToSheet` can hand it to `setZoom`, which installs the pointer anchor
+       * BEFORE starting the render instead of after it has already been consumed (finding 6).
+       */
+      onPinch: (factor, clientX) => {
+        const tv = this.triview;
+        if (!tv) return;
+        this.pinchAnchorClientX = clientX;
+        try {
+          this.dispatchViewport({
+            kind: 'zoom',
+            factor,
+            anchorFrac: tv.pinchFrac(clientX),
+            source: 'sheet'
+          });
+        } finally {
+          this.pinchAnchorClientX = null;
+        }
+      },
       // Direct manipulation, in place of the old popover: drag a notehead on the STAFF to
       // change its pitch, drag a fret digit on the TAB to move it to another string. Moving a
       // note in time is deliberately not offered here — that is the piano roll's job, where a
@@ -9095,7 +10444,10 @@ class App {
       onNoteDragCommit: (p) => this.applySheetDrag(p),
       // #30d, the other half: pointing at a notehead lights the rectangle that made it. The
       // roll's `setHover` is the inward door and never reports back — see the roll's option.
-      onNoteHover: (id) => this.pianoRoll?.setHover(id ? [id] : [])
+      onNoteHover: (id) => this.pianoRoll?.setHover(id ? [id] : []),
+      // The part name engraved down the left of the system, pressed. See `onPartLabelClick`:
+      // it selects that part, and for an imported one it opens the rename on the spot.
+      onPartLabelClick: (trackIndex, rect) => this.onPartLabelClick(trackIndex, rect)
     });
     this.transport.attachAlphaTab(this.triview.api);
     // See `renderEveryPart`: a view built just now defers its first render, so the multi-part
@@ -9573,16 +10925,30 @@ class App {
 
     const origin = this.originSec(score);
     const secPerTick = 60 / (score.tempoBpm || 100) / (score.ir.divisions || 12);
+    // THE LOOP IS A BAR, so it has to be as long as that bar actually was. Past a tempo change the
+    // scalar puts the bar in the wrong place AND gives it the wrong length, so "loop this bar"
+    // caught the tail of one and the head of the next. Same rule as `view/timeAxis.barGrid`: the
+    // map only when the score really changes tempo, the untouched multiply otherwise.
+    const map = tempoMapOf(score);
+    const spanOf = (b: { startTick: number; durTicks: number }): [number, number] => {
+      const from = origin + (map ? map.tickToSec(b.startTick) : b.startTick * secPerTick);
+      return [
+        from,
+        map ? origin + map.tickToSec(b.startTick + b.durTicks) : from + b.durTicks * secPerTick
+      ];
+    };
     const at = this.transport.state.positionSec;
     const bars = score.ir.bars;
     const bar =
       bars.find((b) => {
-        const from = origin + b.startTick * secPerTick;
-        const to = from + b.durTicks * secPerTick;
+        const [from, to] = spanOf(b);
         return at >= from && at < to;
       }) ?? bars.find((b) => !b.implicit) ?? bars[0];
-    const from = Math.max(0, origin + bar.startTick * secPerTick);
-    const to = Math.min(score.durationSec, from + bar.durTicks * secPerTick);
+    // `to` is clamped from the bar's OWN end rather than from the already-clamped `from`: a bar
+    // whose start was clamped at 0 used to have the clamp taken off its length as well.
+    const [barFrom, barTo] = spanOf(bar);
+    const from = Math.max(0, barFrom);
+    const to = Math.min(score.durationSec, barTo);
     this.transport.setLoopRange(from, to);
     this.transport.setLoop(true);
     this.loopBarNumber = bar.number;
@@ -9915,6 +11281,20 @@ class App {
   }
 
   /**
+   * The sounding pitch of one note on the live sheet, or null when it is not there.
+   *
+   * Looked up FRESH every time rather than held: a rebuild replaces the whole index, and the
+   * checks that use this (`__RIFFSHEET_UNDOCAP__`, `__RIFFSHEET_SNAPUNDO__`) are precisely the
+   * ones that rebuild. It is what is actually on the page, which is the only arbiter of whether
+   * an undo cursor is telling the truth.
+   */
+  private midiOfNote(id: string): number | null {
+    const index = this.triview?.scoreIndex;
+    const note = index?.idToNote.get(id);
+    return index && note ? soundingMidi(index, note) : null;
+  }
+
+  /**
    * The one door every edit goes through.
    *
    * It is also where the edit is written down. Anything that edits the score MUST come
@@ -9950,7 +11330,9 @@ class App {
     if (result.requiresRerender || result.requiresMidiUpdate) {
       this.editLog = this.editLog.slice(0, this.editCursor + 1);
       this.editLog.push(action.spec);
-      this.editCursor = this.editLog.length - 1;
+      // DERIVED, never assigned: `UndoStack.perform` may have just retired the oldest action to
+      // stay under its cap, and this log keeps that entry. See `syncEditCursor`.
+      this.syncEditCursor();
       // The interleaving record, so one ⌘Z walks back through sheet edits and roll edits in
       // the order they were actually made.
       this.history = this.history.slice(0, this.historyIndex + 1);
@@ -10104,6 +11486,15 @@ class App {
       ...(Array<'score'>(scoreSteps).fill('score') as Array<'perf' | 'score'>)
     ];
     this.historyIndex = this.history.length - 1;
+    // THE REDO TAIL, appended after the cursor. A rebuild now re-derives the notation stack's
+    // undone actions as well as its done ones (`replayEdits`, `keepRedoTail`), so the record has
+    // to describe them or ⌘⇧Z would have a stack to walk and no route to it.
+    const scoreTail = Math.max(0, this.editLog.length - scoreSteps);
+    const perfTail = Math.max(0, this.perfStack.length - 1 - perfSteps);
+    this.history.push(
+      ...(Array<'score'>(scoreTail).fill('score') as Array<'perf' | 'score'>),
+      ...(Array<'perf'>(perfTail).fill('perf') as Array<'perf' | 'score'>)
+    );
   }
 
   /** Start over from a fresh performance: a new take, or a rebuild that dropped the edits. */
@@ -10805,7 +12196,13 @@ class App {
    * step, lives on the other stack, and is undoable.
    */
   private canUndo(): boolean {
-    return this.historyIndex >= 0 || this.undoStack.canUndo;
+    if (this.undoStack.canUndo) return true;
+    // Nothing left on the notation stack. The button may still be lit for a PERFORMANCE step, but
+    // only for a real one: the interleaving record can outlive the actions it describes, because
+    // the stack caps at 200 and this record does not, and a lit ⌘Z that does nothing is worse
+    // than a grey one. See `undo()`, which walks past exactly these dead steps.
+    for (let i = this.historyIndex; i >= 0; i--) if (this.history[i] === 'perf') return true;
+    return false;
   }
 
   private canRedo(): boolean {
@@ -10849,6 +12246,15 @@ class App {
   }
 
   private undo(): void {
+    // A 'score' step whose action has fallen off the stack's 200-action cap cannot be undone by
+    // anybody. Walking past it — rather than spending a ⌘Z on `UndoStack.undo()` returning
+    // NO_CHANGE — is what stops the interleaving record from pointing at a step that is not
+    // there. It is also the half of the 201-edit divergence the cursor cannot fix on its own:
+    // the cursor is now derived and stays put, and this keeps ⌘Z from looking broken while it
+    // does. See `editLog` and `edit/actions.ts` §"the stack is the authority".
+    while (this.historyIndex >= 0 && this.history[this.historyIndex] === 'score' && !this.undoStack.canUndo) {
+      this.historyIndex--;
+    }
     // One ⌘Z, two layers. Which one is decided by what was done last, not by which panel has
     // focus — the player is undoing "the last thing I did", not "the last thing I did here".
     if (this.historyIndex >= 0 && this.history[this.historyIndex] === 'perf') {
@@ -10864,13 +12270,14 @@ class App {
     const ctx = this.editContext();
     if (!ctx) return;
     if (this.historyIndex >= 0) this.historyIndex--;
+    const before = this.editCursor;
     const result = this.undoStack.undo(ctx);
-    // The cursor moves whenever the stack's does — which UndoStack does on any non-empty
-    // stack, whether or not the action found anything left to undo.
-    if (this.editCursor >= 0) {
-      this.editCursor--;
-      this.scheduleSave();
-    }
+    // DERIVED FROM THE STACK, not decremented alongside it. The old line moved this cursor
+    // whenever it was non-negative, which is one step further than the stack can go once the
+    // 200-action cap has retired the oldest edits: the saved document then said an edit had been
+    // undone while the screen still showed it, and reopening the file changed the score.
+    this.syncEditCursor();
+    if (this.editCursor !== before) this.scheduleSave();
     this.applyResult(result, null);
     this.refreshUndoRedo();
   }
@@ -10887,11 +12294,10 @@ class App {
     const ctx = this.editContext();
     if (!ctx) return;
     if (this.historyIndex < this.history.length - 1) this.historyIndex++;
+    const before = this.editCursor;
     const result = this.undoStack.redo(ctx);
-    if (this.editCursor < this.editLog.length - 1) {
-      this.editCursor++;
-      this.scheduleSave();
-    }
+    this.syncEditCursor();
+    if (this.editCursor !== before) this.scheduleSave();
     this.applyResult(result, null);
   }
 
@@ -10938,6 +12344,56 @@ class App {
       notices.focus();
     };
 
+    /**
+     * ============ APPROPRIATE LEGAL NOTICES, WHICH IS A DEFINED TERM ============
+     *
+     * AGPL-3.0 §0 says an interactive program's Appropriate Legal Notices must display a
+     * copyright notice, SAY THERE IS NO WARRANTY, TELL THE USER THEY MAY REDISTRIBUTE THE WORK
+     * UNDER THESE TERMS, and SHOW THEM HOW TO SEE A COPY OF THE LICENCE. This dialog carried the
+     * first of those and none of the other three (codex-critique §licensing).
+     *
+     * The full text is fetched rather than inlined — 34 KB of legal English does not belong in
+     * the bundle's JavaScript — and it is tried at the two places a build might have put it
+     * before falling back to naming gnu.org, which is the canonical text and is a link the shell
+     * hands to the system browser. A fallback that says WHERE the licence is is still "how to
+     * view it"; silently failing would not be.
+     */
+    let loadedLicense = false;
+    const license = el('pre', {
+      class: 'legal-notices',
+      hidden: true,
+      tabindex: '0',
+      'aria-label': 'GNU Affero General Public License, version 3'
+    });
+    const showLicense = async (event: MouseEvent) => {
+      event.preventDefault();
+      license.hidden = false;
+      if (!loadedLicense) {
+        license.textContent = 'Loading the license…';
+        for (const path of ['./LICENSE.txt', './LICENSE']) {
+          try {
+            const response = await fetch(path);
+            if (!response.ok) continue;
+            const text = await response.text();
+            // A 404 page served as 200 is a real possibility over juce://; the licence's own
+            // first line is the cheapest proof that what came back is the licence.
+            if (!/AFFERO GENERAL PUBLIC LICENSE/i.test(text)) continue;
+            license.textContent = text;
+            loadedLicense = true;
+            break;
+          } catch {
+            /* try the next path */
+          }
+        }
+        if (!loadedLicense) {
+          license.textContent =
+            'The full license text is included as LICENSE in the Riffsheet source release, and ' +
+            'is published at https://www.gnu.org/licenses/agpl-3.0.html';
+        }
+      }
+      license.focus();
+    };
+
     const overlay = el(
       'div',
       {
@@ -10970,6 +12426,29 @@ class App {
           el('strong', { text: 'GNU Affero General Public License, version 3 only (AGPL-3.0-only)' }),
           '. The matching public source release contains the complete source and full license text.'
         ),
+        // The three sentences AGPL §0 requires an interactive program to display, next to the
+        // copyright notice above. See `showLicense` for why they are here and not implied.
+        el('p', {
+          'data-role': 'about-warranty',
+          text:
+            'This program comes with ABSOLUTELY NO WARRANTY, to the extent permitted by ' +
+            'applicable law.'
+        }),
+        el('p', {
+          'data-role': 'about-convey',
+          text:
+            'You are welcome to redistribute Riffsheet, and to modify it, under the terms of the ' +
+            'AGPL version 3. If you run a modified version for others to use over a network, ' +
+            'that license also requires you to offer them its source.'
+        }),
+        el('a', {
+          class: 'legal-notice-link',
+          'data-role': 'about-license-link',
+          href: 'https://www.gnu.org/licenses/agpl-3.0.html',
+          text: 'View the full license',
+          onClick: showLicense
+        }),
+        license,
         el('h3', { text: 'Included work' }),
         el(
           'ul',
@@ -11090,12 +12569,17 @@ class App {
         el('div', { class: 'progress-bar' }, el('i', { 'data-role': 'progress-bar' })),
         el('div', { class: 'progress-note', 'data-role': 'progress-eta' }),
         el('div', { class: 'progress-note', text: 'You can play the original while you wait.' }),
-        // Waiting for another Riffsheet is a wait you must be able to walk away from.
-        this.bridge.transcribeCancel &&
+        // Waiting for another Riffsheet is a wait you must be able to walk away from — and so
+        // is waiting for THIS one. The button used to exist only when the shell could cancel a
+        // native job, so the local engine's own pass was the one wait with no way out of it.
+        // `engineJob` is the worker handle; cancelling it terminates the thread mid-pass, which
+        // is the only thing that stops a synchronous FFT loop (`audio/engineHost.ts`).
+        (this.bridge.transcribeCancel || this.engineJob) &&
           el('button', {
             text: 'Stop waiting',
             'data-role': 'progress-cancel',
             onClick: () => {
+              this.engineJob?.cancel();
               void this.bridge.transcribeCancel?.();
               this.runtime.set({ progress: null, progressEtaSec: null, progressQueuePosition: 0 });
               this.updateProgressUi();
@@ -11104,6 +12588,31 @@ class App {
       )
     );
     this.updateProgressUi();
+  }
+
+  /**
+   * Put the cancel button up once a local pass is actually running.
+   *
+   * The overlay is built before `runLocalEngine` decides whether this take is its job at all, so
+   * on a build with no native cancel the button would otherwise never appear for the one engine
+   * that can always be stopped. Cheap and idempotent: it only ever adds the missing button.
+   */
+  private refreshProgressCancel(): void {
+    const overlay = this.root.querySelector<HTMLElement>('[data-role="progress"]');
+    if (!overlay || !this.engineJob) return;
+    if (overlay.querySelector('[data-role="progress-cancel"]')) return;
+    overlay.appendChild(
+      el('button', {
+        text: 'Stop waiting',
+        'data-role': 'progress-cancel',
+        onClick: () => {
+          this.engineJob?.cancel();
+          void this.bridge.transcribeCancel?.();
+          this.runtime.set({ progress: null, progressEtaSec: null, progressQueuePosition: 0 });
+          this.updateProgressUi();
+        }
+      })
+    );
   }
 
   private updateProgressUi(): void {
@@ -11261,27 +12770,59 @@ class App {
  *     not defaulted: v1.1 shipped with it silently missing, and the cursor led the audio,
  *     the waveform and the piano roll by the whole count-in.
  */
+// `sameTimeWindow()` stood here and is gone (finding 5).
+//
+// It called two windows equal when both ends were within 2% of the span, and it had exactly one
+// caller: the roll's echo guard. The tolerance was chosen to separate "the value we just pushed,
+// back with the roll's clamping on it" from "the player turned a zoom notch" — but it cannot
+// tell a clamp from a pan, so on a 10 s window every pan under 0.2 s was thrown away. That is
+// about 20 px on a 1000 px roll: the roll and the strip moved live, the sheet was never told, and
+// the next sheet event put the roll back where it had been. Careful, small scrolling was
+// precisely what got swallowed. With silent setters there are no echoes to guard against, and
+// the reducer's own guard is `VIEWPORT_EPSILON_SEC` — numeric identity, not a gesture filter.
+
 /**
- * Are these two time windows the same stretch of recording, to within a clamp?
+ * THE SCORE'S TEMPO MAP, built once per score and never rebuilt.
  *
- * Used by exactly one caller — the roll's `onTimeWindowChange` echo guard — and the tolerance
- * is relative because the only thing it has to separate is "the value we just pushed, come
- * back with the roll's own clamping on it" from "the player turned a zoom notch", and a notch
- * is a fifth of the span. Absolute seconds would be wrong at both ends of the zoom range.
+ * Keyed on the `RiffScore` object because every build produces a new one, so the memo is
+ * invalidated by construction and an entry cannot outlive the score it describes.
+ *
+ * `null` IS A DECISION, NOT AN ABSENCE: it means this score has no tempo change worth following,
+ * so every caller below takes the scalar path it has always taken. One segment is an affine map
+ * that `60 / tempoBpm / divisions` already expresses exactly, and a lone declaration at tick 0 is
+ * a tempo rather than a change — so a constant-tempo take reaches none of the new arithmetic and
+ * comes out byte-identical, which is what keeps the playback assembly below untouched.
  */
-function sameTimeWindow(a: { fromSec: number; toSec: number }, b: { fromSec: number; toSec: number }): boolean {
-  const span = a.toSec - a.fromSec;
-  if (!(span > 0)) return false;
-  const slack = span * 0.02;
-  return Math.abs(a.fromSec - b.fromSec) < slack && Math.abs(a.toSec - b.toSec) < slack;
+const tempoMaps = new WeakMap<RiffScore, TickSecondsMap | null>();
+
+function tempoMapOf(score: RiffScore): TickSecondsMap | null {
+  if (tempoMaps.has(score)) return tempoMaps.get(score) ?? null;
+  const built = score.ir?.tempo?.changes?.length ? buildTickSecondsMap(score.ir) : null;
+  const map = built && built.segments.length > 1 ? built : null;
+  tempoMaps.set(score, map);
+  return map;
+}
+
+/**
+ * IR TICKS PER ALPHATAB TICK. alphaTab counts 960 to a quarter; the map is built in the IR's
+ * `divisions`. The map's OWN number is used rather than `score.divisions` because the map applies
+ * its own positive-value fallback, and a rescale that disagreed with the map it feeds would put
+ * every conversion out by a constant factor.
+ */
+function irTicksPerAlphaTick(map: TickSecondsMap): number {
+  return map.divisions / ALPHATAB_QUARTER_TICKS;
 }
 
 function secondsToTick(score: RiffScore, audioSec: number, originSec: number): number {
-  return (((audioSec - originSec) * score.tempoBpm) / 60) * ALPHATAB_QUARTER_TICKS;
+  const map = tempoMapOf(score);
+  if (!map) return (((audioSec - originSec) * score.tempoBpm) / 60) * ALPHATAB_QUARTER_TICKS;
+  return map.secToTick(audioSec - originSec) / irTicksPerAlphaTick(map);
 }
 
 function tickToSeconds(score: RiffScore, tick: number, originSec: number): number {
-  return (tick / ALPHATAB_QUARTER_TICKS) * (60 / score.tempoBpm) + originSec;
+  const map = tempoMapOf(score);
+  if (!map) return (tick / ALPHATAB_QUARTER_TICKS) * (60 / score.tempoBpm) + originSec;
+  return map.tickToSec(tick * irTicksPerAlphaTick(map)) + originSec;
 }
 
 /**
@@ -11372,7 +12913,11 @@ function firstWrittenSecOf(score: RiffScore): number | null {
     }
     if (firstTick !== null) break;
   }
-  return firstTick === null ? null : firstTick * secPerTick;
+  if (firstTick === null) return null;
+  // Through the map when there is one. The first sounding note is almost always before any tempo
+  // change, so the scalar is right today by luck rather than by construction — and this number is
+  // the app's ORIGIN, so it is the one remaining scalar that could move every pane at once.
+  return tempoMapOf(score)?.tickToSec(firstTick) ?? firstTick * secPerTick;
 }
 
 /**
@@ -11471,6 +13016,16 @@ function scoreToSynthNotes(
 
   if (live) {
     const secPerTick = 60 / score.tempoBpm / ALPHATAB_QUARTER_TICKS;
+    // ONLY THE TIME CONVERSION MOVES HERE, and only on a score that really changes tempo: on a
+    // constant-tempo take `tempoMapOf` returns null, the two expressions below run exactly as
+    // they always have, and the assembled events are byte-identical. Nothing about coalescing,
+    // ordering, velocity, tie grouping or `retime` is touched either way.
+    //
+    // UNITS. `beat.absolutePlaybackStart` is in alphaTab's 960-per-quarter ticks and the map is
+    // built in the IR's `divisions`, so an alphaTab tick has to be rescaled before the map sees
+    // it. Hoisted out of the walk: it is one division for the whole score.
+    const map = tempoMapOf(score);
+    const irPerAlphaTick = map ? irTicksPerAlphaTick(map) : 0;
     for (let t = 0; t < live.model.tracks.length; t++) {
       // AN IMPORTED PART IS ENGRAVED AND NEVER PLAYED (pipeline IR.md §Multi-part scores).
       // The flag is the pipeline's own, carried on the data this model was built from, and the
@@ -11484,8 +13039,16 @@ function scoreToSynthNotes(
           for (const voice of bar.voices) {
             for (const beat of voice.beats) {
               if (beat.isEmpty || beat.notes.length === 0) continue;
-              const startSec = beat.absolutePlaybackStart * secPerTick + originSec;
-              const endSec = startSec + beat.playbackDuration * secPerTick;
+              const startSec = map
+                ? map.tickToSec(beat.absolutePlaybackStart * irPerAlphaTick) + originSec
+                : beat.absolutePlaybackStart * secPerTick + originSec;
+              // The end is converted from its OWN tick rather than as start-plus-duration,
+              // because a beat that straddles a tempo change is not `start + duration * anything`.
+              const endSec = map
+                ? map.tickToSec(
+                    (beat.absolutePlaybackStart + beat.playbackDuration) * irPerAlphaTick
+                  ) + originSec
+                : startSec + beat.playbackDuration * secPerTick;
               for (const note of beat.notes) {
                 const info = live.index.noteToInfo.get(note);
                 add(info?.id, {
@@ -11506,6 +13069,9 @@ function scoreToSynthNotes(
 
   // The live graph is unavailable only during early boot. Keep that path correct too.
   const secPerTick = 60 / score.tempoBpm / score.divisions;
+  // These ticks are the IR's OWN, which is the unit the map is built in — so there is no
+  // 960-per-quarter rescale here, unlike the live path above. Applying one would be the bug.
+  const bootMap = tempoMapOf(score);
   const barStart = new Map<number, number>();
   for (const mb of score.data.masterBars) barStart.set(mb.index, mb.startTick);
   for (const track of score.data.tracks) {
@@ -11517,8 +13083,12 @@ function scoreToSynthNotes(
         for (const voice of bar.voices) {
           for (const beat of voice.beats) {
             if (beat.isEmpty || beat.notes.length === 0) continue;
-            const startSec = (base + beat.startTick) * secPerTick + originSec;
-            const endSec = startSec + beat.durTicks * secPerTick;
+            const startSec = bootMap
+              ? bootMap.tickToSec(base + beat.startTick) + originSec
+              : (base + beat.startTick) * secPerTick + originSec;
+            const endSec = bootMap
+              ? bootMap.tickToSec(base + beat.startTick + beat.durTicks) + originSec
+              : startSec + beat.durTicks * secPerTick;
             for (const note of beat.notes) {
               add(note.id, {
                 ...(note.id !== undefined ? { id: note.id } : {}),

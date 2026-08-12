@@ -1,13 +1,29 @@
 # Attributions
 
-`@riffsheet/pipeline` is **GPL-3.0-only**. This file records, per module, what was ported, what
-was written from published numbers, and what licence each source carries.
+```
+SPDX-License-Identifier: GPL-3.0-only
+Copyright © 2026 Oğuzhan Yazıcı
+Portions derived from MuseScore 4, copyright © MuseScore Limited and contributors.
+```
 
-The distinction that matters: **copying or transliterating a `.cpp` file makes this a derivative
-work; re-implementing from published thresholds and observed behaviour does not** — constants and
-algorithms are facts, not protected expression. Everything below in the "re-implemented" column
-was written fresh in TypeScript from the cited papers and upstream sources. GPL-3.0 is declared
-regardless, because the algorithmic debt to MuseScore is real and worth acknowledging plainly.
+**`@riffsheet/pipeline` is a derivative work of MuseScore 4 and is licensed GPL-3.0-only.** That
+is the whole provenance position, it is the same one the root [`NOTICE.md`](../NOTICE.md) states,
+and nothing in this file qualifies it. Several modules are ports of MuseScore's own C++; the
+package therefore carries MuseScore's licence, and it would carry it even if every port were
+replaced tomorrow, because the design was shaped by that code.
+
+This file records, per module, HOW each one came about, so a reader can tell a transliteration
+from a fresh implementation of a published method. Three statuses appear in the table below, and
+none of them is a claim that the package is not derived:
+
+- **ported** — MuseScore's (or music21's, or our predecessor app's) code, transliterated into
+  TypeScript. Modified: restructured for this package's tick domain, its `Rational` type and its
+  station order; behavioural changes are described in each row and at length in the module
+  headers. These are the rows that make the package a derivative work.
+- **constants adopted / tables transcribed** — the algorithm is written fresh here, but published
+  thresholds, weights or tables from the cited source are used verbatim.
+- **written** — implemented from papers, documented behaviour, or first principles, with the
+  citation given so the claim can be checked.
 
 The full GPL-3.0 text this package is under is in [`LICENSE`](LICENSE), beside this file
 (`PIPELINE-LICENSE` in a release package, where `LICENSE` is the AGPL text). The rest

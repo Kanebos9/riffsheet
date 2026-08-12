@@ -1,5 +1,6 @@
 #pragma once
 #include <JuceHeader.h>
+#include "ChildProcessSupervisor.h"
 
 /**
     Owns the local MuScriptor transcription server.
@@ -401,7 +402,20 @@ private:
     bool haveLiveChild() const;
 
     mutable juce::CriticalSection startLock;    // serialises ensureRunning()
-    std::unique_ptr<juce::ChildProcess> child;  // null when we adopted someone else's server
+
+    /** The server process we launched - null when we adopted someone else's.
+
+        A ChildProcessSupervisor rather than a juce::ChildProcess, and the
+        difference is two bugs. It reads the child's stdout and stderr
+        CONTINUOUSLY, from the moment of launch: this was a bare ChildProcess
+        started with both pipes attached and drained exactly once, in the error
+        path, after the child had already died - so a server that printed more
+        than a pipe buffer's worth of model-loading chatter blocked inside its
+        own imports, never bound its port, and was reported as "took too long to
+        start" while sitting there holding a gigabyte. And it kills and reaps in
+        its destructor, so a startup that is cancelled or times out cannot leave
+        the process behind simply because the code path forgot to. */
+    std::unique_ptr<ChildProcessSupervisor> child;
     /** The pid of the server this object is responsible for killing, which is
         NOT always `child`: an orphan left by a force-quit gets taken over by pid
         so that this run's clean shutdown finally clears it up. */

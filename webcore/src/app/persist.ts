@@ -31,6 +31,9 @@ import { strFromU8, strToU8, unzipSync, zipSync, type Zippable } from 'fflate';
 import type { InputNote } from '../pipeline';
 import type { EditSpec } from '../edit/actions';
 import type { NativeBridge } from '../bridge';
+// From `bridge/types` directly rather than the barrel: the barrel pulls in the JUCE and mock
+// bridges, and this module is loaded by the headless test scripts too.
+import { RIFFSHEET_LIMITS } from '../bridge/types';
 import type { TrimResult } from '../audio/trim';
 import type { AppSettings, HostGrid, SourceAudio } from './state';
 import { MAX_SCORE_PARTS, type ImportedPart } from '../score/parts';
@@ -337,14 +340,87 @@ const SCORE_ENTRY = 'score.json';
 const AUDIO_DIR = 'audio/';
 
 /**
- * The most audio a document may carry, going in and coming out.
+ * ===================== THE CEILINGS, AND WHY THERE ARE SIX OF THEM =====================
  *
- * There is no product reason for a ceiling at all; this one exists so that a corrupt or hostile
- * file cannot ask the process to allocate without limit. It is enforced on the WRITE side too —
- * an open-ended save that dies somewhere inside the allocator is worse than a refusal that says
- * what happened.
+ * A `.riffsheet` is opened inside a DAW's process. Anything this reader allocates is memory the
+ * host does not get back, and a plugin that can be made to allocate without limit by a file is a
+ * way to take a session down — the user's session, with their unsaved work in it.
+ *
+ * The old protection was one number (512 MB) checked one way, and it was not protection:
+ *
+ *   - it was per-ENTRY, so an archive of thirty entries at 500 MB each declared nothing over the
+ *     limit and asked for fifteen gigabytes;
+ *   - it had no ratio budget, so a few kilobytes of deflate could declare — and be handed —
+ *     hundreds of megabytes;
+ *   - and it disagreed with everything around it: the writer permitted a 512 MB audio entry that
+ *     the reader's own whole-container check would then refuse, and the shell capped the same
+ *     file at 64 MB, so a document this app wrote could be unopenable by this app.
+ *
+ * THE NUMBERS BELOW ARE THE JS HALF OF ONE AGREED SET. 128 MB is the container ceiling the native
+ * side enforces on `.riffsheet` too (shell/Source/bridge/NativeBridge.cpp) — the same number in
+ * both places, so a file either opens on both paths or on neither.
+ *
+ * THIS IS A MITIGATION, NOT THE FIX. Every budget here is enforced against the archive's DECLARED
+ * sizes, read out of its index before anything is inflated, and against a whole-file buffer this
+ * process is already holding. Streaming the container natively — never materialising more than a
+ * window of it — remains open (codex-critique §3) and is the only thing that makes the ceiling a
+ * property of the reader rather than of the caller.
  */
-export const MAX_DOCUMENT_AUDIO_BYTES = 512 * 1024 * 1024;
+
+/**
+ * The whole file, and the most audio it may carry. One number: see above.
+ *
+ * READ FROM `RIFFSHEET_LIMITS` rather than written again here, because the paragraph above says
+ * "the same number in both places" and a second literal is exactly how that stops being true. The
+ * shell's half is `shell/Source/bridge/TransferLimits.h`.
+ */
+export const MAX_DOCUMENT_BYTES = RIFFSHEET_LIMITS.containerBytes;
+export const MAX_DOCUMENT_AUDIO_BYTES = MAX_DOCUMENT_BYTES;
+
+/**
+ * `score.json` alone. It is JSON describing a few thousand notes; 32 MB is already absurd for
+ * that, and capping it separately is what lets the reader parse the document's own description of
+ * itself before it agrees to inflate the recording that description names.
+ */
+export const MAX_SCORE_JSON_BYTES = 32 * 1024 * 1024;
+
+/**
+ * Everything the archive DECLARES, added up — the budget the old per-entry check did not have.
+ * A document is a score plus one recording, so the sum of the two ceilings is the whole of it.
+ */
+export const MAX_DOCUMENT_INFLATED_BYTES = MAX_DOCUMENT_AUDIO_BYTES + MAX_SCORE_JSON_BYTES;
+
+/**
+ * How many members a document may have at all.
+ *
+ * This app writes exactly two (`score.json` and one `audio/…`). Sixteen leaves room for a format
+ * that grows without leaving room for an archive whose shape is an attack: ten thousand tiny
+ * entries cost ten thousand allocations before any single one of them looks suspicious.
+ */
+export const MAX_DOCUMENT_ENTRIES = 16;
+
+/**
+ * The most an entry may claim to expand by.
+ *
+ * A deflate bomb is a small entry with an enormous declared size — ratios of a thousand to one
+ * are ordinary for one. Real content does not do that: this app's audio entries are STORED
+ * (ratio exactly 1) and `score.json` is note arrays, which deflate to roughly a tenth. 200:1 is
+ * two decimal orders above anything honest here.
+ */
+export const MAX_DOCUMENT_COMPRESSION_RATIO = 200;
+
+/**
+ * …and below this the ratio is not asked about.
+ *
+ * A 40-byte entry inflating to 4 KB is a 100:1 ratio and is also four kilobytes. The budget is
+ * about the SIZE a ratio buys, so it only applies once an entry declares enough to matter.
+ */
+const RATIO_FLOOR_BYTES = 1024 * 1024;
+
+/** For the sentences below — "128 MB" rather than "134217728". */
+function mb(bytes: number): number {
+  return Math.round(bytes / (1024 * 1024));
+}
 
 /**
  * The take's actual audio, inside the document (#34).
@@ -650,8 +726,19 @@ function zipSafeTime(savedAt: number): number {
 }
 
 const OVERSIZE_MESSAGE =
-  'That Riffsheet document is over 512 MB, which is larger than a document with a recording inside ' +
-  'it should ever be. It may be damaged.';
+  `That Riffsheet document is over ${mb(MAX_DOCUMENT_BYTES)} MB, which is larger than a document ` +
+  'with a recording inside it should ever be. It may be damaged.';
+
+/**
+ * What the reader says when the archive's own index does not describe a document.
+ *
+ * One sentence per budget, because "that is not a readable Riffsheet document" for a file that IS
+ * readable and is simply enormous sends the user looking for a corrupt disk. Each of these names
+ * the thing that was refused and the number it was refused against.
+ */
+function budgetMessage(reason: string): string {
+  return `That Riffsheet document could not be opened safely: ${reason}. It may be damaged.`;
+}
 
 /**
  * Write a v3 document. ALWAYS v3 — there is no way to ask for the old container, because the only
@@ -670,11 +757,11 @@ export function writeRiffsheetDocument(document: RiffsheetDocument): Uint8Array 
   if (audio && audio.bytes.byteLength > MAX_DOCUMENT_AUDIO_BYTES) {
     throw new Error(
       // CEIL, not round: this number is only ever printed for a size that is strictly over the
-      // ceiling, and rounding 512 MB + 1 byte down to "512 MB" produces the sentence "that
-      // recording is 512 MB, and the limit is 512 MB", which reads as a bug in the app.
+      // ceiling, and rounding 128 MB + 1 byte down to "128 MB" produces the sentence "that
+      // recording is 128 MB, and the limit is 128 MB", which reads as a bug in the app.
       `That recording is ${Math.ceil(audio.bytes.byteLength / (1024 * 1024))} MB, and a Riffsheet ` +
-        'document can carry at most 512 MB of audio. Export the MusicXML or MIDI instead, or trim ' +
-        'the take and try again.'
+        `document can carry at most ${mb(MAX_DOCUMENT_AUDIO_BYTES)} MB of audio. Export the ` +
+        'MusicXML or MIDI instead, or trim the take and try again.'
     );
   }
 
@@ -726,7 +813,7 @@ export function writeRiffsheetDocument(document: RiffsheetDocument): Uint8Array 
  * side those are the same event.
  */
 export function readRiffsheetDocument(bytes: Uint8Array): RiffsheetDocument {
-  if (bytes.byteLength > MAX_DOCUMENT_AUDIO_BYTES) throw new Error(OVERSIZE_MESSAGE);
+  if (bytes.byteLength > MAX_DOCUMENT_BYTES) throw new Error(OVERSIZE_MESSAGE);
   if (isZip(bytes)) return readZipDocument(bytes);
   if (isJsonStart(bytes)) return readJsonDocument(bytes);
   throw new Error('That is not a readable Riffsheet document.');
@@ -761,36 +848,142 @@ function isJsonStart(bytes: Uint8Array): boolean {
 export function documentScoreText(bytes: Uint8Array): string {
   if (!isZip(bytes)) return new TextDecoder().decode(bytes);
   try {
-    const files = unzipSync(bytes, { filter: (file) => file.name === SCORE_ENTRY });
-    const score = files[SCORE_ENTRY];
+    const score = extractEntry(bytes, SCORE_ENTRY, MAX_SCORE_JSON_BYTES);
     return score ? strFromU8(score) : '';
   } catch {
     return '';
   }
 }
 
-function readZipDocument(bytes: Uint8Array): RiffsheetDocument {
-  let oversize = 0;
-  let files: Record<string, Uint8Array>;
-  try {
-    files = unzipSync(bytes, {
-      // Checked BEFORE the entry is decompressed, which is the whole point of doing it in the
-      // filter: a deflate bomb is refused on its declared size rather than after it has been
-      // handed the memory it asked for.
-      filter: (file) => {
-        if (file.originalSize > MAX_DOCUMENT_AUDIO_BYTES) {
-          oversize = Math.max(oversize, file.originalSize);
-          return false;
-        }
-        return true;
+/** One member of the archive, as its index declares it. Nothing here has been inflated yet. */
+interface ZipEntryInfo {
+  name: string;
+  /** Bytes in the file. */
+  compressedSize: number;
+  /** Bytes the entry CLAIMS it will become. Every budget below is checked against this. */
+  originalSize: number;
+}
+
+/**
+ * Walk the archive's index without inflating a single byte of it.
+ *
+ * `unzipSync` calls the filter once per member and extracts only what the filter accepts, so a
+ * filter that never accepts anything is a manifest read: it costs the central directory and the
+ * local headers, and it is the only way this reader learns what it is about to be asked for
+ * BEFORE it can be asked for it.
+ */
+function scanZipEntries(bytes: Uint8Array): ZipEntryInfo[] {
+  const entries: ZipEntryInfo[] = [];
+  unzipSync(bytes, {
+    filter: (file) => {
+      entries.push({ name: file.name, compressedSize: file.size, originalSize: file.originalSize });
+      return false;
+    }
+  });
+  return entries;
+}
+
+/**
+ * Every budget, against the DECLARED sizes. Throws the sentence the user should see.
+ *
+ * Order matters only in that the message names the first thing found wrong; the checks are
+ * independent and all of them are cheap.
+ */
+function assertZipBudgets(entries: ZipEntryInfo[]): void {
+  if (entries.length > MAX_DOCUMENT_ENTRIES) {
+    throw new Error(
+      budgetMessage(
+        `it contains ${entries.length} items, and a document has at most ${MAX_DOCUMENT_ENTRIES}`
+      )
+    );
+  }
+  let inflated = 0;
+  for (const entry of entries) {
+    // `score.json` gets its own, much tighter ceiling: it is the part that must be parsed before
+    // anything else can be trusted, so it is the part that may not be enormous.
+    const ceiling = entry.name === SCORE_ENTRY ? MAX_SCORE_JSON_BYTES : MAX_DOCUMENT_AUDIO_BYTES;
+    if (entry.originalSize > ceiling) {
+      throw new Error(
+        budgetMessage(
+          `"${entry.name}" declares ${mb(entry.originalSize)} MB, and the limit is ${mb(ceiling)} MB`
+        )
+      );
+    }
+    if (
+      entry.originalSize > RATIO_FLOOR_BYTES &&
+      entry.compressedSize > 0 &&
+      entry.originalSize / entry.compressedSize > MAX_DOCUMENT_COMPRESSION_RATIO
+    ) {
+      throw new Error(
+        budgetMessage(
+          `"${entry.name}" claims to expand ${Math.round(entry.originalSize / entry.compressedSize)} ` +
+            `times over, and the limit is ${MAX_DOCUMENT_COMPRESSION_RATIO}`
+        )
+      );
+    }
+    inflated += entry.originalSize;
+  }
+  if (inflated > MAX_DOCUMENT_INFLATED_BYTES) {
+    throw new Error(
+      budgetMessage(
+        `its contents add up to ${mb(inflated)} MB, and the limit is ` +
+          `${mb(MAX_DOCUMENT_INFLATED_BYTES)} MB`
+      )
+    );
+  }
+}
+
+/**
+ * Inflate EXACTLY ONE named member, or answer undefined.
+ *
+ * The ceiling is re-checked here rather than trusted from the scan: the two passes read the same
+ * headers, and a reader that checks in one place and allocates in another is one refactor away
+ * from checking nothing.
+ */
+function extractEntry(bytes: Uint8Array, name: string, ceiling: number): Uint8Array | undefined {
+  let refused = false;
+  const files = unzipSync(bytes, {
+    filter: (file) => {
+      if (file.name !== name) return false;
+      if (file.originalSize > ceiling) {
+        refused = true;
+        return false;
       }
-    });
+      return true;
+    }
+  });
+  if (refused) throw new Error(OVERSIZE_MESSAGE);
+  return files[name];
+}
+
+/**
+ * Read a v3 container: the index first, then the score, then — and only then — the one recording
+ * the score names.
+ *
+ * IT USED TO INFLATE THE WHOLE ARCHIVE AND LOOK AT IT AFTERWARDS, which is how every budget above
+ * came to be missing: by the time anything had been counted, everything had already been
+ * allocated. Three passes over the index cost three walks of a few hundred bytes and mean this
+ * reader never hands memory to an entry it has not already agreed to.
+ */
+function readZipDocument(bytes: Uint8Array): RiffsheetDocument {
+  let entries: ZipEntryInfo[];
+  try {
+    entries = scanZipEntries(bytes);
   } catch {
     throw new Error('That is not a readable Riffsheet document.');
   }
-  if (oversize > 0) throw new Error(OVERSIZE_MESSAGE);
+  // Outside the try: a budget refusal is a SENTENCE, and swallowing it into "not readable" is
+  // exactly the diagnosis the user cannot act on.
+  assertZipBudgets(entries);
 
-  const scoreBytes = files[SCORE_ENTRY];
+  let scoreBytes: Uint8Array | undefined;
+  try {
+    scoreBytes = extractEntry(bytes, SCORE_ENTRY, MAX_SCORE_JSON_BYTES);
+  } catch (e) {
+    throw e instanceof Error && e.message === OVERSIZE_MESSAGE
+      ? e
+      : new Error('That is not a readable Riffsheet document.');
+  }
   if (!scoreBytes) throw new Error('That is not a readable Riffsheet document.');
   let parsed: Partial<RiffsheetDocument> & { audioData?: unknown };
   try {
@@ -800,9 +993,21 @@ function readZipDocument(bytes: Uint8Array): RiffsheetDocument {
   }
 
   const meta = decodeAudioMeta(parsed.audioData);
-  // ONE copy of the audio on the read path: the slice `unzipSync` returns for a STORED entry.
-  // It is handed onward as-is.
-  const audioData = meta ? withAudioBytes(meta.meta, files[meta.entry]) : null;
+  // ONE copy of the audio on the read path: the slice `unzipSync` returns for a STORED entry,
+  // fetched by the name `score.json` gave and by no other. It is handed onward as-is.
+  let audioBytes: Uint8Array | undefined;
+  if (meta) {
+    try {
+      audioBytes = extractEntry(bytes, meta.entry, MAX_DOCUMENT_AUDIO_BYTES);
+    } catch (e) {
+      // A recording that cannot be got out costs the document its audio, not its notes — the same
+      // trade the legacy base64 path makes — unless it was refused for being oversized, which the
+      // user is entitled to be told about.
+      if (e instanceof Error && e.message === OVERSIZE_MESSAGE) throw e;
+      audioBytes = undefined;
+    }
+  }
+  const audioData = meta ? withAudioBytes(meta.meta, audioBytes) : null;
   return hydrate(parsed, audioData);
 }
 
@@ -826,6 +1031,201 @@ function readJsonDocument(bytes: Uint8Array): RiffsheetDocument {
   return hydrate(parsed, audioData);
 }
 
+// ---------------------------------------------------------------------------
+// Structural validation — for DOCUMENTS only
+// ---------------------------------------------------------------------------
+
+/**
+ * ================= WHY A DOCUMENT IS VALIDATED AND A SESSION BLOB IS NOT =================
+ *
+ * `decodeSource` below is deliberately forgiving: it clamps what it can and drops what it
+ * cannot, because it also serves the session blob, and a session blob is a CONVENIENCE. Losing a
+ * restore costs the user the last few minutes of view state; refusing to boot costs them the app.
+ *
+ * A document is the opposite thing. It is the user's saved work, opened by name, and the
+ * forgiving path applied to it produces the worst outcome available: a file that opens looking
+ * almost right, with a bar of notes silently missing because one array was truncated, or with a
+ * quarter of the waveform because a bucket count disagreed with the bytes behind it. The user
+ * then edits that and saves over the original.
+ *
+ * So a damaged document REFUSES, by name, and the failure is a sentence rather than a shrug. The
+ * checks below are structural — shape, finiteness and internal agreement — and never taste: a
+ * document with strange but coherent numbers in it opens exactly as it always did.
+ */
+
+const MAX_PEAK_BUCKETS = 1 << 20;
+const MAX_DOCUMENT_NOTES = 500_000;
+const MAX_DOCUMENT_TIMES = 500_000;
+const MAX_SOURCE_MIDI_CHARS = 32 * 1024 * 1024;
+
+function damaged(what: string): Error {
+  return new Error(`That Riffsheet document is damaged: ${what}.`);
+}
+
+function isFiniteNumber(value: unknown): value is number {
+  return typeof value === 'number' && Number.isFinite(value);
+}
+
+/**
+ * The note array, checked note by note.
+ *
+ * `startSec`, `endSec` and `midi` are the three the whole app reads without asking again — the
+ * roll's geometry, the pipeline's guards, the synth's scheduler. A NaN in any of them propagates
+ * silently to a rectangle that is never painted and a note that is never heard, which is a note
+ * the user can see in their file and not on their screen.
+ */
+function assertNotes(value: unknown, where: string): void {
+  if (!Array.isArray(value)) throw damaged(`${where} is not a list of notes`);
+  if (value.length > MAX_DOCUMENT_NOTES) {
+    throw damaged(`${where} claims ${value.length} notes, which is more than a document can hold`);
+  }
+  for (let i = 0; i < value.length; i++) {
+    const note = value[i] as Partial<InputNote> | null;
+    if (!note || typeof note !== 'object') throw damaged(`${where} entry ${i} is not a note`);
+    if (!isFiniteNumber(note.startSec) || !isFiniteNumber(note.endSec) || !isFiniteNumber(note.midi)) {
+      throw damaged(`${where} entry ${i} has no usable time or pitch`);
+    }
+    if (note.endSec < note.startSec) throw damaged(`${where} entry ${i} ends before it starts`);
+    if (note.id !== undefined && typeof note.id !== 'string') {
+      throw damaged(`${where} entry ${i} has an identity that is not a name`);
+    }
+  }
+}
+
+/** Beat and downbeat lists: finite seconds, in order, and not a million of them. */
+function assertTimes(value: unknown, where: string): void {
+  if (value === undefined) return;
+  if (!Array.isArray(value)) throw damaged(`${where} is not a list of times`);
+  if (value.length > MAX_DOCUMENT_TIMES) throw damaged(`${where} is impossibly long`);
+  for (let i = 0; i < value.length; i++) {
+    if (!isFiniteNumber(value[i])) throw damaged(`${where} entry ${i} is not a time`);
+  }
+}
+
+/**
+ * The waveform strip's peaks.
+ *
+ * `buckets` reaches `new Float32Array(buckets)` directly, which is the allocation this check
+ * exists for, and it must AGREE with the two strings beside it: `encodePeaks` writes one byte per
+ * bucket into each, so a count that does not match the bytes means the file has been truncated or
+ * hand-edited, and the old reader answered that by drawing a partly-empty waveform.
+ */
+function assertPeaks(value: unknown): void {
+  if (value === undefined) return;
+  if (!value || typeof value !== 'object') throw damaged('the waveform data is not readable');
+  const peaks = value as Partial<PersistedPeaks>;
+  const buckets = peaks.buckets;
+  if (!Number.isInteger(buckets) || (buckets as number) < 1 || (buckets as number) > MAX_PEAK_BUCKETS) {
+    throw damaged(`the waveform declares ${String(buckets)} buckets`);
+  }
+  if (typeof peaks.min !== 'string' || typeof peaks.max !== 'string') {
+    throw damaged('the waveform data is missing');
+  }
+  for (const [name, b64] of [['min', peaks.min], ['max', peaks.max]] as const) {
+    let decoded: Uint8Array;
+    try {
+      decoded = base64ToBytes(b64);
+    } catch {
+      throw damaged(`the waveform's ${name} channel is not readable`);
+    }
+    if (decoded.length !== buckets) {
+      throw damaged(
+        `the waveform declares ${buckets} buckets and carries ${decoded.length} in its ${name} channel`
+      );
+    }
+  }
+}
+
+/** The player's cuts. `normalizeCuts` would quietly repair these; a document may not need it. */
+function assertCuts(value: unknown): void {
+  if (value === undefined) return;
+  if (!Array.isArray(value)) throw damaged('the cut list is not a list');
+  for (let i = 0; i < value.length; i++) {
+    const cut = value[i] as Partial<CutSpan> | null;
+    if (!cut || typeof cut !== 'object') throw damaged(`cut ${i} is not a span`);
+    if (!isFiniteNumber(cut.fromSec) || !isFiniteNumber(cut.toSec)) {
+      throw damaged(`cut ${i} has no usable range`);
+    }
+    if (cut.toSec < cut.fromSec) throw damaged(`cut ${i} ends before it starts`);
+  }
+}
+
+/** The printed parts, and the order that names them. */
+function assertImportedParts(parts: unknown, order: unknown): void {
+  if (parts !== undefined) {
+    if (!Array.isArray(parts)) throw damaged('the part list is not a list');
+    if (parts.length > MAX_SCORE_PARTS - 1) {
+      throw damaged(`it carries ${parts.length} extra parts, and a score holds ${MAX_SCORE_PARTS - 1}`);
+    }
+    const seen = new Set<string>();
+    for (let i = 0; i < parts.length; i++) {
+      const part = parts[i] as Partial<ImportedPart> | null;
+      if (!part || typeof part !== 'object') throw damaged(`part ${i} is not a part`);
+      if (typeof part.id !== 'string' || !part.id) throw damaged(`part ${i} has no identity`);
+      if (seen.has(part.id)) throw damaged(`two parts share the identity "${part.id}"`);
+      seen.add(part.id);
+      // The NAME and the NUDGE keep the reader's older, forgiving policy on purpose. They are
+      // cosmetic scalars with a documented repair each — a blank name becomes "Part", a nonsense
+      // nudge becomes none — and neither can cost the user a note. What is validated here is the
+      // part's STRUCTURE: an identity it can be addressed by, and a note list that is one.
+      assertNotes(part.notes, `part "${part.id}"`);
+    }
+  }
+  if (order !== undefined) {
+    if (!Array.isArray(order)) throw damaged('the part order is not a list');
+    for (let i = 0; i < order.length; i++) {
+      if (typeof order[i] !== 'string') throw damaged(`part order entry ${i} is not a name`);
+    }
+  }
+}
+
+/**
+ * Everything a document's `source` block must be before the app is allowed to see it.
+ *
+ * Throws; never repairs. See the section header for why this and `decodeSource` are two
+ * different policies rather than one function with a flag.
+ */
+export function assertDocumentSource(value: unknown): void {
+  if (!value || typeof value !== 'object') throw damaged('it has no take in it');
+  const source = value as Partial<PersistedSource>;
+  if (typeof source.name !== 'string') throw damaged('the take has no name');
+  for (const key of ['durationSec', 'barOneSec'] as const) {
+    if (source[key] !== undefined && !isFiniteNumber(source[key])) {
+      throw damaged(`the take's ${key === 'durationSec' ? 'length' : 'bar-1 position'} is not a number`);
+    }
+  }
+  assertPeaks(source.peaks);
+  if (source.detected !== undefined) {
+    if (!source.detected || typeof source.detected !== 'object') {
+      throw damaged('the detected performance is not readable');
+    }
+    assertNotes(source.detected.notes, 'the detected performance');
+    assertTimes(source.detected.beats, 'the beat list');
+    assertTimes(source.detected.downbeats, 'the downbeat list');
+  }
+  assertCuts(source.cuts);
+  assertImportedParts(source.importedParts, source.partOrder);
+}
+
+/**
+ * The symbolic original, when there is one.
+ *
+ * It is base64 of a MIDI file and is exported verbatim as "As played". A string that is not
+ * base64 at all would throw out of `atob` at export time — a save button that fails days after
+ * the file was opened — so it is proved decodable here, where the failure is still about the file
+ * the user just opened.
+ */
+function assertSourceMidi(value: unknown): void {
+  if (value === undefined || value === null) return;
+  if (typeof value !== 'string') throw damaged('the original MIDI is not readable');
+  if (value.length > MAX_SOURCE_MIDI_CHARS) throw damaged('the original MIDI is impossibly large');
+  try {
+    base64ToBytes(value);
+  } catch {
+    throw damaged('the original MIDI is not readable');
+  }
+}
+
 /** Everything both containers agree on: validate the document, and answer with a whole one. */
 function hydrate(
   parsed: Partial<RiffsheetDocument> & { audioData?: unknown },
@@ -845,8 +1245,20 @@ function hydrate(
       'That Riffsheet document was made by a newer version of Riffsheet. Update Riffsheet to open it.'
     );
   }
+  // STRUCTURE BEFORE CONTENT. `decodeSource` clamps and drops (see its section header), which is
+  // right for a session blob and wrong for a file the user opened by name — so the document's own
+  // shape is proved first, and anything damaged refuses here rather than half-opening.
+  if (!parsed.source) throw new Error('That Riffsheet document has no score data.');
+  assertDocumentSource(parsed.source);
+  assertSourceMidi(parsed.sourceMidi);
+  if (parsed.edits !== undefined && !Array.isArray(parsed.edits)) {
+    throw damaged('the edit history is not readable');
+  }
+  if (parsed.editCursor !== undefined && !Number.isInteger(parsed.editCursor)) {
+    throw damaged('the edit history has no usable position');
+  }
   const source = decodeSource(parsed.source);
-  if (!source || !parsed.source) throw new Error('That Riffsheet document has no score data.');
+  if (!source) throw new Error('That Riffsheet document has no score data.');
   return {
     app: 'riffsheet-document',
     // The version READ, not the version this build writes. A caller that needs to know whether

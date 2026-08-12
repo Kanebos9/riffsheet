@@ -340,6 +340,7 @@ target_sources(Riffsheet PRIVATE
     Source/bridge/ServerRegistry.cpp    # servers we started, so a force-quit leaves nothing behind
     Source/bridge/ModelCatalog.cpp      # which weights are on disk, and which one 'auto' means
     Source/bridge/MuScriptorProbe.cpp    # "is a MuScriptor answering on this port?", asked over HTTP
+    Source/bridge/ChildProcessSupervisor.cpp # drains a child's pipes for its whole life, and reaps it
     Source/bridge/MuScriptorServer.cpp
     Source/bridge/NativeBridge.cpp
     Source/engines/EngineCatalog.cpp    # the compiled-in engine table + its licensing invariants
@@ -497,6 +498,8 @@ if(RIFFSHEET_BUILD_TESTS)
         test/PreprocessTests.cpp                 # wave 6, and it generates its own audio
         test/EngineInstallerTests.cpp            # wave 5, and it serves its own HTTP
         test/MuScriptorProbeTests.cpp            # the external-server handshake, over a real socket
+        test/PlaybackResamplerTests.cpp          # minutes of transport phase, at every rate x block size
+        test/ChildProcessSupervisorTests.cpp     # a real, deliberately chatty child process
         # ...one file per wave, added by that wave.
 
         # The units under test, compiled in directly. NOT NativeBridge.cpp,
@@ -524,6 +527,13 @@ if(RIFFSHEET_BUILD_TESTS)
         # behind it. Keeping the decision in a unit with no such dependency is
         # what makes it testable at all.
         Source/bridge/MuScriptorProbe.cpp
+        # The child-process owner MuScriptorServer now launches through. It is in
+        # here for the same reason MuScriptorProbe is and MuScriptorServer is
+        # not: it speaks juce::ChildProcess and juce::Thread and nothing else,
+        # while the server class drags WebResources - and a WebView - in behind
+        # it. A pipe that nobody drained survived for as long as it did precisely
+        # because it was inside the file that cannot be tested.
+        Source/bridge/ChildProcessSupervisor.cpp
     )
 
     # BinaryData, unconditionally: the installer reads the pip lock files and the

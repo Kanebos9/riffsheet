@@ -132,7 +132,10 @@ through MusicXML, so these fixtures are the only thing dogfooding the exporter.
 
 ## Licence
 
-**GPL-3.0-only.** Two modules re-implement MuseScore 4 algorithms from their documented behaviour
-and constants (`meter.ts`, `simplify.ts`); MuseScore 4 is GPL-3.0-only and the lineage is kept
-clean by porting from that tree rather than MuseScore 3, whose `importmidi` is GPL-2.0-**only**
-and therefore incompatible. See [ATTRIBUTIONS.md](ATTRIBUTIONS.md) for the full per-file record.
+**GPL-3.0-only.** This package is a derivative work of MuseScore 4: `meter.ts` and the pitch
+half of `spelling.ts` are ports of its C++, and `simplify.ts` was one before that port was
+deleted. MuseScore 4 is GPL-3.0-only and the lineage is kept clean by porting from that tree
+rather than MuseScore 3, whose `importmidi` is GPL-2.0-**only** and therefore incompatible. The
+root [`NOTICE.md`](../NOTICE.md) states the same position; see
+[ATTRIBUTIONS.md](ATTRIBUTIONS.md) for the full per-file record, including which modules are
+ports and which only adopt published constants.

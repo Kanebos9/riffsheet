@@ -36,7 +36,14 @@
  * DOM node; the structural types are the smallest shape each function needs. That is what lets
  * every rule below be unit-tested without a browser — see `timeAxis.test.ts`, which is the only
  * reason any of this is in its own file rather than inside the roll.
+ *
+ * THE ONE IMPORT is `buildTickSecondsMap`, the pipeline's tick<->seconds arithmetic. It takes two
+ * numbers and a list of tempo changes and returns a function; it is not a score, and the rule
+ * above is intact. Copying it here instead would give the grid a second opinion about when bar 4
+ * starts, which is the exact class of bug this module exists to prevent.
  */
+
+import { buildTickSecondsMap } from '../pipeline';
 
 // ---------------------------------------------------------------------------
 // The window
@@ -63,6 +70,18 @@ export interface TimeLimits {
    * `MIN_WINDOW_SEC` below is the shipped value and the reasoning is there.
    */
   minSpanSec: number;
+  /**
+   * The widest window allowed, in seconds — the shallowest zoom. Absent means "the take".
+   *
+   * THIS IS WHERE ALIGNMENT'S EDGE CONTRACT LIVES (finding 9). The roll can draw any span from
+   * 50 ms to the whole take; the sheet can only be engraved between `display.scale` 0.6 and 3,
+   * which is a band of achievable spans and nothing outside it. Alignment is mandatory, so the
+   * shared range is the INTERSECTION of the two — see `intersectLimits`. A window that saturates
+   * therefore stops in both panes at once, which is the difference between "the zoom has reached
+   * its limit" and the old behaviour, where the roll went on alone and the sheet snapped it back
+   * a callback later.
+   */
+  maxSpanSec?: number;
 }
 
 /**
@@ -99,15 +118,24 @@ export function fullWindow(limits: TimeLimits): TimeWindow {
  */
 export function clampWindow(win: TimeWindow, limits: TimeLimits): TimeWindow {
   const duration = Math.max(limits.minSpanSec, limits.durationSec);
-  const minSpan = Math.max(1e-6, Math.min(limits.minSpanSec, duration));
+  const maxSpan = maxSpanOf(limits);
+  const minSpan = Math.max(1e-6, Math.min(limits.minSpanSec, maxSpan));
 
   let span = win.toSec - win.fromSec;
-  if (!Number.isFinite(span) || span <= 0) span = duration;
-  span = Math.max(minSpan, Math.min(duration, span));
+  if (!Number.isFinite(span) || span <= 0) span = maxSpan;
+  span = Math.max(minSpan, Math.min(maxSpan, span));
 
   let from = Number.isFinite(win.fromSec) ? win.fromSec : 0;
   from = Math.max(0, Math.min(duration - span, from));
   return { fromSec: from, toSec: from + span };
+}
+
+/** The widest span these limits allow: the ceiling if one was given, the take otherwise. */
+export function maxSpanOf(limits: TimeLimits): number {
+  const duration = Math.max(limits.minSpanSec, limits.durationSec);
+  const ceiling = limits.maxSpanSec;
+  if (ceiling === undefined || !Number.isFinite(ceiling) || ceiling <= 0) return duration;
+  return Math.max(1e-6, Math.min(duration, ceiling));
 }
 
 /** True when the window is (near enough) the whole take — i.e. fully zoomed out. */
@@ -193,6 +221,252 @@ export function windowFollowing(
 }
 
 // ---------------------------------------------------------------------------
+// THE AUTHORITATIVE VIEWPORT, and the one reducer that moves it
+// ---------------------------------------------------------------------------
+
+/**
+ * THE ONE PIECE OF STATE. Which stretch of recording every pane is showing, and a counter.
+ *
+ * What this replaces is not a smaller version of itself — it is three partial authorities that
+ * had to guess at each other through timers and tolerances (`ownZoomUntilMs`, `ALIGN_HOLD_MS`,
+ * `adoptNextAlignSpan`, `sameTimeWindow`, all now deleted). The sheet produced a window out of
+ * engraving geometry, the roll clamped and re-published a window of its own, and `ui/app.ts`
+ * decided from a 250 ms clock and a 2% comparison which of those two had been a user gesture.
+ * A scroll could therefore come back as a zoom half a second later, which is exactly what
+ * "breathing" was.
+ *
+ * `revision` is the mechanism those clocks were badly approximating. It goes up when, and only
+ * when, the window actually moved. Anything downstream that wants to know "is this the value I
+ * just pushed, or a new one?" compares revisions — an integer, not a tolerance.
+ */
+export interface TimelineViewport {
+  fromSec: number;
+  toSec: number;
+  revision: number;
+}
+
+/** Who asked. Typed, so nothing downstream ever has to infer intent from timing again. */
+export type ViewportSource = 'roll' | 'sheet' | 'waveform' | 'scrollbar' | 'transport' | 'system';
+
+/**
+ * WHAT A VIEW MAY SAY. Note what is not here: a replacement window.
+ *
+ * A view that hands over a finished window is claiming authority it does not have, and the
+ * moment two of them do it the app is back to reconciling. A view may state an INTENT —
+ * "slide by this many seconds", "magnify by this factor about this point", "my left edge is
+ * now this second" — and the reducer below decides what that means against the current state
+ * and the shared limits.
+ *
+ * `sheetScroll` is deliberately the only one that names an absolute position, and deliberately
+ * names ONE edge: a sheet scroll changes where you are looking, never how much you can see.
+ * Deriving a span from the sheet's two engraved endpoints during an ordinary scroll is what
+ * turned a scrollbar drag into a zoom (finding 2), because the engraving is not proportional to
+ * time and the same pane covers a different number of seconds in a dense bar than a sparse one.
+ */
+export type ViewportCommand =
+  | { kind: 'pan'; deltaSec: number; source: ViewportSource }
+  | { kind: 'zoom'; factor: number; anchorFrac: number; source: ViewportSource }
+  | { kind: 'sheetScroll'; fromSec: number; source: ViewportSource }
+  | { kind: 'showSpan'; fromSec: number; toSec: number; source: ViewportSource }
+  | { kind: 'fit'; source: ViewportSource };
+
+/**
+ * Below this two windows are the same window.
+ *
+ * A NUMERIC identity guard and nothing else, which is the whole difference from the 2% echo
+ * guard it replaces (finding 5). That one discarded any pan under a fiftieth of the span — 0.2 s
+ * on a 10 s window, about 20 px of careful trackpad movement — because it was trying to tell a
+ * user gesture from a clamped echo by looking at the numbers. Silent setters mean there are no
+ * echoes to tell apart, so this only has to be smaller than anything a person can ask for.
+ */
+export const VIEWPORT_EPSILON_SEC = 1e-6;
+
+/** The whole take as a viewport, revision zero. */
+export function fullViewport(limits: TimeLimits): TimelineViewport {
+  const win = clampWindow(fullWindow(limits), limits);
+  return { fromSec: win.fromSec, toSec: win.toSec, revision: 0 };
+}
+
+export function viewportSpan(v: TimelineViewport): number {
+  return v.toSec - v.fromSec;
+}
+
+/** The window inside a viewport, for the many callers that do not care about the revision. */
+export function viewportWindow(v: TimelineViewport): TimeWindow {
+  return { fromSec: v.fromSec, toSec: v.toSec };
+}
+
+export function sameViewportWindow(a: TimeWindow, b: TimeWindow): boolean {
+  return (
+    Math.abs(a.fromSec - b.fromSec) < VIEWPORT_EPSILON_SEC &&
+    Math.abs(a.toSec - b.toSec) < VIEWPORT_EPSILON_SEC
+  );
+}
+
+/**
+ * THE REDUCER. Pure: state and a command in, state out, nothing measured and nothing called.
+ *
+ * Everything the old controller needed a clock for is a consequence of this being a function:
+ *
+ *   - A pan NEVER changes the span. `panWindow` slides and `clampWindow` slides it back inside
+ *     the take keeping the span, so scrolling to either edge preserves both the magnification
+ *     and — up to the edge itself — the moment (finding 3). No extrapolated engraving endpoint
+ *     can reach this: the only absolute a view may state is `sheetScroll`'s single edge.
+ *   - A zoom that is already at a limit returns the SAME OBJECT, so `revision` does not move
+ *     and nothing downstream re-renders. That is the saturation contract (finding 9) stated as
+ *     an identity rather than as a snap-back.
+ *   - Every route in is this one function, so sheet pinch and roll pinch cannot feel different:
+ *     the same factor about the same fraction produces the same window (finding 10).
+ */
+export function reduceViewport(
+  state: TimelineViewport,
+  cmd: ViewportCommand,
+  limits: TimeLimits
+): TimelineViewport {
+  const win = viewportWindow(state);
+  let next: TimeWindow;
+  switch (cmd.kind) {
+    case 'pan':
+      next = panWindow(win, cmd.deltaSec, limits);
+      break;
+    case 'zoom': {
+      // THE SPAN IS CLAMPED BEFORE THE ANCHOR IS SPENT, and that ordering is the saturation
+      // contract rather than a detail. `zoomWindowAt` divides first and clamps the finished
+      // window, so at a zoom limit it produces a window whose span is illegal, `clampWindow`
+      // widens it back, and the position it widens around is NOT where the gesture asked for —
+      // repeated pinching against the floor walks the window sideways a few milliseconds at a
+      // time while appearing to do nothing. Clamping the span first makes "already at the limit"
+      // an exact no-op: the same state comes back, `revision` does not move, and the panes stop
+      // together and stay stopped.
+      const span = win.toSec - win.fromSec;
+      const maxSpan = maxSpanOf(limits);
+      const minSpan = Math.max(1e-6, Math.min(limits.minSpanSec, maxSpan));
+      const factor = Number.isFinite(cmd.factor) && cmd.factor > 0 ? cmd.factor : 1;
+      const wanted = Math.max(minSpan, Math.min(maxSpan, span / factor));
+      if (Math.abs(wanted - span) < VIEWPORT_EPSILON_SEC) return state;
+      const frac = Number.isFinite(cmd.anchorFrac) ? Math.max(0, Math.min(1, cmd.anchorFrac)) : 0.5;
+      const anchorSec = fracToSec(win, frac);
+      next = clampWindow({ fromSec: anchorSec - frac * wanted, toSec: anchorSec + (1 - frac) * wanted }, limits);
+      break;
+    }
+    case 'sheetScroll': {
+      // ONE EDGE, SPAN PRESERVED. The sheet says where its left edge is; how much is on screen
+      // is not its to say, and asking the engraving would give a different answer in every bar.
+      const span = win.toSec - win.fromSec;
+      const from = Number.isFinite(cmd.fromSec) ? cmd.fromSec : win.fromSec;
+      next = clampWindow({ fromSec: from, toSec: from + span }, limits);
+      break;
+    }
+    case 'showSpan':
+      next = clampWindow({ fromSec: cmd.fromSec, toSec: cmd.toSec }, limits);
+      break;
+    case 'fit':
+      next = clampWindow(fullWindow(limits), limits);
+      break;
+  }
+  if (sameViewportWindow(next, win)) return state;
+  return { fromSec: next.fromSec, toSec: next.toSec, revision: state.revision + 1 };
+}
+
+/** Which way the zoom has run out of room. Both true means there is only one legal span. */
+export function viewportSaturation(
+  state: TimelineViewport,
+  limits: TimeLimits
+): { atMinSpan: boolean; atMaxSpan: boolean } {
+  const duration = Math.max(limits.minSpanSec, limits.durationSec);
+  const maxSpan = maxSpanOf(limits);
+  const minSpan = Math.max(1e-6, Math.min(limits.minSpanSec, maxSpan));
+  const span = viewportSpan(state);
+  return {
+    atMinSpan: span <= minSpan + VIEWPORT_EPSILON_SEC,
+    atMaxSpan: span >= Math.min(maxSpan, duration) - VIEWPORT_EPSILON_SEC
+  };
+}
+
+/**
+ * The span band the SHEET can actually engrave, from one measurement of it.
+ *
+ * `display.scale` multiplies every engraved coordinate linearly, so a pane of a fixed width
+ * shows `refSpanSec * refScale / scale` seconds at any other scale. Feed in what the sheet is
+ * doing right now and the two ends of `[minScale, maxScale]` come back as two spans.
+ *
+ * This is measured rather than assumed for the same reason `absoluteSheetScale` is: how many
+ * seconds a bar is wide at scale 1 depends on the meter, the density and the clef, so there is
+ * no constant to write down.
+ */
+export function sheetSpanLimits(
+  refSpanSec: number,
+  refScale: number,
+  minScale: number,
+  maxScale: number
+): { minSpanSec: number; maxSpanSec: number } | null {
+  if (!(refSpanSec > 0) || !(refScale > 0) || !(minScale > 0) || !(maxScale >= minScale)) return null;
+  const pxSeconds = refSpanSec * refScale;
+  return { minSpanSec: pxSeconds / maxScale, maxSpanSec: pxSeconds / minScale };
+}
+
+/**
+ * THE INTERSECTION, and it is the whole of the edge contract.
+ *
+ * Alignment is mandatory in this app, so the shared zoom range cannot be either pane's own: it
+ * is the stretch both can reach. The roll cannot zoom past what the sheet can follow, and the
+ * take is still the outer wall in both directions.
+ *
+ * A degenerate intersection (a sheet band entirely outside the roll's) collapses to a single
+ * legal span rather than throwing: better a saturated view than a window with `min > max`.
+ */
+export function intersectLimits(
+  base: TimeLimits,
+  sheet: { minSpanSec: number; maxSpanSec: number } | null
+): TimeLimits {
+  const duration = Math.max(base.minSpanSec, base.durationSec);
+  if (!sheet) return base;
+  const maxSpan = Math.max(1e-6, Math.min(maxSpanOf(base), sheet.maxSpanSec));
+  const minSpan = Math.max(1e-6, Math.min(Math.max(base.minSpanSec, sheet.minSpanSec), maxSpan));
+  return { durationSec: duration, minSpanSec: minSpan, maxSpanSec: maxSpan };
+}
+
+/**
+ * FRACTIONAL PINCH DELTAS, KEPT (finding 10).
+ *
+ * A trackpad reports a pinch as a cumulative scale, and the per-event ratio is routinely a
+ * fraction of a percent. Both pinch paths used to drop anything under their threshold AND
+ * advance their baseline, so the dropped part was gone for good — at sheet scale 0.6 a
+ * one-pixel wheel delta asks for a 0.0009 change against a 0.001 floor, so the sheet simply did
+ * not move while the same fingers over the roll did.
+ *
+ * Folding the ratio in instead makes the threshold a RATE LIMIT rather than a filter: nothing
+ * is lost, it merely arrives one or two events later.
+ */
+export class PinchAccumulator {
+  private pending = 1;
+
+  /** A new gesture starts with nothing owed. */
+  reset(): void {
+    this.pending = 1;
+  }
+
+  /** Fold in one raw ratio. Returns the factor to apply, or null while it is still too small. */
+  take(ratio: number, minStep = 1e-4): number | null {
+    if (!Number.isFinite(ratio) || ratio <= 0) return null;
+    this.pending *= ratio;
+    if (!Number.isFinite(this.pending) || this.pending <= 0) {
+      this.pending = 1;
+      return null;
+    }
+    if (Math.abs(this.pending - 1) < minStep) return null;
+    const out = this.pending;
+    this.pending = 1;
+    return out;
+  }
+
+  /** What is still owed, for a test that wants to prove nothing was thrown away. */
+  get owed(): number {
+    return this.pending;
+  }
+}
+
+// ---------------------------------------------------------------------------
 // The grid: bars and beats, at the seconds they were played
 // ---------------------------------------------------------------------------
 
@@ -206,6 +480,14 @@ export interface BarGridSource {
   tempoBpm: number;
   /** IR ticks per quarter note. */
   divisions: number;
+  /**
+   * `ir.tempo.changes` — symbolic tempo changes at absolute IR ticks, quarter-note BPM.
+   *
+   * Optional because most sources have none and because the blank-document grid has no IR to take
+   * them from. Absent, empty, or describing a single tempo, `tempoBpm` alone decides the grid and
+   * the arithmetic below is byte-for-byte what it was before this field existed.
+   */
+  tempoChanges?: readonly { tick: number; bpm: number }[];
   bars: ReadonlyArray<{
     index: number;
     number: number;
@@ -233,16 +515,22 @@ export interface BarSpan {
 /**
  * Bars and their beats, in RECORDING seconds.
  *
- * `secPerTick` is deliberately the SAME expression the roll's existing `barLines()` and the
- * app's loop bar use — `60 / bpm / divisions` with the same fallbacks — because three pictures
- * of one bar line that are each 2 ms out from the others is a bug nobody can see and everybody
- * can feel.
+ * TEMPO CHANGES ARE FOLLOWED, and they are followed through the pipeline's own map. A score with
+ * `ir.tempo.changes` has no single `secPerTick`: at 120 then 60 BPM the fifth bar starts a whole
+ * bar later than the scalar says, and the error grows with every bar after the change. When
+ * `src.tempoChanges` describes two or more tempi, each bar's two ends go through
+ * `buildTickSecondsMap`, which is the same piecewise arithmetic the MIDI writer and the MusicXML
+ * tempo directions use, so a bar line here cannot disagree with the file we export.
  *
- * ONE TEMPO. `ir.tempo.changes` is not consulted, for the same reason `secondsToTick` in the
- * app does not: every other second<->tick conversion on this path is single-tempo, and a grid
- * that followed a tempo map while the notes beside it did not would put a bar line beside the
- * downbeat rather than on it. When the app grows a real tempo map this is one of the places
- * that has to learn about it, and it is written to make that a change of one function.
+ * `gridMarks()` inherits all of it for free: it reads `startSec` and `beatSec` off these spans and
+ * has never seen a BPM, so its beats and subdivisions bend with the tempo the moment these do.
+ *
+ * ONE TEMPO IS STILL THE SCALAR, deliberately. `60 / bpm / divisions` is the same expression the
+ * roll's `barLines()` and the app's loop bar use, and three pictures of one bar line that are each
+ * 2 ms out from the others is a bug nobody can see and everybody can feel. The map's own
+ * `60 / (bpm * divisions)` is the same quantity but not necessarily the same double, so a
+ * constant-tempo score — every existing test, probe and screenshot — keeps the multiply verbatim,
+ * ends included, rather than being nudged by a rounding step it did not ask for.
  *
  * `beats` is the time signature's numerator, so 6/8 comes out as six eighth-note beats rather
  * than two dotted-quarter ones. That is what the edit grid and the note-name row already
@@ -250,10 +538,26 @@ export interface BarSpan {
  */
 export function barGrid(src: BarGridSource, originSec: number): BarSpan[] {
   const secPerTick = 60 / (src.tempoBpm || 100) / (src.divisions || 12);
+  // The map is built on the SAME two fallbacks, so a source with a missing tempo or missing
+  // divisions lands on 100 and 12 whichever branch reads it. `segments.length > 1` is the whole
+  // test for "this score changes tempo": one segment is an affine map that the multiply below
+  // already expresses exactly, and a lone change at tick 0 is a tempo, not a change.
+  const built = src.tempoChanges?.length
+    ? buildTickSecondsMap({
+        divisions: src.divisions || 12,
+        tempo: { displayBpm: src.tempoBpm || 100, changes: [...src.tempoChanges] }
+      })
+    : null;
+  const map = built && built.segments.length > 1 ? built : null;
   const out: BarSpan[] = [];
   for (const bar of src.bars) {
-    const startSec = originSec + bar.startTick * secPerTick;
-    const endSec = startSec + bar.durTicks * secPerTick;
+    const startSec = originSec + (map ? map.tickToSec(bar.startTick) : bar.startTick * secPerTick);
+    // The END is converted from its own tick rather than from `startSec + duration`, because past
+    // a tempo change the two are different numbers and only the tick is true. `beatSec` below is
+    // then tempo-aware for nothing extra: both ends already are.
+    const endSec = map
+      ? originSec + map.tickToSec(bar.startTick + bar.durTicks)
+      : startSec + bar.durTicks * secPerTick;
     const beats = Math.max(1, Math.round(bar.timeSig?.[0] ?? 4));
     out.push({
       index: bar.index,
@@ -454,55 +758,30 @@ export function medianBeatSec(bars: ReadonlyArray<BarSpan>): number {
 // ---------------------------------------------------------------------------
 
 /**
- * What the sheet looks like right now, in the two numbers this file needs.
- *
- * Deliberately not `TriViewViewport`: this function must be callable from a test with three
- * literals, and it must not drag a renderer into a module about arithmetic.
- */
-export interface SheetViewport {
-  scrollLeft: number;
-  viewportWidth: number;
-  contentWidth: number;
-  /** alphaTab's `display.scale`. */
-  scale: number;
-}
-
-/**
- * How wide the sheet's left gutter is, in px — the column the roll uses for pitch names and
- * the sheet is padded to leave blank. Aligning the two edges means aligning the two MUSIC
- * edges, not the two element edges, so this comes off both.
+ * How wide the sheet's left gutter is, in px — the column the roll uses for pitch names and the
+ * sheet is padded to leave blank. Aligning the two edges means aligning the two MUSIC edges, not
+ * the two element edges, so this comes off both. `TIMELINE_GUTTER_PX` in view/pianoroll.ts is
+ * this same number under the name the roll knows it by; there is deliberately only one.
  */
 export const ALIGN_GUTTER_PX = 34;
 
-/**
- * Where to scroll the sheet so its first engraved column shows `sec`.
- *
- * `contentXAt` is the sheet's own geometry — `tickToContentX` through the app's second<->tick
- * mapping — so this asks the engraving where a moment is rather than assuming anything about
- * how it is spaced. That is the whole reason Align can be exact at the edge while the two
- * views remain differently spaced inside it: only ONE point is being matched.
- *
- * Null when the sheet cannot place that second yet (nothing engraved), which is a normal state
- * and means "leave the scroll alone this frame".
- *
- * IT PARKS, IT DOES NOT GO NEGATIVE (F13). Scroll the roll left of the first note — into the
- * leading silence, which the roll and the waveform quite rightly go on drawing — and the second
- * asked for here is before written second 0. There is no page there, so the answer is 0: the
- * sheet sits still at its start while the other two strips keep scrolling. The alternative, a
- * negative scroll clamped by the browser to 0 anyway, is the same picture arrived at through a
- * value nothing else can reason about; and letting it wrap to the far end would make the sheet
- * jump, which is what was reported.
- */
-export function sheetScrollForSec(
-  sec: number,
-  contentXAt: (sec: number) => number | null,
-  view: SheetViewport
-): number | null {
-  const x = contentXAt(sec);
-  if (x === null || !Number.isFinite(x)) return null;
-  const max = Math.max(0, view.contentWidth - view.viewportWidth);
-  return Math.max(0, Math.min(max, x - ALIGN_GUTTER_PX));
-}
+// FOUR THINGS STOOD HERE AND ARE GONE (finding 14): `SheetViewport`,
+// `sheetScrollForSec`, `clampXToEngraving` and `windowFromSheet`.
+//
+// They were a COMPLETE SECOND DESIGN for alignment — sheet scrolling, engraved-edge clamping and
+// window extraction — with no production caller. `ui/app.ts` hand-implemented a different edge
+// policy beside them, and the two disagreed on the one question that matters: `windowFromSheet`
+// documented engraved clamping as necessary while the shipped `TriView.contentXToTick` deliberately
+// extrapolated through the page padding. Both were tested, both were described as correct, and the
+// live feedback bugs came directly out of trying to keep two incompatible generations alive.
+//
+// There is nothing left to clamp, because nothing derives a window from the engraving any more.
+// The sheet states ONE edge (`ViewportCommand.sheetScroll`) and the reducer supplies the span.
+//
+// `coupledSheetScale` went with them. It scaled the sheet by the RATIO of the previous span to
+// the new one, which needs a previous span to be remembered and therefore needs somebody to
+// decide which of several remembered spans was the real one. `absoluteSheetScale` below answers
+// the same question from a measurement of the live engraving and needs no memory at all.
 
 /**
  * How far the ENGRAVING actually reaches, in content pixels.
@@ -517,64 +796,28 @@ export interface EngravedExtent {
 }
 
 /**
- * Hold an x inside the engraving before anybody turns it into a time.
+ * How many content pixels the engraving spends on one second, at the CURRENT `display.scale`.
  *
- * THE BUG THIS EXISTS FOR. `x -> tick` extrapolates past both ends on purpose (a note's tail
- * that runs a fraction past the last beat has to land somewhere). Feed it the sheet's RIGHT
- * VIEWPORT EDGE, though, and the extrapolation is not a rounding detail: on a take whose
- * engraving is narrower than the pane — a short riff, or any take at a deep zoom-out — the edge
- * is hundreds of pixels past the last bar, so the derived window ends well past the end of the
- * recording. `clampWindow` then slides that window back inside the take KEEPING ITS SPAN, which
- * moves `fromSec` away from the second the sheet's left edge is really showing. The roll and the
- * sheet are then looking at different music at different scales, and the next coupled zoom
- * computes its ratio from the wrong previous span and compounds it. Measured as ~578 px of
- * drift.
+ * The one measurement the sheet's half of the coupling rests on, and the only thing anybody
+ * still asks the engraving's geometry for. Taken across the WHOLE engraved extent rather than
+ * across the viewport, on purpose: alphaTab spaces a dense bar wider than a sparse one, so a
+ * measurement over one screenful moves as you scroll, and a calibration that moves when you
+ * scroll is how a scroll turns back into a zoom. Over both ends it is one number for the take.
  *
- * Clamping is the honest answer rather than a fudge: past the last engraved bar there is no more
- * music, so the last engraved moment IS what that edge is showing.
- *
- * BOTH ENDS, and the left one was re-measured rather than assumed (G2).
- *
- * Left of the first engraved beat is the CLEF, KEY AND METER PREFIX: real page width standing
- * for no time at all. Dropping the left clamp so that column extrapolates was tried, live, on
- * the grand-staff demo — it fixes the first note (177 px -> 83 px) and makes every note after it
- * worse (1 px -> 159 px), because the extrapolation runs off the slope of the FIRST TWO BEATS,
- * which at the start of a fast figure is far steeper than the take's average. Pinning the window
- * to the first engraved beat is the better of the two, and it is measured that way round rather
- * than argued.
- *
- * The residual it leaves — the first note sitting up to `firstX - ALIGN_GUTTER_PX` right of its
- * own rectangle at scroll 0 — is a FRACTION question, not a clamping one: the roll is told the
- * first anchor is at frac 0 (its gutter) when the sheet has it at `firstX`. See
- * `windowFromSheet` and the anchor list in ui/app.ts.
+ * Null when there is nothing engraved yet, or when the two ends carry no time between them.
  */
-export function clampXToEngraving(x: number, extent: EngravedExtent | null | undefined): number {
-  if (!extent) return x;
+export function engravedPxPerSec(
+  extent: EngravedExtent | null | undefined,
+  secAtContentX: (x: number) => number | null
+): number | null {
+  if (!extent) return null;
   const { firstX, lastX } = extent;
-  if (!Number.isFinite(firstX) || !Number.isFinite(lastX) || !(lastX > firstX)) return x;
-  return Math.max(firstX, Math.min(lastX, x));
-}
-
-/**
- * The window the roll should show to match what the sheet is showing.
- *
- * The sheet is the one being read here: its left edge and its right edge are turned into
- * seconds and become the window. Null when the sheet cannot answer.
- *
- * `engraved` is the stretch of page that has actually been engraved; pass it and both edges are
- * held inside it first. See `clampXToEngraving` for why that is not optional in practice.
- */
-export function windowFromSheet(
-  view: SheetViewport,
-  secAtContentX: (x: number) => number | null,
-  limits: TimeLimits,
-  engraved?: EngravedExtent | null
-): TimeWindow | null {
-  const from = secAtContentX(clampXToEngraving(view.scrollLeft + ALIGN_GUTTER_PX, engraved));
-  const to = secAtContentX(clampXToEngraving(view.scrollLeft + view.viewportWidth, engraved));
+  if (!Number.isFinite(firstX) || !Number.isFinite(lastX) || !(lastX > firstX)) return null;
+  const from = secAtContentX(firstX);
+  const to = secAtContentX(lastX);
   if (from === null || to === null || !Number.isFinite(from) || !Number.isFinite(to)) return null;
-  if (!(to > from)) return null;
-  return clampWindow({ fromSec: from, toSec: to }, limits);
+  if (!(to - from > 1e-6)) return null;
+  return (lastX - firstX) / (to - from);
 }
 
 // ---------------------------------------------------------------------------
@@ -635,40 +878,6 @@ export function audioSecAt(writtenSec: number, originSec: number): number {
 }
 
 /**
- * THE COUPLING FACTOR, stated once.
- *
- * With Align on, the roll and the sheet must magnify together: zoom the roll in by 2 and the
- * sheet has to get twice as big too, or the two panes stop showing the same music and the
- * feature is a lie the moment anybody touches the wheel.
- *
- * The rule is exactly inverse proportionality:
- *
- *     newScale / oldScale  =  oldSpanSec / newSpanSec
- *
- * and it is not a taste. alphaTab's `display.scale` multiplies every engraved coordinate
- * linearly (measured at 0.5, 1 and 2 in the 1.8.4 build here — the same measurement
- * `leftInkOverhangPerScale` in triview.ts rests on), so the sheet's pixels-per-second is
- * `pxPerSec(1) * scale`. Making the sheet's visible span equal the roll's therefore means
- * making `viewportWidth / (pxPerSec(1) * scale)` equal `spanSec`, which rearranges to the line
- * above with everything unmeasurable cancelled out.
- *
- * Stated as a RATIO rather than an absolute scale because the absolute one needs a measurement
- * of the current engraving (`pxPerSecAtCurrentScale`) that is only available when something has
- * been engraved. `absoluteSheetScale` below is the measured form; this is the one a plain zoom
- * notch uses, and the two agree.
- */
-export function coupledSheetScale(
-  currentScale: number,
-  oldSpanSec: number,
-  newSpanSec: number,
-  minScale: number,
-  maxScale: number
-): number {
-  if (!(oldSpanSec > 0) || !(newSpanSec > 0) || !Number.isFinite(currentScale)) return currentScale;
-  return Math.max(minScale, Math.min(maxScale, currentScale * (oldSpanSec / newSpanSec)));
-}
-
-/**
  * The sheet scale that makes the sheet's viewport show exactly `spanSec` of music.
  *
  * `pxPerSecAtCurrentScale` is MEASURED off the live engraving — take two seconds a known
@@ -676,8 +885,13 @@ export function coupledSheetScale(
  * how wide a bar is at scale 1, which is not a constant anyway (it depends on the meter, the
  * rhythmic density and the clef).
  *
- * Used when Align is switched ON, where there is no "old span" to scale from: the sheet has to
- * be brought to the roll in one step rather than nudged.
+ * THE ONLY COUPLING LAW LEFT, and being absolute is why. Its predecessor scaled by the ratio of
+ * the previous span to the new one, so every zoom had to be told what the previous span had
+ * been — and when the answer was wrong (a clamped window, a stale remembered one, an engraving
+ * that had moved underneath) the error compounded across gestures instead of being corrected by
+ * the next one. This asks only what the sheet is doing NOW and what span is wanted, so a scale
+ * that came out 0.0009 short and was dropped under `setZoom`'s render threshold is simply asked
+ * for again, correctly, on the very next event. Nothing accumulates and nothing is owed.
  */
 export function absoluteSheetScale(
   currentScale: number,

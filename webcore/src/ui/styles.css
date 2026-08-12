@@ -696,20 +696,52 @@ input[type="number"], input[type="text"], select {
   zoom: var(--bar-zoom, 1);
 }
 /*
- * THE WIDEST THINGS GIVE GROUND FIRST, and mostly they give up space nothing is drawn in.
+ * NOTHING ON THIS BAR IS EVER CUT SHORT. NO ELLIPSIS, AT ANY WIDTH.
  *
- * A `<select>` takes its intrinsic width from its LONGEST option, not from the one it is
- * showing: the Key menu reserves room for "Key: C♭ major / A♭ minor" while displaying "Key:
- * Auto — G major", which is 50px shorter, and the Tab menu reserves room for its Fingering
- * section. Letting them shrink therefore costs nothing at all until the row is genuinely out
- * of space, and only then does the ellipsis appear — with the full text still one hover away
- * in the tooltip and one click away in the open menu.
+ * What stood here was the opposite rule and it is worth writing down, because it looked right:
+ * a `<select>` takes its intrinsic width from its LONGEST option rather than the one it is
+ * showing, so letting the boxes shrink "costs nothing at all until the row is genuinely out of
+ * space", and past that point an ellipsis with the full text one hover away seemed a fair price.
  *
- * `min-width: 0` is what makes that possible: a flex item's automatic minimum is its content's
- * minimum, so without it a select refuses to shrink one pixel and the row wraps instead.
+ * It was not. Measured at 390px with a tab on the page: the Key box was 120px wide holding
+ * 123px of text, the tuning 139px holding 105 in 103px of usable width, the clef 72px holding 60
+ * in 36 — every single control on the bar truncated, and the bar on two rows anyway. "Key: Auto
+ * — C majo…" is not a key signature you can read, and the tooltip is not on screen.
+ *
+ * So the boxes are cut to the words they are SHOWING instead (ui/app.ts §fitNotationBar), which
+ * takes about 330px off the bar's natural width, and then they never shrink below that: with no
+ * slack left to give, `flex-shrink` could only ever take the text. `min-width: 0` went with it —
+ * it existed to let a select shrink past its content, which is the thing being forbidden.
  */
-.notation-toolbar > * { flex: 0 1 auto; max-width: 100%; min-width: 0; }
-.notation-toolbar select { min-width: 4.5em; text-overflow: ellipsis; }
+.notation-toolbar > * { flex: 0 0 auto; max-width: 100%; }
+/*
+ * THE DROP-DOWN ARROW IS OURS, and that is what turns the width above from a guess into a
+ * measurement.
+ *
+ * `fitNotationBar` sizes each box to the words it is SHOWING plus the room its arrow needs. With
+ * the PLATFORM arrow that second number is not knowable from the page: the engine reserves a
+ * glyph region of its own choosing, and it does not shrink in step with the `zoom` on this bar.
+ * Measured at the 390px floor, where the bar is drawn at about 0.62: the Key box was sized with
+ * 23 CSS px of arrow allowance, which arrived as 14 visual px against an arrow that still wanted
+ * ~20, and the difference came out of the end of the text — "Key: Auto — C majo", clipped with no
+ * ellipsis to announce it. A key signature missing its last letters is a wrong key signature, and
+ * silently so, which is worse than the truncation this bar was rewritten to remove.
+ *
+ * `appearance: none` plus a drawn chevron makes the reserve exactly the padding written here, at
+ * every zoom and on every platform, so `fitSelects` can stop estimating and simply add the frame.
+ * KEEP `padding-right` AND `NOTATION_ARROW_PX` IN STEP — app.ts measures against this number.
+ */
+.notation-toolbar select {
+  appearance: none;
+  -webkit-appearance: none;
+  padding-right: 20px;
+  /* The chevron, at --text-dim. This app is `color-scheme: dark` and has one palette, so the
+     colour is written rather than tokenised — a data URI cannot read a custom property. */
+  background-image: url("data:image/svg+xml;charset=utf-8,%3Csvg xmlns='http://www.w3.org/2000/svg' width='9' height='6' viewBox='0 0 9 6'%3E%3Cpath d='M1 1l3.5 3.5L8 1' fill='none' stroke='%239aa0ab' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 6px center;
+  background-size: 9px 6px;
+}
 /* Numbers and their labels do not shrink: "Capo" and a 48px box are already the minimum, and
    an ellipsised number is a wrong number. */
 .notation-toolbar .string-count, .notation-toolbar .toolbar-label { flex: 0 0 auto; }
@@ -732,10 +764,11 @@ input[type="number"], input[type="text"], select {
 .notation-toolbar .warn-row {
   color: var(--warn);
   white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  flex: 0 4 auto;
-  min-width: 5em;
+  /* It used to be the first thing to give ground, truncating at `flex: 0 4 auto` so the controls
+     beside it kept their width. It says "1/4 would merge 12 notes" — a sentence about notes
+     being LOST — and half of that sentence is the one thing on this bar that must never be half
+     said. It takes its own line at the floor now, like everything else here. */
+  flex: 0 0 auto;
 }
 .notation-toolbar .document-bars { display: flex; align-items: center; gap: 6px; margin-left: auto; }
 
@@ -977,54 +1010,71 @@ button[data-drag="midi"] .drag-grip {
 }
 button[data-drag="midi"]:hover .drag-grip { opacity: 0.9; }
 
-/* --------------------------------------------------------------- part chips */
+/* ---------------------------------------------------------------- the parts */
 
 /*
- * ONE THIN LINE ABOVE THE SHEET, and on a single-part take it holds two pills.
+ * THE ROW OF PILLS IS GONE, and nothing here replaces its geometry.
  *
- * The height is the whole design constraint: this row appears on every take, including the very
- * many that will only ever have one part, so it must cost the page almost nothing. No border, no
- * heading, no background — just small pills sitting on the app's own surface.
+ * `.part-chips` and `.part-chip` stood here: one thin line directly above the sheet, a pill per
+ * part, a `+` at the end, drag to reorder. It cost a whole row of a plugin window on every take
+ * — including the very many that will only ever have one part, where the entire row read "Bass"
+ * — and this window is already more chrome than music. The parts are one `<select>` on the
+ * notation bar now (ui/app.ts §buildPartControl), so they take no row at all, and the drag went
+ * with the pills: reordering is Move up and Move down, which also works from a keyboard.
+ *
+ * What is left here is the popover that Rename opens, and the target over the name printed on
+ * the sheet.
  */
-.part-chips {
-  display: flex;
-  align-items: center;
-  gap: 5px;
-  padding: 3px 10px;
-  flex-wrap: nowrap;
-  overflow-x: auto;
-  scrollbar-width: none;
-}
-.part-chips::-webkit-scrollbar { display: none; }
 
-.part-chip {
-  display: inline-flex;
-  align-items: center;
-  gap: 5px;
-  padding: 2px 10px;
-  font-size: 11px;
-  white-space: nowrap;
-  touch-action: none;
-  user-select: none;
-}
-/* The live part is accent-filled by `.chip.on`; the dot is the mark that survives a reorder. */
-.part-chip .part-dot { font-size: 8px; line-height: 1; opacity: 0.95; }
-.part-chip .part-nudge { font-size: 10px; opacity: 0.7; font-variant-numeric: tabular-nums; }
-/*
- * ACTIVE IS A RING, NOT A FILL. The fill already means "this is the live part", and reusing it
- * for "this is the chip you last clicked" would leave the two indistinguishable the moment an
- * imported part is selected.
- */
-.part-chip.selected { box-shadow: 0 0 0 2px var(--accent-hover); }
-.part-chip.dragging { opacity: 0.7; cursor: grabbing; }
-.part-add { padding: 2px 9px; font-size: 12px; line-height: 1.1; }
+/* Sized like every other box on that bar — by its own words, from ui/app.ts §fitNotationBar. */
+.part-select { flex: 0 0 auto; }
 
 .part-menu { min-width: 210px; }
 .part-menu .part-menu-row { display: flex; align-items: center; gap: 6px; font-size: 11.5px; }
 .part-menu .part-menu-row > span:first-child { width: 46px; color: var(--text-dim); }
 .part-menu .part-menu-row input { flex: 1 1 auto; min-width: 0; }
 .part-menu .part-menu-row input[type="number"] { flex: 0 0 76px; }
-.part-menu .part-menu-remove { font-size: 11.5px; }
+
+/*
+ * THE PART NAME ON THE PAGE IS A BUTTON, and it has to look like nothing at all.
+ *
+ * alphaTab has already drawn the name; this sits exactly on top of the ink it drew (see
+ * view/triview.ts §syncPartLabelHits), so anything visible here would be a second name on top of
+ * the first. The cursor and the focus ring are the whole of its appearance — the first says it
+ * can be pressed, the second is what a keyboard needs to see.
+ */
+.part-label-hits {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+}
+.part-label-hit {
+  position: absolute;
+  top: 0;
+  left: 0;
+  padding: 0;
+  background: transparent;
+  border: none;
+  border-radius: 3px;
+  cursor: text;
+  pointer-events: auto;
+}
+.part-label-hit:hover { background: var(--accent-soft); }
+.part-label-hit:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+
+/*
+ * The rename, over the name it is renaming. Fixed rather than in the sheet's own scroller: the
+ * commit re-engraves the page under it, so a field parented into the engraving would be deleted
+ * by the change it just made.
+ */
+.part-label-edit {
+  position: fixed;
+  z-index: 41;
+  width: 150px;
+  font-size: 12px;
+  padding: 2px 6px;
+  box-shadow: 0 6px 20px #0009;
+}
 
 /* ------------------------------------------------------------------ tri-view */
 
@@ -1859,8 +1909,30 @@ button[data-drag="midi"]:hover .drag-grip { opacity: 0.9; }
  * the kind of thing somebody finds by dragging a window edge.
  */
 @media (min-width: 700px) {
-  .app-header, .notation-toolbar { flex-wrap: nowrap; }
+  .app-header { flex-wrap: nowrap; }
 }
+
+/*
+ * …AND THE NOTATION BAR IS NOT IN THAT RULE ANY MORE.
+ *
+ * `nowrap` was how the bar bought its single row, and what it bought it with was the selects:
+ * they were allowed to shrink past their own text and the difference came out as an ellipsis.
+ * That is now forbidden (§"nothing on this bar is ever cut short"), so `nowrap` has nothing left
+ * to spend — it would simply push the last control off the right-hand edge, which is the exact
+ * failure the whole of this section exists to prevent (a Capo button 39px past the window, and
+ * the report that said the button had disappeared).
+ *
+ * It does not cost the row that was gained. Cut to their own words the controls come to about
+ * 990px of bar, and the scale ladder above leaves 997px of room at 700px and 1071 at 900 — so
+ * the bar holds ONE LINE all the way down to the 700px floor on its natural widths, with nothing
+ * shrunk and nothing truncated, and wraps below that exactly as the header does.
+ *
+ * A SECOND ROW IS STILL THE HONEST ANSWER AT THE FLOOR, and the arithmetic has not changed since
+ * it was first written down: at 390px the ladder leaves 500px of layout width, the same controls
+ * measure about 990, and no scale that fits them on one line (0.4 of 13px is 5px of type) is a
+ * scale anybody can read. Wrapping shows all of it; the alternatives hide half of it.
+ */
+.notation-toolbar { flex-wrap: wrap; }
 
 /*
  * …AND THE TRANSPORT TAKES THE SAME FLOOR FALLBACK (H6).

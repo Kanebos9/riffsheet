@@ -21,7 +21,8 @@
 
 import { Rational, R } from './rational.js';
 import { DIVISIONS } from './ir.js';
-import type { BuildInput, BuildSettings, ExternalGrid } from './types.js';
+import { buildTickSecondsMap } from './tickSeconds.js';
+import type { BuildInput, BuildSettings, ExternalGrid, InputNote } from './types.js';
 
 /** A downbeat may anticipate its beat by this much and still count as that beat. */
 export const DOWNBEAT_ANTICIPATION_SEC = 0.05;
@@ -34,6 +35,15 @@ const METER_INTERVAL_TOLERANCE = 0.15;
 /** Fallback tempo when there are neither beats nor a bpmOverride. */
 const DEFAULT_BPM = 120;
 const EPS = 1e-6;
+/**
+ * FLOOR ON AN EXTRAPOLATED BEAT (finding 12). `extendGrid` walks outwards using the first and
+ * last supplied gaps; two near-coincident beat times make that gap ~0 and the loop then tries to
+ * allocate however many beats fit in the span, which is an unbounded array from a two-element
+ * input. 20 ms is 3000 BPM — no beat tracker means it and no music contains it.
+ */
+const MIN_EXTENSION_INTERVAL_SEC = 0.02;
+/** ...and a hard budget on top, so a pathological span cannot allocate without limit either. */
+const MAX_EXTENSION_BEATS = 8192;
 
 export interface BarSkeleton {
   index: number;
@@ -48,6 +58,96 @@ export interface BarSkeleton {
   timeSigChanged: boolean;
   number: number;
   implicit: boolean;
+}
+
+/** The bar map a symbolic source (MusicXML / MIDI / Guitar Pro) attaches to its notes. */
+export type SymbolicBarSource = NonNullable<InputNote['sourceBars']>[number];
+/** The tempo map the same source attaches. Ticks are in the source's own ppq. */
+export type SymbolicTempoSource = NonNullable<InputNote['sourceTempoChanges']>[number];
+
+export interface SkeletonOptions {
+  /**
+   * THE SOURCE'S OWN BARS, and they are consumed BEFORE the skeleton decides anything.
+   *
+   * They used to be applied afterwards, by overwriting `bars`, `timeSig` and `totalTicks` on a
+   * finished skeleton (`applySymbolicBars`). Everything derived from the meter had already been
+   * captured by then — above all `ticksPerBeat`, which every one of the conversion closures
+   * closes over — so a 6/8 import announced 6/8 in its public bar objects while its
+   * tick-to-seconds map went on behaving as 4/4: the second downbeat of a two-bar 6/8 source
+   * came back at 1.0 s instead of 1.5 s. The meter has to exist before the beat unit is chosen,
+   * which is what this option is for.
+   */
+  symbolicBars?: SymbolicBarSource[];
+  /** The source's tempo map, used to lay the beat grid when there is nothing else to lay it on. */
+  symbolicTempo?: SymbolicTempoSource[];
+}
+
+/** A validated symbolic bar map, converted into the IR's tick domain. */
+export interface SymbolicClock {
+  bars: Omit<BarSkeleton, 'startBeatIdx'>[];
+  timeSig: [number, number];
+  compound: boolean;
+  /**
+   * TRUE WHEN THE SOURCE CHANGES METER MID-PIECE, which this wave explicitly does not support.
+   * The bars keep their own signatures (they always have) and the score still engraves, but the
+   * TRACKED PULSE is bar 1's throughout, so seconds inside a differently-metered later bar are
+   * only as good as that pulse. Callers surface this; nothing here silently pretends otherwise.
+   */
+  mixedMeter: boolean;
+  totalTicks: number;
+}
+
+/**
+ * Convert and validate a source bar map. Returns null when the map is unusable — a non-finite
+ * or non-positive ppq, a zero-length bar, or bars that do not tile a contiguous span — in which
+ * case the caller falls back to the ordinary detected/synthesised skeleton.
+ */
+export function normalizeSymbolicBars(source: readonly SymbolicBarSource[]): SymbolicClock | null {
+  if (!source.length) return null;
+  const bars: Omit<BarSkeleton, 'startBeatIdx'>[] = [];
+  for (let index = 0; index < source.length; index++) {
+    const bar = source[index];
+    if (
+      !Number.isFinite(bar.ppq) || bar.ppq <= 0 ||
+      !Number.isFinite(bar.startTick) || !Number.isFinite(bar.durationTicks)
+    ) {
+      return null;
+    }
+    const scale = DIVISIONS / bar.ppq;
+    const startTick = Math.round(bar.startTick * scale);
+    const ticks = Math.round(bar.durationTicks * scale);
+    if (startTick < 0 || ticks <= 0) return null;
+    const previous = index > 0 ? source[index - 1] : undefined;
+    // A written source states its own signature, but it is still a signature: a denominator that
+    // names no note value is unprintable here for exactly the reasons `printableTimeSig` gives.
+    const timeSig = printableTimeSig(bar.timeSig[0], bar.timeSig[1]);
+    const previousSig = previous ? printableTimeSig(previous.timeSig[0], previous.timeSig[1]) : undefined;
+    bars.push({
+      index,
+      beats: isCompound(timeSig[0], timeSig[1]) ? timeSig[0] / 3 : timeSig[0],
+      startTick,
+      ticks,
+      timeSig,
+      timeSigChanged:
+        index === 0 ||
+        previousSig![0] !== timeSig[0] ||
+        previousSig![1] !== timeSig[1],
+      number: bar.number,
+      implicit: bar.implicit
+    });
+  }
+  for (let index = 1; index < bars.length; index++) {
+    if (bars[index].startTick !== bars[index - 1].startTick + bars[index - 1].ticks) return null;
+  }
+  const first = bars[0].timeSig;
+  const mixedMeter = bars.some((bar) => bar.timeSig[0] !== first[0] || bar.timeSig[1] !== first[1]);
+  return {
+    bars,
+    timeSig: [first[0], first[1]],
+    compound: isCompound(first[0], first[1]),
+    mixedMeter,
+    totalTicks: bars[bars.length - 1].startTick + bars[bars.length - 1].ticks
+  };
 }
 
 export interface TimeSkeleton {
@@ -72,6 +172,10 @@ export interface TimeSkeleton {
   /** Human-readable diagnosis of the meter decision, for the UI. */
   meterReason: string;
   totalTicks: number;
+  /** true when the bar map came from a symbolic source rather than being laid down here. */
+  symbolic: boolean;
+  /** true when that source changes meter mid-piece — out of scope, surfaced, never silent. */
+  mixedMeter: boolean;
 
   secondsToBeatIdx(sec: number): number;
   beatIdxToSeconds(beatIdx: number): number;
@@ -113,20 +217,32 @@ function interp(x: number, xs: number[], ys: number[]): number {
   return ys[lo] + t * (ys[hi] - ys[lo]);
 }
 
+/** How many beats of `interval` reach from `span` seconds away, floored and budgeted. */
+function extensionCount(span: number, interval: number): number {
+  const step = Math.max(MIN_EXTENSION_INTERVAL_SEC, interval);
+  if (!Number.isFinite(span) || span <= 0) return 1;
+  return Math.max(1, Math.min(MAX_EXTENSION_BEATS, Math.ceil(span / step) + 1));
+}
+
 function extendGrid(beats: number[], fromSec: number, toSec: number): { grid: number[]; offset: number } {
   if (beats.length < 2) {
     const period = 60 / DEFAULT_BPM;
     const base = beats.length ? beats[0] : 0;
-    const before = Math.max(1, Math.ceil((base - fromSec) / period) + 1);
-    const after = Math.max(1, Math.ceil((toSec - base) / period) + 1);
+    const before = extensionCount(base - fromSec, period);
+    const after = extensionCount(toSec - base, period);
     const grid: number[] = [];
     for (let i = -before; i <= after; i++) grid.push(base + i * period);
     return { grid, offset: before };
   }
-  const head = beats[1] - beats[0];
-  const tail = beats[beats.length - 1] - beats[beats.length - 2];
-  const before = head > 0 ? Math.max(1, Math.ceil((beats[0] - fromSec) / head) + 1) : 1;
-  const after = tail > 0 ? Math.max(1, Math.ceil((toSec - beats[beats.length - 1]) / tail) + 1) : 1;
+  // MINIMUM INTERVAL AND EXTENSION BUDGET. The gap the extrapolation walks by is the FIRST (or
+  // last) supplied gap, so a single pair of near-coincident beat times used to drive an
+  // unbounded allocation loop; both are now floored at a musically possible interval and the
+  // count itself is capped. Beyond the budget the grid simply stops — the interpolation in
+  // `interp` extrapolates linearly past both ends anyway, so nothing downstream loses its map.
+  const head = Math.max(MIN_EXTENSION_INTERVAL_SEC, beats[1] - beats[0]);
+  const tail = Math.max(MIN_EXTENSION_INTERVAL_SEC, beats[beats.length - 1] - beats[beats.length - 2]);
+  const before = extensionCount(beats[0] - fromSec, head);
+  const after = extensionCount(toSec - beats[beats.length - 1], tail);
   const grid: number[] = [];
   for (let i = before; i >= 1; i--) grid.push(beats[0] - i * head);
   grid.push(...beats);
@@ -156,6 +272,42 @@ function downbeatToBeatIdx(dbSec: number, grid: number[], ibi: number): number {
 
 function isCompound(num: number, den: number): boolean {
   return den >= 8 && num % 3 === 0 && num > 3;
+}
+
+/**
+ * THE FINEST DENOMINATOR THE PAGE CAN SAY. meter.ts's `VOCABULARY` bottoms out at a 1/32, and
+ * `Rational.toTicksExact` cannot even express a 1/64 at DIVISIONS=24 — it throws.
+ */
+const MAX_PRINTABLE_DENOMINATOR = 32;
+
+function isPrintableDenominator(den: number): boolean {
+  return Number.isInteger(den) && den >= 1 && den <= MAX_PRINTABLE_DENOMINATOR && (den & (den - 1)) === 0;
+}
+
+/**
+ * A TIME SIGNATURE'S DENOMINATOR NAMES A NOTE VALUE, AND ONLY A POWER OF TWO NAMES ONE.
+ *
+ * REAPER (and every other DAW with a free-text meter box) will happily report 3/6, and the host
+ * grid used to be believed verbatim. Nothing downstream can survive it: the tracked beat becomes
+ * a SIXTH of a whole note, `ticksPerBeat` comes out 16, and 16 ticks is not the sum of ANY
+ * combination of printable glyphs (the vocabulary is 3, 6, 9, 12, 18, 24, 36, 48, 72, 96 ticks).
+ * `toDurationList` then recursed down its halving ladder to 1/96, `greedyDecompose` fell through
+ * to its documented "un-notatable remainder", and `typeOf` rounded each 1-tick fragment to the
+ * nearest thing it could name — a 32nd, which is 3 ticks. That is the whole of
+ * "<type>32nd</type> is 3 ticks but the glyph lasts 1": sixteen of them per beat.
+ *
+ * It cannot be repaired further down. A span of 1/6 of a whole note is not engravable at any
+ * resolution, so no merge, tie or absorb law can print it; the only honest fix is to refuse the
+ * denominator at the door and say so in `meterReason`. The nearest power of two on a log scale
+ * is used (6 -> 8), because it keeps the bar closest to the length the host meant, and the
+ * result is clamped to a 1/32 because that is the finest value the page has a symbol for.
+ */
+export function printableTimeSig(num: number, den: number): [number, number] {
+  const beats = Number.isFinite(num) && num >= 1 ? Math.round(num) : 4;
+  if (isPrintableDenominator(den)) return [beats, den];
+  if (!Number.isFinite(den) || den <= 0) return [beats, 4];
+  const exponent = Math.min(5, Math.max(0, Math.round(Math.log2(den))));
+  return [beats, 1 << exponent];
 }
 
 /**
@@ -260,11 +412,47 @@ function gridFromExternal(
   return { beats, downbeats, beatsPerBar, beatUnit, compound };
 }
 
-export function buildTimeSkeleton(input: BuildInput, settings: BuildSettings): TimeSkeleton {
+export function buildTimeSkeleton(
+  input: BuildInput,
+  settings: BuildSettings,
+  options: SkeletonOptions = {}
+): TimeSkeleton {
   const notes = input.notes;
-  const firstSec = notes.length ? Math.min(...notes.map((n) => n.startSec)) : 0;
-  const lastSec = notes.length ? Math.max(...notes.map((n) => n.endSec)) : 0;
-  const ext = input.externalGrid;
+  // ITERATIVE EXTREMA, never a spread (finding 12): `Math.min(...oneMillionNotes)` throws
+  // `RangeError: Maximum call stack size exceeded` in JavaScriptCore, which is the engine the
+  // plugin's WebView runs, so the published one-million-note import limit was unreachable by
+  // construction. Two passes over the array cost nothing and cannot throw.
+  let firstSec = Infinity;
+  let lastSec = -Infinity;
+  let lastOnsetSecScan = -Infinity;
+  for (const n of notes) {
+    if (n.startSec < firstSec) firstSec = n.startSec;
+    if (n.startSec > lastOnsetSecScan) lastOnsetSecScan = n.startSec;
+    if (n.endSec > lastSec) lastSec = n.endSec;
+  }
+  if (!notes.length) {
+    firstSec = 0;
+    lastSec = 0;
+  }
+  const symbolic = options.symbolicBars?.length ? normalizeSymbolicBars(options.symbolicBars) : null;
+  // The symbolic beat unit has to exist BEFORE the fallback grid is synthesised: a 6/8 source
+  // pulses in dotted quarters, and a grid laid down in quarters would place its second downbeat
+  // a third of a bar early no matter what the bar objects went on to say.
+  const symbolicBeatUnit = symbolic
+    ? (symbolic.compound ? R(3, symbolic.timeSig[1]) : R(1, symbolic.timeSig[1]))
+    : null;
+  // THE HOST'S GRID IS BELIEVED, ITS DENOMINATOR IS CHECKED. A DAW's meter box takes free text;
+  // the mock plugin's default (REAPER at 222 BPM in 3/6) is a real user's reproduction case, and
+  // 3/6 is not a signature this or any other engraver can print. See `printableTimeSig`.
+  const hostSig = input.externalGrid ? printableTimeSig(input.externalGrid.timeSig[0], input.externalGrid.timeSig[1]) : null;
+  const hostSigRewritten =
+    !!input.externalGrid && !!hostSig &&
+    (hostSig[0] !== input.externalGrid.timeSig[0] || hostSig[1] !== input.externalGrid.timeSig[1]);
+  const ext: ExternalGrid | undefined = !input.externalGrid
+    ? undefined
+    : hostSigRewritten
+      ? { ...input.externalGrid, timeSig: hostSig! }
+      : input.externalGrid;
   const explicitOrigin = input.startOffsetSec !== undefined || !!ext;
   const anchorSec = input.startOffsetSec ?? 0;
 
@@ -277,6 +465,8 @@ export function buildTimeSkeleton(input: BuildInput, settings: BuildSettings): T
   let compound: boolean;
   let beatUnit: Rational;
   let beatsPerBar: number;
+  /** True when the beat grid itself was laid down from the symbolic source's tempo map. */
+  let symbolicGrid = false;
 
   if (ext) {
     // ---- source 1: the host grid, authoritative ------------------------------------------
@@ -294,13 +484,31 @@ export function buildTimeSkeleton(input: BuildInput, settings: BuildSettings): T
     compound = g.compound;
     beatUnit = g.beatUnit;
     beatsPerBar = g.beatsPerBar;
-    meterReason = `external grid ${num}/${den} @ ${ext.bpm} BPM${ext.barStartsSec?.length ? ' with explicit bar starts' : ''}`;
+    meterReason =
+      `external grid ${num}/${den} @ ${ext.bpm} BPM${ext.barStartsSec?.length ? ' with explicit bar starts' : ''}` +
+      (hostSigRewritten
+        ? ` (host reported ${input.externalGrid!.timeSig[0]}/${input.externalGrid!.timeSig[1]}, whose denominator names no note value)`
+        : '');
   } else {
     // ---- source 2/3: detected beats, or a uniform fallback -------------------------------
     const supplied = (input.beats ?? []).filter((b) => Number.isFinite(b)).sort((a, b) => a - b);
     synthesised = supplied.length < 2;
     if (!synthesised) {
       baseBeats = supplied;
+    } else if (symbolic && symbolicBeatUnit) {
+      // A SYMBOLIC SOURCE BRINGS ITS OWN CLOCK. There is no take to detect beats in, and the
+      // 120 BPM quarter-note fallback below is the wrong shape twice over for, say, a 6/8
+      // source: wrong pulse length AND wrong pulse count per bar. Lay the grid on the source's
+      // own tempo map instead, in the source's own beat unit, so tick-to-seconds is exact.
+      const beatTicks = symbolicBeatUnit.toTicksExact(DIVISIONS);
+      const fallbackBpm = settings.bpmOverride && settings.bpmOverride > 0 ? settings.bpmOverride : DEFAULT_BPM;
+      const changes = (options.symbolicTempo ?? [])
+        .filter((change) => Number.isFinite(change.ppq) && change.ppq > 0 && Number.isFinite(change.bpm) && change.bpm > 0)
+        .map((change) => ({ tick: Math.round((change.tick * DIVISIONS) / change.ppq), bpm: change.bpm }));
+      const map = buildTickSecondsMap({ divisions: DIVISIONS, tempo: { displayBpm: fallbackBpm, changes } });
+      const spanBeats = Math.max(2, Math.ceil(symbolic.totalTicks / beatTicks) + 2);
+      baseBeats = Array.from({ length: spanBeats }, (_, i) => anchorSec + map.tickToSec(i * beatTicks));
+      symbolicGrid = true;
     } else {
       const bpm = settings.bpmOverride && settings.bpmOverride > 0 ? settings.bpmOverride : DEFAULT_BPM;
       const period = 60 / bpm;
@@ -349,10 +557,18 @@ export function buildTimeSkeleton(input: BuildInput, settings: BuildSettings): T
       meterReason = 'fewer than two downbeats; 4/4 prior kept';
     }
     if (override) {
-      num = override[0];
-      den = override[1];
+      // The same check as the host grid's, and it has to be here too: webcore's "Manual" tempo
+      // source FREEZES whatever meter is on screen onto the take as an override, so a host's
+      // unprintable signature arrives a second time by this door the moment the player switches
+      // away from Follow DAW.
+      const printable = printableTimeSig(override[0], override[1]);
+      const rewritten = printable[0] !== override[0] || printable[1] !== override[1];
+      num = printable[0];
+      den = printable[1];
       compound = isCompound(num, den);
-      meterReason = `manual override ${num}/${den}`;
+      meterReason = rewritten
+        ? `manual override ${num}/${den} (asked for ${override[0]}/${override[1]}, whose denominator names no note value)`
+        : `manual override ${num}/${den}`;
       if (compound) {
         const spans: number[] = [];
         for (let i = 1; i < downbeatIdx.length; i++) spans.push(downbeatIdx[i] - downbeatIdx[i - 1]);
@@ -374,14 +590,41 @@ export function buildTimeSkeleton(input: BuildInput, settings: BuildSettings): T
     }
   }
 
+  // ---- the source's own meter, ahead of everything derived from it --------------------------
+  if (symbolic && symbolicBeatUnit) {
+    num = symbolic.timeSig[0];
+    den = symbolic.timeSig[1];
+    compound = symbolic.compound;
+    meterReason = symbolic.mixedMeter
+      ? `symbolic source bars, ${num}/${den} at bar 1 (meter changes mid-piece: every bar keeps its own signature, the tracked pulse stays bar 1's — mixed meter is not fully supported)`
+      : `symbolic source bars ${num}/${den}`;
+    // THE PULSE FOLLOWS THE GRID IT IS MEASURED AGAINST. When the grid came from the source
+    // itself, the source's beat unit is the right one and this is what fixes the 6/8 seconds.
+    // When real beats were detected (or a host supplied a grid), those beat times define the
+    // pulse; adopting a dotted-quarter unit over a quarter-spaced grid would break the seconds
+    // map in the other direction.
+    if (symbolicGrid) {
+      beatUnit = symbolicBeatUnit;
+      beatsPerBar = compound ? num / 3 : num;
+    }
+  }
+
   const ticksPerBeat = beatUnit.toTicksExact(DIVISIONS);
   const barTicksNominal = R(num, den).toTicksExact(DIVISIONS);
+  // A symbolic source states its opening tempo outright; that beats both the host grid's number
+  // and a manual override, because it is the score's own statement about itself.
+  const symbolicOpeningBpm = (options.symbolicTempo ?? [])
+    .filter((change) => change.tick <= 0 && Number.isFinite(change.bpm) && change.bpm > 0)
+    .map((change) => change.bpm)
+    .pop();
   const displayBpm =
-    ext && !ext.tempoChanges?.length
-      ? Math.round(ext.bpm)
-      : settings.bpmOverride && synthesised && !ext
-        ? Math.round(settings.bpmOverride)
-        : Math.round((60 / medianIbi) * (beatUnit.toNumber() * 4));
+    symbolic && symbolicOpeningBpm
+      ? Math.round(symbolicOpeningBpm)
+      : ext && !ext.tempoChanges?.length
+        ? Math.round(ext.bpm)
+        : settings.bpmOverride && synthesised && !ext
+          ? Math.round(settings.bpmOverride)
+          : Math.round((60 / medianIbi) * (beatUnit.toNumber() * 4));
 
   // ---- origin (bar 1 / beat 1) -------------------------------------------------------------
   const firstBeatIdx = notes.length ? interp(firstSec, grid, indices) : 0;
@@ -399,11 +642,16 @@ export function buildTimeSkeleton(input: BuildInput, settings: BuildSettings): T
   } else {
     originIdx = Math.max(0, Math.round(firstBeatIdx));
   }
+  // BAR 1 OF A SYMBOLIC SOURCE IS ITS OWN TICK ZERO, wherever its first note happens to sit. A
+  // score whose first note is in bar 3 must still number bar 3 as bar 3, and the re-phase and
+  // anacrusis rules below are about a beat tracker's uncertainty, which a written score has none
+  // of. `anchorSec` is on the grid by construction here, so this is exact.
+  if (symbolicGrid) originIdx = nearestBeatIdx(anchorSec, grid);
 
   // ---- pre-origin material (§3.5) ------------------------------------------------------------
   const preBarBeats: number[] = [];
   const lead = originIdx - firstBeatIdx;
-  if (notes.length && lead > EPS) {
+  if (!symbolic && notes.length && lead > EPS) {
     if (explicitOrigin) {
       // Keep everything. Within a beat it is an anacrusis; further back it simply gets more
       // implicit measures and leading rests, which is fine.
@@ -429,13 +677,46 @@ export function buildTimeSkeleton(input: BuildInput, settings: BuildSettings): T
   // a final ring-out must not conjure a bar: spilling three ticks over the last barline used to
   // add a whole extra measure of rests to every score. So the end is discounted by one beat of
   // ring-out tolerance, and the last onset is always covered.
-  const lastOnsetSec = notes.length ? Math.max(...notes.map((n) => n.startSec)) : anchorSec;
+  const lastOnsetSec = notes.length ? lastOnsetSecScan : anchorSec;
   const lastBeatIdx = notes.length
     ? Math.max(interp(lastOnsetSec, grid, indices), interp(lastSec, grid, indices) - 1)
     : originIdx;
   const bars: BarSkeleton[] = [];
   let tick = 0;
   let barNumber = 1;
+
+  // ---- the source's bars, verbatim -----------------------------------------------------------
+  // A symbolic source already contains the answer to every question below — where the bars are,
+  // how long each one is, which is a pickup, what each one's signature is. The beat index of each
+  // bar is chained from the origin in units of the TRACKED pulse (`ticks / ticksPerBeat`), which
+  // is what keeps the seconds map consistent whether that pulse is a quarter or a dotted quarter.
+  if (symbolic) {
+    let beatCursor = originIdx;
+    for (const bar of symbolic.bars) {
+      bars.push({ ...bar, timeSig: [bar.timeSig[0], bar.timeSig[1]], startBeatIdx: beatCursor });
+      beatCursor += bar.ticks / ticksPerBeat;
+    }
+    tick = symbolic.totalTicks;
+    return finishSkeleton({
+      ticksPerBeat,
+      beatUnit,
+      timeSig: [num, den],
+      compound,
+      displayBpm,
+      bars,
+      grid,
+      indices,
+      originIdx,
+      // Every bar of a written source is a real bar line the roll must draw, pickup included.
+      downbeatTimesSec: bars.map((bar) => interp(bar.startBeatIdx, indices, grid)),
+      synthesised,
+      external: !!ext,
+      meterReason,
+      totalTicks: tick,
+      symbolic: true,
+      mixedMeter: symbolic.mixedMeter
+    });
+  }
 
   const totalPreBeats = preBarBeats.reduce((a, b) => a + b, 0);
   let preStart = originIdx - totalPreBeats;
@@ -530,6 +811,54 @@ export function buildTimeSkeleton(input: BuildInput, settings: BuildSettings): T
 
   const totalTicks = tick;
 
+  return finishSkeleton({
+    ticksPerBeat,
+    beatUnit,
+    timeSig: [num, den],
+    compound,
+    displayBpm,
+    bars,
+    grid,
+    indices,
+    originIdx,
+    downbeatTimesSec: bars.filter((b) => !b.implicit).map((b) => interp(b.startBeatIdx, indices, grid)),
+    synthesised,
+    external: !!ext,
+    meterReason,
+    totalTicks,
+    symbolic: false,
+    mixedMeter: false
+  });
+}
+
+/**
+ * THE CONVERSION CLOSURES, built once from a finished bar list.
+ *
+ * Extracted so the symbolic path and the detected path cannot drift: both now leave through the
+ * same door, and every closure below is built AFTER `ticksPerBeat` and the bars are final. The
+ * bug this structure exists to prevent is exactly the one finding 2 reported — a bar list
+ * replaced after the closures had already captured a different meter's beat length.
+ */
+function finishSkeleton(parts: {
+  ticksPerBeat: number;
+  beatUnit: Rational;
+  timeSig: [number, number];
+  compound: boolean;
+  displayBpm: number;
+  bars: BarSkeleton[];
+  grid: number[];
+  indices: number[];
+  originIdx: number;
+  downbeatTimesSec: number[];
+  synthesised: boolean;
+  external: boolean;
+  meterReason: string;
+  totalTicks: number;
+  symbolic: boolean;
+  mixedMeter: boolean;
+}): TimeSkeleton {
+  const { bars, grid, indices, ticksPerBeat } = parts;
+
   const barAt = (t: number): BarSkeleton => {
     if (t < bars[0].startTick) return bars[0];
     let lo = 0;
@@ -554,18 +883,20 @@ export function buildTimeSkeleton(input: BuildInput, settings: BuildSettings): T
   return {
     divisions: DIVISIONS,
     ticksPerBeat,
-    beatUnit,
-    timeSig: [num, den],
-    compound,
-    displayBpm,
+    beatUnit: parts.beatUnit,
+    timeSig: parts.timeSig,
+    compound: parts.compound,
+    displayBpm: parts.displayBpm,
     bars,
     beatTimesSec: grid,
-    originBeatIdx: originIdx,
-    downbeatTimesSec: bars.filter((b) => !b.implicit).map((b) => interp(b.startBeatIdx, indices, grid)),
-    synthesised,
-    external: !!ext,
-    meterReason,
-    totalTicks,
+    originBeatIdx: parts.originIdx,
+    downbeatTimesSec: parts.downbeatTimesSec,
+    synthesised: parts.synthesised,
+    external: parts.external,
+    meterReason: parts.meterReason,
+    totalTicks: parts.totalTicks,
+    symbolic: parts.symbolic,
+    mixedMeter: parts.mixedMeter,
 
     secondsToBeatIdx: (sec) => interp(sec, grid, indices),
     beatIdxToSeconds: (b) => interp(b, indices, grid),

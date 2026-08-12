@@ -11,6 +11,34 @@
 
 import type { NativeOmrResult, OmrStatus } from '../import/scoreImage';
 
+/**
+ * THE IMPORT/EXPORT SIZE LIMITS — one definition for the whole web side, paired byte for
+ * byte with `shell/Source/bridge/TransferLimits.h`.
+ *
+ * They used to be four different numbers in four places that did not know about each other:
+ * the native picker refused anything over 64 MB, the base64 hand-off allowed ~412 MB of
+ * decoded payload, the document writer permitted a 512 MB audio entry, and the document
+ * reader rejected any container over 512 MB — so the writer could produce a `.riffsheet`
+ * it would not itself reopen, and which limit a user met depended on which door they came
+ * through. Every one of those call sites reads these constants now.
+ *
+ * If you change a number here, change it in TransferLimits.h in the same commit. The two
+ * halves guard the two ends of one pipe and a limit only one end believes in is not a limit.
+ *
+ * 128 MB is a working ceiling, not a moral position: an 8 GB machine running a DAW, a
+ * WebView and a transcription engine cannot afford a half-gigabyte document, and 128 MB is
+ * about twelve minutes of 24-bit stereo 48 kHz WAV — longer than any riff this is for.
+ */
+export const RIFFSHEET_LIMITS = {
+  /** Biggest file read into memory: a `.riffsheet`, a MusicXML/MIDI/GP import, a drop. */
+  containerBytes: 128 * 1024 * 1024,
+  /** Biggest single decoded audio payload. Deliberately the SAME number as the container:
+      a container that could hold audio it may not then decode would be a limit that lies. */
+  decodedAudioBytes: 128 * 1024 * 1024,
+  /** The base64 hand-off ceiling, in characters — 4 per 3 bytes, plus padding slack. */
+  base64PayloadBytes: Math.ceil((128 * 1024 * 1024) / 3) * 4 + 1024
+} as const;
+
 export interface HostInfo {
   /** 'juce-standalone' | 'juce-plugin' | 'browser' */
   host: string;
@@ -409,6 +437,21 @@ export interface AudioFileRef {
   bytes?: ArrayBuffer;
 }
 
+/**
+ * The original recording behind a native take — see `NativeBridge.getOriginalAudio`.
+ *
+ * `verbatim` is a fact about the bytes, not a hope: true only when they are the file the
+ * user opened (or an untouched copy of it), false when all that survives is something the
+ * shell encoded — a rendered capture. Anything that puts these bytes in a document and
+ * calls them "the original" must check it.
+ */
+export interface OriginalAudio {
+  bytes: Uint8Array;
+  /** The real filename, with its real extension: "riff.flac", never "riff.wav". */
+  name: string;
+  verbatim: boolean;
+}
+
 /** One result from the shell's all-supported-input picker. */
 export type PickedInputFile =
   | { kind: 'audio'; audio: AudioFileRef }
@@ -640,6 +683,32 @@ export interface NativeBridge {
    * to today's behaviour (path only) with an honest message.
    */
   loadAudioBytes?(name: string, bytes: Uint8Array): Promise<AudioFileRef | null>;
+
+  /**
+   * THE RECORDING ITSELF, as the user handed it over — not the samples the transcriber
+   * listened to.
+   *
+   * Everything else on this interface addresses a native take by token and gets back the
+   * ANALYSIS BUFFER: folded to mono, resampled to 44.1 kHz, which is exactly right for a
+   * transcriber and exactly wrong for a document that says it carries the imported file.
+   * Before this existed the page had no bytes at all after a native open, so saving fell
+   * back to encoding that mono buffer as a 16-bit WAV — a 24-bit/96 kHz stereo master
+   * became 16-bit/44.1 kHz mono inside a `.riffsheet`, while the format's own docs promised
+   * a verbatim copy.
+   *
+   * READ ON DEMAND. Nothing is held for it and nothing is base64'd: the shell reads the
+   * file off disk when this is called, so a take that is never saved is never read. Call it
+   * when a document is actually being written, not on import.
+   *
+   * Resolves null when there is no original to give — a track capture before it has been
+   * rendered, a file that has moved, or one larger than `RIFFSHEET_LIMITS.containerBytes`.
+   * `verbatim: false` means the bytes are a re-encode rather than the user's own file, and
+   * the caller must not describe them as the original.
+   *
+   * Optional: an older shell has no such function, and the caller falls back to today's
+   * behaviour (encode the decoded samples) with honest wording.
+   */
+  getOriginalAudio?(token: string): Promise<OriginalAudio | null>;
 
   /**
    * Tell the shell which files are on this app's own Recent list.

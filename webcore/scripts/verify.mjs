@@ -24,7 +24,7 @@ import { createServer } from 'node:http';
 import { readFile, writeFile, mkdir } from 'node:fs/promises';
 import { existsSync, rmSync } from 'node:fs';
 import { extname, join, resolve, normalize } from 'node:path';
-import { spawn } from 'node:child_process';
+import { launchChrome } from './probe-chrome.mjs';
 import { tmpdir } from 'node:os';
 
 const ROOT = resolve(import.meta.dirname, '..');
@@ -58,7 +58,20 @@ const READY_TIMEOUT_MS = Math.max(
 const ALIGN_TOLERANCE_PX = 320;
 
 const VERIFY_STARTED = Date.now();
-const VERIFY_DEADLINE = VERIFY_STARTED + 5 * 60_000;
+/**
+ * The whole run's hard stop.
+ *
+ * RAISED FROM FIVE MINUTES, and the reason is not that the harness got slower at what it was
+ * already doing. Four checks were added that are inherently long because the thing they measure
+ * is long: a thirty-second take really is transcribed (the only way to show the page keeps
+ * moving while it happens), and two hundred and one edits are really performed and walked back
+ * (the only way to reach the undo stack's cap). A budget that killed those would be a budget
+ * that quietly stopped asking the questions.
+ *
+ * It remains a HARD cap, and every phase still has its own: a wedged debugger request cannot
+ * outlive the phase that owns it, and the run cannot outlive this.
+ */
+const VERIFY_DEADLINE = VERIFY_STARTED + 12 * 60_000;
 let activePhase = { name: 'startup', deadline: VERIFY_STARTED + 30_000 };
 
 /**
@@ -822,7 +835,11 @@ async function main() {
     '--window-size=1440,900', '--autoplay-policy=no-user-gesture-required'
   ];
   if (!HEADFUL) args.push('--headless=new', '--disable-gpu');
-  const proc = spawn(chrome, args, { stdio: ['ignore', 'ignore', 'pipe'] });
+  // Through the shared probe bootstrap (scripts/probe-chrome.mjs), which owns the process
+  // GROUP and reaps it on EVERY exit path — Ctrl-C, a kill, an escaped throw — none of which
+  // reaches the `finally` below. An orphaned headless Chrome holding a temp profile is not a
+  // stray process anybody notices on macOS; it is the owner's real Chrome refusing to open.
+  const { proc, dispose: reapChrome } = launchChrome(chrome, args, { profileDir });
 
   let code = 0, cdp;
   const stepTimes = [];
@@ -1862,6 +1879,50 @@ async function main() {
     })()`;
 
     result.support = await evalJson(SUPPORT);
+
+    // --- AGPL Appropriate Legal Notices ------------------------------------------------
+    //
+    // "Appropriate Legal Notices" is a DEFINED TERM in AGPL-3.0 §0, not a description: an
+    // interactive program must display a copyright notice, say there is NO WARRANTY, tell the
+    // user they may redistribute the work under these terms, and tell them HOW TO SEE the
+    // licence. The dialog carried the first and none of the other three (codex-critique
+    // §licensing). The link is then clicked, because "there is an <a> on the page" is not the
+    // same claim as "the licence can be read from inside the app".
+    result.legalNotice = await evalJson(`(() => {
+      const card = document.querySelector('[data-role="about-dialog"]');
+      if (!card) return JSON.stringify({ dialog: false });
+      const text = (card.textContent || '').replace(/\\s+/g, ' ');
+      const link = card.querySelector('[data-role="about-license-link"]');
+      return JSON.stringify({
+        dialog: true,
+        copyright: /Copyright ©/.test(text),
+        warranty: /NO WARRANTY/i.test(text),
+        convey: /redistribute/i.test(text) && /modify/i.test(text),
+        network: /over a network/i.test(text),
+        licenseNamed: /AGPL-3\\.0-only|Affero General Public License/i.test(text),
+        linkText: link ? (link.textContent || '').trim() : null,
+        linkHref: link ? link.getAttribute('href') : null
+      });
+    })()`);
+    await evalJson(`(() => {
+      const link = document.querySelector('[data-role="about-license-link"]');
+      if (link) link.click();
+      return JSON.stringify({ clicked: !!link });
+    })()`);
+    await settle(600);
+    result.legalLicense = await evalJson(`(() => {
+      const pre = document.querySelector('[aria-label="GNU Affero General Public License, version 3"]');
+      const text = pre ? (pre.textContent || '') : '';
+      return JSON.stringify({
+        shown: !!pre && !pre.hidden,
+        chars: text.length,
+        // The licence's own first line, so a 404 page served as 200 cannot pass for it.
+        isTheLicense: /AFFERO GENERAL PUBLIC LICENSE/i.test(text),
+        // …or, if the build did not ship the text, the fallback has to say where it is.
+        namesWhereToRead: /gnu\\.org\\/licenses\\/agpl/i.test(text)
+      });
+    })()`);
+
     await evalJson(`(() => {
       const s = document.querySelector('[data-role="support-makers"]');
       if (s) s.scrollIntoView({ block: 'start' });
@@ -2288,6 +2349,7 @@ async function main() {
       30_000
     );
     await settle(200);
+
 
     // --- the main menu, and a blank score, end to end ----------------------------------
     //
@@ -2907,6 +2969,18 @@ async function main() {
       60_000
     );
     await settle(1200);
+
+    // WHILE THERE IS A REAL RECORDING ON SCREEN, and that is why it is here rather than beside
+    // the other document checks: those run on a demo fixture, which is a note list with no file
+    // behind it, and "does a save carry the original FILE" is not a question a take with no file
+    // can answer. See `ui/app.ts §__RIFFSHEET_ORIGINALAUDIO__`.
+    result.originalAudio = await evalJson(
+      `window.__RIFFSHEET_ORIGINALAUDIO__
+        ? window.__RIFFSHEET_ORIGINALAUDIO__().then(JSON.stringify, e => JSON.stringify({ error: String(e) }))
+        : Promise.resolve('null')`,
+      60_000
+    );
+    await settle(400);
     //
     // An edit is made ON PURPOSE next. The confirm path only exists when there is something
     // to discard, and a probe that happened to run against a clean take would pass by
@@ -3228,6 +3302,56 @@ async function main() {
     );
     await settle(500);
 
+    // --- THE ENGINE, OFF THE MAIN THREAD (codex-critique §11) -------------------------
+    //
+    // Three claims no screenshot can carry: a thirty-second take is transcribed without the
+    // page stopping, the pass reports progress, and it can be stopped. The probe measures the
+    // largest gap between 16 ms timer ticks while the pass runs — on the old inline path that
+    // gap IS the pass, because a synchronous FFT loop services no timers — then kills a second
+    // pass mid-flight and times how long the rejection takes.
+    phase('checking the engine runs off the main thread', 180_000);
+    result.engineWorker = await evalJson(
+      `window.__RIFFSHEET_WORKERPROBE__
+        ? window.__RIFFSHEET_WORKERPROBE__().then(r => JSON.stringify(r), e => JSON.stringify({ error: String(e) }))
+        : Promise.resolve('null')`,
+      170_000
+    );
+
+    // --- ONE ORIGIN (codex-critique §7) ------------------------------------------------
+    //
+    // The roll used to compute its own written second 0 while the app had moved to a
+    // first-attack origin, and `edit/rollPerformance.ts` added the app's back on: with leading
+    // silence, a double-click added a note one whole silence away from the pointer. The probe
+    // manufactures the silence, dispatches a real dblclick at a known x, and reports where the
+    // rectangle came out. It restores the take afterwards.
+    phase('checking a new note lands where it was clicked', 60_000);
+    result.originProbe = await evalJson(
+      `window.__RIFFSHEET_ORIGINPROBE__
+        ? window.__RIFFSHEET_ORIGINPROBE__().then(r => JSON.stringify(r), e => JSON.stringify({ error: String(e) }))
+        : Promise.resolve('null')`,
+      50_000
+    );
+    await settle(500);
+
+    // --- A VIEW CONTROL DOES NOT DESTROY HISTORY (codex-critique §6.2) -----------------
+    phase('checking a snap-mode change keeps undo and redo', 60_000);
+    result.snapUndo = await evalJson(
+      `JSON.stringify(window.__RIFFSHEET_SNAPUNDO__ ? window.__RIFFSHEET_SNAPUNDO__() : null)`,
+      50_000
+    );
+    await settle(500);
+
+    // --- THE 201ST EDIT (codex-critique §7) --------------------------------------------
+    //
+    // DESTRUCTIVE AND THEREFORE LAST: it leaves the score edited, because undoing back past the
+    // stack's 200-action cap is the operation under test. Nothing after this may assume the
+    // demo take is untouched.
+    phase('checking the undo cursor cannot outrun the undo stack', 120_000);
+    result.undoCap = await evalJson(
+      `JSON.stringify(window.__RIFFSHEET_UNDOCAP__ ? window.__RIFFSHEET_UNDOCAP__(201) : null)`,
+      110_000
+    );
+
     const layouts = [
       ['wide', result.namesLayout],
       ['1100x700', result.mid?.layout],
@@ -3237,6 +3361,13 @@ async function main() {
     const namesClearOf = (what) =>
       layouts.every(([, l]) => !!l && l.hasSplit && l.labels > 0 && what(l));
     const drop = result.dropTuned?.layout;
+    /** The five payloads this wave added, short-named because each is asserted many times. */
+    const LN = result.legalNotice;
+    const LL = result.legalLicense;
+    const EW = result.engineWorker;
+    const OP = result.originProbe;
+    const SU = result.snapUndo;
+    const UC = result.undoCap;
     const clickPos = result.rollAfterClick;
     const ed = result.editSync;
     const editOk = !!ed && !ed.error;
@@ -5323,6 +5454,25 @@ async function main() {
           result.document.container === 'zip' &&
           result.document.audioIn === result.document.audioOut
       ],
+      [
+        // THE NATIVE PICKER'S DOCUMENT. A native open hands the page decoded samples and no file
+        // bytes, so `embeddedAudio()` fell through to `encodeWavPcm16` and a 24-bit/96 kHz stereo
+        // master went into the document as a 16-bit mono re-encode of the analysis buffer.
+        // `saveRiffsheetDocument` now fetches the shell's own bytes first (§ensureOriginalBytes).
+        //
+        // BOTH HALVES ARE ASSERTED, because "the document has audio in it" was true before the
+        // fix as well: the fallback must NOT be the original — otherwise this fixture cannot tell
+        // the two apart and the check proves nothing — and after the fetch the document must
+        // carry the original byte for byte.
+        'document: a save after a NATIVE open embeds the original file, not a re-encode',
+        !!result.originalAudio &&
+          !result.originalAudio.error &&
+          result.originalAudio.wantedBytes > 0 &&
+          result.originalAudio.fallbackWasOriginal === false &&
+          result.originalAudio.fetchedIsOriginal === true &&
+          result.originalAudio.documentIsOriginal === true &&
+          result.originalAudio.fetchedBytes === result.originalAudio.wantedBytes
+      ],
 
       // --- About: support the makers ---------------------------------------------------
       //
@@ -6030,37 +6180,53 @@ async function main() {
       ],
 
       // --- PARTS ------------------------------------------------------------------------
+      //
+      // The pill row these checks used to read is gone (owner's redesign): the parts are one
+      // drop-down on the notation bar, so every check below reads that control instead. The
+      // claims are the same claims — one part to two, a reorder, a rename, a cap of four, a
+      // live part that cannot be removed — and two are NEW, because the redesign added two
+      // doors: the name printed on the sheet, and the promise that nothing on the bar is cut.
       [
-        // The row exists on a take that has never had a part added, and it is the two pills
-        // the design asks for: the live chip and the plus. Nothing else.
-        'parts: a single-part take shows [● Live] [+] and nothing else',
-        !!P && !P.error && P.single?.row?.chips.length === 1 &&
-          P.single.row.chips[0].key === 'live' && P.single.row.chips[0].dot === true &&
-          P.single.row.addPresent === true && P.single.row.addDisabled === false
+        // The control exists on a take that has never had a part added, and it holds exactly one
+        // part: the take, marked with the dot it carried on its chip.
+        'parts: a single-part take shows one part, marked ●, in the notation bar',
+        !!P && !P.error && P.single?.box?.parts.length === 1 &&
+          P.single.box.parts[0].value === 'part:live' &&
+          /^Part: ● /.test(P.single.box.shown ?? '') && P.single.box.onBar === true
       ],
       [
-        // The mark, and the sentence beside it. Both are what tell you which staff on the page
-        // is the one the roll below is drawing.
-        'parts: the live chip is accent-filled, dotted and says so',
-        !!P && P.single?.row?.chips[0]?.live === true &&
-          /^Live — transcribed from this track$/.test(P.single.row.chips[0].title ?? '')
+        // THE TAKE IS NOT REMOVABLE AND NOT RENAMEABLE, and the menu says why rather than
+        // silently doing nothing. Its name is derived from the instrument on every build
+        // (score/parts.ts §livePartName), so a rename would be overwritten by the next engrave.
+        'parts: the take can be neither removed nor renamed, and says so',
+        !!P && (P.single?.box?.verbs ?? []).some((v) => v.value === 'do:remove' && v.disabled === true &&
+          /always on the sheet/i.test(v.title ?? '')) &&
+          (P.single?.box?.verbs ?? []).some((v) => v.value === 'do:rename' && v.disabled === true)
       ],
       [
-        'parts: the row sits directly above the sheet, on one line, nothing overlapping',
-        !!P && !!P.two?.row && P.two.row.aboveSheet === true && P.two.row.overlapping === false &&
-          P.two.row.height > 0 && P.two.row.height <= 34
+        // The menu is the five verbs the design asks for, in order, and nothing else.
+        'parts: the menu offers rename, move up, move down, remove and add',
+        !!P && JSON.stringify((P.two?.box?.verbs ?? []).map((v) => v.text)) ===
+          JSON.stringify(['Rename', 'Move up', 'Move down', 'Remove', 'Add part (MusicXML)'])
       ],
       [
-        // NO ELLIPSIS ANYWHERE IN THE ROW, at one part or at four. A truncated part name is a
-        // part you cannot tell from another part.
-        'parts: no ellipsis in the row',
-        !!P && [P.single?.row, P.two?.row, P.full?.row].every((r) => !!r && r.ellipsis === false)
+        // ON THE BAR THAT WAS ALREADY THERE, and on its line: the redesign's whole point is that
+        // the parts cost the page no row of their own.
+        'parts: the part control sits on the notation bar, which stays one row',
+        !!P && P.two?.box?.onBar === true && P.two.box.barRows === 1 && P.full?.box?.barRows === 1
       ],
       [
-        // A MusicXML file became a PART: a second chip, named from the file's own <part-name>.
-        'parts: [+] adds a MusicXML file as a second part, named from the XML',
-        !!P && P.two?.row?.chips.length === 2 &&
-          P.two.row.chips.some((chip) => chip.key === 'imp1' && /Guitar/.test(chip.text ?? ''))
+        // NO ELLIPSIS ANYWHERE ON THE BAR, at one part or at four — neither the character nor a
+        // box narrower than the words in it, which is the other way one appears. Measured by
+        // `notationBarClipped` (ui/app.ts) rather than inferred from a stylesheet.
+        'parts: nothing on the notation bar is cut short',
+        !!P && [P.single?.box, P.two?.box, P.full?.box].every((b) => !!b && b.ellipsis === false)
+      ],
+      [
+        // A MusicXML file became a PART: a second entry, named from the file's own <part-name>.
+        'parts: a MusicXML file is added as a second part, named from the XML',
+        !!P && P.two?.box?.parts.length === 2 &&
+          P.two.box.parts.some((o) => o.value === 'part:imp1' && /Guitar/.test(o.text ?? ''))
       ],
       [
         // The SHEET. Two alphaTab tracks built, and two tracks actually engraved — the second
@@ -6088,51 +6254,70 @@ async function main() {
         !!P && P.scheduleIdenticalAfterReorder === true
       ],
       [
-        // Dragged with real pointer events, and the EMITTED order changed — the part list the
-        // file is written from, not merely the chips.
-        'parts: dragging a chip changes the emitted part order',
-        !!P && P.dragged === true &&
+        // Move up, chosen from the menu the way a mouse chooses it, and the EMITTED order
+        // changed — the part list the file is written from, not merely the control.
+        'parts: Move up changes the emitted part order',
+        !!P && P.selected === true && P.movedUp === true &&
           JSON.stringify(P.two?.partNames ?? []) !== JSON.stringify(P.reordered?.partNames ?? []) &&
           /Guitar/.test((P.reordered?.partNames ?? [])[0] ?? '')
       ],
       [
-        'parts: the chips follow the same order',
-        !!P && (P.reordered?.row?.chips ?? [])[0]?.key === 'imp1' &&
-          (P.reordered?.row?.chips ?? [])[1]?.key === 'live'
+        // …and it is refused at the top rather than doing nothing quietly.
+        'parts: Move up is unavailable once the part is at the top',
+        !!P && P.movedUpAgain === false
       ],
       [
-        // Clicking an imported chip opens its menu, and the menu is the three things the spec
-        // asks for and nothing else.
-        'parts: an imported chip opens a menu with rename, nudge and remove',
+        'parts: the control follows the same order',
+        !!P && (P.reordered?.box?.parts ?? [])[0]?.value === 'part:imp1' &&
+          (P.reordered?.box?.parts ?? [])[1]?.value === 'part:live'
+      ],
+      [
+        // Rename opens the name box, with the nudge still one press behind it.
+        'parts: Rename opens a name box, with the nudge behind it',
         !!P && P.menuShape?.open === true && P.menuShape.hasRename === true &&
-          P.menuShape.hasNudge === true && P.menuShape.hasRemove === true &&
-          P.menuShape.nudgeStart === '0'
+          P.menuShape.hasNudge === true && P.menuShape.nudgeStart === '0'
       ],
       [
-        // Renaming reaches the CHIP and the PAGE, not just the box it was typed into.
-        'parts: renaming a part renames it on the chip and in the export',
+        // Renaming reaches the CONTROL and the PAGE, not just the box it was typed into.
+        'parts: renaming from the menu renames it in the control and in the export',
         !!P && P.renamed === true &&
-          (P.afterRename?.row?.chips ?? []).some((chip) => /Rhythm gtr/.test(chip.text ?? '')) &&
+          (P.afterRename?.box?.parts ?? []).some((o) => /Rhythm gtr/.test(o.text ?? '')) &&
           (P.afterRename?.partNames ?? []).some((n) => /Rhythm gtr/.test(n))
+      ],
+      [
+        // NEW (owner's redesign, b): the name alphaTab prints down the left of the system is a
+        // control. One target per printed name, and pressing one opens a field over it.
+        'parts: the part name printed on the sheet is clickable',
+        !!P && P.labelHits >= 2 && P.inlineOpen === true && P.inlineTyped === true
+      ],
+      [
+        // NEW: and all three agree afterwards — the control on the bar, the name handed to the
+        // engraver, and the <part-name> in the export. One `updatePart`, three readings.
+        'parts: renaming from the sheet agrees with the control, the page and the export',
+        !!P && (P.afterLabelRename?.box?.parts ?? []).some((o) => /Lead gtr/.test(o.text ?? '')) &&
+          (P.afterLabelRename?.printedNames ?? []).some((n) => /Lead gtr/.test(n)) &&
+          (P.afterLabelRename?.partNames ?? []).some((n) => /Lead gtr/.test(n))
       ],
       [
         // A nudge is a number the player can see afterwards, and it really moves the part.
         // 60 ms is typed; 78 comes back, because a nudge is rounded to a whole 32nd — the
-        // finest shift the printed page can spell (score/parts.ts §snapNudgeMs).
-        'parts: a nudge is applied, rounded to a printable unit, and shown on the chip',
-        !!P && P.nudged === true &&
-          (P.afterNudge?.row?.chips ?? []).some((chip) => /\+78ms/.test(chip.text ?? '')) &&
-          P.afterNudge?.tracks === 2
+        // finest shift the printed page can spell (score/parts.ts §snapNudgeMs). Read off the
+        // re-opened box; the chip that used to carry a `+78ms` badge is gone with the row.
+        'parts: a nudge is applied, rounded to a printable unit, and shown as +78ms',
+        !!P && P.nudged === true && P.nudgeShown === '78' && P.afterNudge?.tracks === 2
       ],
       [
         'parts: Remove takes the part off the sheet',
-        !!P && P.afterRemove?.tracks === 1 && (P.afterRemove?.row?.chips ?? []).length === 1
+        !!P && P.removed === true && P.afterRemove?.tracks === 1 &&
+          (P.afterRemove?.box?.parts ?? []).length === 1
       ],
       [
-        // Four staves is the cap. The plus goes dim and says why rather than disappearing.
-        'parts: [+] is limited to 4 parts and says why',
-        !!P && P.full?.tracks === 4 && P.full?.row?.addDisabled === true &&
-          /at most 4 parts/i.test(P.full?.row?.addTitle ?? '') && P.refusedFifth === true
+        // Four staves is the cap. Add goes dim and says why rather than disappearing.
+        'parts: adding is limited to 4 parts and says why',
+        !!P && P.full?.tracks === 4 &&
+          (P.full?.box?.verbs ?? []).some((v) => v.value === 'do:add' && v.disabled === true &&
+            /at most 4 parts/i.test(v.title ?? '')) &&
+          P.refusedFifth === true
       ],
       [
         // …and the take is put back afterwards, or every check after this one is about a
@@ -6149,7 +6334,89 @@ async function main() {
       [
         '8va: none on an in-range riff',
         !!result.namesLayout && result.namesLayout.octaveShiftNotes === 0 && result.namesLayout.octaveMarks === 0
-      ]
+      ],
+
+      // --- AGPL Appropriate Legal Notices (codex-critique §licensing) ------------------
+      ['legal: the About dialog names the copyright holder', !!LN && LN.copyright === true],
+      ['legal: it says there is no warranty', !!LN && LN.warranty === true],
+      ['legal: it says the work may be redistributed and modified', !!LN && LN.convey === true],
+      ['legal: it states the network-use source obligation', !!LN && LN.network === true],
+      ['legal: it names the licence', !!LN && LN.licenseNamed === true],
+      ['legal: there is a way to view the full licence', !!LN && /view the full license/i.test(LN.linkText ?? '')],
+      [
+        // Either the bundled text opened, or the fallback said where to read it. Both are "how
+        // to view a copy"; a link that silently does nothing is not.
+        'legal: clicking it shows the licence, or says where it is',
+        !!LL && LL.shown === true && (LL.isTheLicense === true || LL.namesWhereToRead === true)
+      ],
+      ['legal: the bundled licence text is the AGPL itself', !!LL && LL.isTheLicense === true && LL.chars > 20_000],
+
+      // --- the engine, off the main thread (codex-critique §11) ------------------------
+      ['worker: the page really has workers, not the inline fallback', !!EW && EW.workers === true],
+      ['worker: a 30-second take transcribes without error', !!EW && !EW.error && EW.ok !== null],
+      [
+        // THE CLAIM. Inline, this gap is the whole pass — seconds — because a synchronous FFT
+        // loop services no timers. 400 ms is generous for a headless renderer under load and
+        // still two orders below what the old path produced on this fixture.
+        'worker: the page keeps servicing timers while it listens',
+        !!EW && EW.maxGapMs !== null && EW.maxGapMs < 400 && EW.ticks > 10
+      ],
+      ['worker: the pass reports progress as it goes', !!EW && EW.progressCount >= 3 && EW.progressMonotonic === true],
+      ['worker: the progress it reports reaches the end of the pass', !!EW && EW.progressLast !== null && EW.progressLast >= 0.5],
+      [
+        // `terminate()` does not wait for the loop it interrupts, so a cancel that took as long
+        // as the pass would mean it was never a cancel at all.
+        'worker: a pass can be stopped, and stops promptly',
+        !!EW && EW.cancelMessage === 'riffsheet-engine-cancelled' && EW.cancelMs < 2_000
+      ],
+
+      // --- one origin (codex-critique §7) ---------------------------------------------
+      ['origin: the probe ran on a take with real leading silence', !!OP && !OP.error && OP.appOrigin > 0.5],
+      ['origin: the roll draws on the app’s origin and not its own', !!OP && Math.abs((OP.rollOrigin ?? 99) - OP.appOrigin) < 0.01],
+      ['origin: a double-click adds a note', !!OP && !!OP.addedNoteId],
+      [
+        // WHAT THE RESIDUAL IS. An added note is a performance edit, so the sheet is rebuilt and
+        // the pipeline QUANTIZES it onto a line it can print: the note lands on the nearest
+        // printable position to the pointer, not on the pointer. That is the app working, and it
+        // is worth about a tenth of a second here.
+        //
+        // The bug this check exists for is a different size entirely — it displaced the note by
+        // the WHOLE leading silence — so the bound is stated in that unit. A fixed pixel budget
+        // would be a bound on the roll's zoom, which varies run to run (measured: 107 px/s and
+        // 351 px/s on two runs of the same fixture).
+        'origin: the new note lands where the pointer was',
+        !!OP && OP.errorPx !== null && OP.errorPx < (OP.pxPerSec * OP.silenceSec) / 4
+      ],
+      [
+        // Relative, so the claim is "nowhere near one leading silence away" rather than a pixel
+        // budget that would have to be re-tuned with the fixture.
+        'origin: …and at the second that was clicked, not a silence later',
+        !!OP && OP.errorSec !== null && OP.errorSec < Math.min(0.3, OP.silenceSec / 4)
+      ],
+
+      // --- a view control does not destroy history (codex-critique §6.2) ---------------
+      ['snap-undo: the probe had a real history to lose', !!SU && !SU.error && SU.before?.undoDepth >= 3 && SU.before?.canRedo === true],
+      ['snap-undo: changing the snap mode keeps the undo stack', !!SU && SU.after?.undoDepth === SU.before?.undoDepth],
+      ['snap-undo: it keeps the cursor where the player left it', !!SU && SU.after?.undoCursor === SU.before?.undoCursor],
+      ['snap-undo: undo is still available afterwards', !!SU && SU.after?.canUndo === true],
+      ['snap-undo: and so is the redo the player had not used yet', !!SU && SU.after?.canRedo === true],
+      ['snap-undo: nothing had to be dropped from the replay', !!SU && SU.droppedReplays === 0],
+
+      // --- the 201st edit (codex-critique §7) ------------------------------------------
+      ['undo-cap: 201 edits were actually performed', !!UC && !UC.error && UC.performed === 201],
+      ['undo-cap: the stack held its 200-action cap', !!UC && UC.undoDepth === 200],
+      ['undo-cap: the log kept every edit, including the retired ones', !!UC && UC.editLogLength >= 201],
+      ['undo-cap: the stack is walked all the way back', !!UC && UC.undoCursor === -1],
+      [
+        // THE DIVERGENCE, STATED AS ONE EQUATION. `editCursor` is what gets SAVED; the pitch on
+        // the page is what the player can see. One retired edit is still applied, so the cursor
+        // must say one edit is applied. It used to say none, and reopening the file changed the
+        // score.
+        'undo-cap: the saved cursor agrees with what is on the page',
+        !!UC && UC.appliedAfterUndo !== null && UC.editCursor + 1 === UC.appliedAfterUndo
+      ],
+      ['undo-cap: exactly the edits past the cap remain in force', !!UC && UC.appliedAfterUndo === 1],
+      ['undo-cap: ⌘Z goes grey once there is nothing left to undo', !!UC && UC.canUndoNow === false]
     ];
 
     phase('reporting checks', 15_000);
@@ -6209,6 +6476,9 @@ async function main() {
         new Promise((ok) => setTimeout(ok, 1_500))
       ]);
     }
+    // The group, and the profile with it: the polite close above handles the browser process,
+    // this handles anything it did not adopt. Idempotent — a clean run reaches it as a no-op.
+    reapChrome();
     server.closeAllConnections?.();
     await new Promise((ok) => server.close(ok));
     // Chrome needs a moment to let go of the profile before it can be removed.

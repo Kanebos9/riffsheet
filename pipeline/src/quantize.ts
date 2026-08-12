@@ -32,7 +32,7 @@
  */
 
 import type { GridSetting } from './types.js';
-import { THIRTYSECOND_TICKS } from './ir.js';
+import { DIVISIONS, THIRTYSECOND_TICKS } from './ir.js';
 
 /**
  * `'exact'` is INTERNAL and never reachable from `BuildSettings.grid`. It is the symbolic-import
@@ -121,32 +121,115 @@ function median(values: number[]): number {
  * beat and are out of scope for v1. They emerge as tied eighth-triplets, which is correct
  * arithmetic and slightly verbose notation.
  */
-function statesFor(grid: QuantGrid, ticksPerBeat: number, compound: boolean): RhythmState[] {
+/**
+ * A GRID NAME IS AN ABSOLUTE NOTE VALUE, NOT A FRACTION OF THE TRACKED BEAT.
+ *
+ * This used to be `ticksPerBeat / division`, which silently redefined every grid name by the
+ * meter's denominator. In 3/8 the tracked beat is an EIGHTH, so `'1/8'`'s `straight-8` (half a
+ * beat) was a SIXTEENTH and `'1/16'` reached a 32nd — the caller asked for eighths and the page
+ * was allowed to print 16ths, off-times included, because `basicQuant` is read off the same
+ * ladder. `'auto'` was worse: in x/8 meters it offered a 1/32 lattice, which the documented
+ * policy says only `grid: 'thirtysecond'` may ever see.
+ *
+ * The ladder is therefore stated in ticks at `DIVISIONS` per quarter and is the same ladder in
+ * every meter. In 4/4 and in compound meters, where the tracked beat is a quarter or a dotted
+ * quarter, this reproduces the old state sets exactly.
+ */
+const QUARTER_TICKS = DIVISIONS;
+const STRAIGHT_LADDER = [QUARTER_TICKS, QUARTER_TICKS / 2, QUARTER_TICKS / 4, QUARTER_TICKS / 8];
+
+/** The FINEST absolute value each grid setting permits. Nothing shorter may be offered. */
+const GRID_FLOOR_TICKS: Record<string, number> = {
+  '1/4': QUARTER_TICKS,
+  '1/8': QUARTER_TICKS / 2,
+  '1/16': QUARTER_TICKS / 4,
+  thirtysecond: QUARTER_TICKS / 8,
+  // 'auto' offers straight values down to a 1/16 and no further (see the 1/32 note below).
+  auto: QUARTER_TICKS / 4,
+  // The triplet grid's finest STRAIGHT word is the eighth; the triplet itself is added below.
+  '1/8T': QUARTER_TICKS / 2
+};
+
+function gcd(a: number, b: number): number {
+  let x = Math.abs(a);
+  let y = Math.abs(b);
+  while (y) {
+    const t = x % y;
+    x = y;
+    y = t;
+  }
+  return x || 1;
+}
+
+/**
+ * The span one rhythm decision covers. Normally the tracked beat — but a grid name COARSER than
+ * the beat cannot be a whole division of it (a quarter inside a 3/8 eighth-beat), so the window
+ * widens to the least common multiple and the quarter becomes expressible. Every meter whose
+ * beat is at least as long as the requested value keeps a one-beat window, which is every case
+ * that existed before this change.
+ */
+export function quantWindowTicks(grid: QuantGrid, ticksPerBeat: number): number {
+  const floor = GRID_FLOOR_TICKS[grid];
+  if (!floor || floor <= ticksPerBeat) return ticksPerBeat;
+  return (ticksPerBeat * floor) / gcd(ticksPerBeat, floor);
+}
+
+function statesFor(
+  grid: QuantGrid,
+  ticksPerBeat: number,
+  compound: boolean,
+  windowTicks: number
+): RhythmState[] {
   const out: RhythmState[] = [];
-  const add = (name: string, division: number, tuplet: boolean): void => {
-    const g = ticksPerBeat / division;
-    if (!Number.isInteger(g) || g < 1) return; // not representable at this resolution
+  const addLattice = (name: string, gridTicks: number, tuplet: boolean): void => {
+    // Not representable in this window, or finer than notation's own floor.
+    if (!(gridTicks >= 1) || !Number.isInteger(windowTicks / gridTicks)) return;
+    if (out.some((state) => state.grid === gridTicks && state.tuplet === tuplet)) return;
+    const division = windowTicks / gridTicks;
+    const normal = tuplet ? normalFor(division) : 1;
+    // A TUPLET UNIT HAS TO BE SAYABLE ON THE WRITTEN SIDE TOO. The glyph printed for one unit of
+    // an actual:normal group is the sounding length scaled by actual/normal (`tupletWrittenLen`
+    // in meter.ts), so its written value is `windowTicks / normal` ticks. The sounding floor is
+    // checked above; without this one, a x/16 meter offered a sextuplet whose unit is ONE tick
+    // and whose written value is a 1/64 — a value the vocabulary has no symbol for, so `typeOf`
+    // fell back to the nearest thing it could name and the page claimed a 32nd for a 1-tick
+    // glyph. A grid the engraver cannot spell is not a grid; it is never offered.
+    if (tuplet) {
+      const writtenUnitTicks = windowTicks / normal;
+      if (!Number.isInteger(writtenUnitTicks) || writtenUnitTicks < THIRTYSECOND_TICKS) return;
+    }
     out.push({
       name,
       division,
-      grid: g,
+      grid: gridTicks,
       tuplet,
       actual: tuplet ? division : 1,
-      normal: tuplet ? normalFor(division) : 1,
+      normal,
       complexity: COMPLEXITY[division] ?? 2
     });
   };
-  const fine = grid === '1/16' || grid === 'thirtysecond';
-  // A compound beat is a dotted value: its natural divisions are 3 and 6, not 2 and 4, and a
-  // 1/32 inside a dotted quarter is a TWELFTH of the beat.
-  if (compound) {
-    add('beat', 1, false);
-    if (grid !== '1/4') add('compound-8', 3, false);
-    if (grid === 'auto' || fine) add('compound-16', 6, false);
-    if (grid === 'thirtysecond') add('compound-32', 12, false);
-    return out;
+
+  const floor = GRID_FLOOR_TICKS[grid] ?? QUARTER_TICKS / 4;
+  // The tracked beat is always a legal lattice — it is the pulse the take is measured against —
+  // unless it is FINER than the caller's grid, in which case offering it would let the page say
+  // something shorter than the caller allowed. `1/4` collapses to the quarter on purpose.
+  if (ticksPerBeat >= floor) addLattice('beat', ticksPerBeat, false);
+  for (const ticks of STRAIGHT_LADDER) {
+    // 1/32 IS OPT-IN, never offered by 'auto'. FiloBass's 46,281 human glyphs are 0.009% 32nds
+    // (§0.1); handing the Viterbi a 1/32 lattice by default buys nothing and gives sloppy playing
+    // somewhere finer to hide. The caller has to ask for it by name — which the floor enforces.
+    if (ticks < floor) continue;
+    addLattice(`straight-${QUARTER_TICKS * 4 / ticks}`, ticks, false);
   }
-  add('beat', 1, false);
+  out.sort((a, b) => b.grid - a.grid);
+
+  // A compound beat is a dotted value and its natural divisions are 3 and 6; the straight ladder
+  // above already supplies the eighth and the sixteenth inside it. No tuplet states: a triplet
+  // inside a dotted beat is the beat's ordinary subdivision, not a tuplet.
+  if (compound) return out;
+  // Tuplets are defined against the TRACKED BEAT and are only meaningful when a decision covers
+  // exactly one of them; a widened window (a grid coarser than the beat) never has any.
+  if (windowTicks !== ticksPerBeat) return out;
   // '1/8T' IS THE TRIPLET GRID, NOT A TRIPLET-ONLY GRID. It used to withhold `straight-8`, on
   // the reading that a caller asking for triplets wants nothing else. That is not what it did.
   // The tuplet gates below are deliberately strict (all three positions occupied, a 25% margin
@@ -154,17 +237,9 @@ function statesFor(grid: QuantGrid, ticksPerBeat: number, compound: boolean): Rh
   // left — `beat`, a whole-beat lattice. A straight eighth then snapped a HALF BEAT onto its
   // neighbour's tick, where the collision fuse deleted one of the two attacks; a "two of three"
   // shuffle figure lost a note the same way. A grid setting chooses what the page may SAY, and
-  // no setting is allowed to delete a note that was played. `1/4` collapses on purpose because
-  // the quarter IS its finest word; the triplet grid's finest straight word is the eighth, which
-  // is what tieMerge.test.ts's STEP table has always declared it to be.
-  if (grid !== '1/4') add('straight-8', 2, false);
-  if (grid === 'auto' || fine) add('straight-16', 4, false);
-  // 1/32 IS OPT-IN, never offered by 'auto'. FiloBass's 46,281 human glyphs are 0.009% 32nds
-  // (§0.1); handing the Viterbi a 1/32 lattice by default buys nothing and gives sloppy playing
-  // somewhere finer to hide. The caller has to ask for it by name.
-  if (grid === 'thirtysecond') add('straight-32', 8, false);
-  if (grid === 'auto' || grid === '1/8T') add('triplet-8', 3, true);
-  if (grid === 'auto') add('triplet-16', 6, true);
+  // no setting is allowed to delete a note that was played.
+  if (grid === 'auto' || grid === '1/8T') addLattice('triplet-8', ticksPerBeat / 3, true);
+  if (grid === 'auto') addLattice('triplet-16', ticksPerBeat / 6, true);
   return out;
 }
 
@@ -186,16 +261,72 @@ interface BeatWindow {
  * offset, not noise; measuring it as jitter would veto the very reading it supports. Each
  * window is recentered by the median displacement of the REST of the take, so no window can
  * shift its own measurement frame.
+ *
+ * O(N log N), and it used to be quadratic in occupied beats: the complement was REBUILT for
+ * every window ("for each window, concatenate every other window's residuals, then sort them"),
+ * which is O(W x N log N) — a five-minute sixteenth-note import spent minutes here and a large
+ * one exhausted memory rebuilding million-element arrays W times.
+ *
+ * The same numbers come out. All residuals are ranked once per state; a Fenwick tree over those
+ * ranks then answers "median of everything except this window's values" by removing the window's
+ * own entries, querying two order statistics and putting them back — exactly the leave-one-out
+ * median the loop computed, including the even-length mean-of-two-middles rule.
  */
 function recenterWindows(windows: BeatWindow[], stateCount: number): void {
   for (let s = 0; s < stateCount; s++) {
-    for (const w of windows) {
-      const complement: number[] = [];
-      for (const other of windows) if (other !== w) complement.push(...other.signed[s]);
-      const trend = complement.length >= TREND_MIN_SUPPORT ? median(complement) : 0;
+    const values: number[] = [];
+    const windowOf: number[] = [];
+    windows.forEach((w, wi) => {
+      for (const v of w.signed[s]) {
+        values.push(v);
+        windowOf.push(wi);
+      }
+    });
+    const n = values.length;
+    const order = values.map((_, i) => i).sort((a, b) => values[a] - values[b] || a - b);
+    const sorted = order.map((i) => values[i]);
+    const rankOf = new Int32Array(n);
+    order.forEach((valueIndex, rank) => {
+      rankOf[valueIndex] = rank;
+    });
+
+    const tree = new Int32Array(n + 1);
+    const add = (rank: number, delta: number): void => {
+      for (let p = rank + 1; p <= n; p += p & -p) tree[p] += delta;
+    };
+    /** 0-based rank of the `k`-th smallest (k is 1-based) among the entries currently present. */
+    const kth = (k: number): number => {
+      let pos = 0;
+      let rest = k;
+      let step = 1;
+      while (step * 2 <= n) step *= 2;
+      for (; step > 0; step >>= 1) {
+        if (pos + step <= n && tree[pos + step] < rest) {
+          pos += step;
+          rest -= tree[pos];
+        }
+      }
+      return pos;
+    };
+    for (let i = 0; i < n; i++) add(rankOf[i], 1);
+
+    const indexesOf: number[][] = windows.map(() => []);
+    windowOf.forEach((wi, i) => indexesOf[wi].push(i));
+
+    windows.forEach((w, wi) => {
+      const own = indexesOf[wi];
+      for (const i of own) add(rankOf[i], -1);
+      const m = n - own.length;
+      let trend = 0;
+      if (m >= TREND_MIN_SUPPORT) {
+        trend = m % 2
+          ? sorted[kth((m + 1) >> 1)]
+          : (sorted[kth(m >> 1)] + sorted[kth((m >> 1) + 1)]) / 2;
+      }
       w.recentered[s] = w.signed[s].map((v) => v - trend);
       w.recenteredSum[s] = rms(w.recentered[s]);
-    }
+      for (const i of own) add(rankOf[i], 1);
+    });
   }
 }
 
@@ -308,16 +439,22 @@ export function quantizeOnsets(
   if (opts.grid === 'free') return quantizeFree(notes);
   if (opts.grid === 'exact' || !notes.length) return quantizeExact(notes);
 
-  const states = statesFor(opts.grid, opts.ticksPerBeat, opts.compound);
+  // The span one rhythm decision covers: the tracked beat, widened only when the caller's grid
+  // names a value the beat cannot divide (see `quantWindowTicks`).
+  const windowTicks = quantWindowTicks(opts.grid, opts.ticksPerBeat);
+  const states = statesFor(opts.grid, opts.ticksPerBeat, opts.compound, windowTicks);
   const straight = states.filter((s) => !s.tuplet);
   // `basicQuant`: the finest STRAIGHT subdivision actually on offer, and therefore the step
-  // BOTH an onset and its off-time snap to.
-  const finestStraight = Math.min(...straight.map((s) => s.grid));
+  // BOTH an onset and its off-time snap to. Iterative: a spread over a million-note import
+  // throws `RangeError` before it ever computes anything.
+  let finestStraight = Infinity;
+  for (const s of straight) if (s.grid < finestStraight) finestStraight = s.grid;
+  if (!Number.isFinite(finestStraight)) finestStraight = windowTicks;
 
   // ---- beat windows -------------------------------------------------------------------------
   const byBeat = new Map<number, QuantNote[]>();
   for (const n of notes) {
-    const beat = Math.floor(n.rawStartTick / opts.ticksPerBeat);
+    const beat = Math.floor(n.rawStartTick / windowTicks);
     const g = byBeat.get(beat) ?? [];
     g.push(n);
     byBeat.set(beat, g);
@@ -325,7 +462,7 @@ export function quantizeOnsets(
   const beats = [...byBeat.keys()].sort((a, b) => a - b);
   const windows: BeatWindow[] = beats.map((beat) => {
     const ns = byBeat.get(beat)!;
-    const origin = beat * opts.ticksPerBeat;
+    const origin = beat * windowTicks;
     return {
       beat,
       origin,
@@ -421,8 +558,8 @@ export function quantizeOnsets(
     if (!state.tuplet) continue;
     const g: QuantTupletGroup = {
       id: `tup-${beat}`,
-      startTick: beat * opts.ticksPerBeat,
-      endTick: (beat + 1) * opts.ticksPerBeat,
+      startTick: beat * windowTicks,
+      endTick: (beat + 1) * windowTicks,
       unitTicks: state.grid,
       actual: state.actual,
       normal: state.normal
@@ -433,9 +570,9 @@ export function quantizeOnsets(
 
   const out: QuantResult['notes'] = [];
   for (const n of notes) {
-    const beat = Math.floor(n.rawStartTick / opts.ticksPerBeat);
+    const beat = Math.floor(n.rawStartTick / windowTicks);
     const state = decoded.get(beat) ?? states[0];
-    const origin = beat * opts.ticksPerBeat;
+    const origin = beat * windowTicks;
     const candidate = state.tuplet ? tupletByBeat.get(beat) : undefined;
     const unit = candidate ? candidate.unitTicks : state.grid;
     const startTick = snapTo(n.rawStartTick, unit, origin);
@@ -457,7 +594,7 @@ export function quantizeOnsets(
     //                    on it and the whole build died with no score at all.
     //
     // A group spans exactly its beat, so the landed tick names its group unambiguously.
-    const landed = tupletByBeat.get(Math.floor(startTick / opts.ticksPerBeat));
+    const landed = tupletByBeat.get(Math.floor(startTick / windowTicks));
     const group = landed && startTick >= landed.startTick && startTick < landed.endTick ? landed : undefined;
 
     // SPEC RULE R4: the off-time snaps on the SAME grid as its onset, never independently —
@@ -490,7 +627,7 @@ export function quantizeOnsets(
     // vocabulary. Ending it on the group's own lattice keeps the sounding length within half a
     // unit and keeps every span on the page notatable.
     if (!group) {
-      const host = tupletByBeat.get(Math.floor(offTick / opts.ticksPerBeat));
+      const host = tupletByBeat.get(Math.floor(offTick / windowTicks));
       // A non-member's onset is necessarily before the group, so rounding down to the group's
       // own start still leaves a positive length; no floor is needed.
       if (host && offTick > host.startTick && offTick < host.endTick) {

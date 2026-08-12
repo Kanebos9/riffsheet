@@ -353,7 +353,21 @@ export interface RiffsheetOptions {
    * fixture can be shown to have produced more than zero before. The app never sets it.
    */
   unsettled?: boolean;
+  /**
+   * How far through the pass we are, 0..1. See `OnsetOptions.onProgress`, which this forwards
+   * into: the pass runs in a Worker now (`audio/engineWorker.ts`) and a job that says nothing
+   * for several seconds cannot be told from one that has hung.
+   *
+   * The two heavy phases are the spectral flux pass (the detector) and the per-segment pitch
+   * read, and the fractions below are their measured share of the whole rather than a guess at
+   * one. Every existing caller omits this and gets exactly the function it always had.
+   */
+  onProgress?: (fraction: number) => void;
 }
+
+/** Where the detector's own progress ends and the segment read's begins. See `onProgress`. */
+const PROGRESS_ONSETS_SHARE = 0.6;
+const PROGRESS_SEGMENTS_END = 0.9;
 
 /** How much confidence a note keeps after the octave guard moved it. See `RiffsheetNote`. */
 const MOVED_CONFIDENCE = 0.75;
@@ -435,7 +449,10 @@ export function transcribeRiffsheet(
   }
 
   const takePeak = takePeakOf(pcm);
-  const detected = detectOnsets(pcm, sampleRate);
+  const progress = opts.onProgress;
+  const detected = detectOnsets(pcm, sampleRate, {
+    onProgress: progress ? (f) => progress(f * PROGRESS_ONSETS_SHARE) : undefined
+  });
   const clusters = clusterOnsetsDetailed(detected.onsets);
 
   // --- 1. segmentation ----------------------------------------------------
@@ -475,6 +492,11 @@ export function transcribeRiffsheet(
 
   const segments: Segment[] = [];
   for (let i = 0; i < starts.length; i++) {
+    if (progress && starts.length > 0) {
+      progress(
+        PROGRESS_ONSETS_SHARE + (i / starts.length) * (PROGRESS_SEGMENTS_END - PROGRESS_ONSETS_SHARE)
+      );
+    }
     const from = starts[i].atSec;
     // The furthest this note may run. Three things can stop it and the earliest wins: the next
     // attack, the mute that ended it (recorded either inside the next cluster or as a mute

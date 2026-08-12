@@ -35,11 +35,19 @@ import {
   audioSecAt,
   barGrid,
   clampWindow,
-  clampXToEngraving,
+  engravedPxPerSec,
   subdivisionsPerBeat,
   writtenSecAt,
-  coupledSheetScale,
   fracToSec,
+  fullViewport,
+  intersectLimits,
+  maxSpanOf,
+  reduceViewport,
+  sheetSpanLimits,
+  viewportSaturation,
+  viewportSpan,
+  PinchAccumulator,
+  VIEWPORT_EPSILON_SEC,
   fullWindow,
   gridDetail,
   gridMarks,
@@ -48,14 +56,14 @@ import {
   panWindow,
   secPerPx,
   secToFrac,
-  sheetScrollForSec,
   windowFollowing,
-  windowFromSheet,
   windowShowing,
   zoomWindowAt,
   zoomWindowCentred,
+  type BarGridSource,
   type BarSpan,
   type TimeLimits,
+  type TimelineViewport,
   type TimeWindow
 } from '../src/view/timeAxis';
 import {
@@ -288,6 +296,111 @@ windowIs(windowShowing(5, 0, 4, limits), 5, 9, 'windowShowing at the left edge')
   assert(sixEight[0].beats === 6, '6/8 is six beats, not two — the edit grid already assumes it');
 }
 
+// ---------------------------------------------------------------------------
+// timeAxis: the grid follows REAL TEMPO CHANGES
+// ---------------------------------------------------------------------------
+
+{
+  // Four 4/4 bars at 12 ticks a quarter: 48 ticks each, starting at 0, 48, 96, 144.
+  const fourBars: BarGridSource['bars'] = [
+    { index: 0, number: 1, implicit: false, startTick: 0, durTicks: 48, timeSig: [4, 4] },
+    { index: 1, number: 2, implicit: false, startTick: 48, durTicks: 48, timeSig: [4, 4] },
+    { index: 2, number: 3, implicit: false, startTick: 96, durTicks: 48, timeSig: [4, 4] },
+    { index: 3, number: 4, implicit: false, startTick: 144, durTicks: 48, timeSig: [4, 4] }
+  ];
+
+  // THE NO-REGRESSION CLAIM, as arithmetic rather than as a promise: with no tempo changes the
+  // output is the old scalar expression to the last bit, so `===` and not `near()`. Every probe
+  // and screenshot of a detected-from-audio take rests on this.
+  const secPerTick = 60 / 120 / 12;
+  const constant = barGrid({ tempoBpm: 120, divisions: 12, bars: fourBars }, 0.25);
+  assert(
+    constant.every((bar, i) => {
+      const startSec = 0.25 + fourBars[i].startTick * secPerTick;
+      return bar.startSec === startSec && bar.endSec === startSec + fourBars[i].durTicks * secPerTick;
+    }),
+    'a score with no tempo changes keeps the exact scalar arithmetic, bit for bit'
+  );
+
+  // A single tempo DECLARED as a change is not a change, and must take the same branch.
+  const declared = barGrid(
+    { tempoBpm: 120, divisions: 12, tempoChanges: [{ tick: 0, bpm: 120 }], bars: fourBars },
+    0.25
+  );
+  assert(
+    declared.every(
+      (bar, i) =>
+        bar.startSec === constant[i].startSec &&
+        bar.endSec === constant[i].endSec &&
+        bar.beatSec === constant[i].beatSec
+    ),
+    'one tempo stated as a change produces the identical grid'
+  );
+
+  // THE BUG, in numbers. 120 bpm for two bars then 60 bpm from tick 96: the second half of the
+  // score runs at half speed, so its bars are FOUR seconds each and not two.
+  //
+  //   bar 1  0 -> 2      bar 2  2 -> 4      bar 3  4 -> 8      bar 4  8 -> 12
+  //
+  // The scalar version put bar 3 at 4 -> 6 and bar 4 at 6 -> 8, so by the last bar line it was
+  // four seconds — two whole bars — early.
+  const changing = barGrid(
+    {
+      tempoBpm: 120,
+      divisions: 12,
+      tempoChanges: [
+        { tick: 0, bpm: 120 },
+        { tick: 96, bpm: 60 }
+      ],
+      bars: fourBars
+    },
+    0
+  );
+  near(changing[0].startSec, 0, 'bar 1 starts at the origin');
+  near(changing[1].startSec, 2, 'bar 2 at 120bpm');
+  near(changing[2].startSec, 4, 'bar 3 starts where the tempo change is');
+  near(changing[3].startSec, 8, 'bar 4 is a FULL FOUR seconds later — the scalar said 6');
+  near(changing[3].endSec, 12, 'and the take is twelve seconds long, not eight');
+  near(changing[1].endSec - changing[1].startSec, 2, 'a bar before the change is two seconds');
+  near(changing[2].endSec - changing[2].startSec, 4, 'a bar after it is twice as long');
+  near(changing[0].beatSec, 0.5, 'a beat at 120bpm is half a second');
+  near(changing[2].beatSec, 1, 'and a whole second after the change');
+
+  // The origin still offsets every bar, tempo map or not.
+  const shifted = barGrid(
+    {
+      tempoBpm: 120,
+      divisions: 12,
+      tempoChanges: [
+        { tick: 0, bpm: 120 },
+        { tick: 96, bpm: 60 }
+      ],
+      bars: fourBars
+    },
+    0.25
+  );
+  assert(
+    shifted.every((bar, i) => Math.abs(bar.startSec - (changing[i].startSec + 0.25)) < 1e-9),
+    'the bar-1 origin shifts a tempo-mapped grid exactly as it shifts a scalar one'
+  );
+
+  // AND `gridMarks` INHERITS IT FOR FREE: it has never seen a BPM, only these spans.
+  const marks = gridMarks(
+    changing,
+    { fromSec: 0, toSec: 12 },
+    { bars: true, beats: true, subs: false, labelEvery: 1, subsPerBeat: 4 }
+  );
+  assert(
+    marks.some((m) => m.level === 'beat' && Math.abs(m.sec - 5) < 1e-9),
+    'the beats of bar 3 are a second apart, so one lands on 5'
+  );
+  assert(
+    !marks.some((m) => Math.abs(m.sec - 4.5) < 1e-9),
+    'and none lands on 4.5, where the single-tempo grid drew one'
+  );
+  near(medianBeatSec(changing), 1, 'the median beat of a half-and-half score is the slower one');
+}
+
 {
   const detailDeep = gridDetail(0.5, 0.5 / 40);
   assert(detailDeep.bars && detailDeep.beats && detailDeep.subs, 'a wide beat gets every level');
@@ -374,35 +487,24 @@ windowIs(windowShowing(5, 0, 4, limits), 5, 9, 'windowShowing at the left edge')
 // ---------------------------------------------------------------------------
 
 {
-  const view = { scrollLeft: 0, viewportWidth: 400, contentWidth: 1000, scale: 1 };
-  near(sheetScrollForSec(2, () => 500, view) ?? -1, 500 - ALIGN_GUTTER_PX, 'the gutter comes off the scroll');
-  near(sheetScrollForSec(2, () => 20, view) ?? -1, 0, 'a scroll before zero clamps to zero');
-  near(sheetScrollForSec(2, () => 5000, view) ?? -1, 600, 'a scroll past the end clamps to the last page');
-  assert(sheetScrollForSec(2, () => null, view) === null, 'an unengraved second means leave the scroll alone');
-  assert(sheetScrollForSec(2, () => Number.NaN, view) === null, 'and so does a NaN');
+  // `sheetScrollForSec`, `windowFromSheet`, `clampXToEngraving` and `coupledSheetScale` were
+  // tested here. All four are deleted (finding 14): they were a second, uncalled generation of
+  // the alignment design whose documented edge policy contradicted the shipped one, and the
+  // ratio-based coupling law they went with needed a remembered previous span that nothing could
+  // authoritatively supply. What is left is the one measurement of the engraving anything makes.
 
-  const win = windowFromSheet({ scrollLeft: 100, viewportWidth: 400, contentWidth: 2000, scale: 1 },
-    (x) => x / 100, { durationSec: 30, minSpanSec: MIN_WINDOW_SEC });
-  assert(win !== null, 'the sheet can answer here');
-  near(win!.fromSec, (100 + ALIGN_GUTTER_PX) / 100, 'the window starts at the sheet left edge past the gutter');
-  near(win!.toSec, 5, 'and ends at the sheet right edge');
-  assert(windowFromSheet({ scrollLeft: 0, viewportWidth: 400, contentWidth: 2000, scale: 1 }, () => null,
-    { durationSec: 30, minSpanSec: MIN_WINDOW_SEC }) === null, 'nothing engraved, no window');
-  assert(windowFromSheet({ scrollLeft: 0, viewportWidth: 400, contentWidth: 2000, scale: 1 }, () => 4,
-    { durationSec: 30, minSpanSec: MIN_WINDOW_SEC }) === null, 'a backwards or empty span is not a window');
-}
-
-// THE COUPLING RULE: newScale / oldScale === oldSpan / newSpan.
-{
-  near(coupledSheetScale(1, 4, 2, 0.25, 4), 2, 'halving the roll span doubles the sheet scale');
-  near(coupledSheetScale(2, 2, 4, 0.25, 4), 1, 'and doubling it halves the scale back');
-  near(coupledSheetScale(1, 4, 1, 0.25, 3), 3, 'the coupling is clamped at the top');
-  near(coupledSheetScale(1, 1, 100, 0.5, 4), 0.5, 'and at the bottom');
-  near(coupledSheetScale(1.5, 0, 2, 0.25, 4), 1.5, 'a zero old span leaves the scale alone');
-  near(coupledSheetScale(1.5, 2, 0, 0.25, 4), 1.5, 'so does a zero new span');
-  for (const [scale, oldSpan, newSpan] of [[1, 4, 2], [0.8, 3.3, 7.1], [2, 10, 0.4]] as const) {
-    const next = coupledSheetScale(scale, oldSpan, newSpan, 0.01, 100);
-    near(next / scale, oldSpan / newSpan, 'the ratio rule holds away from the clamps', 1e-9);
+  // THE CALIBRATION: pixels per second, over the WHOLE engraved extent rather than a screenful.
+  {
+    const secAt = (x: number): number | null => (x - 40) / 36;
+    near(engravedPxPerSec({ firstX: 40, lastX: 760 }, secAt)!, 36, 'the slope comes back as measured');
+    assert(engravedPxPerSec(null, secAt) === null, 'nothing engraved, no calibration');
+    assert(engravedPxPerSec({ firstX: 400, lastX: 40 }, secAt) === null, 'a backwards extent is refused');
+    assert(engravedPxPerSec({ firstX: 40, lastX: 760 }, () => null) === null, 'unanswerable x, no calibration');
+    assert(engravedPxPerSec({ firstX: 40, lastX: 41 }, () => 3) === null, 'no time between the ends, no slope');
+    // The point of measuring across the WHOLE extent: a dense stretch and a sparse one give the
+    // same answer, so scrolling from one into the other cannot re-scale anything.
+    const uneven = (x: number): number | null => (x < 400 ? (x - 40) / 72 : 5 + (x - 400) / 18);
+    near(engravedPxPerSec({ firstX: 40, lastX: 760 }, uneven)!, 720 / 25, 'one slope for the take, however uneven');
   }
 
   near(absoluteSheetScale(1, 100, 900, 3, 0.25, 4), 3, 'the measured form reaches the wanted span in one step');
@@ -626,53 +728,14 @@ assert(countRendererCredits(undefined) === 0, 'no root, nothing counted');
 // Review MAJOR — the align window is clamped to what is actually engraved
 // ---------------------------------------------------------------------------
 
-{
-  const extent = { firstX: 40, lastX: 400 };
-  assert(clampXToEngraving(200, extent) === 200, 'an x inside the engraving is left alone');
-  assert(clampXToEngraving(900, extent) === 400, 'an x past the last bar becomes the last bar');
-  assert(clampXToEngraving(-50, extent) === 40, 'an x before the first beat becomes the first beat');
-  assert(clampXToEngraving(900, null) === 900, 'with no extent measured, nothing is clamped');
-  assert(
-    clampXToEngraving(900, { firstX: 400, lastX: 40 }) === 900,
-    'a nonsense extent is ignored rather than inverting the answer'
-  );
-
-  // THE FAILURE, END TO END, with the numbers written out.
-  //
-  // A 20 s take engraved at 36 px per second: the first beat is at content x 40 and the last bar
-  // ends at x 760. The page is 900 px wide (alphaTab's trailing padding), the pane is 500 px,
-  // and the reader has scrolled to 400 — so the sheet is showing 10.94 s .. 20 s, and its right
-  // viewport edge (x 900) is 140 px PAST the end of the music.
-  const limits: TimeLimits = { durationSec: 20, minSpanSec: MIN_WINDOW_SEC };
-  const secAt = (x: number): number => (x - 40) / 36;
-  const music = { firstX: 40, lastX: 760 };
-  const view = { scrollLeft: 400, viewportWidth: 500, contentWidth: 900, scale: 1 };
-  const sheetLeftSec = secAt(400 + ALIGN_GUTTER_PX);
-
-  // Extrapolated, x 900 reads as 23.89 s. The window is then 12.94 s wide but ends past the end
-  // of the take, so `clampWindow` SLIDES it back keeping its span — and the left edge, which was
-  // the one number Align exists to get right, moves 3.9 s (about 140 px) away from the music the
-  // sheet is really showing. That is the drift.
-  const unclamped = windowFromSheet(view, secAt, limits)!;
-  assert(
-    Math.abs(unclamped.fromSec - sheetLeftSec) > 3,
-    'unclamped, the window no longer starts where the sheet does'
-  );
-  assert(unclamped.toSec > limits.durationSec - 1e-9, 'and it has been shoved against the end');
-
-  const clamped = windowFromSheet(view, secAt, limits, music)!;
-  near(clamped.fromSec, sheetLeftSec, 'clamped, the left edge is the second the sheet shows');
-  near(clamped.toSec, 20, 'and the right edge is the end of the engraving, not somewhere past it');
-  assert(clamped.toSec <= limits.durationSec + 1e-9, 'the window never runs off the end of the take');
-
-  // Scrolled into the middle of a long engraving, the clamp must do nothing at all.
-  const wide = { firstX: 40, lastX: 5000 };
-  const mid = { scrollLeft: 200, viewportWidth: 500, contentWidth: 5000, scale: 1 };
-  const a = windowFromSheet(mid, secAt, limits)!;
-  const b = windowFromSheet(mid, secAt, limits, wide)!;
-  near(a.fromSec, b.fromSec, 'inside the engraving the clamp changes nothing (from)');
-  near(a.toSec, b.toSec, 'inside the engraving the clamp changes nothing (to)');
-}
+// The whole of this block tested `clampXToEngraving` and `windowFromSheet` — holding the sheet's
+// two viewport edges inside the engraving before turning them into a window. Nothing turns the
+// sheet's edges into a window any more: a sheet scroll states ONE edge and the reducer supplies
+// the span (`ViewportCommand.sheetScroll`), so the extrapolation past the last bar that this
+// clamp existed to survive can no longer reach the shared window at all. The failure it
+// documented — a 500 px pane at scroll 400 on a 20 s take reading its right edge as 23.89 s, and
+// `clampWindow` then sliding the window back and moving the LEFT edge 3.9 s — is now impossible
+// by construction, and the reducer block above asserts the property directly instead.
 
 // ---------------------------------------------------------------------------
 // F13 — bar 1 is pinned to the FIRST NOTE, not to the top of the tape
@@ -699,26 +762,17 @@ assert(countRendererCredits(undefined) === 0, 'no root, nothing counted');
   assert(alignOriginSec(0, Number.NaN, 7) === 7, 'a NaN is a missing answer, not an answer');
   assert(alignOriginSec(null, null) === 0, 'and the default fallback is zero');
 
-  // The sheet PARKS at its start rather than scrolling negative. Everything left of the first
-  // note is silence the roll and the waveform still draw; the sheet simply has no page there.
-  const sheet = { scrollLeft: 0, viewportWidth: 800, contentWidth: 2000, scale: 1 };
-  const contentXAt = (sec: number): number => 40 + sec * 36; // written seconds -> content x
-  assert(
-    sheetScrollForSec(-2.5, contentXAt, sheet) === 0,
-    'a second before bar 1 parks the sheet at its start'
-  );
-  assert(
-    sheetScrollForSec(-100, contentXAt, sheet) === 0,
-    'and it stays parked however far left the other strips scroll — no jump to the far end'
-  );
-  assert(
-    sheetScrollForSec(4, contentXAt, sheet) === 40 + 4 * 36 - ALIGN_GUTTER_PX,
-    'inside the take it is the plain mapping, gutter removed'
-  );
-  assert(
-    sheetScrollForSec(1000, contentXAt, sheet) === 2000 - 800,
-    'and it stops at the end of the page rather than scrolling past it'
-  );
+  // The sheet used to PARK at its start rather than scrolling negative, and `sheetScrollForSec`
+  // was where that was decided. The reducer decides it now, for all three panes at once and in
+  // seconds rather than in one pane's pixels: a window can never start before the recording does,
+  // so there is no negative scroll to park. Asserted on the shared state instead.
+  {
+    const limits: TimeLimits = { durationSec: 20, minSpanSec: MIN_WINDOW_SEC };
+    const at5 = reduceViewport(fullViewport(limits), { kind: 'showSpan', fromSec: 5, toSec: 9, source: 'system' }, limits);
+    const left = reduceViewport(at5, { kind: 'pan', deltaSec: -100, source: 'roll' }, limits);
+    near(left.fromSec, 0, 'panning far left parks at the start of the recording');
+    near(viewportSpan(left), 4, 'and it parks WITHOUT narrowing — a pan is never a zoom');
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -868,5 +922,191 @@ assert(countRendererCredits(undefined) === 0, 'no root, nothing counted');
     'the two renders are byte-identical once colour is removed: nothing moved, nothing was dropped'
   );
 }
+
+
+// ---------------------------------------------------------------------------
+// THE VIEWPORT REDUCER — the whole scroll/zoom controller, as a pure function
+// ---------------------------------------------------------------------------
+//
+// This is the regression armour for the coupling rewrite. The old controller could not be tested
+// here at all: it lived across three files, inferred user intent from a 250 ms timer and a 2%
+// comparison, and only misbehaved when a real render landed between two callbacks. Every one of
+// those behaviours is now a property of `reduceViewport`, which takes state and a command and
+// returns state.
+
+{
+  const limits: TimeLimits = { durationSec: 20, minSpanSec: 0.05 };
+  const at = (from: number, to: number): TimelineViewport => ({ fromSec: from, toSec: to, revision: 7 });
+
+  // --- PAN NEVER CHANGES THE SPAN (findings 3, 4) -------------------------------------------
+  {
+    const v = at(5, 9);
+    const right = reduceViewport(v, { kind: 'pan', deltaSec: 2, source: 'roll' }, limits);
+    near(right.fromSec, 7, 'a pan moves the left edge by the delta');
+    near(viewportSpan(right), 4, 'and leaves the span alone');
+    assert(right.revision === 8, 'a pan that moved bumps the revision by exactly one');
+
+    // At BOTH edges, which is finding 3: `clampWindow` slides the window back keeping its span,
+    // so the magnification survives an over-scroll in either direction.
+    const offLeft = reduceViewport(v, { kind: 'pan', deltaSec: -50, source: 'scrollbar' }, limits);
+    near(offLeft.fromSec, 0, 'over-scrolling left stops at the start of the take');
+    near(viewportSpan(offLeft), 4, 'span constant at the left edge');
+    const offRight = reduceViewport(v, { kind: 'pan', deltaSec: 50, source: 'scrollbar' }, limits);
+    near(offRight.toSec, 20, 'over-scrolling right stops at the end of the take');
+    near(viewportSpan(offRight), 4, 'span constant at the right edge');
+  }
+
+  // --- A 15 px PAN IS NOT SWALLOWED (finding 5) ---------------------------------------------
+  {
+    // The reported case, in its own numbers: a 10 s window on a 1000 px pane, moved 15 px. The
+    // old `sameTimeWindow` guard called anything under 2% of the span (0.2 s) an echo and threw
+    // it away, so 15 px — 0.15 s — moved the roll and the strip and never reached the sheet.
+    const v = at(4, 14);
+    const nudged = reduceViewport(v, { kind: 'pan', deltaSec: (15 / 1000) * 10, source: 'roll' }, limits);
+    assert(nudged !== v, 'a 15 px pan on a 10 s window is a real move');
+    near(nudged.fromSec, 4.15, 'and it moves by exactly what was asked for');
+    assert(nudged.revision === v.revision + 1, 'so the revision moves too');
+    // The guard that IS left is numeric identity and nothing more.
+    const still = reduceViewport(v, { kind: 'pan', deltaSec: VIEWPORT_EPSILON_SEC / 10, source: 'roll' }, limits);
+    assert(still === v, 'a sub-epsilon pan is the same state, by identity');
+    assert(still.revision === v.revision, 'and does not bump the revision');
+  }
+
+  // --- ZOOM ANCHORS, AND SATURATES (finding 9) ----------------------------------------------
+  {
+    const v = at(4, 14);
+    const inAtHalf = reduceViewport(v, { kind: 'zoom', factor: 2, anchorFrac: 0.5, source: 'roll' }, limits);
+    near(viewportSpan(inAtHalf), 5, 'zooming in by 2 halves the span');
+    near((inAtHalf.fromSec + inAtHalf.toSec) / 2, 9, 'and the second under the anchor stays there');
+
+    const atPointer = reduceViewport(v, { kind: 'zoom', factor: 2, anchorFrac: 0.25, source: 'sheet' }, limits);
+    near(atPointer.fromSec + 0.25 * viewportSpan(atPointer), 6.5, 'a quarter-way anchor is honoured');
+
+    // Saturation is an IDENTITY, not a snap-back: the same object comes out, so the revision
+    // does not move and nothing downstream re-renders or fights it.
+    const deep = reduceViewport(at(4, 5), { kind: 'zoom', factor: 40, anchorFrac: 0.5, source: 'roll' }, limits);
+    near(viewportSpan(deep), 0.05, 'the deepest zoom is the min span, not the span that was asked for');
+    near((deep.fromSec + deep.toSec) / 2, 4.5, 'and the anchor is still honoured at the floor');
+    const again = reduceViewport(deep, { kind: 'zoom', factor: 4, anchorFrac: 0.5, source: 'roll' }, limits);
+    assert(again === deep, 'zooming past the floor returns the same state object');
+    const out = reduceViewport(at(0, 20), { kind: 'zoom', factor: 0.25, anchorFrac: 0.5, source: 'roll' }, limits);
+    near(viewportSpan(out), 20, 'zooming out past the take is the take');
+
+    const sat = viewportSaturation(deep, limits);
+    assert(sat.atMinSpan && !sat.atMaxSpan, 'saturation says which end it has run out at');
+    assert(viewportSaturation(at(0, 20), limits).atMaxSpan, 'and the other end too');
+  }
+
+  // --- A SHEET SCROLL IS ONE EDGE (finding 2) -----------------------------------------------
+  {
+    const v = at(5, 9);
+    const scrolled = reduceViewport(v, { kind: 'sheetScroll', fromSec: 11, source: 'sheet' }, limits);
+    near(scrolled.fromSec, 11, 'the sheet moves the left edge');
+    near(viewportSpan(scrolled), 4, 'and cannot change the span, whatever the engraving says');
+
+    // THE ACTUAL BUG, in numbers. The old controller turned the sheet's two engraved viewport
+    // edges into the window, and the engraving is not proportional to time — the same pane
+    // covered ~20% more seconds in a sparse bar than in a dense one, so dragging the scrollbar
+    // across a density change visibly re-scaled the roll. Feed the same walk here: only the
+    // position may move.
+    let cur = v;
+    for (const [from] of [[6.1], [7.4], [9.2], [12.9], [15.0]] as const) {
+      cur = reduceViewport(cur, { kind: 'sheetScroll', fromSec: from, source: 'sheet' }, limits);
+      near(viewportSpan(cur), 4, 'the span is constant across a whole scrollbar drag', 1e-9);
+    }
+    // And at the far right it parks rather than shrinking.
+    cur = reduceViewport(cur, { kind: 'sheetScroll', fromSec: 19.5, source: 'sheet' }, limits);
+    near(cur.fromSec, 16, 'a scroll past the end parks the window against it');
+    near(viewportSpan(cur), 4, 'still without narrowing');
+  }
+
+  // --- SHEET PINCH AND ROLL PINCH ARE THE SAME GESTURE (finding 10) -------------------------
+  {
+    // Same factor, same anchor, from two different sources: the same window, to the last bit.
+    const v = at(3, 11);
+    const fromRoll = reduceViewport(v, { kind: 'zoom', factor: 1.2, anchorFrac: 0.37, source: 'roll' }, limits);
+    const fromSheet = reduceViewport(v, { kind: 'zoom', factor: 1.2, anchorFrac: 0.37, source: 'sheet' }, limits);
+    const fromWave = reduceViewport(v, { kind: 'zoom', factor: 1.2, anchorFrac: 0.37, source: 'waveform' }, limits);
+    assert(fromRoll.fromSec === fromSheet.fromSec && fromRoll.toSec === fromSheet.toSec,
+      'sheet pinch and roll pinch produce the identical window');
+    assert(fromWave.fromSec === fromSheet.fromSec, 'and so does the waveform');
+    // The source is carried for the caller's benefit; the arithmetic must not consult it.
+  }
+
+  // --- FIT, AND THE SHARED CEILING ----------------------------------------------------------
+  {
+    const fit = reduceViewport(at(5, 9), { kind: 'fit', source: 'roll' }, limits);
+    near(fit.fromSec, 0, 'fit goes back to the start');
+    near(fit.toSec, 20, 'and shows the whole take');
+    near(maxSpanOf(limits), 20, 'with no ceiling given, the take is the ceiling');
+    const capped: TimeLimits = { durationSec: 20, minSpanSec: 0.05, maxSpanSec: 6 };
+    near(maxSpanOf(capped), 6, 'a ceiling is honoured');
+    const cappedFit = reduceViewport(at(5, 9), { kind: 'fit', source: 'roll' }, capped);
+    near(viewportSpan(cappedFit), 6, 'and fit stops at it rather than at the take');
+  }
+}
+
+// --- THE INTERSECTION: alignment is mandatory, so the range is the overlap (finding 9) -------
+{
+  const roll: TimeLimits = { durationSec: 100, minSpanSec: 0.05 };
+  // A pane showing 8 s at scale 1 shows 8/3 s at scale 3 and 8/0.6 s at scale 0.6.
+  const sheet = sheetSpanLimits(8, 1, 0.6, 3)!;
+  near(sheet.minSpanSec, 8 / 3, 'the sheet cannot show less than its deepest scale allows');
+  near(sheet.maxSpanSec, 8 / 0.6, 'nor more than its shallowest');
+  assert(sheetSpanLimits(0, 1, 0.6, 3) === null, 'no reference span, no band');
+  assert(sheetSpanLimits(8, 0, 0.6, 3) === null, 'no reference scale, no band');
+
+  const shared = intersectLimits(roll, sheet);
+  near(shared.minSpanSec, 8 / 3, 'the shared floor is the sheet’s, not the roll’s 50 ms');
+  near(maxSpanOf(shared), 8 / 0.6, 'and the shared ceiling is the sheet’s too, inside the take');
+  assert(intersectLimits(roll, null).minSpanSec === roll.minSpanSec, 'unmeasured sheet, roll limits stand');
+
+  // THE POINT: the roll cannot zoom past what the sheet can follow. Fifty notches of zoom-in
+  // land exactly on the shared floor and stay there, rather than running on to 50 ms and being
+  // snapped back by a sheet callback some time later.
+  let v = fullViewport(shared);
+  for (let i = 0; i < 50; i++) v = reduceViewport(v, { kind: 'zoom', factor: 1.25, anchorFrac: 0.5, source: 'roll' }, shared);
+  near(viewportSpan(v), 8 / 3, 'fifty roll zoom notches stop at the sheet’s floor');
+  assert(viewportSaturation(v, shared).atMinSpan, 'and say so');
+  const nothing = reduceViewport(v, { kind: 'zoom', factor: 1.25, anchorFrac: 0.5, source: 'roll' }, shared);
+  assert(nothing === v, 'one more notch changes nothing at all');
+
+  // A degenerate intersection collapses rather than producing min > max.
+  const impossible = intersectLimits({ durationSec: 100, minSpanSec: 40 }, { minSpanSec: 1, maxSpanSec: 5 });
+  assert(impossible.minSpanSec <= maxSpanOf(impossible), 'a degenerate overlap is still a legal range');
+}
+
+// --- FRACTIONAL PINCH DELTAS ARE KEPT, NOT DROPPED (finding 10) ------------------------------
+{
+  const acc = new PinchAccumulator();
+  assert(acc.take(1.00002) === null, 'a ratio under the step is not applied yet');
+  assert(acc.take(1.00002) === null, 'nor is the second one');
+  // They compound until they clear the 1e-4 step, and the whole product arrives — none of the
+  // events that were "too small to bother with" is lost, which is the whole of finding 10.
+  let out: number | null = null;
+  let events = 2;
+  while (out === null && events < 40) {
+    out = acc.take(1.00002);
+    events++;
+  }
+  assert(out !== null, 'but they add up and arrive');
+  near(out!, Math.pow(1.00002, events), 'and nothing was thrown away on the way', 1e-9);
+  near(acc.owed, 1, 'with nothing still owed afterwards');
+
+  const big = new PinchAccumulator();
+  near(big.take(1.05)!, 1.05, 'a ratio over the step is applied at once');
+  acc.reset();
+  near(acc.owed, 1, 'a new gesture starts owing nothing');
+  assert(acc.take(0) === null && acc.take(Number.NaN) === null, 'rubbish is refused rather than poisoning the fold');
+
+  // THE MEASURED CASE from the audit: at sheet scale 0.6 a one-pixel wheel delta asks for
+  // 0.6 * exp(0.0015) - 0.6 = 0.0009 of scale, under `setZoom`'s 0.001 render threshold. The
+  // old path advanced its baseline anyway, so that 0.0009 was gone. Two events now reach it.
+  const fine = new PinchAccumulator();
+  const oneStep = Math.exp(0.0015);
+  assert(fine.take(oneStep, 0.002) === null, 'one fine step is below a 0.002 threshold');
+  assert(fine.take(oneStep, 0.002) !== null, 'two of them are not');
+}
+
 
 console.log(`view-units-test: passed (${checks} checks)`);

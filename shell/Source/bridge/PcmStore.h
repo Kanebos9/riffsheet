@@ -82,6 +82,38 @@ public:
             file for something ~Entry may delete. */
         juce::Array<juce::File> ownedTempFiles;
 
+        /** THE RECORDING THE USER ACTUALLY GAVE US, byte for byte, when we still
+            have it - which is NOT the same file as `sourceFile`.
+
+            WHY THE TWO ARE DIFFERENT NOW. `sourceFile` is "a file on disk this
+            entry can be re-read from", and `persistTake()` deliberately
+            overwrites it with a take of our own making: the picker path calls it
+            with forceOwnedCopy, which used to re-encode the DOWNMIXED, RESAMPLED
+            analysis buffer as a 24-bit mono WAV and point `sourceFile` at that.
+            From that moment nothing native knew where the user's file was, the
+            page had no bytes of its own, and saving a document therefore
+            embedded a 16-bit mono re-encode of a resampled mono mixdown while
+            the format's own documentation promised the imported file "copied
+            verbatim". A 24-bit/96 kHz stereo master became 16-bit/44.1 kHz mono
+            inside a `.riffsheet`, silently.
+
+            So this field is kept separately and is never pointed at anything
+            derived. It is the file the ORIGINAL BYTES are in - the user's own
+            file, or an untouched copy of it in the takes folder - and it is what
+            /native/source/<token> serves to the page at save time. Empty when
+            there is no such file (a track capture never had one). */
+        juce::File   originalFile;
+
+        /** True when `originalFile` holds the authoritative recording rather
+            than something derived from the analysis buffer.
+
+            False - and this is the honest case, not a failure - when all that
+            survives is a re-encode: a capture that has been rendered to WAV, or
+            an original too large to keep a copy of. The page shows different
+            words and embeds different bytes depending on this, which is the
+            whole point: "verbatim" has to be a fact, not a hope. */
+        bool         originalIsVerbatim = false;
+
         juce::String displayName;
 
         /** IMMUTABLE once the entry has been stored. The audio thread reads
@@ -190,6 +222,33 @@ public:
 
     /** Raw bytes for the /native/pcm/<token>.f32 route, or nullopt. */
     std::optional<std::vector<std::byte>> getRawFloatBytes (const juce::String& token) const;
+
+    /** What the page needs in order to talk about the original recording without
+        reading it: whether one survives, how big it is and what it is called.
+        Cheap - one stat. */
+    struct OriginalInfo
+    {
+        bool available = false;      // there is a file and it is within the limit
+        bool verbatim = false;       // ...and it is the user's own bytes, not a re-encode
+        juce::int64 bytes = 0;
+        juce::String name;           // with its real extension: "riff.flac", not "riff.wav"
+    };
+
+    OriginalInfo getOriginalInfo (const juce::String& token) const;
+
+    /** The original recording's bytes for the /native/source/<token> route.
+
+        READ ON DEMAND, never eagerly. The page asks for these once, when it is
+        actually writing a document, and a hundred-megabyte take that nobody
+        saves is therefore never read, never base64'd and never resident twice.
+        That is also why this is a resource route rather than a bridge function:
+        the JSON bridge would have to base64 it, which is the 3.5x amplification
+        the document format was redesigned to get rid of.
+
+        nullopt when the token is unknown, the file has gone, or it is larger
+        than riffsheet::limits::containerBytes - in which case the page keeps its
+        current behaviour (embed the decoded samples) and says so truthfully. */
+    std::optional<std::vector<std::byte>> getOriginalFileBytes (const juce::String& token) const;
 
     /** Live entry count and total bytes. Sweeps dead map slots on the way. */
     Stats getStats() const;

@@ -21,6 +21,7 @@ import type {
   GuideStep,
   HostInfo,
   NativeBridge,
+  OriginalAudio,
   PlaybackState,
   TranscribeOptions,
   TranscribeProgress,
@@ -968,6 +969,27 @@ export function createMockBridge(options: MockOptions = {}): NativeBridge {
       const path = `mock-embedded/${name}`;
       audioBytes.set(path, copy);
       return { path, name, token: `mock:${path}`, bytes: copy.slice(0) };
+    },
+
+    /**
+     * The recording as it was handed over, by token — the browser twin of the shell's
+     * `/native/source/<token>.bin` route.
+     *
+     * In a browser the page always had the file's own bytes, so this is a lookup rather than
+     * a read; the point of implementing it at all is that the SAVE PATH can be exercised here.
+     * Without it, "does a saved document carry the original file or a re-encode of the
+     * analysis buffer?" would be a question only answerable inside a DAW, which is precisely
+     * where that bug survived unnoticed.
+     *
+     * `verbatim: true` because these bytes are the file the user chose. The shell has to be
+     * more careful — it can be holding a rendered capture instead.
+     */
+    async getOriginalAudio(token: string): Promise<OriginalAudio | null> {
+      if (!token.startsWith('mock:')) return null;
+      const path = token.slice('mock:'.length);
+      const bytes = audioBytes.get(path);
+      if (!bytes || bytes.byteLength === 0) return null;
+      return { bytes: new Uint8Array(bytes.slice(0)), name: path.split('/').pop() ?? path, verbatim: true };
     },
 
     /**

@@ -131,6 +131,24 @@ std::optional<juce::WebBrowserComponent::Resource> WebResources::lookup (const j
         return std::nullopt;
     }
 
+    // The ORIGINAL recording's own bytes - the file the user opened, not the
+    // downmixed, resampled analysis buffer the route above serves. The page
+    // fetches this only when it is actually writing a document, which is why it
+    // is a resource route and not part of the AudioRef reply: a hundred-megabyte
+    // take that nobody saves is never read at all, and nothing on this path is
+    // ever base64'd. See PcmStore::getOriginalFileBytes().
+    if (path.startsWith ("native/source/"))
+    {
+        const auto token = path.fromFirstOccurrenceOf ("native/source/", false, false)
+                               .upToLastOccurrenceOf (".bin", false, false);
+
+        if (auto bytes = pcm.getOriginalFileBytes (token))
+            return juce::WebBrowserComponent::Resource { std::move (*bytes),
+                                                         juce::String ("application/octet-stream") };
+
+        return std::nullopt;
+    }
+
     // ---- the bundle ---------------------------------------------------------
     if (devDir.isDirectory())
         if (auto fromDevDir = fromDisk (path))

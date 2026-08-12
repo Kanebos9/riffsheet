@@ -16,8 +16,15 @@
  *  5. an opened document never claims an Original it is about to play as silence.
  */
 
+import { strToU8, zipSync } from 'fflate';
+
 import {
   MAX_DOCUMENT_AUDIO_BYTES,
+  MAX_DOCUMENT_BYTES,
+  MAX_DOCUMENT_COMPRESSION_RATIO,
+  MAX_DOCUMENT_ENTRIES,
+  MAX_DOCUMENT_INFLATED_BYTES,
+  MAX_SCORE_JSON_BYTES,
   RIFFSHEET_DOCUMENT_VERSION,
   SESSION_VERSION,
   audioEntryName,
@@ -510,7 +517,12 @@ assert(
 // The read guard has always existed. The write guard is new: a save with no ceiling at all dies
 // somewhere inside the allocator, and "Riffsheet quit" is a worse answer than a sentence. Checked
 // by faking the length rather than by allocating half a gigabyte of test data.
-assert(MAX_DOCUMENT_AUDIO_BYTES === 512 * 1024 * 1024, 'the ceiling is 512 MB');
+// UPDATED IN THIS WAVE, and this line is the reason the number is worth asserting at all: the
+// reader, the writer and the native shell now enforce ONE ceiling. The old 512 MB was a number
+// only this file believed — the writer permitted a 512 MB audio entry the reader's own whole-file
+// check would then refuse, and the shell capped the same document at 64 MB.
+assert(MAX_DOCUMENT_AUDIO_BYTES === 128 * 1024 * 1024, 'the ceiling is 128 MB');
+assert(MAX_DOCUMENT_BYTES === MAX_DOCUMENT_AUDIO_BYTES, 'the container and the audio share one ceiling');
 
 const hugeAudio = {
   name: 'huge.wav',
@@ -521,14 +533,14 @@ const hugeAudio = {
 };
 throws(
   () => writeRiffsheetDocument({ ...document, audioData: hugeAudio }),
-  'at most 512 MB of audio'
+  'at most 128 MB of audio'
 );
 // The refusal names the size and offers a way forward rather than only saying "no".
 try {
   writeRiffsheetDocument({ ...document, audioData: hugeAudio });
 } catch (e) {
   const m = (e as Error).message;
-  assert(m.includes('513 MB'), `the write refusal should name the size, got "${m}"`);
+  assert(m.includes('129 MB'), `the write refusal should name the size, got "${m}"`);
   assert(/MusicXML|MIDI|trim/i.test(m), `the write refusal should offer a way forward, got "${m}"`);
 }
 // One byte under the ceiling is a size question, not a refusal — proved by the guard not firing.
@@ -540,12 +552,12 @@ try {
     audioData: { ...hugeAudio, bytes: { byteLength: MAX_DOCUMENT_AUDIO_BYTES } as unknown as Uint8Array }
   });
 } catch (e) {
-  guardFired = /at most 512 MB/.test((e as Error).message);
+  guardFired = /at most 128 MB/.test((e as Error).message);
 }
-assert(!guardFired, 'exactly 512 MB is allowed; only more than that is refused');
+assert(!guardFired, 'exactly 128 MB is allowed; only more than that is refused');
 
 // The read guard, on a file whose declared length is over the ceiling.
-rejects({ byteLength: MAX_DOCUMENT_AUDIO_BYTES + 1 } as unknown as Uint8Array, 'over 512 MB');
+rejects({ byteLength: MAX_DOCUMENT_BYTES + 1 } as unknown as Uint8Array, 'over 128 MB');
 
 // ---------------------------------------------------------------------------
 // 8. THE SILENT ORIGINAL — the reviewer's scenario
@@ -681,6 +693,223 @@ assert(
 // Not an array at all is "no cuts", never a throw: a bad blob costs the restore, not the app.
 assert(decodeSource({ ...uncut!, cuts: 'nope' as unknown as PersistedSource['cuts'] })!.cuts === undefined,
   'a non-array cut list is ignored rather than thrown over');
+
+// ---------------------------------------------------------------------------
+// 10. THE CONTAINER AS AN ATTACK SURFACE (codex-critique §3)
+// ---------------------------------------------------------------------------
+/*
+ * A `.riffsheet` is opened inside a DAW's process, so every byte this reader allocates is the
+ * host's memory. The old guard was one per-ENTRY ceiling, which is not a guard at all: thirty
+ * entries under it still add up, a few kilobytes of deflate can declare hundreds of megabytes,
+ * and nothing counted how many members an archive had.
+ *
+ * Every fixture below is FORGED RATHER THAN BUILT. A real 200 MB bomb would have to be allocated
+ * to be written, on the machine running the test, to prove a check that never allocates anything
+ * — so the fixtures are ordinary tiny zips whose DECLARED sizes have been rewritten in their
+ * headers, which is precisely the lie the budgets are there to catch.
+ */
+
+/** Little-endian u32 write, for patching a zip header in place. */
+function putU32(bytes: Uint8Array, at: number, value: number): void {
+  bytes[at] = value & 0xff;
+  bytes[at + 1] = (value >>> 8) & 0xff;
+  bytes[at + 2] = (value >>> 16) & 0xff;
+  bytes[at + 3] = (value >>> 24) & 0xff;
+}
+
+/** Every offset where this four-byte signature appears. */
+function signatureOffsets(bytes: Uint8Array, a: number, b: number, c: number, d: number): number[] {
+  const found: number[] = [];
+  for (let i = 0; i + 3 < bytes.length; i++) {
+    if (bytes[i] === a && bytes[i + 1] === b && bytes[i + 2] === c && bytes[i + 3] === d) found.push(i);
+  }
+  return found;
+}
+
+/**
+ * Rewrite what every member of this archive CLAIMS about itself.
+ *
+ * Local file header: compressed size at +18, uncompressed at +22.
+ * Central directory header: compressed at +20, uncompressed at +24.
+ *
+ * The fixtures are a few dozen bytes of text, chosen so a signature cannot occur inside their
+ * payload; a general-purpose patcher would have to walk from the end-of-central-directory record
+ * instead, and would be proving something about itself rather than about the reader.
+ */
+function forgeDeclaredSizes(zip: Uint8Array, originalSize: number, compressedSize: number): Uint8Array {
+  const out = zip.slice();
+  for (const at of signatureOffsets(out, 0x50, 0x4b, 0x03, 0x04)) {
+    putU32(out, at + 18, compressedSize);
+    putU32(out, at + 22, originalSize);
+  }
+  for (const at of signatureOffsets(out, 0x50, 0x4b, 0x01, 0x02)) {
+    putU32(out, at + 20, compressedSize);
+    putU32(out, at + 24, originalSize);
+  }
+  return out;
+}
+
+const bombScore = strToU8(JSON.stringify({ ...document, audioData: null }));
+
+// (a) THE BOMB. One entry, a few bytes on disk, declaring 900 MB. The old reader compared it
+//     against 512 MB and would have refused this one — the ratio budget is what catches the same
+//     trick at 400 MB, which the old ceiling waved through.
+const bomb = forgeDeclaredSizes(
+  zipSync({ 'score.json': bombScore, 'audio/take.wav': strToU8('not really audio') }),
+  900 * 1024 * 1024,
+  64
+);
+rejects(bomb, 'could not be opened safely');
+
+// The ratio budget specifically: 100 MB is under BOTH the per-entry ceiling and the old 512 MB
+// one, so nothing but the ratio can catch it — and the entry is 64 bytes long.
+const ratioBomb = forgeDeclaredSizes(
+  zipSync({ 'audio/take.wav': strToU8('not really audio') }),
+  100 * 1024 * 1024,
+  64
+);
+rejects(ratioBomb, 'expand');
+
+// (b) THE AGGREGATE. Three entries, each declaring 60 MB — under the per-entry ceiling, at a
+//     ratio of 60:1 which is under the ratio budget — and 180 MB between them. This is the shape
+//     the old reader had no answer to at all.
+const aggregate = forgeDeclaredSizes(
+  // No `score.json` in this one: the forge rewrites every member it finds, and score.json has a
+  // ceiling of its own that would fire first and prove a different check.
+  zipSync({ 'audio/one.wav': strToU8('a'), 'audio/two.wav': strToU8('b'), 'audio/three.wav': strToU8('c') }),
+  60 * 1024 * 1024,
+  1024 * 1024
+);
+rejects(aggregate, 'add up to');
+assert(
+  60 * 1024 * 1024 * 3 > MAX_DOCUMENT_INFLATED_BYTES,
+  'the aggregate fixture has to actually exceed the aggregate budget'
+);
+
+// (c) THE ENTRY COUNT. Nothing here is large; the cost is in how many times the reader is asked.
+const manyEntries: Record<string, Uint8Array> = { 'score.json': bombScore };
+for (let i = 0; i < MAX_DOCUMENT_ENTRIES + 4; i++) manyEntries[`pad/${i}.bin`] = strToU8('x');
+rejects(zipSync(manyEntries), 'at most');
+
+// (d) …and an ordinary document is untouched by all four budgets. The guard is only worth having
+//     if it is invisible to every real file.
+const ordinary = readRiffsheetDocument(written);
+assert(ordinary.audioData?.bytes.length === wav.length, 'a real document still opens with its audio');
+assert(MAX_SCORE_JSON_BYTES < MAX_DOCUMENT_AUDIO_BYTES, 'score.json is capped tighter than the audio');
+assert(MAX_DOCUMENT_COMPRESSION_RATIO >= 100, 'the ratio budget leaves room for real JSON');
+
+// ---------------------------------------------------------------------------
+// 11. A DAMAGED DOCUMENT REFUSES TO OPEN — it does not half-open
+// ---------------------------------------------------------------------------
+/*
+ * `decodeSource` clamps and drops, which is right for a SESSION blob: losing a restore costs the
+ * user their view state, and refusing to boot costs them the app. Applied to a FILE they opened
+ * by name it produces the worst outcome available — a document that opens looking nearly right,
+ * missing a bar of notes because one array was truncated, which they then edit and save over the
+ * original.
+ *
+ * Every fixture here is the v1 JSON container, because `hydrate` is the one gate both containers
+ * pass through and JSON is the form a corruption is legible in.
+ */
+function damagedDocument(mutate: (doc: Record<string, unknown>) => void): Uint8Array {
+  const doc = JSON.parse(JSON.stringify({ ...document, audioData: null })) as Record<string, unknown>;
+  mutate(doc);
+  return utf8(JSON.stringify(doc));
+}
+
+const peakSource = encodeSource({
+  ...(decodeSource(source) as SourceAudio),
+  peaks: { min: new Float32Array([-0.5, -0.2, -0.9]), max: new Float32Array([0.5, 0.2, 0.9]) }
+})!;
+// A HEALTHY peaks block opens, so the checks below are about damage and not about peaks existing.
+readRiffsheetDocument(damagedDocument((doc) => (doc.source = peakSource)));
+
+// `peaks.buckets` reaches `new Float32Array(buckets)`. A count that disagrees with the bytes
+// beside it used to draw a partly-empty waveform; a count of 2^31 used to be an allocation.
+rejects(
+  damagedDocument((doc) => (doc.source = { ...peakSource, peaks: { ...peakSource.peaks!, buckets: 9_000_000 } })),
+  'buckets'
+);
+rejects(
+  damagedDocument((doc) => (doc.source = { ...peakSource, peaks: { ...peakSource.peaks!, buckets: 1 << 30 } })),
+  'buckets'
+);
+rejects(
+  damagedDocument((doc) => (doc.source = { ...peakSource, peaks: { ...peakSource.peaks!, buckets: 0 } })),
+  'buckets'
+);
+rejects(
+  damagedDocument((doc) => (doc.source = { ...peakSource, peaks: { ...peakSource.peaks!, min: 'not base64!!' } })),
+  'waveform'
+);
+
+// The notes. A NaN start is a rectangle that is never painted and a note that is never heard.
+rejects(
+  damagedDocument((doc) => {
+    (doc.source as PersistedSource).detected!.notes[1] = { startSec: null, endSec: 1, midi: 40 } as never;
+  }),
+  'no usable time or pitch'
+);
+rejects(
+  damagedDocument((doc) => {
+    (doc.source as PersistedSource).detected!.notes = 'nope' as never;
+  }),
+  'not a list of notes'
+);
+rejects(
+  damagedDocument((doc) => {
+    (doc.source as PersistedSource).detected!.notes[0] = { startSec: 2, endSec: 1, midi: 40 };
+  }),
+  'ends before it starts'
+);
+
+// The beat grid.
+rejects(
+  damagedDocument((doc) => {
+    (doc.source as PersistedSource).detected!.beats = [0.5, Number.NaN, 1.5] as never;
+  }),
+  'not a time'
+);
+
+// The cuts. `normalizeCuts` would quietly repair these; a document may not need repairing.
+rejects(
+  damagedDocument((doc) => {
+    (doc.source as PersistedSource).cuts = [{ fromSec: 1, toSec: 'x' }] as never;
+  }),
+  'no usable range'
+);
+
+// The imported parts, whose note arrays used to be cast wholesale.
+rejects(
+  damagedDocument((doc) => {
+    (doc.source as PersistedSource).importedParts = [
+      { id: 'p1', name: 'Guitar', nudgeMs: 0, notes: [{ startSec: 0, endSec: 'x', midi: 40 }] }
+    ] as never;
+  }),
+  'no usable time or pitch'
+);
+rejects(
+  damagedDocument((doc) => {
+    (doc.source as PersistedSource).importedParts = [
+      { id: 'p1', name: 'Guitar', nudgeMs: 0, notes: [{ startSec: 0, endSec: 1, midi: 40 }] },
+      { id: 'p1', name: 'Bass', nudgeMs: 0, notes: [{ startSec: 0, endSec: 1, midi: 28 }] }
+    ] as never;
+  }),
+  'share the identity'
+);
+
+// The symbolic original. Left unchecked, this throws out of `atob` at EXPORT time — days after
+// the file was opened, in a save button, about a file the user is no longer thinking about.
+rejects(damagedDocument((doc) => (doc.sourceMidi = 'not base64!!!')), 'original MIDI');
+rejects(damagedDocument((doc) => (doc.sourceMidi = 42 as never)), 'original MIDI');
+
+// And the session blob keeps the OPPOSITE policy, deliberately: the same damage costs a restore
+// and never an exception on the way up.
+assert(
+  readSession(JSON.stringify({ v: SESSION_VERSION, app: 'riffsheet', source: { peaks: { buckets: 1 << 30 } } })) !==
+    undefined,
+  'a damaged session blob is answered, never thrown over'
+);
 
 // ---------------------------------------------------------------------------
 // H4 — settings must not leak from one project into the next

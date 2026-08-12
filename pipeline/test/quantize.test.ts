@@ -6,7 +6,7 @@ const TPB = 12;
 function notes(pairs: [number, number][]): QuantNote[] {
   return pairs.map(([start, off], i) => ({ id: `n${i}`, rawStartTick: start, rawOffTick: off }));
 }
-const opts = (grid: 'auto' | '1/8' | '1/16' | 'free' = 'auto') => ({
+const opts = (grid: 'auto' | '1/4' | '1/8' | '1/16' | 'free' = 'auto') => ({
   grid,
   ticksPerBeat: TPB,
   compound: false,
@@ -41,9 +41,33 @@ describe('STATION 1b — onset placement', () => {
   });
 
   it("grid:'1/8' never offers a sixteenth", () => {
+    // A GRID NAME IS AN ABSOLUTE NOTE VALUE. This case used to run at `ticksPerBeat: 12` — an
+    // eighth-note beat, as in 3/8 — and assert `basicQuantTicks === 6`, which at 24 divisions
+    // per quarter is a SIXTEENTH: the very glyph the test's own name forbids. That was finding
+    // 13's bug written down as an expectation. On a quarter-note beat the eighth is 12 ticks.
+    const q = quantizeOnsets(notes([[0, 6], [6, 12], [12, 18], [18, 24]]), { ...opts('1/8'), ticksPerBeat: 24 });
+    expect(q.basicQuantTicks).toBe(12);
+    for (const n of q.notes) expect(n.startTick % 12).toBe(0);
+  });
+
+  it("grid:'1/8' still means an EIGHTH when the tracked beat is itself an eighth (3/8)", () => {
+    // ticksPerBeat 12 is an eighth-note pulse. The finest word the page may say is still an
+    // eighth, not the half-of-a-beat sixteenth the relative ladder used to hand out.
     const q = quantizeOnsets(notes([[0, 3], [3, 6], [6, 9], [9, 12]]), opts('1/8'));
-    expect(q.basicQuantTicks).toBe(6);
-    for (const n of q.notes) expect(n.startTick % 6).toBe(0);
+    expect(q.basicQuantTicks).toBe(12);
+    for (const n of q.notes) expect(n.startTick % 12).toBe(0);
+  });
+
+  it("grid:'1/4' means a QUARTER in 3/8, not the eighth-note beat", () => {
+    // The window widens to the least common multiple (24) so a quarter is expressible at all.
+    const q = quantizeOnsets(notes([[0, 12], [24, 36], [48, 60]]), { ...opts('1/4'), ticksPerBeat: 12 });
+    expect(q.basicQuantTicks).toBe(24);
+    for (const n of q.notes) expect(n.startTick % 24).toBe(0);
+  });
+
+  it("grid:'auto' never reaches a 1/32 lattice in an x/8 meter", () => {
+    const q = quantizeOnsets(notes([[0, 3], [3, 6], [6, 9], [9, 12]]), opts('auto'));
+    expect(q.basicQuantTicks).toBeGreaterThanOrEqual(6);
   });
 });
 

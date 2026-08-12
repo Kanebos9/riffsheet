@@ -14,8 +14,11 @@ class PcmStore;
     Routes:
       /                      -> /index.html
       /juce/index.js         -> JUCE's WebView frontend library (packed in)
-      /native/pcm/<tok>.f32  -> raw Float32 mono PCM for a PcmStore token
-      anything else          -> looked up in the webcore bundle
+      /native/pcm/<tok>.f32    -> raw Float32 mono PCM for a PcmStore token
+      /native/source/<tok>.bin -> the ORIGINAL recording's own bytes, read from
+                                  disk on demand (nothing is held for it, and a
+                                  take nobody saves is never read)
+      anything else            -> looked up in the webcore bundle
 
     The bundle is normally the zip embedded in the binary. If the environment
     variable RIFFSHEET_WEBCORE_DIR points at a directory, that wins - which is

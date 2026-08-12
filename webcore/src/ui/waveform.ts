@@ -187,11 +187,12 @@
 
 import type { TrimResult } from '../audio/trim';
 import type { OnsetResult } from '../audio/onsets';
-import { TIMELINE_GUTTER_PX, wheelZoomFactor, WHEEL_ZOOM_MAX_STEP, type TimeAnchor } from '../view/pianoroll';
-import { PinchAccumulator, type ViewportCommand } from '../view/timeAxis';
-
-/** One pinch, one zoom, whichever road WebKit sends it down. See `PianoRoll`'s constant. */
-const PINCH_DEDUPE_MS = 250;
+import { TIMELINE_GUTTER_PX, type TimeAnchor } from '../view/pianoroll';
+import { type ViewportCommand } from '../view/timeAxis';
+// One pinch, one zoom, whichever road WebKit sends it down — and one copy of that rule for all
+// three surfaces, which is what view/gesture.ts is. The strip's own copy (a `claimPinch`, a
+// `gestureScale` baseline and a 250 ms timer) is gone with it.
+import { PinchGesture } from '../view/gesture';
 
 /** A stretch of the RECORDING, in recording seconds. `fromSec` is always the earlier one. */
 export interface WaveformSelection {
@@ -367,6 +368,7 @@ export class WaveformStrip {
     this.canvas.addEventListener('wheel', this.onWheel, { passive: false });
     this.canvas.addEventListener('gesturestart', this.onGestureStart, { passive: false });
     this.canvas.addEventListener('gesturechange', this.onGestureChange, { passive: false });
+    this.canvas.addEventListener('gestureend', this.onGestureEnd, { passive: false });
     window.addEventListener('resize', this.draw);
     window.addEventListener('keydown', this.onKeyDown);
   }
@@ -1065,11 +1067,21 @@ export class WaveformStrip {
   private onWheel = (e: WheelEvent): void => {
     if (e.ctrlKey || e.metaKey) {
       e.preventDefault();
-      if (e.altKey) return;
       const d = e.deltaY || e.deltaX;
       if (d === 0) return;
-      if (!this.claimPinch('wheel')) return;
-      this.emitZoom(wheelZoomFactor(d, e.deltaMode), e.clientX);
+      // The road is claimed even for an Option+pinch this pane cannot use, so the GestureEvent
+      // copy of the same gesture cannot claim the free road and apply it elsewhere.
+      const out = this.pinch.read({
+        kind: 'wheel',
+        atMs: performance.now(),
+        delta: d,
+        deltaMode: e.deltaMode,
+        ctrlKey: e.ctrlKey,
+        metaKey: e.metaKey,
+        altKey: e.altKey
+      });
+      if (out.kind !== 'zoom' || out.axis !== 'time') return;
+      this.emitZoom(out.factor, e.clientX);
       return;
     }
     const lines = e.deltaMode === 1 ? 16 : e.deltaMode === 2 ? 400 : 1;
@@ -1085,44 +1097,38 @@ export class WaveformStrip {
     });
   };
 
-  private gestureScale = 1;
-  private pinch = new PinchAccumulator();
-  private lastPinchMs = 0;
-  private pinchRoad: 'wheel' | 'gesture' | null = null;
-
-  /** ONE PINCH, ONE ZOOM. The same rule the roll and the sheet apply, on the third surface. */
-  private claimPinch(road: 'wheel' | 'gesture'): boolean {
-    const t = performance.now();
-    if (this.pinchRoad !== null && this.pinchRoad !== road && t - this.lastPinchMs < PINCH_DEDUPE_MS) {
-      return false;
-    }
-    this.pinchRoad = road;
-    this.lastPinchMs = t;
-    return true;
-  }
+  /** ONE PINCH, ONE ZOOM. The roll's and the sheet's law, on the third surface. view/gesture.ts. */
+  private pinch = new PinchGesture();
 
   private onGestureStart = (e: Event): void => {
     e.preventDefault();
-    this.gestureScale = (e as Event & { scale?: number }).scale ?? 1;
-    this.pinch.reset();
+    this.pinch.read({
+      kind: 'gesturestart',
+      atMs: performance.now(),
+      scale: (e as Event & { scale?: number }).scale
+    });
   };
 
   private onGestureChange = (e: Event): void => {
     const g = e as Event & { scale?: number; altKey?: boolean; clientX?: number };
-    const scale = g.scale;
-    if (!scale || !Number.isFinite(scale) || scale <= 0) return;
+    if (!g.scale || !Number.isFinite(g.scale) || g.scale <= 0) return;
     e.preventDefault();
-    const ratio = scale / (this.gestureScale > 0 ? this.gestureScale : 1);
-    this.gestureScale = scale;
-    if (g.altKey) return;
-    const stepped = this.pinch.take(ratio);
-    if (stepped === null) return;
-    if (!this.claimPinch('gesture')) return;
+    const out = this.pinch.read({
+      kind: 'gesturechange',
+      atMs: performance.now(),
+      scale: g.scale,
+      altKey: g.altKey
+    });
+    // The strip has one axis, like the sheet: a pitch zoom is swallowed, not forwarded.
+    if (out.kind !== 'zoom' || out.axis !== 'time') return;
     const rect = this.canvas.getBoundingClientRect();
-    this.emitZoom(
-      Math.min(WHEEL_ZOOM_MAX_STEP, Math.max(1 / WHEEL_ZOOM_MAX_STEP, stepped)),
-      g.clientX ?? rect.left + rect.width / 2
-    );
+    this.emitZoom(out.factor, g.clientX ?? rect.left + rect.width / 2);
+  };
+
+  /** The end of contact, which no surface listened for until now. See view/gesture.ts. */
+  private onGestureEnd = (e: Event): void => {
+    e.preventDefault();
+    this.pinch.read({ kind: 'gestureend', atMs: performance.now() });
   };
 
   /** A client x, as a fraction of the plot, as a zoom command. The gutter anchors at the edge. */
@@ -1574,6 +1580,7 @@ export class WaveformStrip {
     this.canvas.removeEventListener('wheel', this.onWheel);
     this.canvas.removeEventListener('gesturestart', this.onGestureStart);
     this.canvas.removeEventListener('gesturechange', this.onGestureChange);
+    this.canvas.removeEventListener('gestureend', this.onGestureEnd);
     window.removeEventListener('resize', this.draw);
     window.removeEventListener('keydown', this.onKeyDown);
   }

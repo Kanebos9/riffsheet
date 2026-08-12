@@ -36,7 +36,7 @@ import type { NativeBridge } from '../bridge';
 import { RIFFSHEET_LIMITS } from '../bridge/types';
 import type { TrimResult } from '../audio/trim';
 import type { AppSettings, HostGrid, SourceAudio } from './state';
-import { MAX_SCORE_PARTS, type ImportedPart } from '../score/parts';
+import { cleanPartName, MAX_SCORE_PARTS, type ImportedPart } from '../score/parts';
 import { normalizeCuts, type CutSpan } from '../edit/cuts';
 
 /** Raise this AND add a case in `readSession()` when the shape has to change under people. */
@@ -104,6 +104,24 @@ export interface PersistedSource {
    */
   importedParts?: ImportedPart[];
   partOrder?: string[];
+  /**
+   * The live part's name, when the player has typed one (`state.ts §SourceAudio.livePartName`).
+   *
+   * STILL DOCUMENT v4, and that is a decision rather than an oversight. The field is purely
+   * ADDITIVE and it degrades to exactly the documented fallback: a reader that has never heard of
+   * it ignores one key and shows the live part under its derived name, which is what the document
+   * said before anybody renamed anything. Bumping to v5 would instead make every older Riffsheet
+   * REFUSE the whole file — `readRiffsheetDocument` accepts v1 up to its own version and no
+   * further — so the cost of the bump is the entire document and the benefit is one word. The
+   * version moves when a reader would otherwise be WRONG about the music, as v4 did for parts (a
+   * v3 reader would have dropped them and written the file back without them). Losing an override
+   * is not that: nothing is silently discarded on a round trip through a new reader, and an old
+   * one shows a name that is still true of the instrument.
+   *
+   * Omitted rather than written empty, for the same reason `cuts` and `importedParts` are: a take
+   * nobody has renamed must serialise to the bytes it always did.
+   */
+  livePartName?: string;
 }
 
 export interface PersistedSession {
@@ -217,7 +235,10 @@ export function encodeSource(source: SourceAudio | null): PersistedSource | null
           notes: part.notes
         }))
       : undefined,
-    partOrder: source.importedParts?.length ? source.partOrder?.slice() : undefined
+    partOrder: source.importedParts?.length ? source.partOrder?.slice() : undefined,
+    // The live part's name is NOT conditional on there being imported parts: a solo take is the
+    // commonest thing to rename, and `partOrder` above is only written beside a list it orders.
+    livePartName: cleanPartName(source.livePartName) || undefined
   };
 }
 
@@ -253,7 +274,12 @@ export function decodeSource(source: PersistedSource | null | undefined): Source
     importedParts: decodeImportedParts(source.importedParts),
     partOrder: Array.isArray(source.partOrder)
       ? source.partOrder.filter((key): key is string => typeof key === 'string')
-      : undefined
+      : undefined,
+    // Through the same gate the rename itself goes through, so a hand-edited blob cannot carry a
+    // 4000-character staff label or a name made entirely of spaces. Empty stays ABSENT rather than
+    // becoming '': `livePartName()` treats both the same, and one representation of "no override"
+    // is what keeps the round trip byte-stable.
+    livePartName: cleanPartName(source.livePartName) || undefined
   };
 }
 
@@ -1205,6 +1231,11 @@ export function assertDocumentSource(value: unknown): void {
   }
   assertCuts(source.cuts);
   assertImportedParts(source.importedParts, source.partOrder);
+  // A name is a name. Anything else in the field is a damaged document rather than something to
+  // quietly ignore — `decodeSource` trims and bounds a STRING, and cannot make one out of a list.
+  if (source.livePartName !== undefined && typeof source.livePartName !== 'string') {
+    throw damaged('the part name is not a name');
+  }
 }
 
 /**

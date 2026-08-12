@@ -20,7 +20,11 @@
 import { buildRiffScore, type BuildRequest } from '../src/pipeline';
 import {
   buildPartedRiffScore,
+  cleanPartName,
+  importedPartName,
   LIVE_PART_ID,
+  livePartName,
+  MAX_PART_NAME_LENGTH,
   nudgeStepMs,
   orderedPartSlots,
   type ImportedPart
@@ -283,6 +287,70 @@ assert(
 assert(
   orderedPartSlots([guitar], ['imp1'])[0].kind === 'live',
   'an order that forgot the live take gets it back, at the top'
+);
+
+// ---------------------------------------------------------------------------
+// 6. The live part's NAME — derived by default, overridden when the player types one (Z2b)
+// ---------------------------------------------------------------------------
+
+assert(livePartName(settings) === 'Bass', 'a bass take is called Bass when nobody has said otherwise');
+assert(livePartName(settings, 'Rhythm gtr') === 'Rhythm gtr', 'a stored name wins over the instrument');
+assert(livePartName(settings, '   ') === 'Bass', 'a name of nothing but spaces is no name at all');
+assert(livePartName(settings, undefined) === 'Bass', 'an absent override falls back');
+assert(
+  livePartName(settings, 'x'.repeat(200)).length === MAX_PART_NAME_LENGTH,
+  'an over-long name is bounded rather than printed'
+);
+assert(cleanPartName('  Low end  ') === 'Low end', 'names are trimmed on the way in');
+assert(cleanPartName(undefined) === '', 'an absent name cleans to nothing');
+assert(importedPartName(undefined, 'Guitar demo.musicxml') === 'Guitar demo', 'a file name names a part');
+
+// The override travels on the slot, so one resolved list feeds the menu AND the build.
+const namedSlots = orderedPartSlots(undefined, undefined, ' Low end ');
+assert(namedSlots.length === 1 && namedSlots[0].kind === 'live', 'a renamed take is still one slot');
+assert(
+  namedSlots[0].kind === 'live' && namedSlots[0].name === 'Low end',
+  'the slot carries the cleaned override'
+);
+assert(
+  orderedPartSlots(undefined, undefined, '  ')[0].kind === 'live' &&
+    (orderedPartSlots(undefined, undefined, '  ')[0] as { name?: string }).name === undefined,
+  'an empty override leaves the slot with no name at all'
+);
+
+// …and it reaches the page and the file. A one-part build is the case that matters: it is the
+// commonest document this app makes and the one `buildScore` cannot name.
+const renamed = buildPartedRiffScore(request, settings, orderedPartSlots(undefined, undefined, 'Low end'));
+assert(renamed.data.tracks.length === 1, 'a renamed take is still a one-track score');
+assert(renamed.data.tracks[0].name === 'Low end', 'the engraved track carries the typed name');
+assert(renamed.parts[0].name === 'Low end', 'so does the parts sidecar the UI reads');
+assert(
+  renamed.musicxml().includes('<part-name>Low end</part-name>'),
+  'and so does the exported MusicXML'
+);
+// The abbreviation is DERIVED from the new name, never sliced off a stale one.
+assert(
+  renamed.data.tracks[0].shortName === 'Low end',
+  `a short name is printed whole (got ${renamed.data.tracks[0].shortName})`
+);
+const renamedLong = buildPartedRiffScore(
+  request,
+  settings,
+  orderedPartSlots(undefined, undefined, 'Rhythm guitar')
+);
+assert(
+  renamedLong.data.tracks[0].shortName === 'Rhyt. Gtr.',
+  `a long name abbreviates by the pipeline's rule (got ${renamedLong.data.tracks[0].shortName})`
+);
+// Two parts: the live half follows the override, the imported half is untouched by it.
+const bothNamed = buildPartedRiffScore(
+  request,
+  settings,
+  orderedPartSlots([guitar], [LIVE_PART_ID, 'imp1'], 'Low end')
+);
+assert(
+  bothNamed.parts.map((p) => p.name).join(',') === 'Low end,Guitar',
+  'the override names the take and only the take'
 );
 
 if (failures > 0) {

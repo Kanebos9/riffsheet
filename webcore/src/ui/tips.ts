@@ -320,8 +320,12 @@ export const TIPS = {
   rollEditing:
     'Lets you change notes on the piano roll. Every change rewrites the sheet and the tab to match, and ⌘Z takes it back.',
   tooltips: 'Turn these explanations on or off.',
-  engineModel:
-    'Which set of weights does the listening. Bigger is more accurate but slower and hungrier for memory; "Choose for me" picks the biggest one installed that still fits this machine.',
+  /*
+   * `engineModel` STOOD HERE, explaining a drop-down that no longer exists (Z5b/c). The entry is
+   * deleted with the control rather than left as a tooltip for nothing: it also said "picks the
+   * biggest one installed that still fits this machine", which is not the rule any more — `auto`
+   * takes the LIGHTEST installed one, and the card reports what actually got loaded.
+   */
   engineStatus: 'Whether the part that listens to your audio is installed, and what it is doing right now.',
   engineBusy:
     'Another Riffsheet is using the transcription engine. There is only one of it and it does one job at a time, so yours starts as soon as that one finishes.',

@@ -65,8 +65,23 @@ export interface ImportedPart {
   nudgeMs: number;
 }
 
-/** A slot in printed order, top to bottom. */
-export type PartSlot = { kind: 'live' } | { kind: 'imported'; part: ImportedPart };
+/**
+ * A slot in printed order, top to bottom.
+ *
+ * The live slot carries the player's NAME OVERRIDE when there is one (`SourceAudio.livePartName`),
+ * so that everything downstream of `orderedPartSlots` — the menu, the build, the emitters — reads
+ * one resolved list rather than each consumer having to remember to consult the document as well
+ * as the settings. Absent means "no override", and `livePartName()` derives the name instead.
+ */
+export type PartSlot = { kind: 'live'; name?: string } | { kind: 'imported'; part: ImportedPart };
+
+/** The longest a part name may be, typed or stored. Imported and live alike. */
+export const MAX_PART_NAME_LENGTH = 40;
+
+/** A typed or stored part name, as it is allowed to exist: trimmed, bounded, or nothing at all. */
+export function cleanPartName(value: string | undefined | null): string {
+  return typeof value === 'string' ? value.trim().slice(0, MAX_PART_NAME_LENGTH) : '';
+}
 
 /** What the chip row and the playback filter need to know about one engraved track. */
 export interface ScorePartInfo {
@@ -112,17 +127,22 @@ export function isNotationOnlyTrack(score: RiffScore, trackIndex: number): boole
  */
 export function orderedPartSlots(
   imported: ReadonlyArray<ImportedPart> | undefined,
-  order: ReadonlyArray<string> | undefined
+  order: ReadonlyArray<string> | undefined,
+  liveName?: string
 ): PartSlot[] {
   const parts = (imported ?? []).slice(0, MAX_SCORE_PARTS - 1);
   const byId = new Map(parts.map((p) => [p.id, p]));
   const slots: PartSlot[] = [];
   const seen = new Set<string>();
+  // The override travels on the slot rather than being looked up again by every consumer. Cleaned
+  // here as well as on the way in, because a hand-edited document reaches this function too.
+  const live = cleanPartName(liveName);
+  const liveSlot = (): PartSlot => (live ? { kind: 'live', name: live } : { kind: 'live' });
   for (const key of order ?? []) {
     if (seen.has(key)) continue;
     if (key === LIVE_PART_ID) {
       seen.add(key);
-      slots.push({ kind: 'live' });
+      slots.push(liveSlot());
       continue;
     }
     const part = byId.get(key);
@@ -130,7 +150,7 @@ export function orderedPartSlots(
     seen.add(key);
     slots.push({ kind: 'imported', part });
   }
-  if (!seen.has(LIVE_PART_ID)) slots.unshift({ kind: 'live' });
+  if (!seen.has(LIVE_PART_ID)) slots.unshift(liveSlot());
   for (const part of parts) {
     if (!seen.has(part.id)) slots.push({ kind: 'imported', part });
   }
@@ -143,13 +163,21 @@ export function partOrderOf(slots: ReadonlyArray<PartSlot>): string[] {
 }
 
 /**
- * What the live part is CALLED — on its chip and on the page, which must be the same word.
+ * What the live part is CALLED — on its menu entry and on the page, which must be the same word.
  *
- * Deliberately short and derived from the settings rather than from the built IR: the chip row
+ * Deliberately short and derived from the settings rather than from the built IR: the part menu
  * is drawn before (and independently of) any build, and `defaultPartName(ir)` would give the
- * page a name the row could not know.
+ * page a name the menu could not know.
+ *
+ * `override` IS THE PLAYER'S OWN WORD AND IT WINS. It is `SourceAudio.livePartName`, typed into
+ * the same two fields an imported part is renamed from — the menu's Rename and the name printed
+ * on the sheet — and stored on the document. Empty, missing, or whitespace falls through to the
+ * derived word below, which is what makes "clear the box" mean "go back to following the
+ * instrument" rather than "print an unnamed staff".
  */
-export function livePartName(settings: AppSettings): string {
+export function livePartName(settings: AppSettings, override?: string): string {
+  const chosen = cleanPartName(override);
+  if (chosen) return chosen;
   switch (settings.tabMode) {
     case 'bass':
       return 'Bass';
@@ -164,10 +192,10 @@ export function livePartName(settings: AppSettings): string {
 
 /** A part name out of a MusicXML file: the track's own name, or the file name. */
 export function importedPartName(trackName: string | undefined, fileName: string): string {
-  const named = (trackName ?? '').trim();
-  if (named) return named.slice(0, 40);
-  const base = fileName.replace(/\.[^.]+$/, '').trim();
-  return (base || 'Part').slice(0, 40);
+  const named = cleanPartName(trackName);
+  if (named) return named;
+  const base = fileName.replace(/\.[^.]+$/, '');
+  return cleanPartName(base) || 'Part';
 }
 
 /**
@@ -283,10 +311,12 @@ export function buildPartedRiffScore(
     ...(request.blankBars !== undefined ? { blankBars: request.blankBars } : {})
   };
 
-  const liveName = livePartName(settings);
+  // The override on the live slot when there is one; the derived word otherwise. Resolved once
+  // here so the name in the sheet, in the MusicXML and in the `parts` sidecar is literally the
+  // same string.
   const parts: ScorePart[] = slots.map((slot) =>
     slot.kind === 'live'
-      ? { notes: request.notes, role: 'live', name: liveName }
+      ? { notes: request.notes, role: 'live', name: livePartName(settings, slot.name) }
       : {
           notes: referenceNotes(slot.part.notes),
           role: 'imported',

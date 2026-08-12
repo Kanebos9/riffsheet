@@ -234,13 +234,31 @@ input[type="number"], input[type="text"], select {
  * to be able to hit.
  */
 .app-header > button { flex: 0 0 auto; white-space: nowrap; }
-/* Shrink before anything else does — the export buttons must never wrap off-screen. */
+/*
+ * THE TAKE'S NAME, WHOLE OR NOT AT ALL (Z6).
+ *
+ * It was `flex: 1 1 6ch; min-width: 0` with an ellipsis, on the reasoning written in `.view-tools`
+ * below: it is "a name you can still hover for, not a control you have to be able to hit", so it
+ * was the thing the row squeezed. Measured at 900px that squeeze was 161px of name in a 36px box —
+ * "demo — trip…", four characters and a full stop's worth of a document's identity — which is the
+ * same fault as the clipped clock and the "heard in y…" the transport was rewritten to remove. A
+ * name cut to four letters is not a shorter name; it is a different one.
+ *
+ * So it does not shrink: `min-width: max-content` puts a floor under `flex-shrink` at its own
+ * text. What happens when the row genuinely cannot afford it is decided in JS rather than at a
+ * breakpoint, because the width needed is the length of somebody's file name and no media query
+ * can know it — `ui/app.ts §fitTopBars` measures the row and DROPS the name whole when it will not
+ * go, exactly as the tempo detail is dropped whole below 1150px. It is still one press away in the
+ * Main menu, which prints it under "Current work".
+ *
+ * It stays `flex: 0 1 auto` rather than growing: the space it used to soak up now belongs to the
+ * spacer, so the export buttons and the gear stay where they are as the name changes length.
+ */
 .app-header .filename {
   font-weight: 600;
-  flex: 1 1 6ch;
-  min-width: 0;
+  flex: 0 1 auto;
+  min-width: max-content;
   overflow: hidden;
-  text-overflow: ellipsis;
   white-space: nowrap;
 }
 .app-header .spacer { flex: 0 1 auto; }
@@ -258,10 +276,19 @@ input[type="number"], input[type="text"], select {
  */
 .app-header .engine-chip {
   font-size: 11px;
-  flex: 0 1 auto;
-  min-width: 7em;
-  overflow: hidden;
-  text-overflow: ellipsis;
+  /*
+   * NOT SHRINKABLE ANY MORE (Z6). It was `flex: 0 1 auto` with a 7em floor and an ellipsis, which
+   * is how "MuScriptor running — click to stop" — 213px of sentence — arrived on a squeezed header
+   * as "MuScriptor running — cli…". A control whose label is cut in half is a control nobody can
+   * be sure of pressing, and this one ends somebody's process.
+   *
+   * The fix is the label, not the box: it says "Stop MuScriptor" now (`ui/app.ts
+   * §refreshEngineChip`) — a verb and its object, about 100px, which the row can afford at every
+   * width. The memory figure and the rest of the explanation are in the tooltip, where they were
+   * already.
+   */
+  flex: 0 0 auto;
+  min-width: max-content;
   white-space: nowrap;
 }
 
@@ -614,6 +641,15 @@ input[type="number"], input[type="text"], select {
   border: 1px solid var(--border);
   border-radius: 999px;
   cursor: pointer;
+  /*
+   * THE ARROW'S ROOM, RESTATED (Z6). `.app-header select` above reserves `SELECT_ARROW_PX` for the
+   * chevron it draws, and `.view-tools .chip` — two classes to that rule's one class and one type
+   * — was overriding it back to the chip's own 9px. The result is not a narrow arrow: `fitSelects`
+   * cuts the box to `text + padding`, so the last word of "Grid: Triplet (1/12)" was sitting under
+   * a chevron drawn on top of it, with no overflow anywhere to show for it. Restated here at a
+   * specificity that survives, and it must move with `SELECT_ARROW_PX`.
+   */
+  padding-right: 20px;
 }
 /*
  * …and a chip select that is DOING something is lit, like any other chip.
@@ -718,7 +754,7 @@ input[type="number"], input[type="text"], select {
  * THE DROP-DOWN ARROW IS OURS, and that is what turns the width above from a guess into a
  * measurement.
  *
- * `fitNotationBar` sizes each box to the words it is SHOWING plus the room its arrow needs. With
+ * `fitTopBars` sizes each box to the words it is SHOWING plus the room its arrow needs. With
  * the PLATFORM arrow that second number is not knowable from the page: the engine reserves a
  * glyph region of its own choosing, and it does not shrink in step with the `zoom` on this bar.
  * Measured at the 390px floor, where the bar is drawn at about 0.62: the Key box was sized with
@@ -729,9 +765,19 @@ input[type="number"], input[type="text"], select {
  *
  * `appearance: none` plus a drawn chevron makes the reserve exactly the padding written here, at
  * every zoom and on every platform, so `fitSelects` can stop estimating and simply add the frame.
- * KEEP `padding-right` AND `NOTATION_ARROW_PX` IN STEP — app.ts measures against this number.
+ * KEEP `padding-right` AND `SELECT_ARROW_PX` IN STEP — app.ts measures against this number.
  */
-.notation-toolbar select {
+/*
+ * THE SAME FRAME ON EVERY BAR (Z6). The header (its view chips) and the transport carry
+ * drop-downs too, and `fitSelects` now sizes all three bars — so all three need the arrow to be
+ * OURS rather than the platform's, or the two rows it did not previously cover would be fitted
+ * against a reserve nobody can measure. Measured before this: the tempo source was clipping
+ * "From recording" at 900px, and the roll's Snap chip at 390px, with 7 to 9px of platform padding
+ * where the arrow wanted about 20.
+ */
+.notation-toolbar select,
+.app-header select,
+.transport select {
   appearance: none;
   -webkit-appearance: none;
   padding-right: 20px;
@@ -937,10 +983,22 @@ input[type="number"], input[type="text"], select {
  */
 /* The right-hand end of the transport row, where the BPM box used to live on its own (G4). It
    shrinks as one control: the select gives up width first, the number box never does. */
-.tempo-source { gap: 6px; flex: 0 1 auto; min-width: 0; }
-.tempo-source-select { max-width: 12em; min-width: 4.5em; flex: 0 1 auto; }
+.tempo-source { gap: 6px; flex: 0 0 auto; min-width: 0; }
+/*
+ * "From re…" (Z6). This box was `max-width: 12em; min-width: 4.5em; flex: 0 1 auto`, so the row
+ * took its slack out of the one control on it whose text names what the tempo IS: measured at
+ * 900px, 92px of "From recording" in 43px of room, and at the 390px floor 92 in 89. Both were
+ * clipped by the platform's own `<select>` rendering, which draws no ellipsis of its own — the
+ * text simply stopped.
+ *
+ * Both limits are gone and the box is sized in JS to the option it is SHOWING, by the same
+ * `fitSelects` that has sized the notation bar's drop-downs since the same bug was fixed there
+ * (`ui/app.ts §fitTopBars`). A `<select>` reserves its LONGEST option by default, so fitting it to
+ * the shown one takes width off this row as well as putting the text back.
+ */
+.tempo-source-select { flex: 0 0 auto; }
 .tempo-source input[data-role="bpm"] { flex: 0 0 auto; }
-.tempo-source select[data-role="timesig"] { min-width: 4em; flex: 0 1 auto; }
+.tempo-source select[data-role="timesig"] { flex: 0 0 auto; }
 .tempo-source input[readonly] {
   /* Read-only, not broken. Dimmed enough to say "not yours to type in right now" and still
      legible, because the NUMBER is what most people came to this row to read. */
@@ -971,9 +1029,32 @@ input[type="number"], input[type="text"], select {
   overflow: visible;
 }
 
-/* The first thing to give. A blend fader is still usable at 60px and the row is not usable at
-   all if this refuses to move. */
-.fader { display: flex; align-items: center; gap: 8px; min-width: 0; flex: 1 1 auto; }
+/*
+ * THE SOUND ROW DOES NOT SHRINK EITHER (Z6).
+ *
+ * `.transport > *` gives every child `min-width: 0`, which for a `.row` means "shrink past your own
+ * contents". Measured at 900px: 148px of "Sound · Finger bass" in a 126px box, its `<select>`
+ * spilling under the control beside it with no ellipsis and no scrollbar to admit it. The same rule
+ * the clock, the tempo detail and the tempo source now follow applies here: a control is as wide as
+ * the words in it or it is not on screen at all. The slack it stops giving comes from the fader
+ * below, which is the item this row is explicitly allowed to take it from.
+ */
+.transport [data-role="sound-picker-row"] { flex: 0 0 auto; min-width: max-content; }
+/* The room kept for "loading…", so the row does not jump when a sample set is being fetched. It
+   is a courtesy, and it is the first thing this row gives back when the width runs out — see the
+   breakpoint below. */
+.transport [data-role="sound-picker-note"] { min-width: 7ch; }
+
+/*
+ * The first thing to give. A blend fader is still usable at 60px and the row is not usable at all
+ * if this refuses to move.
+ *
+ * WITH A FLOOR UNDER IT (Z6). "Gives first" used to mean "gives everything": with `min-width: 0` on
+ * both the fader and its range, a squeezed transport took the fader to 0px and the control simply
+ * was not there — which is the same fault as a clipped readout, arrived at from the other side.
+ * 56px is the number the range's own `clamp()` already calls its minimum.
+ */
+.fader { display: flex; align-items: center; gap: 8px; min-width: 56px; flex: 1 1 auto; }
 .fader label { font-size: 11.5px; color: var(--text-dim); }
 .fader input[type="range"] { width: clamp(56px, 12vw, 132px); min-width: 0; flex: 1 1 auto; }
 .fader .end { font-size: 11.5px; }
@@ -1794,6 +1875,23 @@ button[data-drag="midi"]:hover .drag-grip { opacity: 0.9; }
 @media (max-width: 1000px) {
   .transport { gap: 9px; padding: 7px 10px; }
   .fader .end { display: none; }
+  /*
+   * THE SOUND ROW GIVES BACK ITS TWO COURTESIES HERE, AND KEEPS ITS CONTROL (Z6).
+   *
+   * G4's rule is ONE transport row at 900x600 — the product's floor and the width people work at
+   * — and H6's is that nothing in it is ever cut short. Both, at once, is arithmetic: measured at
+   * 900px the row's contents came to 972px against 900 of window, and the 72px had been coming
+   * out of the blend fader (crushed to nothing) and out of this row's own `<select>` (148px of
+   * "Sound · Finger bass" spilling out of a 126px box).
+   *
+   * These two are what a row can afford to lose: the WORD "Sound", which introduces a box that
+   * already reads "Finger bass", and the blank space held for a "loading…" that is on screen for
+   * a second or two the first time a sampled voice is chosen. 91px between them, which is what
+   * buys the fader its floor and the row its single line. The picker itself — the thing anybody
+   * came to this row to change — is untouched at every width.
+   */
+  .transport [data-role="sound-picker-label"] { display: none; }
+  .transport [data-role="sound-picker-note"] { min-width: 0; }
   .app-header { padding: 7px 10px; }
   button { padding: 5px 8px; }
   .fader label, .fader .end { font-size: 11px; }

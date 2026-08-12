@@ -1185,6 +1185,95 @@ async function main() {
       });
     })()`;
 
+    /*
+     * NOTHING IN THE HEADER OR THE TRANSPORT IS CUT SHORT, AT ANY OF THE THREE WIDTHS (Z6).
+     *
+     * The rule this puts in the harness is the one the notation bar has had since its own boxes
+     * were fitted to their words: a control is either as wide as the text in it, or the text is
+     * not there at all. Both halves are asserted, because both have shipped from this repo —
+     * "From re" for "From recording" in the tempo source at 900px, 36px of a 161px take name in
+     * the header, and "Snap: Off" clipped at the 390px floor.
+     *
+     * Three kinds of failure, all counted the same way:
+     *
+     *   1. a `<select>` narrower than the option it is SHOWING. A select is not a scroller and
+     *      reports scrollWidth === clientWidth however little of its text fits, so it is measured
+     *      the way `ui/app.ts §barClipped` measures it — the shown text against the room left
+     *      inside the frame. `barClipped` is asked as well, from the app itself, so the harness
+     *      and the app cannot disagree about the rule;
+     *   2. any other leaf whose content overflows its box;
+     *   3. a LITERAL ellipsis in the text. `text-overflow` is not the only way one appears — a
+     *      label that spells "…" itself is the same truncation with the same cost.
+     *
+     * `display: none` is skipped, and that is not a loophole: dropping a thing whole is the
+     * sanctioned second state (the tempo detail below 1150px, the gear's word below 620px, the
+     * take's name when the row cannot afford it). What is forbidden is showing HALF of one.
+     */
+    const BAR_SWEEP = `(() => {
+      const scan = (selector) => {
+        const host = document.querySelector(selector);
+        if (!host) return null;
+        const bad = [];
+        const canvas = document.createElement('canvas').getContext('2d');
+        for (const e of host.querySelectorAll('*')) {
+          const cs = getComputedStyle(e);
+          if (cs.display === 'none' || cs.visibility === 'hidden') continue;
+          const name = () => e.getAttribute('data-role') || e.className || e.tagName;
+          if (e instanceof HTMLSelectElement) {
+            canvas.font = cs.font || (cs.fontSize + ' ' + cs.fontFamily);
+            const box = parseFloat(e.style.width) || e.getBoundingClientRect().width;
+            const room = box - parseFloat(cs.paddingLeft) - parseFloat(cs.paddingRight) -
+              parseFloat(cs.borderLeftWidth) - parseFloat(cs.borderRightWidth);
+            const shown = e.options[e.selectedIndex] ? e.options[e.selectedIndex].text : '';
+            if (canvas.measureText(shown).width > room + 0.5) {
+              bad.push({ what: name(), shown, room: Math.round(room), kind: 'select' });
+            }
+            // The chevron is drawn inside padding-right; less padding than arrow means the arrow
+            // sits on the last word with no overflow to show for it.
+            if (parseFloat(cs.paddingRight) + 0.5 < 20) bad.push({ what: name(), kind: 'arrow' });
+            continue;
+          }
+          if (e.children.length > 0) continue;
+          const text = (e.textContent || '').trim();
+          if (e.scrollWidth > e.clientWidth + 1) {
+            bad.push({ what: name(), text: text.slice(0, 32), kind: 'clip' });
+          }
+          // Doubled backslashes, on purpose: this expression is inside a TEMPLATE LITERAL, which
+          // eats one level of them before the regex is ever compiled. Written singly it becomes
+          // an any-three-characters pattern, and reported every label in both rows as truncated.
+          if (/…|\\.\\.\\./.test(text)) bad.push({ what: name(), text: text.slice(0, 32), kind: 'ellipsis' });
+        }
+        const rect = host.getBoundingClientRect();
+        return {
+          bad,
+          // A row that fits by clipping has not fitted.
+          overflow: Math.max(0, host.scrollWidth - host.clientWidth),
+          rows: new Set([...host.children].map((c) => {
+            const b = c.getBoundingClientRect();
+            return Math.round((b.top + b.height / 2) / 4);
+          })).size,
+          w: Math.round(rect.width)
+        };
+      };
+      const name = document.querySelector('.app-header .filename');
+      return JSON.stringify({
+        header: scan('.app-header'),
+        transport: scan('.transport'),
+        // The app's own measurement of the same rule, so the two cannot drift.
+        appSaysClipped: window.__RIFFSHEET_BARCLIP__ ? window.__RIFFSHEET_BARCLIP__() : null,
+        // Whole or absent — never a fragment. See ui/app.ts §fitHeaderName.
+        takeName: name
+          ? {
+              shown: getComputedStyle(name).display !== 'none',
+              whole: name.scrollWidth <= name.clientWidth + 1,
+              text: (name.textContent || '').trim()
+            }
+          : null,
+        docScrollW: document.documentElement.scrollWidth,
+        innerW: window.innerWidth
+      });
+    })()`;
+
     phase('checking responsive layouts', 40_000);
     for (const [w, h, key, file] of [
       [900, 600, 'narrow', 'app-900x600.png'],
@@ -1197,6 +1286,22 @@ async function main() {
       view.overflow = await evalJson(OVERFLOW);
       result[key] = { ...view.overflow, layout: view.layout, roll: view.roll };
       result[key].reach = await evalJson(REACH);
+      result[key].bars = await evalJson(BAR_SWEEP);
+    }
+    /*
+     * …AND AT THE THREE WIDTHS Z6 NAMES: 1440, 900 and 390.
+     *
+     * 900 is already in the list above; 1440 is the default the run opens at and 390 is REAPER's
+     * docked FX window, one pixel-band away from the 360 floor already measured — the width the
+     * owner reported the truncations at. Measured in its own pass rather than folded into the
+     * loop, because the loop's screenshots and re-engraving budget belong to the layout checks.
+     */
+    for (const [w, h, key] of [[1440, 900, 'sweep1440'], [900, 600, 'sweep900'], [390, 800, 'sweep390']]) {
+      await cdp.send('Emulation.setDeviceMetricsOverride', {
+        width: w, height: h, deviceScaleFactor: 1, mobile: false
+      });
+      await settle(900);
+      result[key] = await evalJson(BAR_SWEEP);
     }
     await cdp.send('Emulation.clearDeviceMetricsOverride');
     await new Promise((o) => setTimeout(o, 700));
@@ -1517,6 +1622,80 @@ async function main() {
     await evalJson(NAMES_SWITCH);
     await settle(900);
     result.namesBackOn = await evalJson(LAYOUT);
+
+    // --- Z1: THE GRAND STAFF, WITH AND WITHOUT TABLATURE -----------------------------
+    //
+    // Two reported collisions, each with a cause that a number can settle:
+    //
+    //   (a) GRAND + TAB. alphaTab's `rhythmMode` defaults to Automatic, which resolves per stave
+    //       to ShowWithBars when that stave carries no standard notation. Grand + tab has a
+    //       dedicated TAB-ONLY third stave, so it grew a full set of stems, beams and tuplet
+    //       brackets under the tablature — a second engraving of a rhythm already written twice
+    //       above it, drawn outside the stave's reserved box on everything but tuplets. Counted
+    //       here as INK BELOW THE TAB: with the mode set to Hidden there is none.
+    //
+    //   (b) GRAND + NO TAB. The names row was placed in the gap between the treble and bass
+    //       staves, which is not a label lane — it is where the treble's descending stems and
+    //       the bass's ledger lines go, and the row was printed on top of them. "Between" means
+    //       notation-to-tab now; with no tab the row takes the 'above' fallback it already had
+    //       for a single-stave score. Asserted as ZERO intersections against engraved ink.
+    phase('checking the grand staff, with and without tablature', 60_000);
+    const INK_VS_NAMES = `(() => {
+      const host = document.querySelector('.at-host');
+      if (!host) return JSON.stringify({ error: 'no host' });
+      const hr = host.getBoundingClientRect();
+      const labels = [...document.querySelectorAll('.note-name')]
+        .map((e) => e.getBoundingClientRect())
+        .filter((r) => r.width > 0 && r.height > 0);
+      // PATHS AND RECTS ONLY. Bravura's <text> em box is about four times its ink — a 36px
+      // notehead reports a 144px tall box — so intersecting against it answers a question
+      // nobody asked. Stems, beams, ledger lines, staff lines and bar lines are all paths or
+      // rects with tight boxes, and they are what the row was landing on.
+      const ink = [...host.querySelectorAll('svg path, svg rect')]
+        .map((e) => e.getBoundingClientRect())
+        .filter((r) => r.width > 0 && r.height > 0 && r.height < 400);
+      let hits = 0;
+      let sample = null;
+      for (const lb of labels) {
+        for (const g of ink) {
+          if (lb.left < g.right && lb.right > g.left && lb.top < g.bottom && lb.bottom > g.top) {
+            hits++;
+            if (!sample) sample = [Math.round(lb.left - hr.left), Math.round(lb.top - hr.top)];
+            break;
+          }
+        }
+      }
+      const L = window.__RIFFSHEET_LAYOUT__ ? window.__RIFFSHEET_LAYOUT__() : null;
+      // Ink BELOW the tab staff's top line by more than the digits' own rise: on a tab-only
+      // stave with rhythm shown, this is the stems and beams. Zero is the claim.
+      let belowTab = 0;
+      if (L && L.hasSplit && L.tabTop > 0) {
+        for (const g of ink) {
+          if (g.height >= 3 && g.top - hr.top > L.tabTop + 46) belowTab++;
+        }
+      }
+      const systemTop = Math.min(...ink.map((g) => g.top - hr.top).filter((v) => Number.isFinite(v)));
+      const labelBottom = labels.length ? Math.max(...labels.map((r) => r.bottom - hr.top)) : null;
+      return JSON.stringify({
+        labels: labels.length,
+        inkHits: hits,
+        sample,
+        belowTab,
+        hasSplit: !!L && L.hasSplit,
+        systemTop: Number.isFinite(systemTop) ? Math.round(systemTop) : null,
+        labelBottom: labelBottom === null ? null : Math.round(labelBottom)
+      });
+    })()`;
+    await evalJson(setSelect('clef-view', 'grand'));
+    await settle(1400);
+    result.grandTabOn = await evalJson(INK_VS_NAMES);
+    await evalJson(setSelect('tab-view', 'off'));
+    await settle(1400);
+    result.grandTabOff = await evalJson(INK_VS_NAMES);
+    await evalJson(setSelect('tab-view', 'bass'));
+    await settle(1200);
+    await evalJson(setSelect('clef-view', 'auto'));
+    await settle(1200);
 
     // --- engine setup: guide and find ------------------------------------------------
     //
@@ -2009,7 +2188,15 @@ async function main() {
       // field survives so a v11 blob still round-trips rather than silently losing the only
       // evidence of what its owner had chosen. The MODE has a control, and it is checked above.
       rollSnapToGrid:
-        'dead: translated once by the v12 migration into rollSnap (Off/Grid/Beat), which is the control on screen (G25)'
+        'dead: translated once by the v12 migration into rollSnap (Off/Grid/Beat), which is the control on screen (G25)',
+      // The sixth, added in Z5b/c. The size drop-down on MuScriptor's card is DELETED: the shell
+      // adopts a MuScriptor server that is already running whenever it finds one, and that
+      // server's weights belong to whoever started it — so on the machine where the preference
+      // mattered most, setting it did nothing and the card had to explain why afterwards. `auto`
+      // decides now, lightest installed first, and the read-out on the card says what is actually
+      // loaded. The FIELD survives so an old profile still reads.
+      engineModel:
+        'dead: the model-size chooser is deleted (Z5b/c) — Riffsheet cannot honour a size preference against a server it adopted, so `auto` decides and the card reports what is loaded'
     };
 
     /** Every `[data-setting]` on screen right now, counted. */
@@ -2803,7 +2990,10 @@ async function main() {
           hasModelSelect: !!c.querySelector('[data-role="engine-model"]'),
           hasUseExisting: !!c.querySelector('[data-role="engine-use-existing"]'),
           scrollW: c.scrollWidth,
-          clientW: c.clientWidth
+          clientW: c.clientWidth,
+          // How tall the card is. Z5b's claim is about SIZE CLASS, and a card is only comparable
+          // to its neighbours by the room it takes on the panel.
+          h: Math.round(c.getBoundingClientRect().height)
         };
       };
       const group = document.querySelector('[data-role="engine-setup-group"]');
@@ -2820,6 +3010,31 @@ async function main() {
     })()`;
 
     result.cardDetail = await evalJson(CARD_DETAIL);
+
+    /*
+     * THE SYSTEM LINE (Z5a), and where the memory sentence is NOT.
+     *
+     * `first` is the claim that matters and it is positional: the line has to be above the first
+     * heading in the panel, because "at the top" is the whole point of moving it there. Compared by
+     * document order rather than by pixels, which survives a panel that has been scrolled.
+     */
+    result.systemLine = await evalJson(`(() => {
+      const panel = document.querySelector('.settings-panel');
+      const line = panel && panel.querySelector('[data-role="system-line"]');
+      const firstHeading = panel && panel.querySelector('h3');
+      const card = document.querySelector('[data-role="engine-card"][data-engine-id="muscriptor"]');
+      const readout = card && card.querySelector('[data-role="engine-readout"]');
+      return JSON.stringify({
+        present: !!line,
+        text: line ? (line.textContent || '').trim() : null,
+        // Node.DOCUMENT_POSITION_FOLLOWING === 4: the heading comes AFTER the line.
+        first: !!(line && firstHeading && (line.compareDocumentPosition(firstHeading) & 4)),
+        // "3.0 GB of memory free, out of 8.0 GB" — the sentence that used to live on the card.
+        memoryOnCard: readout
+          ? [...readout.children].filter((r) => /of memory free/.test(r.textContent || '')).length
+          : 0
+      });
+    })()`);
 
     // "Use existing installation…" — the sniff, then a path that is refused, then one that is
     // accepted. All three through the one native call the contract defines.
@@ -3294,6 +3509,20 @@ async function main() {
       await mkdir(join(ROOT, 'spike-results'), { recursive: true });
       await writeFile(join(ROOT, 'spike-results', 'app-parts.png'), Buffer.from(partsShot.data, 'base64'));
     }
+    /*
+     * THE PRINTED PAGE, WHILE THERE ARE TWO PARTS ON IT (Z2c).
+     *
+     * Taken here and nowhere else, because this is the only moment in the run when the document
+     * has more than one part — and the claim ("the name at every system start") needs both a
+     * second part and a second SYSTEM. The tri-view has neither: it is horizontal, one system
+     * wide. The print render is `Page` layout, so it has as many systems as the music needs.
+     */
+    result.printLabels = await evalJson(
+      `window.__RIFFSHEET_PDFTEST__
+        ? window.__RIFFSHEET_PDFTEST__().then(r => JSON.stringify(r), e => JSON.stringify({ error: String(e) }))
+        : Promise.resolve('null')`,
+      60_000
+    );
     // Back to one part. Everything after this expects the take it has had all along, and a
     // probe that left four staves on the page would fail checks that have nothing to do with it.
     result.partsReset = await evalJson(
@@ -3301,6 +3530,109 @@ async function main() {
       30_000
     );
     await settle(500);
+
+    /*
+     * --- ADD PART (MUSICXML): THE MENU ITEM ITSELF (Z2a) ------------------------------
+     *
+     * The reported bug was that choosing it did NOTHING — no picker, no error, no log line — and
+     * the parts scenario above could not have caught it, because it adds its part by calling the
+     * importer directly and says so: "the item ends in a native file picker no script may answer".
+     * That is true of the picker and false of everything in front of it, which is where it broke.
+     *
+     * Three passes at the same door. The first two answer the picker at the bridge, which is where
+     * a shell answers it; the third takes the browser branch and is answered THROUGH CHROME with a
+     * real file written to disk, which is as close to a hand on a mouse as a harness gets.
+     */
+    phase('checking Add part (MusicXML) opens a picker and imports one', 60_000);
+    result.partAddNative = await evalJson(
+      `window.__RIFFSHEET_PARTADD__
+        ? window.__RIFFSHEET_PARTADD__('native').then(r => JSON.stringify(r), e => JSON.stringify({ error: String(e) }))
+        : Promise.resolve('null')`,
+      40_000
+    );
+    await evalJson(`JSON.stringify(window.__RIFFSHEET_PARTSRESET__ ? window.__RIFFSHEET_PARTSRESET__() : null)`, 20_000);
+    await settle(300);
+    result.partAddRefused = await evalJson(
+      `window.__RIFFSHEET_PARTADD__
+        ? window.__RIFFSHEET_PARTADD__('refused').then(r => JSON.stringify(r), e => JSON.stringify({ error: String(e) }))
+        : Promise.resolve('null')`,
+      40_000
+    );
+    await cdp.send('Runtime.evaluate', {
+      expression: `document.querySelectorAll('.toast button').forEach(b => b.click())`,
+      returnByValue: true
+    });
+
+    /*
+     * …AND THE BROWSER BRANCH, WITH A REAL FILE OFF THE DISK.
+     *
+     * `input.click()` is the one link no page script can complete: a file picker needs a user
+     * gesture, and `change` on a `<select>` is not one — which is half of why the item did nothing
+     * in the plugin. Headless Chrome does not merely refuse it, it CANCELS the chooser, so the
+     * page's own `oncancel` tidies the input away before anything can be put in it.
+     * `Page.setInterceptFileChooserDialog` is how a debugger answers a chooser instead: Chrome
+     * reports the input that opened it and hands over without cancelling.
+     */
+    const fixturePath = join(tmpdir(), `riffsheet-verify-part-${process.pid}.musicxml`);
+    await writeFile(
+      fixturePath,
+      await evalJson(`JSON.stringify(window.__RIFFSHEET_PARTFILE__ ? window.__RIFFSHEET_PARTFILE__() : '')`, 20_000)
+    );
+    let chooserNode = null;
+    const onChooser = (p) => {
+      chooserNode = p.backendNodeId ?? null;
+    };
+    cdp.on('Page.fileChooserOpened', onChooser);
+    await cdp.send('Page.setInterceptFileChooserDialog', { enabled: true });
+    await cdp.send('DOM.enable');
+    // A real gesture, so the picker is genuinely allowed to open — `userGesture` is what makes
+    // this the same call a mouse makes rather than a script pretending.
+    await cdp.send('Runtime.evaluate', {
+      expression: `window.__RIFFSHEET_PARTADD__('html')`,
+      awaitPromise: true,
+      returnByValue: true,
+      userGesture: true
+    });
+    await settle(400);
+    if (chooserNode) {
+      await cdp.send('DOM.setFileInputFiles', { backendNodeId: chooserNode, files: [fixturePath] });
+      await settle(900);
+    }
+    await cdp.send('Page.setInterceptFileChooserDialog', { enabled: false }).catch(() => {});
+    const chooserSeen = chooserNode !== null;
+    result.partAddHtml = {
+      // Chrome reported a chooser: the `<optgroup>` verb really did reach `input.click()`, which
+      // is the link that was missing in the plugin.
+      chooserSeen,
+      ...(await evalJson(
+        `(() => {
+          const box = document.querySelector('[data-role="part-view"]');
+          return JSON.stringify({
+            parts: box ? [...box.options].filter((o) => o.value.startsWith('part:')).map((o) => o.text) : []
+          });
+        })()`,
+        20_000
+      ))
+    };
+    await evalJson(`JSON.stringify(window.__RIFFSHEET_PARTSRESET__ ? window.__RIFFSHEET_PARTSRESET__() : null)`, 20_000);
+    await settle(400);
+    rmSync(fixturePath, { force: true });
+
+    /*
+     * --- THE LIVE PART IS RENAMABLE (Z2b) ---------------------------------------------
+     *
+     * Driven end to end in the page (`__RIFFSHEET_LIVENAME__`): the menu's Rename, the name
+     * printed on the sheet, the export, the document, and the clear that puts the instrument's own
+     * word back. It leaves the take exactly as it found it.
+     */
+    phase('checking the live part can be renamed', 60_000);
+    result.liveName = await evalJson(
+      `window.__RIFFSHEET_LIVENAME__
+        ? window.__RIFFSHEET_LIVENAME__().then(r => JSON.stringify(r), e => JSON.stringify({ error: String(e) }))
+        : Promise.resolve('null')`,
+      40_000
+    );
+    await settle(400);
 
     // --- THE ENGINE, OFF THE MAIN THREAD (codex-critique §11) -------------------------
     //
@@ -4343,34 +4675,80 @@ async function main() {
         })()
       ],
       [
-        // The three RAM numbers, on the card of the engine they belong to. "small / medium /
-        // large" are three adjectives; these are what lets somebody with 8 GB decide, and they
-        // are exactly what `auto` is deciding with on their behalf.
-        'engine cards: MuScriptor shows what each model size costs in memory',
-        /small 0\.9 GB/.test(result.cardDetail?.mu?.ram ?? '') &&
-          /medium 1\.8 GB/.test(result.cardDetail?.mu?.ram ?? '') &&
-          /large 5 GB/.test(result.cardDetail?.mu?.ram ?? '')
-      ],
-      [
-        // The figures come from `engineStatus().models`, which carries `fits` — the auto rule's
-        // own answer about this machine. A size that cannot run here is SAID to be, rather than
-        // listed beside the ones that can and left to be chosen and wondered about. (The mock's
-        // machine has 8 GB, so `large` does not fit, which is the whole reason it models one.)
-        'engine cards: a model size this machine cannot run is named as such',
-        /large 5 GB \(too big for this machine\)/.test(result.cardDetail?.mu?.ram ?? '') &&
-          !/0\.9 GB \(too big/.test(result.cardDetail?.mu?.ram ?? '')
-      ],
-      [
-        // MOVED, not copied. The old row sat in the group above, named no engine, and applied
-        // to exactly one of the four — somebody running Basic Pitch could set "large" and watch
-        // nothing happen. Exactly one model select on the whole panel, and it is on the card.
-        'engine cards: the model chooser lives on MuScriptor’s card and nowhere else',
-        result.cardDetail?.mu?.hasModelSelect === true &&
+        /*
+         * THE MODEL SIZE CONTROL IS GONE FROM THE WHOLE PANEL (Z5b/c) — and this is the same
+         * shape of check as `linkControl` above: the claim has flipped, so the probe reads the
+         * same selectors and asserts an ABSENCE.
+         *
+         * Three checks used to stand here: that MuScriptor's card listed "small 0.9 GB · medium
+         * 1.8 GB · large 5 GB", that a size too big for this machine said so, and that exactly
+         * one model `<select>` existed and it was on that card. All three described a preference
+         * Riffsheet could not honour — the shell adopts a MuScriptor server that is already
+         * running and its weights belong to whoever started it — so the control is deleted and
+         * `auto` decides. What is still asserted, below, is that nothing HONEST went with it:
+         * the card still says which weights are loaded and whether they fit.
+         */
+        'engine cards: no model-size chooser anywhere on the panel',
+        result.cardDetail?.mu?.hasModelSelect === false &&
           result.cardDetail?.basic?.hasModelSelect === false &&
           result.cardDetail?.bass?.hasModelSelect === false &&
           result.cardDetail?.transkun?.hasModelSelect === false &&
-          result.cardDetail?.modelSelectsOnPanel === 1 &&
-          result.cardDetail?.modelSelectsInSetupGroup === 1
+          result.cardDetail?.modelSelectsOnPanel === 0 &&
+          result.cardDetail?.modelSelectsInSetupGroup === 0
+      ],
+      [
+        // …and the RAM table went with it. It existed to be compared while choosing, and there
+        // is nothing left to choose.
+        'engine cards: the model RAM table is gone with the chooser',
+        result.cardDetail?.mu?.ram === null && result.cardDetail?.basic?.ram === null
+      ],
+      [
+        /*
+         * EVERY CARD THE SAME SIZE CLASS (Z5b). MuScriptor's used to be several times the height
+         * of the others — a status sentence, a live read-out, three detail lines, a RAM table, a
+         * labelled drop-down, a refusal row, two buttons and a guide — which read as this engine
+         * being more configurable rather than as it being the guided one. Measured against the
+         * tallest of the other three with a generous allowance: it may be taller (it carries the
+         * live read-out and the setup guide, which are its own), never in a different league.
+         */
+        'engine cards: MuScriptor is in the same size class as the rest',
+        (() => {
+          const mu = result.cardDetail?.mu?.h ?? 0;
+          const others = [result.cardDetail?.basic, result.cardDetail?.bass, result.cardDetail?.transkun]
+            .map((c) => c?.h ?? 0)
+            .filter((h) => h > 0);
+          return mu > 0 && others.length === 3 && mu <= Math.max(...others) * 2;
+        })()
+      ],
+      [
+        /*
+         * THE MACHINE, AT THE TOP OF THE PANEL (Z5a). Free memory used to be a sentence inside
+         * MuScriptor's card, where it read as a fact about that engine and was the last place
+         * anybody would look for it. It is one dim line under the title now, with the processor
+         * beside it, and it is the first thing in the panel because it is what everything below
+         * it depends on.
+         */
+        'settings: one system line at the top says what this machine is',
+        (() => {
+          const line = result.systemLine;
+          if (!line || !line.present) return false;
+          // The mock reports 8 GB total and 3 GB free and no processor fields, which is exactly
+          // the "shell that has not been asked about the CPU yet" case: memory, and no invented
+          // chip name or core count beside it.
+          return (
+            line.first === true &&
+            /GB/.test(line.text ?? '') &&
+            /free/.test(line.text ?? '') &&
+            !/unknown/i.test(line.text ?? '') &&
+            !/0 cores/.test(line.text ?? '')
+          );
+        })()
+      ],
+      [
+        // …and it is not still on the card as well. Moved, not copied — the same rule the model
+        // row was held to when it moved onto a card in the first place.
+        'settings: the free-memory sentence has left MuScriptor’s card',
+        result.systemLine?.memoryOnCard === 0
       ],
       [
         // Cards are ~300px wide inside a panel that is a fixed column, and a <select> takes
@@ -4484,12 +4862,22 @@ async function main() {
                 result.engineChip.adopted === true))
       ],
       [
-        // And when it IS shown it says what it is and what pressing it does, in the accent —
-        // "Listener · 1.5 GB" read as a status badge, and nobody clicks a status badge. The
-        // memory figure is not lost; it moved into the tooltip.
+        /*
+         * And when it IS shown it says what it is and what pressing it does, in the accent —
+         * "Listener · 1.5 GB" read as a status badge, and nobody clicks a status badge. The
+         * memory figure is not lost; it moved into the tooltip.
+         *
+         * THE WORDING IS SHORTER THAN IT WAS (Z6), and this check moved with it. It used to read
+         * "MuScriptor running — click to stop": 213px of sentence in the row that has to survive
+         * REAPER's 390px docked FX window, which is why it shipped ellipsized to "MuScriptor
+         * running — cli…". "Stop MuScriptor" is a verb and its object — the same two facts, about
+         * 100px, and unmistakably a button. That it is RUNNING is what the chip's presence means:
+         * it is drawn only where a process exists, which is the check above.
+         */
         'listener chip: shown means named, highlighted, and offering to stop',
         !result.engineChip?.visible ||
-          (/ running — click to stop$| starting…$/.test(result.engineChip?.text ?? '') &&
+          (/^Stop \S| starting$/.test(result.engineChip?.text ?? '') &&
+            !/…/.test(result.engineChip?.text ?? '') &&
             result.engineChip?.highlighted === true)
       ],
 
@@ -4670,6 +5058,32 @@ async function main() {
         namesClearOf((l) => l.clearAboveStaff >= MIN_CLEAR_ABOVE_STAFF)
       ],
       ['names: no label sits on an engraved digit or number', namesClearOf((l) => l.textOverlaps === 0)],
+      [
+        // Z1a. Counted rather than looked at: the stems alphaTab drew under a tab-only stave are
+        // paths and rects, and there are none of them once the rhythm mode is Hidden.
+        'grand + tab: no rhythm stems are drawn under the tablature',
+        !!result.grandTabOn && result.grandTabOn.hasSplit === true && result.grandTabOn.belowTab === 0,
+        `belowTab=${result.grandTabOn?.belowTab}`
+      ],
+      [
+        'grand + tab: and the names row still clears every engraved stem and line',
+        !!result.grandTabOn && result.grandTabOn.labels > 0 && result.grandTabOn.inkHits === 0,
+        `hits=${result.grandTabOn?.inkHits} at ${JSON.stringify(result.grandTabOn?.sample)}`
+      ],
+      [
+        // Z1b. The row is drawn ABOVE the system with no tab, so it cannot be on the interstaff
+        // ink at all — asserted as both facts, because "above" alone would pass with no labels.
+        'grand, tab off: the names row is drawn, and above the system',
+        !!result.grandTabOff && result.grandTabOff.labels > 0 &&
+          result.grandTabOff.labelBottom !== null && result.grandTabOff.systemTop !== null &&
+          result.grandTabOff.labelBottom <= result.grandTabOff.systemTop + 2,
+        `labels=${result.grandTabOff?.labels} bottom=${result.grandTabOff?.labelBottom} systemTop=${result.grandTabOff?.systemTop}`
+      ],
+      [
+        'grand, tab off: and no label sits on a stem, a ledger line or a staff line',
+        !!result.grandTabOff && result.grandTabOff.inkHits === 0,
+        `hits=${result.grandTabOff?.inkHits} at ${JSON.stringify(result.grandTabOff?.sample)}`
+      ],
       ['names: switching them off empties the row', !!result.namesOff && result.namesOff.labels === 0],
       [
         // STAFF_TAB_GAP, the whole of the reserved room, must come back out.
@@ -6195,13 +6609,22 @@ async function main() {
           /^Part: ● /.test(P.single.box.shown ?? '') && P.single.box.onBar === true
       ],
       [
-        // THE TAKE IS NOT REMOVABLE AND NOT RENAMEABLE, and the menu says why rather than
-        // silently doing nothing. Its name is derived from the instrument on every build
-        // (score/parts.ts §livePartName), so a rename would be overwritten by the next engrave.
-        'parts: the take can be neither removed nor renamed, and says so',
+        /*
+         * THE TAKE IS NOT REMOVABLE — the take IS the document — and the menu says why rather
+         * than silently doing nothing.
+         *
+         * RENAME IS NO LONGER REFUSED, and this check has flipped with the feature (Z2b). It used
+         * to assert `disabled === true` on the reasoning that the take's name is derived from the
+         * instrument on every build, so a rename would be overwritten by the next engrave. There
+         * is a stored override now (`state.ts §SourceAudio.livePartName`) and the instrument only
+         * supplies the DEFAULT, so the one part on nearly every sheet this app makes is no longer
+         * the one part nobody can name. What it does is checked in the `live name:` block below.
+         */
+        'parts: the take cannot be removed, and can be renamed',
         !!P && (P.single?.box?.verbs ?? []).some((v) => v.value === 'do:remove' && v.disabled === true &&
           /always on the sheet/i.test(v.title ?? '')) &&
-          (P.single?.box?.verbs ?? []).some((v) => v.value === 'do:rename' && v.disabled === true)
+          (P.single?.box?.verbs ?? []).some((v) => v.value === 'do:rename' && v.disabled !== true &&
+            /^Rename /.test(v.title ?? ''))
       ],
       [
         // The menu is the five verbs the design asks for, in order, and nothing else.
@@ -6324,6 +6747,188 @@ async function main() {
         // four-part document nobody asked for.
         'parts: the harness leaves the take on one part',
         !!result.partsReset && result.partsReset.tracks === 1
+      ],
+
+      // --- Z2a: "Add part (MusicXML)" actually opens a picker ---------------------------
+      [
+        /*
+         * THE REPORTED BUG, in one line: choosing the item did nothing at all. The chain is
+         * `<optgroup>` verb -> change -> `addPartFromPicker()` -> a picker, and the last link was
+         * an `<input type="file">` in a plugin webview that will not open one without a user
+         * gesture the `change` event does not carry. The shell's own picker is the first branch
+         * now, exactly as the opening screen's "Choose a file" has always done it.
+         *
+         * `asked === 1` is the claim the old parts scenario could not make: the picker was really
+         * called, by the menu item, once.
+         */
+        'add part: the menu item opens the shell picker and imports what comes back',
+        (() => {
+          const a = result.partAddNative;
+          return (
+            !!a && !a.error && a.asked === 1 && a.before === 1 && a.after === 2 &&
+            (a.parts ?? []).some((p) => /^imported:Guitar/.test(p)) &&
+            (a.partNames ?? []).some((n) => /Guitar/.test(n)) && a.tracks === 2
+          );
+        })()
+      ],
+      [
+        // The native chooser has no MusicXML filter — it is the universal one — so "not a part
+        // file" is a real outcome and has to be a SENTENCE. Silence was the bug being fixed; a
+        // silent refusal would be the same bug wearing a different hat.
+        'add part: a file that is not MusicXML is refused out loud, and adds nothing',
+        (() => {
+          const a = result.partAddRefused;
+          return (
+            !!a && !a.error && a.asked === 1 && a.after === 1 &&
+            (a.toast ?? []).some((t) => /MusicXML/.test(t) && /Could not add that part/.test(t))
+          );
+        })()
+      ],
+      [
+        // …and the browser branch too, answered through Chrome with a real file off the disk.
+        // `chooserSeen` is the evidence that the item reached `input.click()` at all.
+        'add part: the browser branch opens a real file chooser and imports the file it is given',
+        !!result.partAddHtml && result.partAddHtml.chooserSeen === true &&
+          (result.partAddHtml.parts ?? []).some((t) => /Guitar/.test(t))
+      ],
+
+      // --- Z2b: the live part is renamable ---------------------------------------------
+      [
+        // It was the one part on the sheet whose printed name nobody could change: the item was
+        // disabled and said the take "is named after its instrument and follows it".
+        'live name: Rename is offered on the take, with a name field and no nudge',
+        (() => {
+          const L = result.liveName;
+          return (
+            !!L && !L.error && L.offered === true && L.opened === true &&
+            L.menuShape?.open === true && L.menuShape.hasName === true &&
+            // A nudge slides an imported part AGAINST the take; the take is the clock both are
+            // measured on, so it has none.
+            L.menuShape.hasNudge === false &&
+            // The placeholder is the instrument's own word — what clearing the box goes back to.
+            L.menuShape.placeholder === 'Bass'
+          );
+        })()
+      ],
+      [
+        // ONE WRITE, FOUR READINGS: the closed box on the bar, the name handed to the engraver,
+        // the `<part-name>` in the export, and the document field itself.
+        'live name: renaming from the menu reaches the control, the page, the export and the document',
+        (() => {
+          const a = result.liveName?.afterMenu;
+          return (
+            !!a && /Rhythm gtr/.test(a.box ?? '') &&
+            (a.printed ?? []).some((n) => n === 'Rhythm gtr') &&
+            (a.exported ?? []).some((n) => n === 'Rhythm gtr') &&
+            a.stored === 'Rhythm gtr'
+          );
+        })()
+      ],
+      [
+        // …and from the other door: the name printed down the left of the system.
+        'live name: renaming from the sheet label agrees with all of them',
+        (() => {
+          const L = result.liveName;
+          const a = L?.afterLabel;
+          return (
+            !!a && L.inlineOpen === true && /Low end/.test(a.box ?? '') &&
+            (a.printed ?? []).some((n) => n === 'Low end') &&
+            (a.exported ?? []).some((n) => n === 'Low end')
+          );
+        })()
+      ],
+      [
+        // The document carries it — through the very encode/decode the session save uses.
+        'live name: the name survives the document round trip',
+        result.liveName?.roundTrip === 'Low end'
+      ],
+      [
+        // AN OVERRIDE, NOT A REPLACEMENT. Clearing the box goes back to the instrument's own
+        // word rather than leaving an unnamed staff, which is what makes it safe to clear.
+        'live name: clearing the name goes back to the instrument’s own word',
+        (() => {
+          const a = result.liveName?.afterClear;
+          return !!a && /Bass/.test(a.box ?? '') && a.stored === null;
+        })()
+      ],
+
+      // --- Z2c: the name at every system start ------------------------------------------
+      [
+        /*
+         * STANDARD PRACTICE, ON THE ONLY RENDER THAT HAS SEVERAL SYSTEMS.
+         *
+         * The tri-view is `LayoutMode.Horizontal` — one staff system, scrolled sideways — so the
+         * claim can only be made about the PRINTED page, which is `Page` layout. Full name against
+         * the first system, abbreviation against every one after it, exactly as MusicXML's
+         * `<part-name>`/`<part-abbreviation>` pair has always said it.
+         *
+         * The abbreviation is the PIPELINE's ("Guitar" -> "Gtr."), not webcore's old `slice(0, 4)`,
+         * which turned the same word into "Guit" and a renamed part into the first four letters of
+         * whatever was typed.
+         */
+        'print: the part name is printed at every system — full first, abbreviated after',
+        (() => {
+          const labels = result.printLabels?.systemLabels ?? [];
+          if (labels.length < 4) return false;
+          const first = labels.slice(0, 2).map((l) => l.text);
+          const rest = labels.slice(2).map((l) => l.text);
+          return (
+            first.join(',') === 'Guitar,Bass' &&
+            rest.length >= 2 &&
+            rest.every((t) => t === 'Gtr.' || t === 'Bass') &&
+            rest.some((t) => t === 'Gtr.')
+          );
+        })()
+      ],
+
+      // --- Z6: no ellipsis, no clipping, in the header and the transport ----------------
+      ...[
+        ['1440', result.sweep1440],
+        ['900', result.sweep900],
+        ['390', result.sweep390]
+      ].flatMap(([width, sweep]) => [
+        [
+          /*
+           * THE SWEEP ITSELF. Zero clipped and zero ellipsized leaves in either row, at each of
+           * the three widths the owner named. What this replaced, measured before the fix: at
+           * 900px the tempo source had 43px of room for 92px of "From recording" and the take's
+           * name 36px for 161px; at 390px the roll's Snap chip had 45 for 50.
+           */
+          `${width}: nothing in the header or the transport is cut short or ellipsized`,
+          (() => {
+            if (!sweep?.header || !sweep?.transport) return false;
+            const bad = [...sweep.header.bad, ...sweep.transport.bad];
+            if (bad.length > 0) console.log(`\n${width} clipped:`, JSON.stringify(bad));
+            return bad.length === 0;
+          })()
+        ],
+        [
+          // …and the app agrees, measured by the same `barClipped` the fit is written against.
+          `${width}: the app’s own clipping check is clean for all three bars`,
+          !!sweep?.appSaysClipped && Object.values(sweep.appSaysClipped).every((v) => v === false)
+        ],
+        [
+          // A row that fits by clipping has not fitted, and the page never scrolls sideways.
+          `${width}: neither row overflows its own edge, and the document does not scroll sideways`,
+          !!sweep && sweep.header.overflow === 0 && sweep.transport.overflow === 0 &&
+            sweep.docScrollW <= sweep.innerW + 1
+        ],
+        [
+          // WHOLE OR ABSENT. Dropping the take's name is the sanctioned answer when the row
+          // genuinely cannot afford it (`ui/app.ts §fitHeaderName`); showing four letters of it
+          // is not. At these three widths it is present AND whole, which is what the fit bought.
+          `${width}: the take’s name is on screen whole`,
+          !!sweep?.takeName && sweep.takeName.shown === true && sweep.takeName.whole === true
+        ]
+      ]),
+      [
+        // The engine chip is a CONTROL that ends somebody's process, and it used to say
+        // "MuScriptor running — click to stop" — 213px of sentence in the row that has to survive
+        // a 390px docked FX window, ellipsized to "MuScriptor running — cli…". A verb and its
+        // object says the same two things in half the width.
+        'chip: the listener chip is a verb, and it fits at every width',
+        !!result.engineChip && /^Stop /.test(result.engineChip.text ?? '') &&
+          !/…/.test(result.engineChip.text ?? '')
       ],
 
       // --- octave-folded tab positions ------------------------------------------------

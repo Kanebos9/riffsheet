@@ -16,7 +16,7 @@
  *   - runTranscription() listens to the audio again. Seconds. Only on new input.
  */
 
-import { el, replace, formatTime, debounce, type Store } from './dom';
+import { el, fitSelects, replace, formatTime, debounce, type Store } from './dom';
 import { installTooltipLayer, t, TIPS } from './tips';
 import {
   getBridge,
@@ -38,11 +38,14 @@ import {
   buildRiffScore,
   buildTickSecondsMap,
   scoreOriginSec,
+  notationIntentTicks,
+  NOTATION_INTENT_DENOMINATORS,
   type InputNote,
+  type NotationIntent,
   type RiffScore,
   type TickSecondsMap
 } from '@pipeline';
-import { TriView, MIN_ZOOM, MAX_ZOOM, type NoteHit } from '../view/triview';
+import { TriView, MIN_ZOOM, MAX_ZOOM, type NoteHit, type SheetTarget } from '../view/triview';
 import {
   absoluteSheetScale,
   alignOriginSec,
@@ -73,6 +76,18 @@ import {
   type SheetMap
 } from '../view/pianoroll';
 import { applyRollEditToNotes } from '../edit/rollPerformance';
+// THE SHEET'S WRITE-THROUGH ROAD. Not `commitPerformance` directly — see the file's own note
+// for what that costs on a snapped or a cut take, and why the victims of a collision have to be
+// named rather than inferred from the command.
+import {
+  applyBarOp,
+  applySheetEditToNotes,
+  durationMenuLabel,
+  mergePerformanceEditOntoCutTake,
+  type BarOp,
+  type SheetEdit
+} from '../edit/performanceEdit';
+import { closeSheetMenu, showSheetMenu, sheetMenuProbe, type SheetMenuItem } from '../edit/sheetMenu';
 import {
   addCut,
   applyCutsToPeaks,
@@ -104,10 +119,12 @@ import { EngineHost, isEngineCancelled, type EngineJobHandle } from '../audio/en
 import { soundingMidi } from '../score/fromPipeline';
 import {
   buildPartedRiffScore,
+  cleanPartName,
   importedPartName,
   isNotationOnlyTrack,
   livePartName,
   LIVE_PART_ID,
+  MAX_PART_NAME_LENGTH,
   MAX_SCORE_PARTS,
   nudgeStepMs,
   orderedPartSlots,
@@ -321,11 +338,27 @@ const OPEN_FILE_ACCEPT = [
  * does not shrink it in step with the `zoom` this bar is drawn at, so at the 390px floor a box
  * sized with 23 px of allowance had about 14 visual px of it and clipped the end of its text.
  *
- * `ui/styles.css §.notation-toolbar select` now draws the chevron itself behind exactly this much
- * `padding-right`, so the reserve is known rather than inferred. THE TWO NUMBERS MUST MOVE
- * TOGETHER; this one is here so `notationBarClipped` can assert the rule the stylesheet sets.
+ * `ui/styles.css` now draws the chevron itself behind exactly this much `padding-right` — on the
+ * notation bar, the header and the transport alike — so the reserve is known rather than inferred.
+ * THE TWO NUMBERS MUST MOVE TOGETHER; this one is here so `barClipped` can assert the rule the
+ * stylesheet sets.
+ *
+ * NOT ONLY THE NOTATION BAR ANY MORE (Z6), which is why it is no longer named for one: the same
+ * fit and the same assertion now cover every drop-down in the three rows of chrome above the
+ * sheet.
  */
-const NOTATION_ARROW_PX = 20;
+const SELECT_ARROW_PX = 20;
+
+/**
+ * THE THREE ROWS OF CHROME ABOVE THE SHEET, in the order a reader meets them.
+ *
+ * One list because one rule now covers all three (Z6): every drop-down in them is cut to the words
+ * it is SHOWING (`fitTopBars`), and nothing in them may be narrower than its own text
+ * (`barClipped`). It used to be the notation bar alone, which is why the notation bar was the only
+ * one of the three with no truncations left in it — measured at 900px the transport was showing
+ * "From re" for "From recording" and the header 36px of a 161px take name.
+ */
+const TOP_BAR_SELECTORS = ['.app-header', '.transport', '[data-role="notation-toolbar"]'] as const;
 
 const MUSICXML_ACCEPT = '.xml,.musicxml,.mxl';
 const MUSICXML_NAME = /\.(musicxml|mxl|xml)$/i;
@@ -401,6 +434,20 @@ function audioArrayBuffer(bytes: Uint8Array): ArrayBuffer {
     ? (bytes.buffer as ArrayBuffer)
     : (bytes.slice().buffer as ArrayBuffer);
 }
+
+/**
+ * `IRBeat.durationType` spells the printed value in words; `NotationIntent` spells it as the
+ * denominator MusicXML's `<type>` implies. One map, so the duration menu's ticked item is the
+ * glyph actually on the page rather than a second opinion about it. See `App.intentOf`.
+ */
+const DURATION_TYPE_DENOMINATOR: Readonly<Record<string, NotationIntent['denominator']>> = {
+  whole: 1,
+  half: 2,
+  quarter: 4,
+  eighth: 8,
+  '16th': 16,
+  '32nd': 32
+};
 
 class App {
   private root: HTMLElement;
@@ -3180,11 +3227,30 @@ class App {
     chip.style.display = up ? '' : 'none';
     if (!up || !e) return;
     const name = this.listenerName();
-    // IT SAYS WHAT IT IS AND WHAT PRESSING IT DOES. "Listener · 1.5 GB" named neither: it read
-    // as a status badge, and a status badge is not something anybody clicks. The figure has not
-    // been thrown away — it is in the tooltip, with the rest of the explanation.
+    /*
+     * IT SAYS WHAT IT IS AND WHAT PRESSING IT DOES, AND IT FITS (Z6).
+     *
+     * "Listener · 1.5 GB" named neither: it read as a status badge, and a status badge is not
+     * something anybody clicks. What replaced it — "MuScriptor running — click to stop" — named
+     * both and did not fit: 213px of sentence in the one row that has to survive a 390px docked
+     * FX window, inside `overflow: hidden` with an ellipsis, so on a squeezed header it arrived
+     * as "MuScriptor running — cli…". Half a label on the control that ends somebody's process.
+     *
+     * A VERB AND ITS OBJECT says the same two things in half the width and cannot be mistaken for
+     * a badge: "Stop MuScriptor" is unambiguously a button, names whose process is about to end,
+     * and is about 100px — which the header can afford at every width in the ladder, so nothing
+     * has to be cut and nothing has to be dropped. That it is RUNNING is what the chip's presence
+     * means: it is drawn only while `engineProcessAlive()` (G17) and lit while it is there.
+     *
+     * NO "…" ON THE STARTING STATE EITHER. The character is the truncation this whole sweep is
+     * about, and a label that ends in one is indistinguishable from a label that was cut.
+     */
     chip.querySelector('[data-role="engine-text"]')!.textContent =
-      e.state === 'starting' ? `${name} starting…` : `${name} running — click to stop`;
+      e.state === 'starting' ? `${name} starting` : `Stop ${name}`;
+    // The chip is about 100px of header that was not there a moment ago, so the row's budget has
+    // just changed and the take's name may no longer fit (or may fit again). Same call the
+    // resize handler makes; it is one layout read.
+    this.fitHeaderName();
     const mb =
       typeof e.memoryMb === 'number' && e.memoryMb > 0
         ? ` It is holding ${(e.memoryMb / 1024).toFixed(1)} GB right now.`
@@ -4629,11 +4695,55 @@ class App {
     // The print path is the riskiest thing in the app to leave untested: it is a SECOND
     // alphaTab instance, and the spike found that a second worker-backed instance never
     // renders. This exercises it for real (build the document, do not open a dialog).
-    (window as unknown as Record<string, unknown>).__RIFFSHEET_PDFTEST__ = async () => {
+    (window as unknown as Record<string, unknown>).__RIFFSHEET_PDFTEST__ = async (mount = false) => {
       try {
         const score = this.runtime.get().score;
         if (!score) return { error: 'no score' };
         const html = await buildPrintDocument(score, { title: 'spike' });
+        /**
+         * THE NAME BESIDE EVERY SYSTEM, MEASURED ON THE PRINTED PAGE (Z2c).
+         *
+         * The claim can only be made here. The tri-view is `LayoutMode.Horizontal` — ONE staff
+         * system, scrolled sideways, and `view/triview.ts` asserts that count — so "the label on
+         * every system after the first" does not exist on screen at all. The printed document is
+         * `Page` layout (`atSettings.createPrintSettings`), so it is the only render this app
+         * produces that HAS a second system to label.
+         *
+         * The labels are found the way `view/triview.ts §partLabelBoxes` finds them: alphaTab
+         * writes them as ordinary rotated `<text>` in the reserved column left of the system, and
+         * there is no bounds entry for them. Here the document is a STRING, so the rotation is
+         * read off the `<g transform>` the text sits in rather than off a rectangle.
+         *
+         * `mount` puts the whole document into a fixed iframe over the app so a probe can
+         * PHOTOGRAPH it. Off by default: it covers the screen, and every other caller wants the
+         * numbers.
+         */
+        const doc = new DOMParser().parseFromString(html, 'text/html');
+        const systemLabels = [...doc.querySelectorAll('svg text')]
+          .filter((node) => /rotate/.test(node.parentElement?.getAttribute('transform') ?? ''))
+          .map((node) => {
+            const transform = node.parentElement?.getAttribute('transform') ?? '';
+            const at = /translate\(\s*([-\d.]+)\s*,\s*([-\d.]+)/.exec(transform);
+            return {
+              text: node.textContent ?? '',
+              x: at ? Math.round(Number(at[1])) : null,
+              y: at ? Math.round(Number(at[2])) : null
+            };
+          })
+          // The reserved column only. A rotated glyph inside the music (a bend arrow, say) is not
+          // a part name, and the column is the leftmost ink on the page by construction.
+          .filter((label) => /[A-Za-z]/.test(label.text));
+
+        if (mount) {
+          document.querySelector('[data-role="print-preview"]')?.remove();
+          const frame = document.createElement('iframe');
+          frame.setAttribute('data-role', 'print-preview');
+          frame.style.cssText =
+            'position:fixed;inset:0;width:100vw;height:100vh;border:0;background:#fff;z-index:9999;';
+          frame.srcdoc = html;
+          document.body.appendChild(frame);
+        }
+
         return {
           bytes: html.length,
           svgCount: (html.match(/<svg/g) ?? []).length,
@@ -4643,7 +4753,8 @@ class App {
           // alphaTab leaves the music font to a document CSS rule, so a serialised SVG can
           // be full of glyph <text> and still print a page of empty boxes. What has to be
           // true is that the font travels WITH the markup. See export/pdf.ts.
-          glyphsCarryFont: (html.match(/font-family: alphaTab/g) ?? []).length
+          glyphsCarryFont: (html.match(/font-family: alphaTab/g) ?? []).length,
+          systemLabels
         };
       } catch (e) {
         return { error: String((e as Error).message ?? e) };
@@ -4765,6 +4876,35 @@ class App {
     // than recomputed. The row collided with the tab once (reported from the field, and
     // visible in the screenshot the harness writes); this is how the harness proves it
     // does not any more, at every viewport it tests.
+    /**
+     * THE SHEET'S CONTEXT MENU, as labels and state — never as pixels.
+     *
+     * The probe right-clicks the real sheet and reads this back, so what is asserted is the menu
+     * the player would see: which items exist, which are ticked, which are refused and why.
+     */
+    (window as unknown as Record<string, unknown>).__RIFFSHEET_SHEETMENU__ = () => sheetMenuProbe();
+
+    /**
+     * EVERYTHING THE SHEET-EDIT PROBE POINTS AT, in one call and in client coordinates.
+     *
+     * One hook rather than four, because the probe needs them in the SAME frame: a notehead's
+     * position, a point of empty staff, what is selected and how long the document says it is
+     * are all invalidated by the next rebuild, and four calls would straddle one.
+     */
+    (window as unknown as Record<string, unknown>).__RIFFSHEET_SHEETEDIT__ = () => {
+      const view = this.triview?.editProbe() ?? { noteHeads: [], emptyNotation: null };
+      return {
+        ...view,
+        selection: [...this.runtime.get().selection],
+        documentBars: this.runtime.get().source?.documentBars ?? null,
+        canEditBars: this.canEditBars(),
+        rawNotes: this.runtime.get().source?.detected?.notes.length ?? 0,
+        feedNotes: this.performanceFeed().length,
+        undoTitle: this.undoTitle(),
+        menu: sheetMenuProbe()
+      };
+    };
+
     (window as unknown as Record<string, unknown>).__RIFFSHEET_LAYOUT__ = () =>
       this.triview?.layoutProbe() ?? null;
     // The piano roll's own view of itself, plus the transport position so a synthetic
@@ -7490,6 +7630,243 @@ class App {
       }
     };
 
+    /**
+     * "ADD PART (MUSICXML)" THROUGH THE MENU ITEM ITSELF (Z2a).
+     *
+     * The bug this exists for: choosing that item did NOTHING — no dialog, no error, nothing in
+     * the log. `__RIFFSHEET_PARTS__` above could not have caught it, and says so in as many words:
+     * it adds its part by calling `addPartFromMusicXml` directly "because the item ends in a
+     * native file picker no script may answer". That reasoning covered the import and left the
+     * DOOR — the `<optgroup>` verb, the change handler, the picker call — untested, which is
+     * exactly where it broke.
+     *
+     * So the door is driven here, both ways, and the picker is answered at the seam a real host
+     * answers it at:
+     *
+     *   'native'  installs a `bridge.pickInputFile` for the duration of one call, which is what a
+     *             shell provides, and is the branch the plugin takes. This is the branch that did
+     *             not exist before Z2a — the plugin had no native path at all, so the item fell
+     *             through to an `<input type="file">` that a WKWebView will not open without a
+     *             user gesture the `change` event does not carry.
+     *   'refused' answers that same picker with a file that is NOT MusicXML. The native chooser
+     *             has no format filter, so this is a real outcome, and the claim is that it comes
+     *             back as a message rather than as silence or as a mangled part.
+     *   'html'    takes the browser branch and leaves the `<input>` in the document for the
+     *             harness to fill through CDP — the one part of the chain no page script can do.
+     *
+     * Every mode chooses `do:add` on the real control with a real `change`, so a disabled item, a
+     * missing handler or a picker that is never called fails this.
+     */
+    /**
+     * The part fixture as a FILE's worth of bytes, so the harness can write a real `.musicxml` to
+     * disk and hand it to the picker through the debugger — the only part of the Add-part chain a
+     * page script cannot reach on its own (`__RIFFSHEET_PARTADD__`, mode 'html').
+     */
+    (window as unknown as Record<string, unknown>).__RIFFSHEET_PARTFILE__ = () => GUITAR_PART_MUSICXML;
+
+    /**
+     * THE APP'S OWN ANSWER to "is anything in the three top bars narrower than its own text?"
+     *
+     * The harness measures this itself as well (`scripts/verify.mjs §BAR_SWEEP`), and that is the
+     * point of also asking here: the rule is enforced by `barClipped`, which is what
+     * `fitTopBars` is written against, so a harness that agreed with a stylesheet but not with the
+     * app would be checking the wrong thing. One `true` from either side is a failure.
+     */
+    (window as unknown as Record<string, unknown>).__RIFFSHEET_BARCLIP__ = () =>
+      Object.fromEntries(TOP_BAR_SELECTORS.map((sel) => [sel, this.barClipped(sel)]));
+
+    (window as unknown as Record<string, unknown>).__RIFFSHEET_PARTADD__ = async (
+      mode: 'native' | 'refused' | 'html' = 'native'
+    ) => {
+      const bridge = this.bridge as unknown as Record<string, unknown>;
+      const had = Object.prototype.hasOwnProperty.call(bridge, 'pickInputFile');
+      const previous = bridge.pickInputFile;
+      let asked = 0;
+      try {
+        const control = this.root.querySelector<HTMLSelectElement>('[data-role="part-view"]');
+        const item = control ? [...control.options].find((o) => o.value === 'do:add') : undefined;
+        const before = this.partSlots().length;
+        if (!control || !item || item.disabled) {
+          return { error: 'the Add item is missing or disabled', hasItem: !!item, disabled: item?.disabled };
+        }
+
+        if (mode !== 'html') {
+          bridge.pickInputFile = async () => {
+            asked++;
+            return mode === 'refused'
+              ? { kind: 'bytes', path: '/tmp/riff.gp5', name: 'Riff.gp5', bytes: new Uint8Array([1, 2, 3]) }
+              : {
+                  kind: 'bytes',
+                  path: '/tmp/Guitar demo.musicxml',
+                  name: 'Guitar demo.musicxml',
+                  bytes: new TextEncoder().encode(GUITAR_PART_MUSICXML)
+                };
+          };
+        } else if (had) {
+          delete bridge.pickInputFile;
+        }
+
+        control.value = 'do:add';
+        control.dispatchEvent(new Event('change', { bubbles: true }));
+        // One turn for the picker, then the parse and the rebuild it starts.
+        await new Promise((ok) => setTimeout(ok, mode === 'html' ? 60 : 260));
+
+        const file = document.querySelector<HTMLInputElement>('input[type="file"]');
+        const score = this.runtime.get().score;
+        return {
+          asked,
+          before,
+          after: this.partSlots().length,
+          parts: scoreParts(score).map((part) => `${part.role}:${part.name}`),
+          tracks: score?.data.tracks.length ?? 0,
+          partNames: score
+            ? [...score.musicxml().matchAll(/<part-name>([^<]*)<\/part-name>/g)].map((m) => m[1])
+            : [],
+          // The browser branch's own evidence: an input, laid out (never `display: none`, which
+          // WebKit refuses to open a picker for) and asking for the part formats only.
+          picker: file ? { accept: file.accept, laidOut: getComputedStyle(file).display !== 'none' } : null,
+          // What the player was told. A refusal has to SAY so — silence is the bug.
+          toast: [...document.querySelectorAll('.toast')].map((n) => (n.textContent ?? '').slice(0, 90))
+        };
+      } catch (e) {
+        return { error: String((e as Error).message ?? e) };
+      } finally {
+        if (had) bridge.pickInputFile = previous;
+        else delete bridge.pickInputFile;
+      }
+    };
+
+    /**
+     * THE LIVE PART IS RENAMABLE, AND ONE NAME REACHES EVERY SURFACE (Z2b).
+     *
+     * The take used to be the one part on the sheet whose printed name nobody could change: the
+     * menu's Rename was disabled for it and the label on the page did nothing. What is asserted,
+     * in the order somebody would do it:
+     *
+     *   1. Rename is OFFERED on the take (not disabled, and its reason is a promise rather than a
+     *      refusal);
+     *   2. typing a name into the menu's field puts it in the closed box, on the printed staff
+     *      label and in the exported `<part-name>` — read back from three independent places, so
+     *      a rename that reached one of them and not the others fails;
+     *   3. the same again from the LABEL ON THE SHEET, which is the other door;
+     *   4. clearing the field goes back to the instrument's own word rather than to a blank
+     *      staff label — the override is an override, not a replacement;
+     *   5. the document carries it: `encodeSource`/`decodeSource` round-trip through the same
+     *      call the session save makes.
+     *
+     * It leaves the take exactly as it found it, so it can run anywhere in the harness.
+     */
+    (window as unknown as Record<string, unknown>).__RIFFSHEET_LIVENAME__ = async () => {
+      const settle = (ms: number) => new Promise((ok) => setTimeout(ok, ms));
+      const control = () => this.root.querySelector<HTMLSelectElement>('[data-role="part-view"]');
+      const started = this.runtime.get().source?.livePartName;
+      try {
+        const score = () => this.runtime.get().score;
+        const shape = () => ({
+          // The closed box, which is the whole of the control on screen.
+          box: (() => {
+            const node = control();
+            return node?.options[node.selectedIndex]?.text ?? '';
+          })(),
+          // What alphaTab was given to print down the left of the system.
+          printed: (this.triview?.model?.tracks ?? []).map((track) => track.name),
+          shortNames: (this.triview?.model?.tracks ?? []).map((track) => track.shortName),
+          exported: score()
+            ? [...score()!.musicxml().matchAll(/<part-name>([^<]*)<\/part-name>/g)].map((m) => m[1])
+            : [],
+          stored: this.runtime.get().source?.livePartName ?? null
+        });
+        const choose = (value: string) => {
+          const node = control();
+          const option = node ? [...node.options].find((o) => o.value === value) : undefined;
+          if (!node || !option || option.disabled) return false;
+          node.value = value;
+          node.dispatchEvent(new Event('change', { bubbles: true }));
+          return true;
+        };
+        const typeInto = (role: string, value: string) => {
+          const input = document.querySelector<HTMLInputElement>(`[data-role="${role}"]`);
+          if (!input) return false;
+          input.value = value;
+          input.dispatchEvent(new Event('change', { bubbles: true }));
+          return true;
+        };
+
+        this.activePartKey = LIVE_PART_ID;
+        this.syncPartSelect();
+        const derived = shape();
+        const node = control();
+        const item = node ? [...node.options].find((o) => o.value === 'do:rename') : undefined;
+        const offered = !!item && !item.disabled;
+
+        // (2) through the menu.
+        const opened = choose('do:rename');
+        const menu = document.querySelector<HTMLElement>('[data-role="part-menu"]');
+        const menuShape = {
+          open: !!menu,
+          hasName: !!menu?.querySelector('[data-role="part-rename"]'),
+          // The take has no nudge: a nudge slides an imported part AGAINST the take, and the take
+          // is the clock both are measured on.
+          hasNudge: !!menu?.querySelector('[data-role="part-nudge"]'),
+          placeholder:
+            menu?.querySelector<HTMLInputElement>('[data-role="part-rename"]')?.placeholder ?? null
+        };
+        const typed = typeInto('part-rename', 'Rhythm gtr');
+        await settle(60);
+        this.closePartMenu();
+        const afterMenu = shape();
+
+        // (3) …and from the name printed on the sheet.
+        const hit = [...document.querySelectorAll<HTMLElement>('.part-label-hit')].find((button) => {
+          const info = scoreParts(score()).find((part) => part.key === LIVE_PART_ID);
+          return Number(button.dataset.track) === (info?.trackIndex ?? 0);
+        });
+        hit?.click();
+        const inlineOpen = !!document.querySelector('[data-role="part-label-rename"]');
+        const inline = document.querySelector<HTMLInputElement>('[data-role="part-label-rename"]');
+        if (inline) {
+          inline.value = 'Low end';
+          inline.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }));
+        }
+        await settle(80);
+        const afterLabel = shape();
+
+        // (5) the document carries it, through the same encode/decode a save uses.
+        const source = this.runtime.get().source;
+        const roundTrip = source ? decodeSource(encodeSource(source))?.livePartName ?? null : null;
+
+        // (4) …and clearing it goes back to the instrument's word.
+        choose('do:rename');
+        typeInto('part-rename', '   ');
+        await settle(80);
+        this.closePartMenu();
+        const afterClear = shape();
+
+        return {
+          offered,
+          opened,
+          menuShape,
+          typed,
+          derived,
+          afterMenu,
+          inlineOpen,
+          afterLabel,
+          roundTrip,
+          afterClear
+        };
+      } catch (e) {
+        return { error: String((e as Error).stack ?? e) };
+      } finally {
+        // Exactly as it was found, whatever happened above.
+        const source = this.runtime.get().source;
+        if (source && (source.livePartName ?? undefined) !== (started ?? undefined)) {
+          this.runtime.set({ source: { ...source, livePartName: started } });
+          this.rebuildNotation();
+          this.renderMain();
+        }
+      }
+    };
+
     /** Put the take back to one part, so nothing downstream of the parts probe inherits four. */
     (window as unknown as Record<string, unknown>).__RIFFSHEET_PARTSRESET__ = () => {
       try {
@@ -7686,8 +8063,22 @@ class App {
     // `buildScore`, so routing everything through the multi-part door would be defensible; not
     // routing it there is stronger, because a take with no imported parts then executes not one
     // line of the parts code and cannot be changed by it.
+    //
+    // WITH ONE EXCEPTION, AND IT IS THE ONLY WAY A NAME CAN REACH THE PAGE (Z2b). `buildScore`
+    // takes no part name: a single-part build calls the part whatever the pipeline's
+    // `defaultPartName(ir)` calls it, derived from the instrument and the tuning, with nothing in
+    // the request that could override it. `buildPartedRiffScore` DOES take one — it is how the
+    // live part is already named on a two-part sheet — so a take the player has renamed goes
+    // through that door instead, and the sheet, the PDF, the `<part-name>` and the menu all read
+    // the word that was typed.
+    //
+    // NARROW BY DESIGN: `livePartName` is absent on every document until somebody types a name, so
+    // the ordinary take is on exactly the path it was on before this existed. What the renamed one
+    // gains beyond its name is the pipeline's byte-identity guarantee plus one extra diagnostics
+    // line ("1 parts on one sheet") and a one-entry `parts` sidecar — both of which the two-part
+    // case has carried since parts shipped.
     const slots = this.partSlots(source);
-    if (slots.length < 2) return buildRiffScore(request, settings);
+    if (slots.length < 2 && !cleanPartName(source.livePartName)) return buildRiffScore(request, settings);
     return buildPartedRiffScore(request, settings, slots);
   }
 
@@ -7698,7 +8089,44 @@ class App {
   /** The parts of the document in printed order. Always at least the live take. */
   private partSlots(source?: SourceAudio | null): PartSlot[] {
     const take = source ?? this.runtime.get().source;
-    return orderedPartSlots(take?.importedParts, take?.partOrder);
+    return orderedPartSlots(take?.importedParts, take?.partOrder, take?.livePartName);
+  }
+
+  /**
+   * WHAT THE LIVE PART IS CALLED RIGHT NOW: the player's name if they typed one, the instrument's
+   * if they did not (`score/parts.ts §livePartName`).
+   *
+   * One reader for the whole file. Every place the take's name appears — the menu entry, the
+   * tooltips on the verbs that act on it, the popover's own label — used to call `livePartName`
+   * with the settings alone, and each of them would have had to remember the document's override
+   * as well.
+   */
+  private liveName(source?: SourceAudio | null): string {
+    const take = source ?? this.runtime.get().source;
+    return livePartName(this.settings.get(), take?.livePartName);
+  }
+
+  /**
+   * Store (or clear) the live part's name and re-engrave.
+   *
+   * ON THE DOCUMENT, through `runtime.source`, for the reason written out at
+   * `state.ts §SourceAudio.livePartName`: a part name belongs to the piece and not to the plugin.
+   * The rest of this is `setParts` verbatim — a rebuild so the page and the exports carry the new
+   * word, a render so the menu does, and a save so the document does.
+   *
+   * AN EMPTY NAME IS A CLEAR, not a blank label: the field goes back to `undefined`, and the next
+   * build derives the name from the instrument again.
+   */
+  private setLivePartName(name: string): void {
+    const source = this.runtime.get().source;
+    if (!source) return;
+    const next = cleanPartName(name) || undefined;
+    if ((source.livePartName ?? undefined) === next) return;
+    this.runtime.set({ source: { ...source, livePartName: next } });
+    // Nothing about the PERFORMANCE changed — same notes, same ids — so the edits still apply.
+    this.rebuildNotation();
+    this.renderMain();
+    this.scheduleSave();
   }
 
   /**
@@ -7961,6 +8389,10 @@ class App {
   }
 
   private rebuildNotation(options?: { keepEdits?: boolean }): void {
+    // A MENU DESCRIBES NOTES THAT ARE ABOUT TO BE REPLACED. Every id it closes over belongs to
+    // the graph this rebuild throws away, so it goes with it rather than acting on a note that
+    // is no longer there. Picking an item already closes it; this is for every other rebuild.
+    closeSheetMenu();
     // THE EDITED TAKE (F16), so the beats, the duration and the bar-1 anchor the pipeline is
     // handed all describe the same music as the notes it is handed. Identical to
     // `runtime.source` until the player cuts something out.
@@ -8638,7 +9070,7 @@ class App {
     // The words in the box just changed and the box is cut to its words, so it has to be cut
     // again. Measured without this: the Key box kept the 97px it was given for "Key: Auto" and
     // then showed "Key: Auto — C major" — 123px of text — clipped inside it.
-    this.fitSelects([select]);
+    fitSelects([select]);
   }
 
   // =========================================================================
@@ -9041,7 +9473,7 @@ class App {
   private partMenuGroups(): HTMLElement[] {
     const slots = this.partSlots();
     const order = partOrderOf(slots);
-    const liveName = livePartName(this.settings.get());
+    const liveName = this.liveName();
     // Fall back to the take when the active key names a part that has just been removed.
     const at = Math.max(0, order.indexOf(this.activePartKey));
     const active = slots[at];
@@ -9065,13 +9497,16 @@ class App {
       el(
         'optgroup',
         { label: 'Edit' },
+        // RENAME IS OFFERED FOR THE TAKE TOO NOW. It used to be refused with "the take is named
+        // after its instrument and follows it", which was true of the code and unhelpful as an
+        // answer: the one part on nearly every sheet this app makes was the one part whose printed
+        // name nobody could change. The instrument still supplies the DEFAULT — clearing the box
+        // goes back to it — but the player's own word wins wherever it appears (Z2b;
+        // `state.ts §SourceAudio.livePartName`).
         el('option', {
           value: 'do:rename',
           text: 'Rename',
-          disabled: live,
-          title: live
-            ? 'The take is named after its instrument and follows it'
-            : `Rename ${name}`
+          title: `Rename ${name}`
         }),
         el('option', {
           value: 'do:move-up',
@@ -9118,8 +9553,8 @@ class App {
     if (!select) return;
     replace(select, ...this.partMenuGroups());
     // The name in the box just changed, and the box is only as wide as the name it shows.
-    // See `fitNotationBar`.
-    this.fitNotationBar();
+    // See `fitTopBars`.
+    this.fitTopBars();
   }
 
   private onPartControlChange(select: HTMLSelectElement): void {
@@ -9136,7 +9571,8 @@ class App {
     switch (raw) {
       case 'do:rename': {
         const slot = this.partSlots().find((s) => s.kind === 'imported' && s.part.id === this.activePartKey);
-        if (slot?.kind === 'imported') this.openPartMenu(select, slot.part);
+        // The take is a target like any other now; only the nudge box is missing from its popover.
+        this.openPartMenu(select, slot?.kind === 'imported' ? slot.part : null);
         return;
       }
       case 'do:move-up':
@@ -9202,19 +9638,42 @@ class App {
    *
    * Remove is NOT here any more: it is an item on the part menu, beside Move up and Move down,
    * which is where the rest of the verbs went.
+   *
+   * `part === null` IS THE TAKE, and it gets the name row and nothing else. There is no nudge to
+   * offer it: a nudge slides an imported chart AGAINST the take, and the take is the clock both of
+   * them are measured on — a box that moved the document against itself would mean nothing. Its
+   * name row carries the placeholder that says what clearing it does, which is the one thing about
+   * the live name that is not true of an imported one.
    */
-  private openPartMenu(anchor: HTMLElement, part: ImportedPart): void {
+  private openPartMenu(anchor: HTMLElement, part: ImportedPart | null): void {
     this.closePartMenu();
+    const shown = part ? part.name : this.liveName();
     const commitName = (value: string) => {
-      const name = value.trim().slice(0, 40);
+      if (!part) {
+        // Empty is allowed here and only here: it is how the take goes back to being named after
+        // its instrument. An imported part has no derived name to fall back to.
+        this.setLivePartName(value);
+        return;
+      }
+      const name = cleanPartName(value);
       if (!name || name === part.name) return;
       this.updatePart(part.id, (p) => ({ ...p, name }));
     };
     const nameBox = el('input', {
       type: 'text',
       'data-role': 'part-rename',
-      value: part.name,
+      value: shown,
+      maxlength: String(MAX_PART_NAME_LENGTH),
       'aria-label': 'Part name',
+      ...(part
+        ? {}
+        : {
+            placeholder: livePartName(this.settings.get()),
+            title: t(
+              'What this part is called on the page and in every export. Clear it and the take goes ' +
+                'back to being named after its instrument.'
+            )
+          }),
       onKeyDown: (e: KeyboardEvent) => {
         if (e.key !== 'Enter') return;
         e.preventDefault();
@@ -9229,33 +9688,36 @@ class App {
     // box showing a number that is not what happened.
     const bpm = this.runtime.get().score?.tempoBpm ?? 120;
     const step = nudgeStepMs(bpm);
-    const nudgeBox = el('input', {
-      type: 'number',
-      step: String(Math.round(step)),
-      'data-role': 'part-nudge',
-      value: String(Math.round(part.nudgeMs)),
-      'aria-label': 'Nudge in milliseconds',
-      title: `Move this part against the take. Rounded to a 32nd note — ${Math.round(step)} ms at this tempo.`,
-      onChange: (e: Event) => {
-        const ms = Number((e.target as HTMLInputElement).value);
-        const asked = Number.isFinite(ms) ? Math.max(-10_000, Math.min(10_000, ms)) : 0;
-        const next = Math.round(snapNudgeMs(asked, bpm));
-        if (next === part.nudgeMs) return;
-        this.updatePart(part.id, (p) => ({ ...p, nudgeMs: next }));
-      }
-    });
+    const nudgeBox =
+      part &&
+      el('input', {
+        type: 'number',
+        step: String(Math.round(step)),
+        'data-role': 'part-nudge',
+        value: String(Math.round(part.nudgeMs)),
+        'aria-label': 'Nudge in milliseconds',
+        title: `Move this part against the take. Rounded to a 32nd note — ${Math.round(step)} ms at this tempo.`,
+        onChange: (e: Event) => {
+          const ms = Number((e.target as HTMLInputElement).value);
+          const asked = Number.isFinite(ms) ? Math.max(-10_000, Math.min(10_000, ms)) : 0;
+          const next = Math.round(snapNudgeMs(asked, bpm));
+          if (next === part.nudgeMs) return;
+          this.updatePart(part.id, (p) => ({ ...p, nudgeMs: next }));
+        }
+      });
 
     const popover = el(
       'div',
-      { class: 'popover part-menu', 'data-role': 'part-menu', role: 'dialog', 'aria-label': `${part.name} part` },
+      { class: 'popover part-menu', 'data-role': 'part-menu', role: 'dialog', 'aria-label': `${shown} part` },
       el('label', { class: 'part-menu-row' }, el('span', { text: 'Name' }), nameBox),
-      el(
-        'label',
-        { class: 'part-menu-row' },
-        el('span', { text: 'Nudge' }),
-        nudgeBox,
-        el('span', { class: 'dim', text: 'ms' })
-      )
+      nudgeBox &&
+        el(
+          'label',
+          { class: 'part-menu-row' },
+          el('span', { text: 'Nudge' }),
+          nudgeBox,
+          el('span', { class: 'dim', text: 'ms' })
+        )
     );
     document.body.appendChild(popover);
     this.partMenu = popover;
@@ -9300,8 +9762,11 @@ class App {
    * bar, the name on the page, the MusicXML `<part-name>` and the saved document cannot come out
    * of the rename disagreeing: there is one write and they are all four downstream of it.
    *
-   * The take's own label selects and does not offer a rename, for the reason in
-   * `buildPartControl`: its printed name is derived from the instrument on every build.
+   * THE TAKE'S OWN LABEL OPENS THE SAME FIELD NOW (Z2b). It used to select the part and stop
+   * there, because there was no stored name to write into; there is one, so the sentence a player
+   * wants to correct is editable wherever it is printed, and the same rule applies to both kinds
+   * of part. The take's write goes to `setLivePartName` instead of `updatePart` — one field, two
+   * destinations, and nothing else about the gesture differs.
    */
   private onPartLabelClick(trackIndex: number, rect: { x: number; y: number; w: number; h: number }): void {
     const info = scoreParts(this.runtime.get().score).find((part) => part.trackIndex === trackIndex);
@@ -9312,7 +9777,7 @@ class App {
       this.syncPartSelect();
     }
     const slot = this.partSlots().find((s) => s.kind === 'imported' && s.part.id === key);
-    if (slot?.kind === 'imported') this.renamePartInline(slot.part, rect);
+    this.renamePartInline(slot?.kind === 'imported' ? slot.part : null, rect);
   }
 
   private partLabelEdit: HTMLInputElement | null = null;
@@ -9324,25 +9789,40 @@ class App {
    * the commit re-engraves and the engraving is replaced under it — a field living inside the
    * thing it is about would be destroyed by its own success. It is horizontal even though the
    * label it covers is printed sideways: this is a word being typed, not a word being read.
+   *
+   * `part === null` is the TAKE's label; see `onPartLabelClick`.
    */
-  private renamePartInline(part: ImportedPart, rect: { x: number; y: number; w: number; h: number }): void {
+  private renamePartInline(
+    part: ImportedPart | null,
+    rect: { x: number; y: number; w: number; h: number }
+  ): void {
     this.closePartLabelEdit();
+    const shown = part ? part.name : this.liveName();
     let done = false;
     const finish = (commit: boolean, value: string) => {
       if (done) return;
       done = true;
-      const name = value.trim().slice(0, 40);
+      const name = cleanPartName(value);
       this.closePartLabelEdit();
-      if (!commit || !name || name === part.name) return;
+      if (!commit) return;
+      // An empty name clears the take's override — the same "go back to the instrument" the
+      // popover offers — and is refused for an imported part, which has nothing to fall back to.
+      if (!part) {
+        this.setLivePartName(name);
+        return;
+      }
+      if (!name || name === part.name) return;
       this.updatePart(part.id, (p) => ({ ...p, name }));
     };
     const input = el('input', {
       type: 'text',
       class: 'part-label-edit',
       'data-role': 'part-label-rename',
-      value: part.name,
+      value: shown,
+      maxlength: String(MAX_PART_NAME_LENGTH),
       spellcheck: 'false',
       'aria-label': 'Part name',
+      ...(part ? {} : { placeholder: livePartName(this.settings.get()) }),
       onKeyDown: (e: KeyboardEvent) => {
         if (e.key === 'Enter') {
           e.preventDefault();
@@ -9392,20 +9872,66 @@ class App {
    */
   private async addPartFromPicker(): Promise<void> {
     if (this.partSlots().length >= MAX_SCORE_PARTS) return;
-    const file = await this.pickMusicXmlFile();
-    if (!file) return;
     try {
+      const file = await this.pickMusicXmlFile();
+      if (!file) return;
       await this.addPartFromMusicXml(file.name, file.bytes);
     } catch (e) {
       this.toast('danger', 'Could not add that part', (e as Error).message);
     }
   }
 
-  private pickMusicXmlFile(): Promise<{ name: string; bytes: Uint8Array } | null> {
+  /**
+   * THE SHELL'S PICKER FIRST, AND THAT IS THE WHOLE OF WHY "Add part (MusicXML)" DID NOTHING.
+   *
+   * The reported symptom was a menu entry with no effect at all: choose it in the plugin and no
+   * dialog appears, no error appears, nothing happens. The chain is `<optgroup>` verb -> `change`
+   * on the `<select>` -> `addPartFromPicker()` -> a hidden `<input type="file">` -> `.click()`,
+   * and it breaks at the last link for two reasons that compound:
+   *
+   *  - A FILE PICKER NEEDS A USER GESTURE, and `change` is not one of them. The events that grant
+   *    transient activation are the pointer and key ones; `change` is not on that list, so by the
+   *    time this runs the only activation left is whatever survived from the press that OPENED the
+   *    drop-down — and on macOS the native `<select>` popup is a modal menu that consumes it.
+   *    A blocked picker throws nothing and logs nothing to the page: `click()` simply returns.
+   *  - AND THE PLUGIN'S WEBVIEW IS NOT A BROWSER ANYWAY. `pickFile()` (the "Choose a file" door on
+   *    the opening screen) has said so in a comment for as long as it has existed: "HTML file
+   *    inputs are unreliable inside DAW WebViews", which is why THAT path asks the shell first and
+   *    only falls back to an `<input>` in a plain browser tab. This one never got the same
+   *    treatment, so the door a player actually uses was the one door with no native path behind
+   *    it.
+   *
+   * So this now follows `pickFile()` exactly: `bridge.pickInputFile` when the shell has it, the
+   * `<input>` when it does not. Feature-detected rather than assumed, because the same page runs
+   * in a browser tab and in shells older than the call.
+   *
+   * THE NATIVE CHOOSER HAS NO MUSICXML FILTER — it is the universal one, and it offers audio and
+   * Guitar Pro and PDFs alongside the part formats (`NativeBridge::fnPickInputFile`). Rather than
+   * silently do something else with what came back, anything that is not MusicXML is refused BY
+   * NAME here, which is the same sentence `addPartFromMusicXml` would have thrown and reaches the
+   * player as an ordinary toast. Audio is refused before it is looked at: the shell hands audio
+   * over as decoded samples with no file bytes at all, so there is nothing to parse.
+   */
+  private async pickMusicXmlFile(): Promise<{ name: string; bytes: Uint8Array } | null> {
+    const refuse = (name: string): never => {
+      throw new Error(
+        `A part is added from a MusicXML file (.xml, .musicxml or .mxl), and ${name} is not one. ` +
+          'Guitar Pro, MIDI and audio open as whole documents from the Main menu instead.'
+      );
+    };
+    if (this.bridge.pickInputFile) {
+      const picked = await this.bridge.pickInputFile();
+      if (!picked) return null;
+      if (picked.kind !== 'bytes') return refuse(picked.audio.name || 'that recording');
+      if (!MUSICXML_NAME.test(picked.name)) return refuse(picked.name);
+      return { name: picked.name, bytes: picked.bytes };
+    }
     return new Promise((resolve) => {
       const input = document.createElement('input');
       input.type = 'file';
       input.accept = MUSICXML_ACCEPT;
+      // Laid out, not `display: none` — WebKit refuses to open a picker for a hidden control,
+      // and this is the same off-screen 1px trick `pickFile()` uses for the same reason.
       Object.assign(input.style, {
         position: 'fixed',
         left: '-10000px',
@@ -9836,50 +10362,59 @@ class App {
    * ones — measured at the 390px floor, where this bar is drawn at about 0.62, a box sized with
    * 23px of allowance had about 14 of it and clipped "Key: Auto — C majo" with no ellipsis to
    * announce it. The stylesheet draws the chevron itself now, inside a `padding-right` of
-   * exactly `NOTATION_ARROW_PX` (ui/styles.css §.notation-toolbar select), so the reserve is part
+   * exactly `SELECT_ARROW_PX` (ui/styles.css §.notation-toolbar select), so the reserve is part
    * of the frame and there is nothing left to estimate.
    *
    * Two passes over the list rather than one, deliberately: every width is cleared, then every
    * width is read, then every width is written. Interleaving them is one forced layout per
    * control instead of one for the bar.
    */
-  private fitNotationBar(): void {
-    const bar = this.root.querySelector<HTMLElement>('[data-role="notation-toolbar"]');
-    if (!bar) return;
-    this.fitSelects([...bar.querySelectorAll('select')]);
+  private fitTopBars(): void {
+    const bars = TOP_BAR_SELECTORS.flatMap((sel) => [
+      ...this.root.querySelectorAll<HTMLElement>(sel)
+    ]);
+    fitSelects(bars.flatMap((bar) => [...bar.querySelectorAll('select')]));
+    this.fitHeaderName();
   }
 
-  /** The measurement itself. See `fitNotationBar` for what it is for and why it is a measurement. */
-  private fitSelects(boxes: HTMLSelectElement[]): void {
-    const ctx = (this.textMeasure ??= document.createElement('canvas').getContext('2d'));
-    if (!ctx) return;
-    for (const select of boxes) select.style.width = '';
-    const wanted = boxes.map((select) => {
-      const cs = getComputedStyle(select);
-      ctx.font = cs.font || `${cs.fontSize} ${cs.fontFamily}`;
-      const width = (text: string) => ctx.measureText(text).width;
-      // THE FRAME IS THE WHOLE ANSWER NOW. `padding-right` already holds the arrow (styles.css
-      // draws it there, NOTATION_ARROW_PX wide), so there is nothing left to estimate: the box is
-      // its text plus its own box model. The version this replaces derived the arrow by
-      // subtracting the longest option from the control's intrinsic width, which mixed a ZOOMED
-      // rect with UNZOOMED text and clipped at the 390px floor.
-      const frame =
-        parseFloat(cs.paddingLeft) +
-        parseFloat(cs.paddingRight) +
-        parseFloat(cs.borderLeftWidth) +
-        parseFloat(cs.borderRightWidth);
-      const shown = select.options[select.selectedIndex]?.text ?? '';
-      // The two-pixel allowance is for the difference between a canvas measurement and the
-      // engine's own layout of the same string; with no ellipsis to fall back on, a box one
-      // pixel short does not truncate politely, it clips.
-      return Math.ceil(width(shown) + frame) + 2;
-    });
-    boxes.forEach((select, i) => {
-      select.style.width = `${wanted[i]}px`;
-    });
+  /**
+   * THE TAKE'S NAME IS ON SCREEN WHOLE OR IT IS NOT ON SCREEN (Z6).
+   *
+   * The last of the header's truncations, and the one no stylesheet could fix. The tempo detail is
+   * dropped whole at a MEASURED breakpoint (styles.css §1150px) because the longest sentence it can
+   * hold is known in advance; a file name is not — "riff.wav" and "2024-11-03 rehearsal, second
+   * take, bridge only.wav" want 60px and 340px of the same row — so the decision has to be made
+   * against the actual string, after layout, which is here.
+   *
+   * THE TEST IS THE ROW'S, NOT THE NAME'S. `.filename` cannot shrink below its own text any more
+   * (`min-width: max-content`), so a header that cannot afford it OVERFLOWS — and that overflow is
+   * the honest question "is there room?" already answered by the layout engine, at whatever zoom
+   * the ladder has put this bar on. Hidden, it is one press away under Main menu > Current work,
+   * and the row goes back to fitting because the name was the only elastic thing left in it.
+   *
+   * Order matters: the drop-downs are cut to their words FIRST (they give up about 90px of
+   * reserved nothing between them), so the name is only dropped when the row is genuinely full
+   * rather than merely badly divided.
+   */
+  private fitHeaderName(): void {
+    const header = this.root.querySelector<HTMLElement>('.app-header');
+    const name = header?.querySelector<HTMLElement>('.filename');
+    if (!header || !name) return;
+    // Shown first, always: the row is a different width than it was last time this ran, and a
+    // name hidden at 900px must come back when the window is dragged out to 1440.
+    name.style.display = '';
+    if (header.scrollWidth > header.clientWidth + 1) name.style.display = 'none';
   }
 
-  private textMeasure: CanvasRenderingContext2D | null = null;
+  /*
+   * `fitSelects` MOVED TO `ui/dom.ts`, unchanged, and this is the whole of why: the transport's
+   * sound picker rebuilds its own `<select>` whenever a sample set finishes loading
+   * (`ui/settings.ts §soundPicker`), which threw away the width this bar had just given it — so
+   * the one box on the transport that could not be fitted from here was the one the row was
+   * squeezing. It fits itself now, through the same function, and there is exactly one definition
+   * of "as wide as the words in it" in the app.
+   */
+
 
   /**
    * TRUE WHEN ANYTHING ON THE NOTATION BAR IS NARROWER THAN THE WORDS IN IT.
@@ -9902,20 +10437,36 @@ class App {
    * the same space as the padding and the font, so it is what gets compared.
    */
   private notationBarClipped(): boolean {
-    const bar = this.root.querySelector<HTMLElement>('[data-role="notation-toolbar"]');
+    return this.barClipped('[data-role="notation-toolbar"]');
+  }
+
+  /**
+   * The same measurement, for any of the three bars. See `notationBarClipped` for the rule.
+   *
+   * A hidden node is not a clipped one — `fitHeaderName` DROPS the take's name rather than cutting
+   * it, and a dropped name reports `clientWidth: 0`, which would otherwise read as the very fault
+   * it exists to prevent. `display: none` is the honest second state of "on screen whole or not on
+   * screen", so it is skipped here exactly as `.tempo-detail` is when its breakpoint hides it.
+   */
+  private barMeasure: CanvasRenderingContext2D | null = null;
+
+  private barClipped(selector: string): boolean {
+    const bar = this.root.querySelector<HTMLElement>(selector);
     if (!bar) return false;
-    const ctx = (this.textMeasure ??= document.createElement('canvas').getContext('2d'));
+    const ctx = (this.barMeasure ??= document.createElement('canvas').getContext('2d'));
     for (const node of bar.querySelectorAll<HTMLElement>('*')) {
+      const style = getComputedStyle(node);
+      if (style.display === 'none' || style.visibility === 'hidden') continue;
       if (node instanceof HTMLSelectElement) {
         if (!ctx) continue;
-        const cs = getComputedStyle(node);
+        const cs = style;
         ctx.font = cs.font || `${cs.fontSize} ${cs.fontFamily}`;
         const box = parseFloat(node.style.width) || node.getBoundingClientRect().width;
         // THE STYLESHEET'S HALF OF THE BARGAIN, asserted rather than assumed. The chevron is
         // painted inside `padding-right`; if that padding ever falls below the arrow it is drawn
         // at, the arrow is on top of the last word and the text is unreadable without a single
         // pixel of overflow to show for it. Counted as a clip, because that is what it is.
-        if (parseFloat(cs.paddingRight) + 0.5 < NOTATION_ARROW_PX) return true;
+        if (parseFloat(cs.paddingRight) + 0.5 < SELECT_ARROW_PX) return true;
         const room =
           box -
           parseFloat(cs.paddingLeft) -
@@ -10158,8 +10709,9 @@ class App {
 
     // The bar is in the document at last, so its boxes can be measured and cut to their words.
     // Here rather than inside `buildNotationToolbar`, which builds an unmounted tree that has no
-    // computed style to read (§fitNotationBar).
-    this.fitNotationBar();
+    // computed style to read (§fitTopBars). The header and the transport are fitted in the same
+    // pass, for the same reason and by the same measurement.
+    this.fitTopBars();
 
     if (focusRole) {
       const again = this.root.querySelector<HTMLElement>(`[data-role="${focusRole}"]`);
@@ -10447,7 +10999,10 @@ class App {
       onNoteHover: (id) => this.pianoRoll?.setHover(id ? [id] : []),
       // The part name engraved down the left of the system, pressed. See `onPartLabelClick`:
       // it selects that part, and for an imported one it opens the rename on the spot.
-      onPartLabelClick: (trackIndex, rect) => this.onPartLabelClick(trackIndex, rect)
+      onPartLabelClick: (trackIndex, rect) => this.onPartLabelClick(trackIndex, rect),
+      // RIGHT-CLICK IS EDIT (Z4). The sheet resolves the press to a semantic target and this
+      // builds the menu out of it — see `onSheetContextMenu`.
+      onSheetContextMenu: (target) => this.onSheetContextMenu(target)
     });
     this.transport.attachAlphaTab(this.triview.api);
     // See `renderEveryPart`: a view built just now defers its first render, so the multi-part
@@ -11192,11 +11747,21 @@ class App {
   private applySheetDrag(
     p:
       | { noteId: string; kind: 'pitch'; semitones: number }
+      | { noteId: string; kind: 'time'; tick: number }
       | { noteId: string; kind: 'string'; direction: 1 | -1; steps: number }
   ): void {
     // See `onNoteClick`: an imported part is engraved, not edited. Refused here as well as at
     // the selection, because a drag does not have to go through a selection to reach an action.
     if (this.isImportedNoteId(p.noteId)) return;
+    if (p.kind === 'time') {
+      // A HORIZONTAL drag is a performance edit and nothing else: the note is attacked at a
+      // different written time, and the roll, the synth and every export follow from that one
+      // change. See `applySheetEdit` and edit/performanceEdit.ts for the collision law.
+      const startSec = this.beatSecAtTick(p.tick);
+      if (startSec === null) return;
+      this.applySheetEdit({ kind: 'moveNote', noteId: p.noteId, startSec });
+      return;
+    }
     if (p.kind === 'pitch') {
       if (p.semitones === 0) return;
       this.perform(new ChangePitchAction(p.noteId, p.semitones), p.noteId);
@@ -11455,6 +12020,18 @@ class App {
    * push, every truncation and every step, and keeping them in step is one line each.
    */
   private perfCuts: CutSpan[][] = [NO_CUTS];
+  /**
+   * THE DOCUMENT'S DECLARED LENGTH at each performance step, parallel to `perfStack` (Z4c).
+   *
+   * A bar insert is not only a note edit: it changes `SourceAudio.documentBars`, which is the
+   * `BuildInput.minimumBars` floor the pipeline engraves against. Undo used to restore the notes
+   * and leave the length alone, so walking back an inserted bar gave a document one bar longer
+   * than its own history said it was. Structural state joins the transaction here.
+   *
+   * `undefined` is a document that declares no length at all — every recorded take — and
+   * restoring it is a no-op, so this costs a take that never inserts a bar exactly nothing.
+   */
+  private perfBars: Array<number | undefined> = [undefined];
   /** The order the two layers were edited in, so one ⌘Z walks back through both. */
   private history: Array<'perf' | 'score'> = [];
   private historyIndex = -1;
@@ -11503,6 +12080,7 @@ class App {
     this.perfStack = [notes];
     this.perfLabels = [null];
     this.perfCuts = [this.cuts()];
+    this.perfBars = [this.runtime.get().source?.documentBars];
     this.perfIndex = 0;
     this.history = [];
     this.historyIndex = -1;
@@ -11564,6 +12142,318 @@ class App {
           : mergeEditedOntoRaw(raw, result.notes, touched),
       result.label
     );
+  }
+
+  // =========================================================================
+  // Sheet editing (Z4) — right-click is edit, and every road ends at the adapter
+  // =========================================================================
+  //
+  // `IRBeat.durationType` spells the printed value in words; `NotationIntent` spells it as the
+  // denominator MusicXML's `<type>` implies. One map, here, so the menu's ticked item is the
+  // glyph on the page rather than a second opinion about it.
+
+  /**
+   * The written tick of the nearest BEAT to an engraved tick, in the score's own meter.
+   *
+   * The sheet hands over an unrounded tick because rounding is a question about the METER and
+   * the sheet does not hold the IR (see `SheetTarget.tick`). This is that question answered:
+   * find the bar the tick is in, and round to its own beat lattice — `divisions * 4 / d` ticks
+   * for a bar in n/d, so 6/8 rounds to eighths and 4/4 to quarters, which is what a player means
+   * by "the nearest beat" in each.
+   */
+  private nearestBeatTick(score: RiffScore, tick: number): number | null {
+    const bars = score.ir.bars;
+    const divisions = score.ir.divisions || 12;
+    if (!bars.length) return null;
+    const clamped = Math.max(0, tick);
+    let bar = bars[0];
+    for (const b of bars) {
+      if (clamped >= b.startTick) bar = b;
+      else break;
+    }
+    const denominator = bar.timeSig?.[1] || 4;
+    const beatTicks = Math.max(1, Math.round((divisions * 4) / denominator));
+    const from = bar.startTick;
+    const beats = Math.round((clamped - from) / beatTicks);
+    // Never past the end of the bar it was dropped in: rounding forward off the last beat would
+    // silently move the note into the next bar, which is not what the hand did.
+    const maxBeats = Math.max(0, Math.round(bar.durTicks / beatTicks));
+    return from + Math.max(0, Math.min(maxBeats, beats)) * beatTicks;
+  }
+
+  /** A sheet tick, rounded to the nearest beat and stated in FEED seconds. Null with no score. */
+  private beatSecAtTick(tick: number): number | null {
+    const score = this.runtime.get().score;
+    if (!score) return null;
+    const beat = this.nearestBeatTick(score, tick);
+    if (beat === null) return null;
+    return tickToSeconds(score, beat, this.originSec(score));
+  }
+
+  /**
+   * How long one written value lasts, starting where it starts. TEMPO-MAP AWARE, on purpose.
+   *
+   * Both ends go through `tickToSeconds`, which walks `ir.tempo.changes`. Multiplying by one
+   * scalar BPM — which is what `edit/rollPerformance.ts` still does for `sourceTiming` — gives a
+   * quarter note the wrong number of seconds everywhere past a tempo change, and the error grows
+   * with distance. Null when the intent names nothing printable; see `notationIntentTicks`.
+   */
+  private intentLengthSec(startSec: number, intent: NotationIntent): number | null {
+    const score = this.runtime.get().score;
+    if (!score) return null;
+    const ticks = notationIntentTicks(intent, score.ir.divisions);
+    if (ticks === null) return null;
+    const origin = this.originSec(score);
+    const startTick = secondsToTick(score, startSec, origin);
+    return tickToSeconds(score, startTick + ticks, origin) - tickToSeconds(score, startTick, origin);
+  }
+
+  /**
+   * ONE SHEET EDIT, THROUGH THE ADAPTER. The sheet's counterpart of `applyRollEdit`.
+   *
+   * Identical in shape and for identical reasons — derived-domain reducer, explicit touched ids,
+   * cut/snap-aware merge back into the recording, one `commitPerformance` — with the one
+   * difference the sheet forces: the reducer names its own COLLISION VICTIMS, so a note trimmed
+   * because something landed on it is merged back rather than restored from raw on the next
+   * rebuild. See edit/performanceEdit.ts, which is the whole argument.
+   */
+  private applySheetEdit(edit: SheetEdit): boolean {
+    const source = this.runtime.get().source;
+    const score = this.runtime.get().score;
+    if (!source?.detected || !score) return false;
+
+    const raw = source.detected.notes;
+    // WHAT THE PLAYER WAS LOOKING AT, exactly as the roll's road does it: the sheet is engraved
+    // from the feed, so a time read off the engraving is a feed second.
+    const feed = this.performanceFeed();
+    const result = applySheetEditToNotes(feed, edit, {
+      originSec: this.originSec(score),
+      tempoBpm: score.tempoBpm,
+      newNoteId: () => `add${++this.addedNoteCount}`,
+      intentLengthSec: (startSec, intent) => this.intentLengthSec(startSec, intent)
+    });
+    if (!result) return false;
+
+    // The player has decided about every note this edit named — including the victims — so the
+    // auto-edit pass leaves them alone from here on. See `userTouchedIds`.
+    for (const id of result.touchedIds) this.userTouchedIds.add(id);
+
+    const cuts = this.cuts();
+    this.commitPerformance(
+      cuts.length
+        ? mergePerformanceEditOntoCutTake(raw, result.notes, result.touchedIds, cuts)
+        : feed === raw
+          ? result.notes
+          : mergeEditedOntoRaw(raw, result.notes, result.touchedIds),
+      result.label
+    );
+    return true;
+  }
+
+  /**
+   * BARS ARE STRUCTURE, so a bar operation is a note edit AND a document-length change, in one
+   * undo step.
+   *
+   * `documentBars` is the floor the pipeline is given as `BuildInput.minimumBars`, and it now
+   * travels on the performance stack beside the notes and the cuts (see `perfBars`) — without
+   * that, undoing an inserted bar would put the notes back and leave the document a bar longer,
+   * which is a page that disagrees with its own history.
+   *
+   * Refused on anything with a recording behind it, and the menu says so rather than hiding the
+   * items. The reason is in edit/performanceEdit.ts §BarOp: inserted silence cannot be expressed
+   * against an immutable waveform, and pretending otherwise would slide the notes a bar away
+   * from the audio they were transcribed from.
+   */
+  private canEditBars(): boolean {
+    return this.barRefusal() === null;
+  }
+
+  /**
+   * Why a bar operation is refused, or null when it is not. The menu prints this verbatim.
+   *
+   * Two refusals, and the second is not a smaller version of the first. A RECORDING cannot have
+   * silence inserted into it (edit/performanceEdit.ts §BarOp). An IMPORTED PART is a different
+   * refusal with the same shape: a multi-part score shares one master clock — one bar list, one
+   * meter map, one set of downbeats — so "insert a bar into the live part" is not a coherent
+   * request while somebody else's engraving is pinned to those same bars. Lengthening the
+   * document would silently re-bar the imported chart, which is exactly the paper-only rule.
+   */
+  private barRefusal(): string | null {
+    const source = this.runtime.get().source;
+    if (!source) return 'Bars are fixed by the recording';
+    if (source.documentBars === undefined || source.peaks || this.pcm) {
+      return 'Bars are fixed by the recording';
+    }
+    for (const part of scoreParts(this.runtime.get().score)) {
+      if (part.role === 'imported') return 'Imported parts share these bars';
+    }
+    return null;
+  }
+
+  private applyBarOperation(op: BarOp): boolean {
+    const source = this.runtime.get().source;
+    const score = this.runtime.get().score;
+    if (!this.canEditBars() || !source?.detected || !score) return false;
+    const bars = source.documentBars;
+    const meter = source.timeSignature;
+    if (!bars || !meter || !source.tempoBpm) return false;
+    const barLengthSec = meter.numerator * (4 / meter.denominator) * (60 / source.tempoBpm);
+
+    const feed = this.performanceFeed();
+    const result = applyBarOp(feed, op, { barLengthSec, barCount: bars });
+    if (!result) return false;
+    for (const id of result.touchedIds) this.userTouchedIds.add(id);
+
+    const raw = source.detected.notes;
+    const merged =
+      feed === raw ? result.notes : mergeEditedOntoRaw(raw, result.notes, result.touchedIds);
+    // The document's new length, written before the commit so the rebuild inside it engraves the
+    // bar that was just added rather than the one that was there a moment ago.
+    const durationSec = result.barCount * barLengthSec;
+    this.runtime.set({
+      source: { ...source, documentBars: result.barCount, durationSec }
+    });
+    if (this.audioRef) this.audioRef = { ...this.audioRef, durationSec };
+    this.commitPerformance(merged, result.label);
+    const label = this.root.querySelector<HTMLElement>('[data-role="bar-count"]');
+    if (label) label.textContent = `${result.barCount} bars`;
+    return true;
+  }
+
+  /**
+   * The right-click menu, built from what the sheet says is under the pointer.
+   *
+   * EVERY REFUSAL IS SHOWN AND EXPLAINED rather than omitted. A menu that silently drops the
+   * items it will not run teaches the player that the feature does not exist; one that shows
+   * them greyed with a reason teaches them the rule. The two rules that do the refusing are the
+   * two this wave is built around: imported parts are paper, and bars are fixed by a recording.
+   */
+  private onSheetContextMenu(target: SheetTarget): void {
+    const score = this.runtime.get().score;
+    if (!score) return;
+    const items: SheetMenuItem[] = [];
+    const imported = target.trackIndex !== null && !target.live;
+    const importedReason = 'Imported parts are paper-only';
+
+    if (target.noteId) {
+      const current = this.intentOf(target.noteId);
+      for (const denominator of NOTATION_INTENT_DENOMINATORS) {
+        for (const dots of [0, 1] as const) {
+          const intent: NotationIntent = { denominator, dots };
+          // The one combination the union admits and the tick domain cannot hold. Greyed with
+          // its reason rather than hidden, so the gap in the grid is explained.
+          const printable = notationIntentTicks(intent, score.ir.divisions) !== null;
+          items.push({
+            label: durationMenuLabel(intent),
+            checked:
+              !!current && current.denominator === denominator && (current.dots ?? 0) === dots,
+            disabled: imported || !printable,
+            ...(imported ? { reason: importedReason } : {}),
+            ...(!imported && !printable ? { reason: 'no such glyph' } : {}),
+            separatorBefore: dots === 0 && denominator === 1,
+            onPick: () => {
+              this.applySheetEdit({ kind: 'setDuration', noteId: target.noteId!, intent });
+            }
+          });
+        }
+      }
+      items.push({
+        label: 'Delete note',
+        separatorBefore: true,
+        disabled: imported,
+        ...(imported ? { reason: importedReason } : {}),
+        onPick: () => {
+          this.applySheetEdit({ kind: 'deleteNote', noteId: target.noteId! });
+        }
+      });
+    } else {
+      // EMPTY SPACE. A pitch only exists on a NOTATION staff — a y over the tab names a string,
+      // and the fret is the other half of an answer nothing here has. See `SheetTarget.midi`.
+      const canAdd = !imported && target.staff === 'notation' && target.midi !== null && target.tick !== null;
+      items.push({
+        label: 'Add note',
+        disabled: !canAdd,
+        ...(imported
+          ? { reason: importedReason }
+          : target.staff === 'tab'
+            ? { reason: 'a tab position is a string, not a pitch' }
+            : {}),
+        onPick: () => this.addNoteAt(target)
+      });
+    }
+
+    const barRefusal = this.barRefusal();
+    const barsEditable = barRefusal === null;
+    const barReason = barRefusal ?? undefined;
+    const barIndex = target.barIndex;
+    for (const [label, op] of [
+      ['Insert bar before', { kind: 'insertBar', barIndex: barIndex ?? 0, where: 'before' }],
+      ['Insert bar after', { kind: 'insertBar', barIndex: barIndex ?? 0, where: 'after' }],
+      ['Delete bar', { kind: 'deleteBar', barIndex: barIndex ?? 0 }]
+    ] as Array<[string, BarOp]>) {
+      items.push({
+        label,
+        separatorBefore: label === 'Insert bar before',
+        disabled: !barsEditable || barIndex === null,
+        ...(barReason ? { reason: barReason } : {}),
+        onPick: () => {
+          this.applyBarOperation(op);
+        }
+      });
+    }
+
+    showSheetMenu(target.clientX, target.clientY, items);
+  }
+
+  /**
+   * The written value a note is CURRENTLY printed at, so the menu can tick it.
+   *
+   * Read off the IR — the page's own answer — rather than off the note's stored intent, because
+   * most notes have no stored intent at all: they were written by the quantizer, and what they
+   * print as is `IRBeat.durationType` plus its dot. A menu that ticked nothing until the player
+   * had already set something would be lying about the note in front of them.
+   *
+   * The ATTACK's beat, not any of them: a held note is engraved as several tied pieces of
+   * different values, and the one the player is choosing to replace is the one they struck.
+   */
+  private intentOf(noteId: string): NotationIntent | null {
+    const score = this.runtime.get().score;
+    if (!score) return null;
+    for (const bar of score.ir.bars) {
+      for (const voice of bar.voices) {
+        for (const beat of voice.beats) {
+          for (const note of beat.notes) {
+            if (note.id !== noteId || note.tieStop) continue;
+            if (note.notationIntent) return note.notationIntent;
+            const denominator = DURATION_TYPE_DENOMINATOR[beat.durationType];
+            if (denominator === undefined) return null;
+            return { denominator, dots: beat.dots === 1 ? 1 : 0 };
+          }
+        }
+      }
+    }
+    return null;
+  }
+
+  /**
+   * Draw a note where the player right-clicked: their pitch, the nearest beat, one beat long.
+   *
+   * ONE BEAT is the default length and the collision law then trims it — a note drawn in front
+   * of an existing one becomes as long as the room it was given, which is what a player means by
+   * putting a note there. See edit/performanceEdit.ts.
+   */
+  private addNoteAt(target: SheetTarget): void {
+    const score = this.runtime.get().score;
+    if (!score || target.midi === null || target.tick === null) return;
+    const beat = this.nearestBeatTick(score, target.tick);
+    if (beat === null) return;
+    const origin = this.originSec(score);
+    const divisions = score.ir.divisions || 12;
+    const bar = score.ir.bars.find((b) => beat >= b.startTick && beat < b.startTick + b.durTicks);
+    const beatTicks = Math.max(1, Math.round((divisions * 4) / (bar?.timeSig?.[1] || 4)));
+    const startSec = tickToSeconds(score, beat, origin);
+    const durationSec = tickToSeconds(score, beat + beatTicks, origin) - startSec;
+    this.applySheetEdit({ kind: 'addNote', midi: target.midi, startSec, durationSec });
   }
 
   // -------------------------------------------------------------------------
@@ -12153,9 +13043,13 @@ class App {
     this.perfStack = this.perfStack.slice(0, this.perfIndex + 1);
     this.perfLabels = this.perfLabels.slice(0, this.perfIndex + 1);
     this.perfCuts = this.perfCuts.slice(0, this.perfIndex + 1);
+    this.perfBars = this.perfBars.slice(0, this.perfIndex + 1);
     this.perfStack.push(notes);
     this.perfLabels.push(label);
     this.perfCuts.push(cuts);
+    // Read AFTER the caller has written it: `applyBarOperation` sets the new length on the
+    // runtime and then commits, so this snapshot is the length this step produced.
+    this.perfBars.push(this.runtime.get().source?.documentBars);
     this.perfIndex = this.perfStack.length - 1;
     this.history = this.history.slice(0, this.historyIndex + 1);
     this.history.push('perf');
@@ -12163,6 +13057,25 @@ class App {
 
     this.setPerformance(notes, cuts);
     this.refreshUndoRedo();
+  }
+
+  /**
+   * Put the document's declared length back where a history step had it. See `perfBars`.
+   *
+   * A no-op — including the audio reference and the bar-count label — on any document that
+   * declares no length, which is every recorded take.
+   */
+  private restoreDocumentBars(bars: number | undefined): void {
+    const source = this.runtime.get().source;
+    if (!source || bars === undefined || source.documentBars === undefined) return;
+    if (source.documentBars === bars) return;
+    const meter = source.timeSignature;
+    if (!meter || !source.tempoBpm) return;
+    const durationSec = bars * meter.numerator * (4 / meter.denominator) * (60 / source.tempoBpm);
+    this.runtime.set({ source: { ...source, documentBars: bars, durationSec } });
+    if (this.audioRef) this.audioRef = { ...this.audioRef, durationSec };
+    const label = this.root.querySelector<HTMLElement>('[data-role="bar-count"]');
+    if (label) label.textContent = `${bars} bars`;
   }
 
   /** Put a performance on screen: new notes in, pipeline re-run, notation edits replayed. */
@@ -12262,6 +13175,7 @@ class App {
       this.perfIndex = Math.max(0, this.perfIndex - 1);
       // Both halves of the step, or undoing a cut would put the notes back and leave the tape
       // still cut — see `perfCuts`.
+      this.restoreDocumentBars(this.perfBars[this.perfIndex]);
       this.setPerformance(this.perfStack[this.perfIndex], this.perfCuts[this.perfIndex] ?? NO_CUTS);
       this.refreshUndoRedo();
       return;
@@ -12286,6 +13200,7 @@ class App {
     if (this.historyIndex < this.history.length - 1 && this.history[this.historyIndex + 1] === 'perf') {
       this.historyIndex++;
       this.perfIndex = Math.min(this.perfStack.length - 1, this.perfIndex + 1);
+      this.restoreDocumentBars(this.perfBars[this.perfIndex]);
       this.setPerformance(this.perfStack[this.perfIndex], this.perfCuts[this.perfIndex] ?? NO_CUTS);
       this.refreshUndoRedo();
       return;
@@ -12703,6 +13618,30 @@ class App {
   }
 
   private installGlobalHandlers(): void {
+    /*
+     * THE HEADER RE-DECIDES ABOUT THE TAKE'S NAME WHEN THE WINDOW CHANGES SIZE (Z6).
+     *
+     * `fitHeaderName()` answers "can this row afford the name?", and the answer is a function of
+     * the width — so it has to be asked again when the width moves. Nothing else in the fit does:
+     * `fitSelects` writes a width in CSS px against text in CSS px, and the `zoom` ladder scales
+     * both together, so a box cut to its words stays cut to its words at every rung.
+     *
+     * Coalesced onto one animation frame, because a window drag delivers a resize per frame and
+     * this reads layout. `passive`, since it never prevents anything.
+     */
+    let nameFit = 0;
+    window.addEventListener(
+      'resize',
+      () => {
+        if (nameFit) return;
+        nameFit = requestAnimationFrame(() => {
+          nameFit = 0;
+          this.fitHeaderName();
+        });
+      },
+      { passive: true }
+    );
+
     // Window-wide drop, so a file dropped anywhere works — and so the browser never
     // navigates away to the dropped file, which is what happens without preventDefault.
     window.addEventListener('dragover', (e) => e.preventDefault());

@@ -5,7 +5,7 @@
  * opinion about, and every one carries a plain-language tooltip.
  */
 
-import { el, replace, type Store } from './dom';
+import { el, fitSelects, replace, type Store } from './dom';
 import { t, TIPS, tipsEnabled, setTipsEnabled } from './tips';
 import {
   DEFAULT_SETTINGS,
@@ -139,8 +139,10 @@ export function soundPicker(opts: {
 }): HTMLElement {
   const root = el('div', { class: 'row', 'data-role': 'sound-picker-row' });
   const note = el('span', { class: 'dim', 'data-role': 'sound-picker-note' });
-  // Room for "loading…" so the transport bar does not jump when a set is being fetched.
-  note.style.minWidth = '7ch';
+  // Room for "loading…" so the transport bar does not jump when a set is being fetched — IN THE
+  // STYLESHEET now rather than inline, because it is a reserve the transport can afford at some
+  // widths and not at others, and an inline style cannot be given a breakpoint (styles.css
+  // §.transport [data-role="sound-picker-note"]). An inline rule would also have outranked it.
   note.style.fontSize = '11.5px';
 
   const draw = () => {
@@ -152,10 +154,14 @@ export function soundPicker(opts: {
     }, 'Playback sound');
     // `t()` returns undefined when the player has turned tooltips off.
     select.title = t(TIPS.sound) ?? '';
-    // A <select> sizes itself to its widest recorded-instrument name. Capped here rather than in
-    // styles.css so this stays a drop-in with no CSS to remember; the full text is still
-    // there when the menu is open, and in the tooltip.
-    select.style.maxWidth = '150px';
+    // NO WIDTH CAP ANY MORE (Z6). It used to carry `maxWidth: 150px`, because a `<select>` sizes
+    // itself to its widest recorded-instrument name and 247px of Sound row on a bar that has to
+    // survive a 390px window is too much. A cap is the wrong instrument for that: it does not
+    // shorten the reserve, it clips whatever is showing when the reserve is too big — and the
+    // longest voice name is longer than 150px, so the box could show a truncated name of the
+    // sound that is playing. The box is sized to the option it is SHOWING now, by `fitSelects`
+    // (`ui/app.ts §fitTopBars`), which takes MORE off the row than the cap did and cannot cut a
+    // word in half. On the settings panel, where there is no bar to fit, it is left alone.
 
     // Short, because this lives on a bar that has to survive a 360px-wide window
     // (design notes §2.4). The settings panel carries the full sentence.
@@ -164,7 +170,21 @@ export function soundPicker(opts: {
       state === 'loading' ? 'loading…' : state === 'unavailable' ? 'not in this build' : '';
     note.title = soundNote(voice, status)?.text ?? '';
 
-    replace(root, el('span', { class: 'dim', text: 'Sound' }), select, note);
+    replace(
+      root,
+      // Named so the transport can drop it where the row runs out of width; the box beside it
+      // says "Finger bass" on its own, which is the instrument this word was introducing.
+      el('span', { class: 'dim', 'data-role': 'sound-picker-label', text: 'Sound' }),
+      select,
+      note
+    );
+    // AND CUT TO ITS OWN WORDS, every time it is rebuilt (Z6). This picker redraws itself whenever
+    // a sample set finishes loading, which used to throw away the width `App.fitTopBars` had just
+    // given it — leaving the one box on the transport still reserving its LONGEST option ("Electric
+    // guitar") while showing a shorter one, and a Sound row 50px wider than the space it had. On
+    // the settings panel there is no bar to fit and the call is harmless: a box the width of its
+    // own text is what that panel wants too. Skipped while detached; see `fitSelects`.
+    fitSelects([select]);
   };
 
   // No framework here to own a lifecycle, so the element owns its own. The transport bar is
@@ -189,42 +209,27 @@ export function soundPicker(opts: {
   return root;
 }
 
-/** Written down once so the select and the read-out cannot drift apart. */
-type EngineModel = AppSettings['engineModel'];
 
-/**
- * The weights, described by what they cost the player rather than by parameter count.
- * "Choose for me" is first because it is the right answer for almost everybody.
- */
-const ENGINE_MODELS: Array<[EngineModel, string]> = [
-  ['auto', 'Choose for me'],
-  ['small', 'Small — fastest'],
-  ['medium', 'Medium — the balanced one'],
-  ['large', 'Large — most accurate, slowest, most memory']
-];
-
-/** Smallest first — the order the RAM line on the card lists them in. */
-const MODEL_ORDER = ['small', 'medium', 'large'] as const;
-
-/**
- * What each MuScriptor size holds in memory, when the shell has not said.
+/*
+ * THE MODEL SIZE DROP-DOWN IS DELETED, AND WITH IT `ENGINE_MODELS`, `MODEL_ORDER`,
+ * `DEFAULT_MODEL_RAM_MB` AND `SINGLE_ENGINE_STAND_IN` (Z5b/c).
  *
- * BRIDGE.md §3.4's own figures — "roughly 0.9 GB (small), 1.8 GB (medium) or 5 GB (large),
- * Python and the Metal buffers included" — which is the same table `auto` steps down through
- * when it drops a size that needs more than 40% of physical RAM. Written here so the card is
- * still honest against a shell that predates `EngineSummary.modelRamMb`, and superseded the
- * moment that field arrives, because the shell is the one that knows.
- */
-const DEFAULT_MODEL_RAM_MB: Record<string, number> = { small: 900, medium: 1800, large: 5000 };
-
-/**
- * The engine a single-engine shell is talking about, for `modelChooser`'s benefit only.
+ * What stood here was a "Model" row on MuScriptor's card — Choose for me / Small / Medium / Large
+ * — over a line quoting what each size holds in memory. It is gone rather than moved, and the
+ * reasoning is the owner's: the choice was one Riffsheet could not honour. The shell adopts a
+ * MuScriptor server that is already running whenever it finds one, and that server's weights
+ * belong to whoever started it (§3.3), so on the machine where the setting mattered most it did
+ * nothing; where it did work, it invited somebody with 8 GB to pick "large" and then explained
+ * afterwards why their transcription crawled. `auto` picks for everybody now, lightest installed
+ * first, and the card says what is ACTUALLY loaded rather than offering a preference about it.
  *
- * A shell too old for `listEngines()` has exactly one engine and it is MuScriptor — that is
- * what "too old" means here, since the registry is what introduced the others. Enough of an
- * `EngineSummary` to name it and to get the RAM table; nothing else is read.
+ * `AppSettings.engineModel` survives as a stored field — an old profile must still read — and the
+ * only thing left that consults it is the read-out below, which reports what the shell says is in
+ * use. There is nothing in this panel that writes it any more.
+ *
+ * `pickEngineModel`, `engineModelError` and `bridge.setEngineModel` went with the control: a
+ * refusal message has nothing left that could provoke it.
  */
-const SINGLE_ENGINE_STAND_IN = { id: 'muscriptor', name: 'MuScriptor' } as EngineSummary;
 
 /**
  * How often the engine read-out refreshes while the panel is open.
@@ -267,21 +272,12 @@ function formatMb(mb: number): string {
   return mb >= 1024 ? `${(mb / 1024).toFixed(1)} GB` : `${Math.round(mb)} MB`;
 }
 
-/**
- * A model's memory cost, in the GB the rest of the product quotes it in.
- *
- * NOT `formatMb`, on purpose. That one switches to GB at 1024 MB and rounds to one decimal, so
- * the three MuScriptor sizes come out "900 MB · 1.8 GB · 4.9 GB" — three different units, one
- * of which disagrees with BRIDGE.md's own "roughly 0.9 GB (small), 1.8 GB (medium) or 5 GB
- * (large)". A row whose job is to be compared at a glance has to be in one unit, and the unit
- * has to be the one the documentation and the `auto` thresholds are written in.
- *
- * Decimal GB, and a trailing ".0" trimmed, so 5000 reads "5 GB" rather than "5.0 GB".
+/*
+ * `formatRamGb()` STOOD HERE. Its only caller was the deleted size table on MuScriptor's card —
+ * "small 0.9 GB · medium 1.8 GB · large 5 GB" — which existed to be compared at a glance and so
+ * had to be in one unit. Nothing left in this panel quotes a model's size: `formatMb` says what is
+ * FREE and what a loaded set of weights wants, and those are read one at a time.
  */
-function formatRamGb(mb: number): string {
-  const gb = mb / 1000;
-  return `${gb.toFixed(1).replace(/\.0$/, '')} GB`;
-}
 
 /** The same, from raw bytes — what the engine manifest and the download frames speak in. */
 function formatBytes(bytes: number): string {
@@ -425,8 +421,13 @@ export class SettingsPanel {
   private engineReadout: HTMLElement | null = null;
   private enginePoll: number | undefined;
   private engineAsking = false;
-  /** What the shell said when it refused a model change. Cleared by the next attempt. */
-  private engineModelError: string | null = null;
+  /**
+   * The one-line system read-out at the top of the panel (`renderSystemLine`).
+   *
+   * Its own element for the reason `engineReadout` above is: the two-second engine poll writes
+   * into it without redrawing the controls around it, which would close an open drop-down.
+   */
+  private systemLine: HTMLElement | null = null;
 
   // --- engine setup: guide and find ------------------------------------------------------
   /** Where the setup block draws, refreshed in place like the read-out above it. */
@@ -621,6 +622,7 @@ export class SettingsPanel {
         if (!e.installing && !this.installingHere.has(e.id)) this.installProgress.delete(e.id);
       }
       this.guideStatus = await this.askGuideEngine();
+      this.renderSystemLine();
       this.renderEngineReadout();
       this.renderEngineSetup();
     } catch {
@@ -660,41 +662,92 @@ export class SettingsPanel {
     return this.guideStatus?.id === engine.id ? this.guideStatus : null;
   }
 
-  /**
-   * Change which weights the engine uses.
-   *
-   * The shell is allowed to say no, and it does when Riffsheet joined a MuScriptor server
-   * somebody else started (§3.3): that server is not ours to restart. When it refuses, the
-   * sentence it gives back IS the answer, so it goes on screen and the select returns to what
-   * it was. Silently snapping the select back with no explanation is how a control ends up
-   * looking broken.
+  /*
+   * `pickEngineModel()` STOOD HERE and is deleted with the control that called it (Z5b/c). It
+   * wrote `engineModel`, asked the shell to swap weights, and put the shell's refusal on screen
+   * when it said no. With no drop-down there is nothing to write, nothing to refuse, and no
+   * refusal to display — see the note where `ENGINE_MODELS` used to be.
    */
-  private async pickEngineModel(next: EngineModel, previous: EngineModel): Promise<void> {
-    // Cleared BEFORE the write, because the write re-renders: leave it until afterwards and
-    // last time's refusal is still on screen under a select that has just been accepted.
-    this.engineModelError = null;
-    // Neither a rebuild nor a view change: this decides how the NEXT transcription listens,
-    // and the sheet on screen was written from whatever was in use at the time.
-    this.opts.settings.set({ engineModel: next });
 
-    let refusal: string | null = null;
-    try {
-      const result = await this.bridge.setEngineModel?.(next);
-      if (result && !result.ok) refusal = result.error ?? 'The engine kept the weights it already had.';
-    } catch (err) {
-      refusal = err instanceof Error ? err.message : 'The engine could not be asked to change weights.';
+  /**
+   * THE MACHINE, IN ONE LINE AT THE TOP OF THE PANEL (Z5a).
+   *
+   * "Apple M1 · 8 cores · 8 GB, 3.0 GB free". It is the first thing in the panel because it is the
+   * fact everything below it is decided by: whether a transcription will take twenty seconds or
+   * four minutes, and whether the engine's weights will fit beside whatever else is open. The
+   * memory half of it used to be a sentence buried inside MuScriptor's card — "3.0 GB of memory
+   * free, out of 8.0 GB" — which is where you would look for it last, and read as a fact about
+   * that engine rather than about the computer.
+   *
+   * EVERY FIELD IS OPTIONAL AND UNKNOWN MEANS SILENT. The shell answers "" for a chip it cannot
+   * name, 0 for a core count it cannot read and null for a load average it has no cheap source
+   * for (`shell/Source/bridge/SystemProbe.h §processor` is explicit about all three), and Windows
+   * is the case where several of them are absent at once. A missing figure is dropped from the
+   * line; it is never filled with "unknown CPU" or "0 cores", and if nothing at all is known the
+   * line does not exist.
+   *
+   * FEATURE-DETECTED OFF THE PAYLOAD, not off a version number. The processor fields are new on
+   * `engineStatus()` and the TS bridge does not surface them yet, so they are read through a
+   * widening cast: present, they are drawn; absent, the line is the memory it always had. That
+   * makes this correct against a shell older than the fields AND against a bridge newer than this
+   * file, which is the same rule everything else here follows.
+   *
+   * WHY IT COMES OFF `engineStatus()` AT ALL: because that is where the shell puts it, and it is
+   * already polled every two seconds while the panel is open (`ENGINE_POLL_MS`). Free memory moves,
+   * so a static reading taken when the panel opened would be a stale number that looks live.
+   */
+  private renderSystemLine(): void {
+    const host = this.systemLine;
+    if (!host) return;
+    const st = this.engine as
+      | (EngineStatus & { cpuName?: string; cpuCores?: number; cpuThreads?: number; cpuLoad1m?: number | null })
+      | null;
+
+    const bits: string[] = [];
+    const cpu = typeof st?.cpuName === 'string' ? st.cpuName.trim() : '';
+    if (cpu) bits.push(cpu);
+    // PHYSICAL cores, which is what the machine has. The thread count goes in the tooltip beside
+    // it rather than on the line: "8 cores · 16 threads" is two numbers where the reader wanted a
+    // sense of size, and on Apple Silicon they are the same number anyway.
+    const cores = Number(st?.cpuCores) || 0;
+    if (cores > 0) bits.push(cores === 1 ? '1 core' : `${cores} cores`);
+    const total = Number(st?.ramTotalMb) || 0;
+    const free = Number(st?.ramFreeMb) || 0;
+    if (total > 0 && free > 0) bits.push(`${formatMb(total)}, ${formatMb(free)} free`);
+    else if (total > 0) bits.push(formatMb(total));
+    else if (free > 0) bits.push(`${formatMb(free)} free`);
+
+    if (bits.length === 0) {
+      replace(host);
+      return;
     }
 
-    if (refusal) {
-      this.engineModelError = refusal;
-      // Back to what it was, so the select never claims something the engine is not doing.
-      this.opts.settings.set({ engineModel: previous });
-    }
-    void this.askEngine();
+    const threads = Number(st?.cpuThreads) || 0;
+    const load = typeof st?.cpuLoad1m === 'number' && st.cpuLoad1m >= 0 ? st.cpuLoad1m : null;
+    const detail = [
+      'This machine, as the shell reads it.',
+      threads > 0 && threads !== cores ? `${threads} hardware threads.` : '',
+      // The number `uptime` prints, said as what it is. Not a percentage — turning it into one
+      // needs the core count and an assumption about how many of them a job will get.
+      load !== null ? `One-minute load average ${load.toFixed(2)}.` : '',
+      'Free memory is what the system could hand out right now without swapping, so it moves while you work.'
+    ]
+      .filter(Boolean)
+      .join(' ');
+
+    replace(
+      host,
+      el('div', {
+        class: 'status-row dim system-line',
+        'data-role': 'system-line',
+        text: bits.join(' · '),
+        title: t(detail)
+      })
+    );
   }
 
   /**
-   * What is ACTUALLY happening — not what the select above asked for.
+   * What is ACTUALLY happening — not what the panel used to ask for.
    *
    * The two really can differ, and when they do it is the whole story: rather than load a
    * second gigabyte-sized copy of the model, the shell adopts a MuScriptor server that was
@@ -728,7 +781,7 @@ export class SettingsPanel {
     if (st.state === 'ready' && st.adopted) {
       say(
         'ok',
-        `Using ${weights}, on a transcription server that was already running${port}. Riffsheet joined it instead of starting a second copy, so the choice above cannot change it — those weights belong to whoever started that server. Quit it and Riffsheet will start its own.`
+        `Using ${weights}, on a transcription server that was already running${port}. Riffsheet joined it instead of starting a second copy — those weights belong to whoever started that server. Quit it and Riffsheet will start its own.`
       );
     } else if (st.state === 'ready') {
       say('ok', `Riffsheet started the transcription server itself${port}, using ${weights}.`);
@@ -752,13 +805,17 @@ export class SettingsPanel {
     }
 
     // --- memory ------------------------------------------------------------
+    //
+    // THE FREE-MEMORY READING IS NOT ON THIS CARD ANY MORE (Z5a). "3.0 GB of memory free, out of
+    // 8.0 GB" is a fact about the COMPUTER, and it is the system line at the top of the panel now,
+    // beside the processor — see `renderSystemLine()`. Here it read as a fact about MuScriptor, in
+    // the last place anybody would look for it.
+    //
+    // THE WARNING STAYS, BECAUSE IT IS ABOUT THE WEIGHTS AND NOT ABOUT THE MACHINE: "the medium
+    // weights want roughly 1.3 GB and only 0.4 GB is free" is advice about this engine on this
+    // computer right now, which is exactly what belongs on this engine's card.
     const free = st.ramFreeMb ?? 0;
     if (free > 0) {
-      say(
-        'off',
-        st.ramTotalMb ? `${formatMb(free)} of memory free, out of ${formatMb(st.ramTotalMb)}.` : `${formatMb(free)} of memory free.`
-      );
-
       // Only warn about weights that are not already loaded. Once a server is up with them the
       // memory is spent and there is nothing left to warn about.
       const sized = wanted || (st.state === 'ready' ? st.model : '');
@@ -767,7 +824,9 @@ export class SettingsPanel {
       if (needs && !alreadyUp && free < needs + RAM_HEADROOM_MB) {
         say(
           'warn',
-          `The ${sized} weights want roughly ${formatMb(needs)} and only ${formatMb(free)} is free right now. They may be very slow, or fail to load at all. Closing a few other apps — or picking a smaller size above — is the fix.`
+          // No "pick a smaller size above" any more: there is no size control to point at, and
+          // `auto` steps down by itself. What is left is the part the player can act on.
+          `The ${sized} weights want roughly ${formatMb(needs)} and only ${formatMb(free)} is free right now. They may be very slow, or fail to load at all. Closing a few other apps is the fix.`
         );
       }
     }
@@ -829,10 +888,6 @@ export class SettingsPanel {
     // screen it has always had — the guide, on its own, every role where it has always been.
     // An empty picker would imply a choice that shell cannot make.
     if (!list || list.engines.length === 0) {
-      // The model chooser comes too. On this shell there is one engine and it is the guided
-      // one, so "which engine do these weights belong to?" has an obvious answer — but the
-      // control still has to EXIST, or a single-engine build would lose the only way to
-      // choose a model when the row moved onto the cards.
       replace(
         host,
         this.guideStatusRow(this.engine),
@@ -840,7 +895,6 @@ export class SettingsPanel {
         // engine there is — so it lands here rather than being left orphaned. Same element,
         // re-parented; see `render()`.
         ...(this.engineReadout ? [this.engineReadout] : []),
-        ...this.modelChooser(SINGLE_ENGINE_STAND_IN),
         ...this.guideBody(this.engine)
       );
       return;
@@ -931,11 +985,9 @@ export class SettingsPanel {
       rows.push(el('div', { class: 'status-row dim', 'data-role': 'engine-card-source' }, ...provenance));
     }
 
-    // The weights chooser belongs to the engine that HAS weights, not to the panel. See
-    // `modelChooser` — this is the row that used to sit on its own several groups above,
-    // where it applied to an engine it never named.
-    rows.push(...this.modelChooser(engine));
-
+    // NO WEIGHTS CHOOSER. Every card is the same size class now — a status sentence, the detail
+    // lines, the buttons, and (on the guided one) the live read-out and the folded guide. The size
+    // drop-down that used to sit here is deleted; see the note where `modelChooser` was.
     rows.push(this.engineButtons(engine, chosen, usable));
 
     if (engine.install === 'one-click') rows.push(...this.existingInstallBody(engine));
@@ -1121,96 +1173,25 @@ export class SettingsPanel {
     return bits;
   }
 
-  /**
-   * The weights chooser, on the card of the engine whose weights they are.
+  /*
+   * `modelChooser()` STOOD HERE — the "Model" row and the "small 0.9 GB · medium 1.8 GB · large
+   * 5 GB" line above it — AND IT IS DELETED (Z5b/c).
    *
-   * IT USED TO BE A STANDALONE SETTINGS ROW, several groups above this one, labelled "Model"
-   * with three sizes in it. Nothing on that row said which engine it applied to, and once
-   * Riffsheet drove four engines the answer — MuScriptor, and only MuScriptor — was
-   * unguessable. Somebody running Basic Pitch could set "large" and watch nothing happen.
+   * Two reasons, and the first is the owner's: the setting could not be honoured. Riffsheet adopts
+   * a MuScriptor server that is already running rather than loading a second gigabyte of weights
+   * beside it, and the adopted server's size belongs to whoever started it — so on the machine
+   * where the choice mattered most, choosing did nothing, and the card had to explain afterwards
+   * why. The second is the shape of the card: with a status sentence, a live read-out, three detail
+   * lines, a RAM table, a labelled drop-down, a refusal row, two buttons and a guide, MuScriptor's
+   * card was several times the size of every other engine's, which read as this engine being
+   * several times more configurable rather than as it being the guided one.
    *
-   * The three RAM figures are the point of moving it. "small / medium / large" are three
-   * adjectives; "0.9 GB · 1.8 GB · 5 GB" is the sentence that lets somebody with 8 GB decide,
-   * and it is exactly what `auto` is deciding with on their behalf.
+   * WHAT IS LOST IS THE PREFERENCE AND NOTHING ELSE. Which weights are actually loaded, which are
+   * installed on this machine, and whether the ones about to load will fit in free memory are all
+   * still said out loud by `renderEngineReadout()` on this same card — they are observations, and
+   * observations were never the problem. `auto` decides, lightest installed first, and the app
+   * reports what happened instead of asking a question it cannot act on.
    */
-  private modelChooser(engine: EngineSummary): HTMLElement[] {
-    if (!this.bridge.setEngineModel) return [];
-
-    // THE SHELL'S OWN TABLE FIRST. `engineStatus().models` carries a figure, `installed` and
-    // `fits` for every size (BRIDGE.md §3.2), and `fits` is the `auto` rule's own answer —
-    // reading it means the row agrees with what `auto` would actually do instead of
-    // second-guessing it from `ramTotalMb`. The constants below are the documented fallback
-    // for a shell that predates the table; only MuScriptor has sizes at all.
-    const st = this.statusFor(engine);
-    const table =
-      st?.models && st.models.length > 0
-        ? st.models.map((m) => ({ name: m.name, mb: m.approxResidentMb, installed: m.installed, fits: m.fits }))
-        : engine.id === 'muscriptor'
-          ? MODEL_ORDER.map((name) => ({
-              name,
-              mb: DEFAULT_MODEL_RAM_MB[name],
-              installed: (st?.installedModels ?? []).includes(name),
-              fits: true
-            }))
-          : [];
-    if (table.length === 0) return [];
-
-    const s = this.opts.settings.get();
-    const rows: HTMLElement[] = [];
-
-    rows.push(
-      el('div', {
-        class: 'status-row dim',
-        'data-role': 'engine-card-model-ram',
-        // "small 0.9 GB · medium 1.8 GB · large 5 GB", in the order they grow. A size this
-        // machine cannot run is named as such rather than quietly listed beside ones it can:
-        // "large 5 GB (too big for this Mac)" is the sentence that stops somebody choosing it
-        // and wondering why nothing changed.
-        text: table
-          .map((m) => `${m.name} ${formatRamGb(m.mb)}${m.fits === false ? ' (too big for this machine)' : ''}`)
-          .join(' · '),
-        title: t(
-          'What each size holds in memory once it is loaded, Python and the GPU buffers included. ' +
-            'Auto picks the largest one that fits this machine and steps down when free memory is short.'
-        )
-      })
-    );
-
-    rows.push(
-      el(
-        'div',
-        { class: 'settings-row' },
-        el('span', { class: 'label', text: 'Model' }),
-        el(
-          'select',
-          {
-            title: t(TIPS.engineModel),
-            'aria-label': `${engine.name} model size`,
-            'data-role': 'engine-model',
-            'data-setting': 'engineModel',
-            onChange: (e: Event) =>
-              void this.pickEngineModel((e.target as HTMLSelectElement).value as EngineModel, s.engineModel)
-          },
-          ...ENGINE_MODELS.map(([value, label]) =>
-            el('option', { value, text: label, selected: value === s.engineModel })
-          )
-        )
-      )
-    );
-
-    if (this.engineModelError) {
-      rows.push(
-        el(
-          'div',
-          { class: 'status-row', 'data-role': 'engine-model-error' },
-          el('span', { class: 'dot warn' }),
-          this.engineModelError
-        )
-      );
-    }
-
-    return rows;
-  }
 
   /**
    * "Use existing installation…" — the other way an engine gets onto this machine.
@@ -1935,6 +1916,10 @@ export class SettingsPanel {
     this.engineReadout = engineReadout;
     const engineSetup = el('div', { class: 'engine-setup', 'data-role': 'engine-setup' });
     this.engineSetupHost = engineSetup;
+    // The system line, on the same terms and for the same reason. Filled by `renderSystemLine()`
+    // off the engine poll, so the numbers in it are live while the panel is open.
+    const systemLine = el('div', { 'data-role': 'system-line-host' });
+    this.systemLine = systemLine;
 
     replace(
       this.root,
@@ -1945,6 +1930,12 @@ export class SettingsPanel {
         el('div', { class: 'spacer' }),
         el('button', { class: 'ghost icon', text: '✕', 'aria-label': 'Close settings', onClick: () => this.opts.onClose() })
       ),
+
+      // --- the machine, before any setting -----------------------------------
+      // ABOVE EVERYTHING, INCLUDING THE FIRST HEADING (Z5a). It is not a setting and it is not in
+      // a group: it is one dim line under the title saying what this computer is, because that is
+      // the fact the answers below it depend on. See `renderSystemLine()`.
+      systemLine,
 
       // --- notation ---------------------------------------------------------
       el(
@@ -2084,10 +2075,11 @@ export class SettingsPanel {
             : 'Checking…'
         ),
         host?.engineMessage && el('div', { class: 'status-row', text: host.engineMessage }),
-        // THE MODEL ROW IS NOT HERE ANY MORE. It moved onto the card of the engine whose
-        // weights it selects — see `modelChooser()` in the Engine setup group below. Sitting
-        // here it named no engine, applied to exactly one of the four, and did nothing at all
-        // for anybody running the other three.
+        // THE MODEL ROW IS NOT HERE, AND IT IS NOT ANYWHERE ELSE EITHER. It moved onto the card
+        // of the engine whose weights it selected — where, sitting here, it had named no engine,
+        // applied to exactly one of the four and done nothing for anybody running the other
+        // three — and then it was deleted outright (Z5b/c), because Riffsheet cannot honour a
+        // size preference against a server it adopted. See the note where `modelChooser` was.
         //
         // AND NEITHER IS THE ENGINE READ-OUT, for exactly the same reason and by the same
         // route (F10). "The transcription server is not running", "Riffsheet started the
@@ -2219,6 +2211,7 @@ export class SettingsPanel {
       })
     );
 
+    this.renderSystemLine();
     this.renderEngineReadout();
     this.renderEngineSetup();
   }

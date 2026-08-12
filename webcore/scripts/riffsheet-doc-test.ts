@@ -447,6 +447,40 @@ assert(halfParts.source.importedParts?.[0].name === 'Part', 'a nameless part is 
 assert(halfParts.source.importedParts?.[0].nudgeMs === 0, 'a nonsense nudge reads as no nudge');
 
 // ---------------------------------------------------------------------------
+// 4c. THE LIVE PART'S NAME travels too (Z2b) — and does NOT move the version
+// ---------------------------------------------------------------------------
+//
+// It is the name the player typed over the take: on the menu, engraved down the left of the
+// system, in the exported `<part-name>`. It has to survive a save, because a document that
+// re-opens under a different name than it was saved with has lost something the player wrote.
+//
+// STILL v4, deliberately. The field is additive and degrades to the documented fallback — an
+// older reader ignores one key and shows the take under its instrument's name — whereas a version
+// bump would make that reader refuse the whole file. See `persist.ts §PersistedSource.livePartName`.
+const renamedTake = readRiffsheetDocument(
+  writeRiffsheetDocument({ ...document, source: { ...source, livePartName: 'Low end' } })
+);
+assert(renamedTake.source.livePartName === 'Low end', 'the take keeps the name it was given');
+assert(renamedTake.version === RIFFSHEET_DOCUMENT_VERSION, 'a renamed take does not move the format version');
+
+// A take nobody has renamed writes no such key at all, so its bytes are what they always were.
+const unnamedTake = writeRiffsheetDocument({ ...document, source: { ...source, livePartName: '   ' } });
+assert(
+  readRiffsheetDocument(unnamedTake).source.livePartName === undefined,
+  'a name of nothing but spaces is stored as no name at all'
+);
+assert(
+  readRiffsheetDocument(writeRiffsheetDocument(document)).source.livePartName === undefined,
+  'a take that was never renamed carries no name field'
+);
+// Bounded on the way back in, exactly as it is on the way in: a hand-edited document cannot put a
+// 4000-character label down the side of somebody's staff.
+const hugeName = readRiffsheetDocument(
+  writeRiffsheetDocument({ ...document, source: { ...source, livePartName: `  ${'x'.repeat(400)}  ` } })
+);
+assert((hugeName.source.livePartName ?? '').length === 40, 'an over-long stored name is bounded on the way back');
+
+// ---------------------------------------------------------------------------
 // 5. Magic-byte detection
 // ---------------------------------------------------------------------------
 //

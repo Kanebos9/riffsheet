@@ -579,6 +579,25 @@ export interface SourceAudio {
   importedParts?: ImportedPart[];
   /** Printed order, top to bottom: `LIVE_PART_ID` and imported part ids. */
   partOrder?: string[];
+  /**
+   * WHAT THE PLAYER CALLED THE LIVE PART, when they have called it anything.
+   *
+   * An OVERRIDE and nothing more. Absent — which is every take until somebody types a name — the
+   * live part is called what it has always been called: a word derived from the instrument on
+   * every build (`score/parts.ts §livePartName`). Set, that word is replaced everywhere the name
+   * appears, which is the whole point: the box on the notation bar, the name engraved down the
+   * left of the system, the `<part-name>` in the exported MusicXML and the saved document.
+   *
+   * ON THE DOCUMENT AND NOT IN `AppSettings`, deliberately. A part name belongs to the piece, the
+   * same way `tempoBpm` and `timeSignature` above do — not to the plugin. Storing it as a
+   * preference would carry one song's "Rhythm gtr" onto the next take somebody recorded, which is
+   * the bug `tempoBpm` is a document field to avoid.
+   *
+   * EMPTY IS ABSENT. The rename commits a trimmed string and clears the field when nothing is
+   * left of it, so "" can never be stored and there is exactly one way to say "no override":
+   * `livePartName()` then falls back to the derived name rather than printing a blank staff label.
+   */
+  livePartName?: string;
 }
 
 export type Screen = 'opening' | 'main';

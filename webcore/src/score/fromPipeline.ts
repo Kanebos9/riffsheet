@@ -106,6 +106,52 @@ export function buildAlphaTabScore(
   score.title = '';
 
   /**
+   * THE NAME BESIDE EVERY SYSTEM, NOT JUST THE FIRST ONE.
+   *
+   * Standard engraving practice for a score of several instruments, and the one thing a reader
+   * turning to the middle of a two-part page needs: the full name against the first system, the
+   * abbreviation against every one after it. MusicXML has said this with
+   * `<part-name>`/`<part-abbreviation>` for as long as it has existed, the pipeline emits both
+   * halves (`AlphaTabScoreData.tracks[].name` / `.shortName`), and until now the pair was thrown
+   * away one line short of the page — alphaTab's defaults are FirstSystem + ShortName, so a
+   * two-part sheet labelled system 1 with two ABBREVIATIONS and then left the whole rest of the
+   * document anonymous.
+   *
+   * It is on the SCORE and not in `atSettings`, because that is where alphaTab keeps it
+   * (`RenderStylesheet`, read by `StaffSystem._calculateAccoladeSpacing` / `paintPartial`) — which
+   * also means the screen and the PDF get it from one place, since both go through this function.
+   *
+   * A ONE-TRACK SCORE KEEPS THE FIRST SYSTEM ONLY, and that is the standard too: `singleTrack…`
+   * is left at alphaTab's `FirstSystem` on purpose. Repeating "Bass" down the left of all eight
+   * systems of a solo take is not what an engraver does, and at the 390px floor it is width the
+   * page cannot spare for an answer that was never in doubt. The rule is "say who is playing when
+   * there is more than one answer", so the policy that changes is the multi-track one.
+   *
+   * THE FIRST SYSTEM PRINTS THE FULL NAME ONLY WHEN THE FULL NAME IS A NAME — measured, after
+   * setting it unconditionally and looking at the result. Nobody has renamed a plain take, so what
+   * the pipeline calls its one part is a DESCRIPTION of the instrument rather than a name for it:
+   * "Bass — Tuning low → high: E1 A1 D2 G2" (`pipeline/src/musicxml.ts §defaultPartName`). Printed
+   * as a first-system label that is a 213px column of sideways text down the left of the page, for
+   * a fact the string letters beside the tab already state.
+   *
+   * The test is the pipeline's OWN, not a guess about lengths: `abbreviatePartName` splits a name
+   * on `— – :` and keeps the head, because "everything from the em-dash on is a description of the
+   * instrument, not its name, and no engraver prints it beside a system". So a name carrying one
+   * of those separators is a described part and its label is the abbreviation; a name without one
+   * — every name a caller supplied, which is every part on a multi-part sheet and every take the
+   * player has renamed (`score/parts.ts §livePartName`) — is printed in full.
+   *
+   * One rule, no special case for the track count, and it is the rule the two emitters already
+   * agree on.
+   */
+  const described = data.tracks.some((trackData) => /[—–:]/.test(trackData.name));
+  score.stylesheet.multiTrackTrackNamePolicy = alphaTab.model.TrackNamePolicy.AllSystems;
+  score.stylesheet.firstSystemTrackNameMode = described
+    ? alphaTab.model.TrackNameMode.ShortName
+    : alphaTab.model.TrackNameMode.FullName;
+  score.stylesheet.otherSystemsTrackNameMode = alphaTab.model.TrackNameMode.ShortName;
+
+  /**
    * BUILD ORDER MATTERS, and not in an obvious way.
    *
    * alphaTab's `MasterBar.keySignature` SETTER propagates the key through
@@ -187,7 +233,26 @@ export function buildAlphaTabScore(
   for (const trackData of data.tracks) {
     const track = new alphaTab.model.Track();
     track.name = trackData.name;
-    track.shortName = trackData.name.slice(0, 4);
+    /*
+     * THE ABBREVIATION COMES FROM THE PIPELINE, WHICH IS THE ONLY PLACE THAT KNOWS IT.
+     *
+     * `trackData.name.slice(0, 4)` stood here, and it is wrong in both directions on real names:
+     * "Bass — Tuning low → high: E1 A1 D2 G2" came out as "Bass" by luck, "Guitar" came out as
+     * "Guit", and a part somebody had renamed "Rhythm gtr" came out as "Rhyt". Now that the label
+     * is printed against EVERY system after the first (see `score.stylesheet` above), a four
+     * character slice is not a detail — it is what most of the page says.
+     *
+     * `pipeline/src/musicxml.ts §abbreviatePartName` is the one definition: conventional
+     * engraving abbreviations first ("Guitar" -> "Gtr.", "Bass" -> "Bass"), the instrument
+     * description after the em-dash dropped, and anything unrecognised cut to four letters plus
+     * the dot that says it was cut. The pipeline hands the result over as `shortName` and its
+     * contract says consumers must use it rather than truncate `name` themselves, precisely so
+     * that the sheet, the PDF and the exported `<part-abbreviation>` cannot disagree.
+     *
+     * `|| trackData.name` because a label is never left empty: an empty shortName would name
+     * system 1 and leave the rest of the document anonymous, which is the fault being fixed.
+     */
+    track.shortName = trackData.shortName || trackData.name;
     track.playbackInfo.program = trackData.program;
     track.playbackInfo.primaryChannel = 0;
     track.playbackInfo.secondaryChannel = 1;

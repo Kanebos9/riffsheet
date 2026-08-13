@@ -460,8 +460,37 @@ export interface TranscribeResult {
 }
 
 export interface AudioFileRef {
-  /** Filesystem path when the host knows one; "" for a capture. */
+  /**
+   * A path that will still be there tomorrow, or "".
+   *
+   * ONLY DURABLE PATHS APPEAR HERE. A file the user opened reports its own path — the shell
+   * no longer copies it anywhere, so this is their file, in their folder, under its real name.
+   * Everything whose audio exists only in this process reports "": a track capture, a dropped
+   * file the browser gave us as bytes, the recording inside an opened `.riffsheet`. Those
+   * takes work in every other way; they simply cannot be reopened by path later, and a Recents
+   * entry pointing at one would be a promise nothing can keep. See `sessionOnly`.
+   */
   path: string;
+  /**
+   * True when this audio lives only in this process (capture, byte drop, embedded document
+   * audio). It survives the editor being destroyed and recreated — the samples are held by
+   * the processor, not the page — and does NOT survive the DAW or the app closing. Saving a
+   * `.riffsheet` or exporting audio is what makes it durable.
+   *
+   * Absent on shells older than this, where every take had been copied into the app's takes
+   * folder and therefore always had a path.
+   */
+  sessionOnly?: boolean;
+  /**
+   * What this take IS, for deciding whether two of them are the same take.
+   *
+   * `file:<absolute path>` for anything with a durable path, `session:<token>` otherwise.
+   * Path identity rather than a content hash on purpose: hashing hundreds of megabytes per
+   * open would cost more than the import itself, and two opens of one file already agree on
+   * their path. Two session takes never collapse into one, which is correct — two recordings
+   * are two recordings.
+   */
+  identity?: string;
   name: string;
   durationSec?: number;
   sampleRate?: number;
@@ -856,13 +885,19 @@ export interface NativeBridge {
   openEngineSetup?(): Promise<void>;
 
   /**
-   * The shell's own version string, e.g. "0.1.0".
+   * THE VERSION TO SHOW A PLAYER, already in display form: "1.0".
    *
-   * `getHostInfo().version` carries the same value and is the right thing to read when you
-   * are already asking for host info; this exists so an About box does not have to probe
-   * the whole shell (and the whole DAW) to print one number. Optional like everything else
-   * here — in the browser and on an older shell it is simply absent, and the caller shows
-   * whatever it already knows.
+   * Print it as `v${version}` and do nothing else to it. Riffsheet is versioned one-dot from
+   * 1.0 onwards, and the shell is where that decision is made — `shell/CMakeLists.txt` keeps
+   * one `project(Riffsheet VERSION 1.0.0)`, because VST3 and AU both demand `x.y.z`, and
+   * derives the two-part display form from it. A caller that trimmed the patch number off
+   * itself would be a second place deciding the scheme, and the two would drift.
+   *
+   * `getHostInfo().version` is NOT the same string: it carries the full `x.y.z`, which is
+   * build identity — what a bug report quotes, what a compatibility check compares.
+   *
+   * Optional like everything else here — in the browser and on an older shell it is simply
+   * absent, and the caller shows its own build constant.
    */
   getAppVersion?(): Promise<string | null>;
 
@@ -1119,4 +1154,64 @@ export interface NativeBridge {
   getPersistedState?(): Promise<string | null>;
   /** Hand the host a new blob. Pass an empty string to clear it. */
   setPersistedState?(json: string): Promise<void>;
+
+  /**
+   * The same blob, PLUS what to do with it — the call a booting page should make first.
+   *
+   * WHY IT EXISTS. `getPersistedState()` answers "here is a blob", which is not enough to act
+   * on: the identical blob means "the editor you were just looking at was destroyed and
+   * remade — put it back" in one situation and "a project you saved last week has been
+   * loaded — do you want it?" in another, and the page cannot tell them apart. Asking in the
+   * first case is the bug the owner reported: switch FX in REAPER and back, and the app threw
+   * away the screen and asked whether to continue work that had never stopped.
+   *
+   * Only the host knows, and only while its process lives, so the answer is computed natively
+   * from facts that are deliberately never serialized (see BRIDGE.md §2 "Per-instance state").
+   *
+   * AWAIT THIS BEFORE RENDERING ANYTHING. The whole point is that `silent` shows no opening
+   * screen at all — a menu that appears for 200ms and is then replaced is the same bug with
+   * better timing.
+   *
+   * ONE SHOT. Reading it consumes the "state arrived from outside" fact, so the question is
+   * asked once and every later editor recreation in that process is silent. `getPersistedState`
+   * stays side-effect free and can still be called freely.
+   *
+   * Optional like everything else here. When it is absent — a browser tab, an older shell —
+   * the caller falls back to `getPersistedState()` and treats whatever it finds as `ask`,
+   * which is exactly the behaviour that call has always had.
+   */
+  getSessionRestore?(): Promise<SessionRestore>;
 }
+
+/** What a booting page should do with the state the host is holding. */
+export type SessionRestoreMode =
+  /** Same process, new editor (or a plain page refresh). Restore it, show nothing, ask nothing. */
+  | 'silent'
+  /** The state arrived from outside since the last boot — project load, preset, duplicated
+      instance, host undo. Ask once, as before. */
+  | 'ask'
+  /** Nothing stored. The opening screen. */
+  | 'none';
+
+export interface SessionRestore {
+  /** The blob, or null when nothing has ever been stored. Same string `getPersistedState` gives. */
+  state: string | null;
+  restoreMode: SessionRestoreMode;
+}
+
+/*
+ * THE MINIMUM WINDOW SIZE IS NOT DECLARED HERE, and deliberately so — there are already two
+ * places it has to be true and a third copy could only ever drift out of step with both:
+ *
+ *   - `ui/faceScale.ts` FACE_BASE_W x FACE_BASE_H — the size the face is DESIGNED at, which is
+ *     the size below which the one-proportion law starts scaling everything down;
+ *   - `shell/Source/ui/PluginEditor.h` preferredMinEditorWidth/Height — the same two numbers,
+ *     handed to the window manager where that is honoured (the standalone owns its window) and
+ *     REQUESTED, not enforced, inside a DAW. REAPER declines: it shrinks its FX frame and clips
+ *     the editor rather than refusing the drag, which is why the floor actually given to a
+ *     plugin host stays low and the layout is required to survive below it.
+ *
+ * The shell reports all of it on `getShellInfo()` — `minEditorWidth/Height`,
+ * `preferredMinEditorWidth/Height` and `minimumEnforced` — so a page that needs to know whether
+ * it is drawing below the design size can ask instead of assuming.
+ */

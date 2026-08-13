@@ -17,7 +17,20 @@
  */
 
 import { el, fitSelects, replace, formatTime, debounce, type Store } from './dom';
+import {
+  FACE_BASE_H,
+  FACE_BASE_W,
+  FACE_SCALE_EVENT,
+  faceScale,
+  faceScaleFor,
+  faceViewport,
+  installFaceScale,
+  logicalRect,
+  toLogical,
+  toVisual
+} from './faceScale';
 import { installTooltipLayer, t, TIPS } from './tips';
+import { applyTheme, loadTheme } from './theme';
 import {
   getBridge,
   importDroppedFileNative,
@@ -31,6 +44,7 @@ import {
   type ExportPayload,
   type HostInfo,
   type NativeBridge,
+  type SessionRestoreMode,
   type TranscribeOptions,
   type TranscribeResult
 } from '../bridge';
@@ -81,10 +95,12 @@ import { applyRollEditToNotes } from '../edit/rollPerformance';
 // named rather than inferred from the command.
 import {
   applyBarOp,
+  applyBarOpToPartNotes,
   applySheetEditToNotes,
   durationMenuLabel,
   mergePerformanceEditOntoCutTake,
   type BarOp,
+  type BarOpContext,
   type SheetEdit
 } from '../edit/performanceEdit';
 import { closeSheetMenu, showSheetMenu, sheetMenuProbe, type SheetMenuItem } from '../edit/sheetMenu';
@@ -161,12 +177,19 @@ import { buildPrintDocument, renderScorePdf } from '../export/pdf';
 import { ExportBar } from './exportBar';
 import { FINGER_BASS_SAMPLES, SampledBass, sampleStatus } from '../audio/sampler';
 import { schedulePad } from '../audio/pad';
-import { dropTunedRiff, GUITAR_PART_MUSICXML, straightRiff, tripletRiff } from '../score/fixtures';
+import {
+  chordRiff,
+  dropTunedRiff,
+  GUITAR_PART_MUSICXML,
+  straightRiff,
+  tripletRiff
+} from '../score/fixtures';
 import {
   applyDocumentSettings,
   takeScopedDefaults,
   TAKE_SCOPED_SETTING_KEYS,
   createStores,
+  fileIdentity,
   FINGERING_STYLES,
   forgetRecent,
   loadRecent,
@@ -228,10 +251,10 @@ import {
  * How many min/max pairs the waveform picture is reduced to.
  *
  * 2000 was fine while the strip always showed the WHOLE take. It does not any more: linked to the
- * sheet it shows a slice, and the buckets thin out with it. Measured at the 1180px design target,
- * 2000 buckets only reach native screen resolution while at least 57% of the take is on screen —
- * so a three-minute take zoomed to two bars got one peak every 25 pixels and drew a bar chart
- * rather than a waveform. 20000 moves that threshold to 5.7%.
+ * sheet it shows a slice, and the buckets thin out with it. Measured at the 1320px design target,
+ * 2000 buckets only reach native screen resolution while at least 64% of the take is on screen —
+ * so a three-minute take zoomed to two bars got one peak every 29 pixels and drew a bar chart
+ * rather than a waveform. 20000 moves that threshold to 6.4%.
  *
  * The cost is 160 KB of Float32 and one extra pass over samples that are already being read.
  */
@@ -305,12 +328,18 @@ const ENGINE_IDLE_POLL_MS = 8_000;
 /**
  * The version to show when the shell cannot be asked.
  *
+ * ALREADY IN DISPLAY FORM, and that is the whole convention: Riffsheet is versioned one-dot
+ * from 1.0 onwards, so every surface a player reads prints `v` + this string and nothing here
+ * ever trims a patch number off anything. The shell agrees — `getAppVersion` answers with the
+ * same two-part form (RIFFSHEET_VERSION_DISPLAY, derived in `shell/CMakeLists.txt` from the
+ * x.y.z the plugin formats insist on) — so the two paths cannot render differently.
+ *
  * A build-time constant, kept in step with `webcore/package.json` and `shell/CMakeLists.txt`
  * (`project(Riffsheet VERSION …)`). The shell's own number wins whenever `getAppVersion` exists
  * — that is the one stamped into the bundle a user actually installed — and this is what a
  * plain browser tab, and any shell too old for the call, shows instead of nothing.
  */
-const BUILD_VERSION = '0.1.0';
+const BUILD_VERSION = '1.0';
 
 const OPEN_FILE_ACCEPT = [
   'audio/*',
@@ -360,10 +389,30 @@ const SELECT_ARROW_PX = 20;
  */
 const TOP_BAR_SELECTORS = ['.app-header', '.transport', '[data-role="notation-toolbar"]'] as const;
 
+/**
+ * Why the second Off is refused (G2).
+ *
+ * One sentence, said by BOTH menus and by the settings sanitiser, because "Clef: Off" and
+ * "Tab: Off" are the same rule seen from two sides: whichever is chosen first, the other one
+ * would leave a page with nothing engraved on it.
+ */
+const STAFF_OFF_REASON = 'one staff must remain';
+
 const MUSICXML_ACCEPT = '.xml,.musicxml,.mxl';
 const MUSICXML_NAME = /\.(musicxml|mxl|xml)$/i;
 
 export function mountApp(root: HTMLElement): void {
+  // THE LAW GOES ON FIRST, BEFORE ANYTHING MEASURES ANYTHING (G1). `installFaceScale` writes the
+  // one root factor into `--face-scale` synchronously, so the first layout, the first canvas
+  // backing store and the first hit test all happen at the scale the window actually calls for.
+  // Installed here rather than in `App` because the tooltip layer and every body-mounted popover
+  // live under the same scaled body and are built before the app is.
+  installFaceScale();
+  // THE PALETTE GOES ON BEFORE THE FIRST PAINT (G3), for the same reason the law does: the
+  // canvases read their colours out of the tokens when they are constructed, and a page that
+  // boots in the default palette and switches a frame later is a visible flash of the wrong
+  // theme. One synchronous write of custom properties on `:root`; see `ui/theme.ts`.
+  applyTheme(loadTheme());
   installTooltipLayer();
   void new App(root).start();
 }
@@ -377,13 +426,21 @@ export function mountApp(root: HTMLElement): void {
  */
 export async function bootSecondApp(
   root: HTMLElement,
-  options: { autoResume?: boolean } = {}
+  options: { autoResume?: boolean; restoreMode?: SessionRestoreMode } = {}
 ): Promise<{ probe: () => unknown; root: HTMLElement }> {
   const app = new App(root);
   // `autoResume` skips the "Resume previous work / Start fresh" prompt. The persistence probe
   // passes it because what that one is testing is the blob round trip; the resume probe does
   // NOT, because the prompt is the thing it is testing.
-  await app.start({ secondary: true, autoResume: options.autoResume === true });
+  //
+  // `restoreMode` is the silent-restore probe's seam: the browser mock has no processor and
+  // cannot honestly answer "same editor, recreated", so the answer a real shell would have
+  // given is handed in and everything downstream of it is the shipping path. See `App.start`.
+  await app.start({
+    secondary: true,
+    autoResume: options.autoResume === true,
+    ...(options.restoreMode ? { restoreMode: options.restoreMode } : {})
+  });
   return { probe: () => app.sessionProbe(), root };
 }
 
@@ -579,6 +636,14 @@ class App {
   /** True while rehydrating, so the restore cannot save over the blob it is reading. */
   private restoring = false;
   private restored = false;
+  /**
+   * True from the first line of a SILENT boot until its restore has finished, either way.
+   *
+   * The one job of this flag is that `renderOpening()` draws nothing while it is set — see
+   * there. Cleared by `start()` in every case, including the failure one, so it can never
+   * strand a window with an empty root.
+   */
+  private silentBoot = false;
 
   /**
    * The decoded mono samples of the original recording, and their rate.
@@ -703,7 +768,13 @@ class App {
     this.session = new SessionStore(this.bridge);
     // Every settings change is a meaningful change: the sound, the pane toggles, the grid,
     // the tuning. One subscription covers the lot, including anything added later.
-    this.settings.subscribe(() => this.scheduleSave());
+    //
+    // IMMEDIATE, because every one of them is a discrete decision — there is no such thing as
+    // dragging through settings — and because the ones that change the DOCUMENT (the clef, the
+    // key, the quantizer, the tuning) are exactly what "restore the exact prior state" is about.
+    // `saveNow` coalesces a burst into a short debounce on its own, so a control that writes
+    // three keys in one gesture is still one round trip (F).
+    this.settings.subscribe(() => this.saveNow());
     this.transport = new Transport(this.bridge, this.ctx);
     this.exportBar = new ExportBar({
       bridge: this.bridge,
@@ -927,7 +998,36 @@ class App {
    * would otherwise be re-pointed at the clone) and ignores `?demo=`, so it takes the same
    * boot path a reopened plugin editor takes. Only `bootSecondApp` passes it.
    */
-  async start(options?: { secondary?: boolean; autoResume?: boolean }): Promise<void> {
+  async start(options?: {
+    secondary?: boolean;
+    autoResume?: boolean;
+    /**
+     * FOR THE HARNESS ONLY: pretend the host answered this.
+     *
+     * There is no way to destroy and recreate a WebView from inside it, and the browser mock
+     * cannot honestly answer "silent" — it has no processor and no editor generation to answer
+     * from. So the one thing that cannot otherwise be tested outside a DAW, that a `silent`
+     * answer produces NO opening screen at all, is driven by handing the boot the answer a real
+     * shell would have given. Everything downstream of that point is the real code path.
+     */
+    restoreMode?: SessionRestoreMode;
+  }): Promise<void> {
+    /*
+     * ASK WHAT THIS BOOT IS BEFORE DRAWING ANYTHING (F/P9).
+     *
+     * THE BUG, in the owner's words: switching to another plugin in REAPER's FX window and back
+     * "throws Riffsheet to the main menu asking continue?". The editor is destroyed and rebuilt
+     * — the processor, and the work, never went anywhere — and the page came up, drew the
+     * opening screen, read the blob, and then asked whether to resume work that had not stopped.
+     *
+     * The blob alone cannot tell that case from "a project saved last week has been loaded", so
+     * the host is asked (`bridge/types.ts §getSessionRestore`) and the answer is AWAITED HERE,
+     * before the first render. A menu that appears for 200ms and is then replaced is the same
+     * bug with better timing, so on `silent` no opening screen is drawn at all: `renderOpening`
+     * is gated on `silentBoot` until the restore has put the take on screen or failed trying.
+     */
+    const restore = await this.loadRestoreDecision(options?.restoreMode);
+    this.silentBoot = restore.mode === 'silent' && !!restore.session;
     this.renderOpening();
     // The number in the brand block, from the shell if it can say. Fire-and-forget; the block
     // is already drawn with the build-time constant.
@@ -983,14 +1083,30 @@ class App {
 
     const params = new URLSearchParams(location.search);
     if (!options?.secondary && params.has('demo')) {
+      // A demo is an explicit instruction to show something, so it outranks a silent restore
+      // and the gate comes off before it draws.
+      this.silentBoot = false;
       this.loadDemo(params.get('demo') || 'triplet');
       return;
     }
 
     // Nothing above this point can put a take on screen, so a restore cannot fight with
-    // one. It is awaited: the drop zone is already rendered, and a session that arrives
-    // after the user has started dropping a file would be worse than a slightly later boot.
-    await this.restoreSession({ auto: options?.autoResume === true });
+    // one. It is awaited: the drop zone is already rendered — or deliberately NOT rendered,
+    // on a silent boot — and a session that arrives after the user has started dropping a
+    // file would be worse than a slightly later boot.
+    const restored = await this.restoreSession({
+      auto: options?.autoResume === true,
+      preloaded: restore
+    });
+
+    // THE GATE COMES OFF HERE, WHATEVER HAPPENED. A silent restore that succeeded is already
+    // on the main screen and `renderOpening` is a no-op; one that failed — a blob that would
+    // not decode, a take that vanished — must not leave the player looking at nothing, so the
+    // opening screen it was suppressing is drawn now.
+    if (this.silentBoot) {
+      this.silentBoot = false;
+      if (!restored) this.renderOpening();
+    }
   }
 
   // =========================================================================
@@ -1244,7 +1360,41 @@ class App {
     );
   }
 
+  /**
+   * REPLACE THE SCREEN, AND KEEP WHATEVER IS WAITING FOR AN ANSWER ON TOP OF IT.
+   *
+   * A screen is rebuilt wholesale — `replace()` is `replaceChildren()` — and a modal dialog is
+   * a child of the same root, so a re-render while one is open DELETES IT while the promise
+   * behind it is still being awaited. Nothing resolves that promise afterwards: the buttons
+   * that would have are gone, and the caller waits for ever.
+   *
+   * THE BUG THIS WAS FOUND BY, because it is a good illustration of how narrow the window was.
+   * `loadEngines()` is deliberately not awaited at boot and calls `renderOpening()` when the
+   * engine list lands, some tens of milliseconds in. The resume prompt used to be raised AFTER
+   * that, because reading the session blob put an extra round trip in front of it — so the
+   * dialog was appended to a root that had already been rebuilt for the last time and survived
+   * by luck. Reading the blob BEFORE the first render (F) removed that round trip, the prompt
+   * started being raised first, and the engine list quietly deleted it a moment later: the app
+   * hung on a dialog that was no longer on screen.
+   *
+   * So the modals are detached and put back rather than the render being suppressed: a dialog
+   * must not stop the screen behind it from staying current, and the screen must not be able to
+   * take the dialog with it. Direct children only — anything a dialog itself contains goes with
+   * the dialog.
+   */
+  private replaceScreen(...children: Array<Node | string | false | null | undefined>): void {
+    const modals = [...this.root.children].filter((node) => node.classList.contains('modal-backdrop'));
+    replace(this.root, ...children);
+    for (const modal of modals) this.root.appendChild(modal);
+  }
+
   private renderOpening(): void {
+    // ZERO MENU FRAMES (F). While a silent restore is in flight the opening screen is not a
+    // thing to be shown and then replaced — it is the bug. Every caller between the boot's
+    // first line and the restore is gated here rather than at each call site, because there
+    // are five of them (`start`, the host-info reply, `loadEngines`, the engine chip, the
+    // restore's own failure path) and a gate one of them forgets is a flash of main menu.
+    if (this.silentBoot) return;
     if (this.runtime.get().screen !== 'opening') return;
     const rt = this.runtime.get();
     const host = rt.host;
@@ -1340,8 +1490,7 @@ class App {
             : '●  Capture from track'
       );
 
-    replace(
-      this.root,
+    this.replaceScreen(
       host &&
         !host.engineAvailable &&
         el(
@@ -1614,7 +1763,9 @@ class App {
       picked.bytes.byteOffset,
       picked.bytes.byteOffset + picked.bytes.byteLength
     ) as ArrayBuffer;
-    await this.openFile(new File([contents], picked.name));
+    // Same as the picker: a native drop knows where the file came from, and the Recent list
+    // needs it. See `openFile`.
+    await this.openFile(new File([contents], picked.name), picked.path);
   }
 
   private async openRecentFromMenu(entry: RecentFile): Promise<void> {
@@ -2111,7 +2262,16 @@ class App {
     }
   }
 
-  private async ingestRiffsheetDocument(name: string, bytes: Uint8Array): Promise<void> {
+  /**
+   * `path` is the document's own place on disk when the shell knew it — a native pick or a
+   * native OS drop. Empty for a browser `File`, which reports no path at all.
+   *
+   * It is carried this far for ONE reason: the Recent list (E1). The recording inside a
+   * `.riffsheet` is session-only — it has no path, its identity is `session:<token>`, and
+   * `pushRecent` refuses it — so without this an opened document left no trace in Recents at
+   * all, and the file the player actually opened is the document.
+   */
+  private async ingestRiffsheetDocument(name: string, bytes: Uint8Array, path = ''): Promise<void> {
     const document = readRiffsheetDocument(bytes);
     const source = decodeSource(document.source);
     if (!source) throw new Error('That Riffsheet document has no score data.');
@@ -2147,6 +2307,9 @@ class App {
     this.goMain(source.name);
     this.rebuildNotation({ keepEdits: false });
     this.replayEdits(document.edits, document.editCursor);
+    // THE DOCUMENT IS THE RECENT FILE, not the take inside it (E1). Refused by `pushRecent`
+    // when there is no absolute path, which is every browser open.
+    if (path) pushRecent({ name, path, at: Date.now(), identity: fileIdentity(path) });
     // Only when the document named a take and it could not be found. Silence would leave them
     // wondering why the Original side of the fader does nothing.
     if (original.message) this.toast('info', 'Opened without the recording', original.message);
@@ -2168,6 +2331,27 @@ class App {
    * the dead entry is dropped from the list so it stops being offered.
    */
   private async openRecent(entry: RecentFile): Promise<void> {
+    /*
+     * A `.riffsheet` IN THE LIST, AND WHAT THIS SHELL CAN DO WITH ONE.
+     *
+     * The document is listed because it is the file the player opened (E1) — the recording
+     * inside it is session-only and correctly never appears. Reopening it needs its BYTES, and
+     * every by-path call this bridge has (`loadAudioPath`, `loadAudioBytes`) is about audio: a
+     * `.riffsheet` is a zip, and handing it to an audio decoder would fail, be read as "the file
+     * is gone", and delete the entry — destroying the record instead of honouring it.
+     *
+     * So it says what is true and leaves the entry where it is. A shell that grows a
+     * read-a-file-by-path call turns this into an ordinary open; until then this is the one
+     * honest thing to print, and it names the path so the file can be found.
+     */
+    if (isRiffsheetFile(entry.path)) {
+      this.toast(
+        'info',
+        entry.name,
+        `${entry.path} is a Riffsheet document. Open it with “Choose a file” — this host can only reopen recordings by name.`
+      );
+      return;
+    }
     if (!this.bridge.loadAudioPath) {
       this.toast(
         'info',
@@ -2191,12 +2375,16 @@ class App {
         forgetRecent(entry.path);
         this.renderOpening();
       }
+      // NAMED, AND NAMED IN FULL (E1). The list is paths now, not copies the app made, so the
+      // one fact that answers "why did that not open?" is WHERE it was looking — a file the
+      // player moved, a name they changed, an external drive that is not plugged in. Saying
+      // "Bass take 3.wav could not be opened" and stopping leaves them nothing to check.
       this.toast(
         'danger',
         entry.name,
         gone
-          ? `That file could not be opened — it may have been moved, renamed, or be on a drive that is not connected. (${detail})`
-          : `That file is still there, but opening it did not work. (${detail})`
+          ? `Riffsheet could not find ${entry.path} — it may have been moved, renamed, or be on a drive that is not connected. It has been taken off the recent list. (${detail})`
+          : `${entry.path} is still there, but opening it did not work. (${detail})`
       );
     }
   }
@@ -2216,7 +2404,9 @@ class App {
             picked.bytes.byteOffset,
             picked.bytes.byteOffset + picked.bytes.byteLength
           ) as ArrayBuffer;
-          await this.openFile(new File([contents], picked.name));
+          // The path travels with the bytes now. It was dropped here, which is why an opened
+          // `.riffsheet` could never appear in the Recent list (E1).
+          await this.openFile(new File([contents], picked.name), picked.path);
         }
       } catch (e) {
         this.toast('danger', 'Could not open that', (e as Error).message);
@@ -2249,11 +2439,16 @@ class App {
     if (file) await this.openFile(file);
   }
 
-  private async openFile(file: File): Promise<void> {
+  /**
+   * `path` is what the SHELL said this file's path is, when a shell was involved. A browser
+   * `File` has none, and the empty string is the honest answer for one — see `pushRecent`,
+   * which refuses anything that is not absolute rather than writing a name down as a path.
+   */
+  private async openFile(file: File, path = ''): Promise<void> {
     try {
       const bytes = await file.arrayBuffer();
       if (isRiffsheetFile(file.name)) {
-        await this.ingestRiffsheetDocument(file.name, new Uint8Array(bytes));
+        await this.ingestRiffsheetDocument(file.name, new Uint8Array(bytes), path);
         return;
       }
       // MIDI and score formats are parsed here in every host; no audio decoder round-trip.
@@ -2675,7 +2870,27 @@ class App {
       this.transport.setOriginalAvailable(true, pcm.durationSec);
       this.goMain(name);
 
-      if ('name' in input) pushRecent({ name: input.name, path: input.path, at: Date.now() });
+      /*
+       * ONE ENTRY PER REAL FILE (E1/E3).
+       *
+       * The identity comes from the SHELL, not from this call site: `AudioFileRef.identity` is
+       * `file:<absolute path>` for anything with a durable path and `session:<token>` for
+       * everything that exists only in this process — a capture, a byte drop, the recording
+       * inside a `.riffsheet`. `pushRecent` refuses everything that is not a `file:`, so those
+       * three simply do not appear in the list rather than appearing and then failing to open.
+       *
+       * `input.path` is the fallback for a shell too old to send an identity — the same
+       * `file:<path>` it would have sent. It refuses a relative one, which is what a browser
+       * `File` reports for itself.
+       */
+      if ('name' in input) {
+        pushRecent({
+          name: input.name,
+          path: input.path,
+          at: Date.now(),
+          identity: 'identity' in input && input.identity ? input.identity : undefined
+        });
+      }
 
       await this.runTranscription(input, pcm.durationSec);
     } catch (e) {
@@ -2973,7 +3188,10 @@ class App {
     // that speaks recording seconds — `range` is a selection on the edited page (F16).
     this.tuner.show(this.toAudioSec(range.fromSec), this.toAudioSec(range.toSec));
     this.tuner.setExpected(this.expectedMidiAt(range.fromSec));
-    const measured = Math.round(host.getBoundingClientRect().height);
+    // LOGICAL (G1): this number is handed to `setTransientReserve`, which `clampRollHeight`
+    // subtracts from the LOGICAL window height. A visual measurement here would under-reserve by
+    // the face scale and let the roll grow over the tuner.
+    const measured = Math.round(logicalRect(host).height);
     // Halved with the panel itself (its CSS is 29-43px now, plus the host's 8px of padding).
     // These bounds exist so a measurement taken before layout settles cannot hand the roll a
     // silly number; they have to follow the panel or the roll would keep giving back twice the
@@ -3247,10 +3465,10 @@ class App {
      */
     chip.querySelector('[data-role="engine-text"]')!.textContent =
       e.state === 'starting' ? `${name} starting` : `Stop ${name}`;
-    // The chip is about 100px of header that was not there a moment ago, so the row's budget has
-    // just changed and the take's name may no longer fit (or may fit again). Same call the
-    // resize handler makes; it is one layout read.
-    this.fitHeaderName();
+    // The chip is about 100px of header that was not there a moment ago. That used to change the
+    // row's budget and force a re-decision about the take's name; under the one-proportion law
+    // the header is laid out in at least 1320 logical px whatever the window is doing, so 100px
+    // of chip comes out of the spacer between the two groups and nothing has to be dropped.
     const mb =
       typeof e.memoryMb === 'number' && e.memoryMb > 0
         ? ` It is holding ${(e.memoryMb / 1024).toFixed(1)} GB right now.`
@@ -3728,28 +3946,88 @@ class App {
   }
 
   /**
+   * WRITE IT NOW — for a change the player has COMMITTED (F).
+   *
+   * THE HOLE THIS CLOSES, and it is the other half of P9. The editor is destroyed without
+   * warning and with no event a page can finish an asynchronous bridge call from, so a 700ms
+   * debounce is a 700ms window in which an edit is simply lost: make one, click another FX, come
+   * back, and the silent restore faithfully puts back a document one edit out of date — which is
+   * worse than not restoring at all, because nothing says so. "The exact prior state" is only
+   * true if discrete edits are on the host's side of the bridge by the time they are finished.
+   *
+   * WHAT COUNTS AS DISCRETE: a note added, deleted or retimed; a bar inserted or removed; an
+   * undo or a redo; a part added, renamed or reordered; a cut; a setting; the sound; a new sheet.
+   * Every one of them is a thing the player DID, once, and would name if asked what they had
+   * just changed.
+   *
+   * WHAT DOES NOT: the states a gesture passes through on its way to one of those — a fader being
+   * dragged, the bar-1 marker being moved. Those keep `scheduleSave()`, and their COMMIT (the
+   * release) comes back through here.
+   *
+   * Bounded rather than literal, so a held key cannot become a bridge round trip per repeat:
+   * `SessionStore.saveNow` degrades a second immediate write inside 120ms to a short debounce.
+   */
+  private saveNow(): void {
+    if (this.restoring || !this.runtime.get().source) return;
+    void this.session.saveNow(this.snapshot());
+  }
+
+  /**
    * Put back whatever the last editor left behind — after asking.
    *
    * Note what does NOT happen here: no transcription. The detected notes came back in the
    * blob, so the sheet is rebuilt by the same cheap path a settings change uses.
    *
-   * AND IT IS NEVER SILENT ANY MORE. This used to restore without a word, which is right
-   * exactly once — the case it was built for, a DAW destroying the editor when you click
-   * another track, where the work reappearing IS the fix. It is wrong every other time. Open
-   * the plugin on a new track and last week's riff is on screen, apparently belonging to a
-   * project it has nothing to do with; try to start something new and the app has already
-   * decided what you are working on. Worst of all it is unclearable: the way to get rid of it
-   * is to notice it is there and find "Close current work".
+   * SILENT WHEN THE HOST SAYS SO, AND ONLY THEN — and getting that distinction right took two
+   * goes. It used to restore without a word, which is right exactly once: the case it was built
+   * for, a DAW destroying the editor when you click another track, where the work reappearing IS
+   * the fix. It was wrong every other time — open the plugin on a new track and last week's riff
+   * is on screen, apparently belonging to a project it has nothing to do with. So it was made to
+   * ask, always, and that turned the ONE case it had been right about into the owner's P9: switch
+   * FX in REAPER and back, and the app threw away the screen and asked whether to continue work
+   * that had never stopped.
    *
-   * So it asks, with two real answers and no default. "Start fresh" clears the stored copy for
+   * Neither behaviour is a property of the blob, which is identical in both situations. It is a
+   * property of the HOST — same processor, or state that arrived from outside — so the host is
+   * asked (`bridge/types.ts §getSessionRestore`) and `decision.mode` is the answer. `silent`
+   * restores with no prompt and no opening screen; `ask` is the dialog below, unchanged.
+   *
+   * The dialog has two real answers and no default. "Start fresh" clears the stored copy for
    * good, because a fresh start that leaves the old work waiting to ambush the next boot is
    * not one. The Main menu's own "Resume current work" is untouched — that is about work
    * still open in this window, which is a different question with a different answer.
    */
-  private async restoreSession(opts: { auto?: boolean } = {}): Promise<boolean> {
+  /**
+   * READ THE BLOB AND ITS PROVENANCE, ONCE, BEFORE THE FIRST RENDER (F).
+   *
+   * ONE READ, because the provenance half is one-shot by contract: reading it consumes the
+   * host's "state arrived from outside" fact, so a second reader would be told `silent` about a
+   * project load. `start()` takes the answer and hands it down to `restoreSession`.
+   *
+   * On a host that cannot tell the two apart — a browser tab, an older shell — `loadRestore`
+   * falls back to "there is a blob, ask about it", which is exactly what has always happened.
+   */
+  private async loadRestoreDecision(
+    forced?: SessionRestoreMode
+  ): Promise<{ session: PersistedSession | null; mode: SessionRestoreMode }> {
+    if (!this.session.canLoad) return { session: null, mode: 'none' };
+    const answer = await this.session.loadRestore();
+    // The harness's override. It changes the ANSWER, never the reading: the blob is the real
+    // one, read through the real bridge, and everything after this line is the shipping path.
+    return forced ? { session: answer.session, mode: answer.session ? forced : 'none' } : answer;
+  }
+
+  private async restoreSession(
+    opts: {
+      auto?: boolean;
+      /** What `start()` already read. See `loadRestoreDecision` for why it is not read twice. */
+      preloaded?: { session: PersistedSession | null; mode: SessionRestoreMode };
+    } = {}
+  ): Promise<boolean> {
     if (!this.session.canLoad) return false;
 
-    const blob = await this.session.load();
+    const decision = opts.preloaded ?? (await this.loadRestoreDecision());
+    const blob = decision.session;
     if (!blob || !hasRestorableTake(blob)) return false;
 
     // The drop zone was already on screen while that call was in flight. If the user got in
@@ -3760,11 +4038,23 @@ class App {
     const source = decodeSource(blob.source);
     if (!source) return false;
 
-    // `auto` is for the persistence probe only — `bootSecondApp()` is testing that a blob
-    // written by one app comes back identically in another, and a dialog in the middle of
-    // that is a different test wearing its clothes. Nothing a player can reach sets it; the
-    // prompt itself is exercised by `__RIFFSHEET_RESUMEPROMPT__`, both ways.
-    if (!opts.auto && !(await this.askResume(source.name, blob.savedAt))) {
+    /*
+     * THE PROMPT IS FOR 'ask' AND FOR NOTHING ELSE (F/P9).
+     *
+     * `silent` means the host has said, from facts it never serializes, that this is the SAME
+     * processor putting back an editor it just destroyed — the FX-window switch the owner
+     * reported. There is no question to ask: the work never stopped, and asking is the bug.
+     *
+     * `ask` is unchanged and stays the default everywhere the host cannot tell: a project
+     * loaded from disk, a preset, a duplicated instance, a plain browser tab.
+     *
+     * `auto` is for the persistence probe only — `bootSecondApp()` is testing that a blob
+     * written by one app comes back identically in another, and a dialog in the middle of
+     * that is a different test wearing its clothes. Nothing a player can reach sets it; the
+     * prompt itself is exercised by `__RIFFSHEET_RESUMEPROMPT__`, both ways.
+     */
+    const mustAsk = !opts.auto && decision.mode !== 'silent';
+    if (mustAsk && !(await this.askResume(source.name, blob.savedAt))) {
       // Not "leave it and hope". A person who has said Start fresh has said it about this
       // blob, and a blob that survives is one that asks the same question again tomorrow.
       await this.session.clear();
@@ -3824,8 +4114,10 @@ class App {
       }
       return true;
     } catch (e) {
-      // A restore is a convenience. If it goes wrong the app must still open.
+      // A restore is a convenience. If it goes wrong the app must still open — including the
+      // silent one, which has been suppressing the opening screen until this moment.
       console.error('[riffsheet] session restore failed', e);
+      this.silentBoot = false;
       this.runtime.set({ screen: 'opening', source: null, score: null });
       this.renderOpening();
       return false;
@@ -4114,12 +4406,16 @@ class App {
     }
     // 'droptuned' dips below the low E of the default tuning, so the pipeline has to fold
     // those tab positions up an octave — the case the 8va markers exist for.
+    // 'chord' is the stacked-notehead fixture the chord faults are checked against — a chord
+    // whose members were struck 3 ms apart, plus three- and five-note stacks. See fixtures.ts.
     const performance =
       which === 'straight'
         ? straightRiff(bars)
         : which === 'droptuned'
           ? dropTunedRiff(bars)
-          : tripletRiff(bars);
+          : which === 'chord'
+            ? chordRiff(bars)
+            : tripletRiff(bars);
     const name = `demo — ${which} riff, ${bars} bars`;
 
     // A lead-in of silence, so the auto-trim region and the bar-1 marker are exercised too.
@@ -4468,6 +4764,23 @@ class App {
           // pipeline?" can be answered from outside.
           beatCount: score.beatTimesSec?.length ?? 0,
           firstBeats: (score.beatTimesSec ?? []).slice(0, 8).map((b) => Number(b.toFixed(4))),
+          /*
+           * THE STAVES THE RENDERER WILL BE HANDED (G2).
+           *
+           * `score.data` is what BOTH engravings are built from — the tri-view on screen and the
+           * hidden print instance the PDF comes out of (`export/pdf.ts` calls
+           * `buildAlphaTabScore(score.data, …)`) — so this is where "the export respects Clef:
+           * Off" is a fact rather than a second implementation. With the staff hidden every
+           * remaining stave here reads `notation: false, tab: true`, and there is no way for the
+           * printed page to disagree with the screen because there is only one description of it.
+           *
+           * The MusicXML and the MIDI above are written from `score.ir`, which this never
+           * touches — which is the other half of the rule: hiding is a property of this screen,
+           * not of the music.
+           */
+          staves: score.data.tracks.map((track) =>
+            track.staves.map((staff) => ({ notation: staff.showStandardNotation, tab: staff.showTablature }))
+          ),
           diagnostics: score.diagnostics
         };
       } catch (e) {
@@ -4893,15 +5206,115 @@ class App {
      */
     (window as unknown as Record<string, unknown>).__RIFFSHEET_SHEETEDIT__ = () => {
       const view = this.triview?.editProbe() ?? { noteHeads: [], emptyNotation: null };
+      const rt = this.runtime.get();
+      const score = rt.score;
+      const origin = score ? this.originSec(score) : 0;
+      const r4 = (n: number) => Number(n.toFixed(4));
       return {
         ...view,
-        selection: [...this.runtime.get().selection],
-        documentBars: this.runtime.get().source?.documentBars ?? null,
+        selection: [...rt.selection],
+        documentBars: rt.source?.documentBars ?? null,
         canEditBars: this.canEditBars(),
-        rawNotes: this.runtime.get().source?.detected?.notes.length ?? 0,
+        barRefusal: this.barRefusal(),
+        rawNotes: rt.source?.detected?.notes.length ?? 0,
         feedNotes: this.performanceFeed().length,
         undoTitle: this.undoTitle(),
-        menu: sheetMenuProbe()
+        menu: sheetMenuProbe(),
+        /*
+         * THE THINGS THE TICK-DOMAIN AND BAR-OP PROBES ASSERT ON, published rather than inferred.
+         *
+         * The probe this replaces checked that an edit CHANGED something. That is exactly the
+         * check that could not see the forty-times unit error (P2/P3): a note added at a
+         * deterministic wrong second still changes the note count, and a note dropped on the
+         * wrong beat still moves. So the bar list is published in SECONDS — the same numbers
+         * `applyBarOperation` computes, through the tempo map — and every feed note with them,
+         * so a probe can name an exact bar and beat and be told whether the note is there.
+         */
+        bars: (score?.ir.bars ?? []).map((bar) => ({
+          index: bar.index,
+          startSec: r4(tickToSeconds(score!, irTickToAlphaTick(score!, bar.startTick), origin)),
+          durSec: r4(
+            tickToSeconds(score!, irTickToAlphaTick(score!, bar.startTick + bar.durTicks), origin) -
+              tickToSeconds(score!, irTickToAlphaTick(score!, bar.startTick), origin)
+          ),
+          beats: bar.timeSig?.[0] ?? 4
+        })),
+        notes: this.performanceFeed().map((n) => ({
+          id: n.id ?? null,
+          startSec: r4(n.startSec),
+          endSec: r4(n.endSec),
+          midi: n.midi,
+          intent: n.notationIntent ?? null
+        })),
+        /** The written value each note is PRINTED at, which is the menu's own answer. */
+        printed: Object.fromEntries(
+          (rt.source?.detected?.notes ?? [])
+            .map((n) => [n.id ?? '', n.id ? this.intentOf(n.id) : null] as const)
+            .filter(([id, intent]) => id && intent)
+        ),
+        // THE TWO CLOCKS (workstream C). `audio` must never move; `score` may.
+        audioDurationSec: r4(rt.source?.durationSec ?? 0),
+        scoreDurationSec: r4(score?.durationSec ?? 0),
+        timelineDetached: !!rt.source?.timelineDetached,
+        importedPartNotes: (rt.source?.importedParts ?? []).map((p) =>
+          p.notes.map((n) => r4(n.startSec))
+        )
+      };
+    };
+
+    /**
+     * THE POINTER HELPER'S ROUND TRIP, ON THE REAL ENGRAVING (G1) — for `scripts/verify.mjs`.
+     *
+     * The one claim the rest of the harness cannot make. Every coordinate-dependent probe in the
+     * run drives the app at 1440x900, where the face scale is exactly 1 and a visual pixel and a
+     * logical pixel are the same thing — so all of them would pass with the conversion missing.
+     * This asks the question at the scales a plugin window actually runs at:
+     *
+     *   `editProbe()` publishes each notehead in CLIENT pixels (engraved coordinates scaled OUT
+     *   through `toVisual`), which is what a pointer event carries;
+     *   `hitTest()` takes client pixels and converts them back IN through `logicalPoint`, then
+     *   asks alphaTab's bounds lookup which note is there.
+     *
+     * Compose the two and you must get the same note id back. A missed consumer on either side
+     * shows up here as a mismatch that grows with the reciprocal of the scale — and at REAPER's
+     * floor, where the face is drawn at 0.27, a missing conversion puts the answer most of a
+     * system away rather than a pixel or two.
+     *
+     * `nearMiss` is the hit-radius half: a press HALF A NOTEHEAD off centre must still find the
+     * note, at every scale. Half a notehead rather than a fixed eight pixels, because the offset
+     * has to mean the same thing at every scale — at REAPER's floor the whole score is painted at
+     * 0.27 and eight screen pixels is most of a beat, so a fixed offset would be asking whether
+     * the pointer lands on the NEXT note, which is a different (and correct) answer.
+     * `NOTE_HIT_RADIUS_PX` is the thing under test: it is twelve SCREEN pixels, divided by the
+     * face scale on the way in, so the reach it buys is the same for a hand at every window size.
+     */
+    (window as unknown as Record<string, unknown>).__RIFFSHEET_HITROUNDTRIP__ = () => {
+      const tv = this.triview;
+      if (!tv) return null;
+      const heads = tv.editProbe().noteHeads;
+      let matched = 0;
+      let missed = 0;
+      const misses: Array<{ id: string; got: string | null; x: number; y: number }> = [];
+      for (const head of heads) {
+        const hit = tv.hitTest(head.x, head.y);
+        if (hit?.noteId === head.id) matched++;
+        else {
+          missed++;
+          if (misses.length < 4) misses.push({ id: head.id, got: hit?.noteId ?? null, x: head.x, y: head.y });
+        }
+      }
+      const first = heads[0] ?? null;
+      return {
+        scale: Number(faceScale().toFixed(4)),
+        heads: heads.length,
+        matched,
+        missed,
+        misses,
+        // Half a notehead off centre, in the same VISUAL pixels the head's width is reported in.
+        nearMissPx: first ? Math.max(2, Math.round(first.w / 2)) : null,
+        nearMiss: first
+          ? (tv.hitTest(first.x + Math.max(2, Math.round(first.w / 2)), first.y)?.noteId ?? null) === first.id
+          : null
       };
     };
 
@@ -4916,18 +5329,24 @@ class App {
         pane: !!pane,
         visible: !!pane && !pane.classList.contains('off'),
         toggle: !!this.root.querySelector('.pianoroll-toggle'),
-        paneHeight: pane ? Math.round(pane.getBoundingClientRect().height) : 0,
+        // LOGICAL, like everything else in this probe (G1): the saved height it is compared
+        // against is a logical inline style, and mixing the two would make the assertion
+        // "what was saved is what is on screen" false at every face scale below 1.
+        paneHeight: pane ? Math.round(logicalRect(pane).height) : 0,
         // The drag handle, and whether it is really grabbable: a resize affordance with no
         // ns-resize cursor is one nobody discovers.
         handle: !!handle,
         handleCursor: handle ? getComputedStyle(handle).cursor : null,
-        handleHeight: handle ? Math.round(handle.getBoundingClientRect().height) : 0,
+        handleHeight: handle ? Math.round(logicalRect(handle).height) : 0,
         // What has actually been written down, as opposed to what is on screen right now.
         savedHeight: this.settings.get().pianoRollHeight,
-        viewportH: window.innerHeight,
+        viewportH: Math.round(faceViewport().height),
         // The pane's neighbour: the roll growing must never be the sheet disappearing.
         triviewHeight: Math.round(
-          this.root.querySelector('.triview')?.getBoundingClientRect().height ?? 0
+          (() => {
+            const tv = this.root.querySelector('.triview');
+            return tv ? logicalRect(tv).height : 0;
+          })()
         ),
         roll: this.pianoRoll?.probe() ?? null,
         // The other two strips on the same ruler. All three together are what "they line up"
@@ -5906,11 +6325,15 @@ class App {
         if (!canvas) return { error: 'no roll canvas', appOrigin };
         const box = canvas.getBoundingClientRect();
         const idsBefore = new Set(rects.map((r) => r.noteId));
+        // LOGICAL -> VISUAL on the way out (G1). `targetX` and `emptyY` come from the roll's own
+        // painted geometry, which is in the design's pixels; a `MouseEvent`'s client coordinates
+        // are visual ones and are converted back by `canvasPoint()` on the way in. Adding the two
+        // without scaling aimed this probe at the wrong beat at every face scale below 1.
         canvas.dispatchEvent(
           new MouseEvent('dblclick', {
             bubbles: true,
-            clientX: box.left + targetX,
-            clientY: box.top + emptyY
+            clientX: box.left + toVisual(targetX),
+            clientY: box.top + toVisual(emptyY)
           })
         );
         await new Promise((r) => setTimeout(r, 120));
@@ -7119,6 +7542,136 @@ class App {
     };
 
     /**
+     * SILENT RESTORE (F/P9) — THE EDITOR COMES BACK WITH NO MENU AND NO QUESTION.
+     *
+     * THE REPORTED BUG: switch to another plugin in REAPER's FX window and back, and Riffsheet
+     * is on its main menu asking whether to continue work that never stopped.
+     *
+     * WHAT CANNOT BE TESTED HERE, AND WHAT IS SUBSTITUTED FOR IT. A page cannot destroy and
+     * recreate its own WebView, and the browser mock has no processor, no editor generation and
+     * no `setStateInformation` — so it cannot honestly answer "same editor, recreated". What it
+     * CAN do is boot a second, real App and hand it the answer a real shell would have given
+     * (`App.start §restoreMode`). Everything downstream of that one value is the shipping path:
+     * the same `loadRestore`, the same gate on `renderOpening`, the same `restoreSession`.
+     *
+     * ZERO MENU FRAMES IS MEASURED, NOT ASSUMED. A `MutationObserver` watches the second app's
+     * root for the whole of its boot and counts every moment the opening screen existed in it —
+     * a menu that is drawn and replaced 200ms later is the same bug with better timing, and a
+     * check that only looked at the end state would pass it happily.
+     *
+     * BOTH ANSWERS, in one run: 'silent' restores with no menu and no prompt, 'ask' still puts
+     * the prompt up. A fix that made everything silent would be a different bug (a project
+     * loaded from disk quietly deciding what you are working on), and this is what refuses it.
+     */
+    (window as unknown as Record<string, unknown>).__RIFFSHEET_SILENTRESTORE__ = async (
+      /**
+       * `show: true` leaves the restored editor ON SCREEN, over the live app, so the harness can
+       * PHOTOGRAPH what a recreated editor comes back to. It is the same app that was measured —
+       * nothing is re-booted for the picture — and `__RIFFSHEET_SILENTRESTORE_CLEAR__()` takes it
+       * away again. Without this the only proof of a silent boot is a number, and the owner asked
+       * to see the screens.
+       */
+      options: { show?: boolean } = {}
+    ) => {
+      const settled = (ms: number) => new Promise((ok) => setTimeout(ok, ms));
+      const roots: HTMLElement[] = [];
+      const makeRoot = () => {
+        const node = document.createElement('div');
+        Object.assign(node.style, {
+          position: 'fixed',
+          left: '-20000px',
+          top: '0',
+          width: '1200px',
+          height: '800px'
+        });
+        document.body.appendChild(node);
+        roots.push(node);
+        return node;
+      };
+      /** Every frame in which an opening screen existed inside this root. */
+      const watchForMenu = (root: HTMLElement) => {
+        const state = { frames: 0, everSaw: false };
+        const look = () => {
+          if (root.querySelector('.dropzone, .dropzone-screen, [data-role="open-source"]')) {
+            state.frames++;
+            state.everSaw = true;
+          }
+        };
+        const observer = new MutationObserver(look);
+        observer.observe(root, { childList: true, subtree: true });
+        look();
+        return { state, stop: () => observer.disconnect() };
+      };
+
+      const original = await this.session.load();
+      try {
+        if (!this.session.canSave) return { error: 'this host cannot persist state' };
+        // A blob with a real take in it, written by the live app through the real bridge.
+        this.scheduleSave();
+        await this.session.flush();
+        const saved = await this.session.load();
+        if (!saved) return { error: 'nothing was saved to reopen' };
+        const savedNotes = saved.source?.detected?.notes.length ?? 0;
+
+        // --- the editor was recreated: restore it, show nothing, ask nothing ----
+        const silentRoot = makeRoot();
+        const silentWatch = watchForMenu(silentRoot);
+        const silentApp = bootSecondApp(silentRoot, { restoreMode: 'silent' });
+        const silent = (await silentApp).probe() as Record<string, unknown>;
+        await settled(600);
+        silentWatch.stop();
+        const silentPrompt = !!silentRoot.querySelector('[data-dialog="resume-prompt"]');
+        const silentOnSheet = !!silentRoot.querySelector('.app-header');
+        const silentMenuAtEnd = !!silentRoot.querySelector('.dropzone');
+
+        // --- the state came from outside: ask, exactly as before ---------------
+        await this.bridge.setPersistedState?.(JSON.stringify(saved));
+        const askRoot = makeRoot();
+        const askApp = bootSecondApp(askRoot, { restoreMode: 'ask' });
+        await settled(900);
+        const askPrompt = !!askRoot.querySelector('[data-dialog="resume-prompt"]');
+        askRoot.querySelector<HTMLButtonElement>('[data-dialog="resume-prompt"] [data-role="confirm-ok"]')?.click();
+        await askApp;
+        await settled(300);
+
+        return {
+          savedNotes,
+          silent: {
+            notes: (silent.noteCount as number) ?? 0,
+            // The claim, as a number: the opening screen was never in this root.
+            menuFrames: silentWatch.state.frames,
+            everSawMenu: silentWatch.state.everSaw,
+            menuAtEnd: silentMenuAtEnd,
+            prompted: silentPrompt,
+            onSheet: silentOnSheet
+          },
+          ask: { prompted: askPrompt }
+        };
+      } catch (e) {
+        return { error: String((e as Error).stack ?? e) };
+      } finally {
+        await this.bridge.setPersistedState?.(original ? JSON.stringify(original) : '').catch(() => undefined);
+        // The silent root is the FIRST one made, and it is the one worth looking at.
+        const shown = options.show ? roots.shift() : undefined;
+        for (const node of roots) node.remove();
+        if (shown) {
+          Object.assign(shown.style, {
+            left: '0',
+            top: '0',
+            width: '100vw',
+            height: '100vh',
+            zIndex: '99999',
+            background: 'var(--bg)'
+          });
+          (window as unknown as Record<string, unknown>).__RIFFSHEET_SILENTRESTORE_CLEAR__ = () => {
+            shown.remove();
+            return true;
+          };
+        }
+      }
+    };
+
+    /**
      * Plugin amnesia, reproduced and disproved without a DAW.
      *
      * The reported bug is that switching REAPER tracks destroys the plugin editor and
@@ -7675,6 +8228,43 @@ class App {
     (window as unknown as Record<string, unknown>).__RIFFSHEET_BARCLIP__ = () =>
       Object.fromEntries(TOP_BAR_SELECTORS.map((sel) => [sel, this.barClipped(sel)]));
 
+    /**
+     * THE ONE-PROPORTION LAW, AS THE APP SEES IT (G1) — for `scripts/verify.mjs §FACE`.
+     *
+     * Four things the harness cannot work out for itself and must not duplicate:
+     *
+     *   - the scale actually in force, and the scale the law's own arithmetic asks for at this
+     *     viewport. They must be the same number; a difference means the installer is not
+     *     following the resize, which is the failure mode a screenshot cannot show;
+     *   - the LOGICAL viewport, which is where the invariant lives: it is never smaller than the
+     *     design size, at any window size, and that single fact is what retired every breakpoint;
+     *   - the design size itself, so the check is written against the constant rather than
+     *     against a number copied into the harness and left behind when this one moves;
+     *   - whether the scale is really on the BODY. It is the whole mechanism, and a stylesheet
+     *     that lost the declaration would leave a face that looks right at 1440x900 and clips
+     *     everywhere else.
+     */
+    (window as unknown as Record<string, unknown>).__RIFFSHEET_FACE__ = () => {
+      const view = faceViewport();
+      return {
+        scale: Number(faceScale().toFixed(4)),
+        wanted: Number(faceScaleFor(window.innerWidth, window.innerHeight).toFixed(4)),
+        baseW: FACE_BASE_W,
+        baseH: FACE_BASE_H,
+        logicalW: Math.round(view.width),
+        logicalH: Math.round(view.height),
+        innerW: window.innerWidth,
+        innerH: window.innerHeight,
+        bodyZoom: Number(getComputedStyle(document.body).zoom) || 1,
+        // The invariant, evaluated by the app itself: a layout that never sees less than the size
+        // it was designed at. One pixel of tolerance for the browser's own rounding.
+        neverBelowBase: view.width >= FACE_BASE_W - 1 && view.height >= FACE_BASE_H - 1,
+        // A visual length round-tripped through both conversions, which is the pointer helper's
+        // contract in one number.
+        roundTrip: Number(toVisual(toLogical(100)).toFixed(4))
+      };
+    };
+
     (window as unknown as Record<string, unknown>).__RIFFSHEET_PARTADD__ = async (
       mode: 'native' | 'refused' | 'html' = 'native'
     ) => {
@@ -8046,6 +8636,9 @@ class App {
       downbeats: source.detected?.downbeats,
       audioDurationSec: source.durationSec,
       blankBars: source.documentBars,
+      // Once the two clocks have parted company the audio's length is a fact about the audio and
+      // nothing more. See `SourceAudio.timelineDetached`.
+      ...(source.timelineDetached ? { detachedTimeline: true } : {}),
       // The pipeline anchors bar 1 / beat 1 here and KEEPS anything before it as an
       // anacrusis, so auto-trim and the user's marker are the same knob.
       startOffsetSec: source.barOneSec,
@@ -8126,7 +8719,7 @@ class App {
     // Nothing about the PERFORMANCE changed — same notes, same ids — so the edits still apply.
     this.rebuildNotation();
     this.renderMain();
-    this.scheduleSave();
+    this.saveNow();
   }
 
   /**
@@ -8149,7 +8742,7 @@ class App {
     // notes they were made on: `keepEdits` defaults true and the ids are the same ids.
     this.rebuildNotation();
     this.renderMain();
-    this.scheduleSave();
+    this.saveNow();
   }
 
   /** Which chip is lit. The roll and playback are the live part's whatever this says. */
@@ -8365,9 +8958,16 @@ class App {
     // actually on screen. Without it an attack inside the last cell rounds forward onto a line at
     // or past the end of the recording and `pipeline/src/guards.ts` drops it: turning the snap on
     // deleted the last note of the take from the sheet. See `snap.ts` §"the end of the tape".
+    //
+    // ...AND THE DOCUMENT'S LENGTH, NOT THE AUDIO'S, ONCE THE TWO HAVE PARTED COMPANY. This
+    // clamp exists BECAUSE the guard drops notes past the end of the audio; a detached score
+    // lifts that guard (`BuildInput.detachedTimeline`), so clamping to the tape here would keep
+    // doing on its own exactly what the guard has stopped doing — pulling every note an inserted
+    // bar pushed past the old end back onto the last line inside the recording, in a heap.
+    const boundSec = this.documentDurationSec();
     return s.rollSnap === 'beat'
-      ? snapPerformanceToBeat(raw, basis.beatSec, unitSec, basis.originSec, basis.tempoBpm, source.durationSec)
-      : snapPerformanceToGrid(raw, unitSec, basis.originSec, basis.tempoBpm, source.durationSec);
+      ? snapPerformanceToBeat(raw, basis.beatSec, unitSec, basis.originSec, basis.tempoBpm, boundSec)
+      : snapPerformanceToGrid(raw, unitSec, basis.originSec, basis.tempoBpm, boundSec);
   }
 
   /**
@@ -8441,7 +9041,7 @@ class App {
       else if (options?.keepEdits === false) this.resetHistories();
 
       // A new sheet is the biggest change there is; this is the save that matters most.
-      this.scheduleSave();
+      this.saveNow();
     } catch (e) {
       // The stack matters here: this path spans three teams' code, so a bare message
       // ("cannot read 'tracks' of undefined") is not enough to tell whose it is.
@@ -8646,12 +9246,27 @@ class App {
    * shared range is the overlap — the roll cannot zoom past what the sheet can follow. Before the
    * sheet has been measured there is nothing to intersect with and the roll's own limits stand.
    */
+  /**
+   * THE EXTENT THE THREE PANES SHARE: the longer of the recording and the edited score.
+   *
+   * Attached — every document until somebody inserts a bar — this is the recording's length and
+   * nothing else, exactly as before, because the notes were transcribed from it and cannot
+   * outlive it. DETACHED, the two are separate clocks (`SourceAudio.timelineDetached`) and the
+   * viewport has to cover both or an inserted bar would push the last notes past the right-hand
+   * end of a window that still thought the tape was the whole document — visible as music that
+   * cannot be scrolled to.
+   */
+  private documentDurationSec(): number {
+    const rt = this.runtime.get();
+    const audioSec = rt.source?.durationSec ?? 0;
+    const scoreSec = rt.score?.durationSec ?? 0;
+    if (rt.source?.timelineDetached) return Math.max(audioSec, scoreSec);
+    return rt.source ? audioSec : scoreSec;
+  }
+
   private viewportLimits(): TimeLimits {
     const base: TimeLimits = {
-      durationSec: Math.max(
-        0.001,
-        this.runtime.get().source?.durationSec ?? this.runtime.get().score?.durationSec ?? 0
-      ),
+      durationSec: Math.max(0.001, this.documentDurationSec()),
       minSpanSec: MIN_WINDOW_SEC
     };
     const ref = this.sheetRef;
@@ -9001,6 +9616,53 @@ class App {
     view.api.renderTracks(model.tracks);
   }
 
+  /**
+   * CLEF: OFF, AS A PROJECTION ON THE WAY TO THE PAGE (G2).
+   *
+   * WHERE IT HAPPENS AND WHY HERE. `score.data` is the renderer's input — plain JSON that
+   * `score/fromPipeline.ts` turns into an alphaTab model, and the same object the print
+   * instance is handed (`export/pdf.ts` calls `buildAlphaTabScore(score.data, …)`). Editing it
+   * on the one path that leads to both is what makes "the export respects it too" a fact rather
+   * than a second implementation: the PDF gets a tab-only page because it is engraved from the
+   * same data the screen is.
+   *
+   * WHAT IS *NOT* TOUCHED, and this is the whole reason Off is not a clef: the IR, the
+   * MusicXML and the MIDI. `score.musicxml()` and `score.midi()` are written from `score.ir`,
+   * which never sees this. A file exported with the staff hidden opens in Finale with its
+   * notation intact, which is the only defensible meaning of "hide" — hiding is a property of
+   * this screen, not of the music.
+   *
+   * THE STAFF IS DROPPED, NOT BLANKED. `showStandardNotation = false` on a staff that has no
+   * tablature either leaves alphaTab engraving an empty staff — a band of white with a clef and
+   * nothing in it, which on a grand system is two of them. So a staff with nothing left to draw
+   * is removed from the track.
+   *
+   * A TRACK WITH NO TABLATURE AT ALL KEEPS ITS NOTATION. An imported MusicXML part is
+   * notation-only (`pipeline/src/alphatab.ts` gives it no tab staff), so hiding its staff would
+   * delete the part from the page rather than show it differently. The guard on the control
+   * cannot know that — it only knows about the take's own tab — so this is where the honest
+   * answer is: parts that have no other way to be seen are left visible.
+   *
+   * Idempotent by construction: every rebuild produces a fresh `score.data` from the pipeline,
+   * so this never sees a page it has already cut down, and switching the staff back on is a
+   * rebuild like any other.
+   */
+  private projectStaffVisibility(score: RiffScore): void {
+    if (this.settings.get().showStaff) return;
+    for (const track of score.data.tracks) {
+      const withTab = track.staves.filter((staff) => staff.showTablature);
+      if (withTab.length === 0) continue;
+      for (const staff of withTab) {
+        staff.showStandardNotation = false;
+        // The rests were suppressed because the notation staves above were already printing
+        // them (`pipeline/src/alphatab.ts §showRests`). Those staves are about to be gone, so
+        // the tab has to print them or the bar's timing disappears off the page.
+        staff.showRests = true;
+      }
+      track.staves = withTab;
+    }
+  }
+
   private applyScoreToViews(score: RiffScore): void {
     // NO HOLD OPENS HERE ANY MORE (finding 11). A 1500 ms quiet period used to be armed on every
     // rebuild so that the window — which was re-derived from the engraving on every viewport
@@ -9008,6 +9670,7 @@ class App {
     // now, so a rebuild cannot move it and there is nothing to protect it from. `onRenderSettled`
     // simply scrolls the sheet back to the authoritative `fromSec` once the new engraving exists.
     this.refreshTempoBox();
+    this.projectStaffVisibility(score);
     this.triview?.load(score);
     this.renderEveryPart();
     // ONE ORIGIN, PUSHED BEFORE ANYTHING THAT READS IT (codex-critique §7).
@@ -9722,11 +10385,15 @@ class App {
     document.body.appendChild(popover);
     this.partMenu = popover;
 
-    const box = anchor.getBoundingClientRect();
-    const own = popover.getBoundingClientRect();
-    popover.style.left = `${Math.max(8, Math.min(box.left, window.innerWidth - own.width - 8))}px`;
+    // LOGICAL PIXELS THROUGHOUT (G1): `.popover` is `position: fixed`, so its `left`/`top` are
+    // read in the design's own pixels while `getBoundingClientRect()` answers in visual ones.
+    const box = logicalRect(anchor);
+    const own = logicalRect(popover);
+    const view = faceViewport();
+    const boxBottom = box.top + box.height;
+    popover.style.left = `${Math.max(8, Math.min(box.left, view.width - own.width - 8))}px`;
     popover.style.top = `${
-      box.bottom + own.height > window.innerHeight - 8 ? Math.max(8, box.top - own.height - 6) : box.bottom + 6
+      boxBottom + own.height > view.height - 8 ? Math.max(8, box.top - own.height - 6) : boxBottom + 6
     }px`;
     nameBox.focus();
     nameBox.select?.();
@@ -9837,11 +10504,14 @@ class App {
       onBlur: (e: Event) => finish(true, (e.target as HTMLInputElement).value)
     });
     document.body.appendChild(input);
-    const own = input.getBoundingClientRect();
-    input.style.left = `${Math.max(4, Math.min(rect.x, window.innerWidth - own.width - 4))}px`;
+    const own = logicalRect(input);
+    // `rect` arrives in LOGICAL client coordinates (view/triview.ts §syncPartLabelHits), which is
+    // the space a `position: fixed` field is placed in under the face scale (G1).
+    const view = faceViewport();
+    input.style.left = `${Math.max(4, Math.min(rect.x, view.width - own.width - 4))}px`;
     input.style.top = `${Math.max(
       4,
-      Math.min(rect.y + rect.h / 2 - own.height / 2, window.innerHeight - own.height - 4)
+      Math.min(rect.y + rect.h / 2 - own.height / 2, view.height - own.height - 4)
     )}px`;
     input.focus();
     input.select();
@@ -10049,6 +10719,28 @@ class App {
       // rest of it is about. Only where there is a document to have parts — see
       // `buildPartControl` for the row this replaced.
       source && this.buildPartControl(),
+      // THE CLEF MENU — one dropdown, two sections (G2), built on the Tab menu's pattern below.
+      //
+      // SECTION ONE is the clef, plus OFF: the notation staff goes away entirely and the page is
+      // tablature alone. That is a real thing to want — a bass player reading frets does not need
+      // five lines of the same notes above them — and it was previously unreachable.
+      //
+      // "OFF" IS A PROJECTION AND NOT A CLEF. `clefMode` is a pipeline setting: it reaches
+      // `BuildSettings.clefMode` and decides how the music is SPELLED, and it is written into the
+      // MusicXML. There is no such thing as spelling music in no clef, so Off is a separate
+      // boolean (`showStaff`) that hides the staff on screen and in the printed sheet, and leaves
+      // the exported MusicXML and MIDI exactly as they were. `App.projectStaffVisibility` is the
+      // whole of the mechanism.
+      //
+      // THE GUARD: OFF AND OFF CANNOT BOTH BE CHOSEN. With the tab already off, this Off would
+      // leave a page with nothing engraved on it at all, so it is disabled and says why. The Tab
+      // menu carries the mirror of this rule, and `app/state.ts §sanitizeSettings` carries it a
+      // third time for a stored blob that arrives with both — a guard on the control alone is a
+      // guard one restore away from being bypassed.
+      //
+      // SECTION TWO is the note-name row above the staff. It was a checkbox in the settings
+      // panel, two panels away from the names it switches; this is the same rule the Tab menu's
+      // fingering section follows — the choice lives next to the thing it changes.
       el(
         'select',
         {
@@ -10056,10 +10748,51 @@ class App {
           'data-role': 'clef-view',
           'data-setting': 'clefMode',
           title: t(TIPS.clef),
-          onChange: (e: Event) => rebuild({ clefMode: (e.target as HTMLSelectElement).value as AppSettings['clefMode'] })
+          onChange: (e: Event) => {
+            const raw = (e.target as HTMLSelectElement).value;
+            if (raw === 'staff:off') {
+              rebuild({ showStaff: false });
+              return;
+            }
+            if (raw.startsWith('names:')) {
+              // A VIEW change, not a rebuild: the names are HTML labels the tri-view places over
+              // the engraving (`view/triview.ts §setNamesVisible`), so re-engraving the score to
+              // show or hide them would be a re-quantize for nothing.
+              this.settings.set({ showNoteNames: raw === 'names:on' });
+              this.onViewSettingsChanged();
+              this.renderMain();
+              return;
+            }
+            rebuild({ clefMode: raw as AppSettings['clefMode'], showStaff: true });
+          }
         },
-        ...(['auto', 'treble', 'bass', 'grand'] as const).map((value) =>
-          el('option', { value, text: value === 'auto' ? 'Clef: Auto' : `Clef: ${titleCase(value)}`, selected: s.clefMode === value })
+        el(
+          'optgroup',
+          { label: 'Staff', 'data-setting': 'showStaff', 'data-role': 'clef-staff' },
+          ...(['auto', 'treble', 'bass', 'grand'] as const).map((value) =>
+            el('option', {
+              value,
+              text: value === 'auto' ? 'Clef: Auto' : `Clef: ${titleCase(value)}`,
+              selected: s.showStaff && s.clefMode === value
+            })
+          ),
+          el('option', {
+            value: 'staff:off',
+            text: 'Clef: Off',
+            selected: !s.showStaff,
+            disabled: !tabOn,
+            title: tabOn ? undefined : STAFF_OFF_REASON
+          })
+        ),
+        el(
+          'optgroup',
+          { label: 'Note names', 'data-setting': 'showNoteNames', 'data-role': 'clef-names' },
+          ...([true, false] as const).map((on) =>
+            el('option', {
+              value: on ? 'names:on' : 'names:off',
+              text: `${s.showNoteNames === on ? '✓ ' : '   '}Note names: ${on ? 'On' : 'Off'}`
+            })
+          )
         )
       ),
       // THE KEY SIGNATURE, and it belongs to the take rather than to the app — the same rule
@@ -10135,6 +10868,25 @@ class App {
           )
       ),
       this.coarseGridWarning(),
+      /*
+       * THE ROW SPLITS HERE, AND THE SPLIT IS WHAT JUSTIFIES IT (G1).
+       *
+       * The law says every row of chrome is justified edge to edge at every scale, and this bar
+       * had nothing holding its right-hand end: the controls packed left and the surplus width
+       * sat in a dead strip beside the Capo box, at every window size above the one where the
+       * old ladder started squeezing. The redistribution the law licenses ("controls may be
+       * redistributed between rows for balance") is the one the subject matter already suggests:
+       * everything about the STAFF — part, clef, key, quantize and the coarse-grid warning that
+       * belongs to it — stays left, and everything about the TAB — instrument, fret count,
+       * fingering anchor, tuning, capo — goes right, with the blank score's bar counter after it.
+       * Two named groups with the window's spare width between them, which reads as a designed
+       * row rather than as a row that ran out of things to say.
+       *
+       * It is a GAP and not a stretched control: one uniform scale cannot fill two dimensions at
+       * an arbitrary aspect ratio, so surplus goes to gaps and panes and every control keeps the
+       * size it was designed at. See `ui/styles.css §body` for the law itself.
+       */
+      el('div', { class: 'spacer' }),
       // THE TAB MENU — one dropdown, three sections.
       //
       // Everything about the tablature that is a CHOICE now lives here: which instrument it is
@@ -10183,7 +10935,15 @@ class App {
         el(
           'optgroup',
           { label: 'Instrument' },
-          el('option', { value: 'off', text: 'Tab: Off', selected: s.tabMode === 'off' }),
+          // The mirror of the Clef menu's guard (G2): with the notation staff already hidden,
+          // switching the tab off would leave a blank page. Disabled, with the reason on it.
+          el('option', {
+            value: 'off',
+            text: 'Tab: Off',
+            selected: s.tabMode === 'off',
+            disabled: !s.showStaff,
+            title: s.showStaff ? undefined : STAFF_OFF_REASON
+          }),
           el('option', { value: 'bass', text: 'Tab: Bass', selected: s.tabMode === 'bass' }),
           el('option', { value: 'guitar', text: 'Tab: Guitar', selected: s.tabMode === 'guitar' }),
           el('option', { value: 'custom', text: 'Tab: Custom', selected: s.tabMode === 'custom' })
@@ -10323,7 +11083,12 @@ class App {
       // cure (G10): each press used to re-render the screen, so the two buttons moved out from
       // under the cursor as the "12 bars" label between them changed width. The label is written
       // in place by `changeDocumentBars` now and the buttons stay exactly where they are.
+      // ...AND ONLY ON A DOCUMENT WITH NO RECORDING. `documentBars` used to mean "this is a blank
+      // score", which is what this row is for. A bar operation now sets it on a recorded take too
+      // (workstream C adopts the engraved count as the document's declared floor), so the test
+      // that made this row a blank-document control has to be the one it always meant: no audio.
       source?.documentBars !== undefined &&
+        !source.peaks &&
         el('div', { class: 'document-bars' },
           el('button', { text: '− Bar', 'data-role': 'bar-minus', title: 'Remove the last empty bar', onClick: () => this.changeDocumentBars(-1) }),
           el('span', { 'data-role': 'bar-count', text: `${source.documentBars} bars` }),
@@ -10359,9 +11124,11 @@ class App {
    * longest option, the padding and the border, and whatever is left is the platform's arrow.
    * That is true at zoom 1 and false everywhere else, because the intrinsic width comes back
    * through `getBoundingClientRect()` as a VISUAL size while the padding and the text are CSS
-   * ones — measured at the 390px floor, where this bar is drawn at about 0.62, a box sized with
-   * 23px of allowance had about 14 of it and clipped "Key: Auto — C majo" with no ellipsis to
-   * announce it. The stylesheet draws the chevron itself now, inside a `padding-right` of
+   * ones — measured at the 390px floor under the OLD ladder, where this bar carried a zoom of its
+   * own at about 0.62, a box sized with 23px of allowance had about 14 of it and clipped
+   * "Key: Auto — C majo" with no ellipsis to announce it. The ladder is gone (G1) and the bar
+   * carries no zoom, but the reserve stays ours: it is what lets `fitSelects` measure rather than
+   * estimate, on every platform. The stylesheet draws the chevron itself now, inside a `padding-right` of
    * exactly `SELECT_ARROW_PX` (ui/styles.css §.notation-toolbar select), so the reserve is part
    * of the frame and there is nothing left to estimate.
    *
@@ -10374,37 +11141,25 @@ class App {
       ...this.root.querySelectorAll<HTMLElement>(sel)
     ]);
     fitSelects(bars.flatMap((bar) => [...bar.querySelectorAll('select')]));
-    this.fitHeaderName();
   }
 
-  /**
-   * THE TAKE'S NAME IS ON SCREEN WHOLE OR IT IS NOT ON SCREEN (Z6).
+  /*
+   * `fitHeaderName()` IS DELETED (G1), and it is the one deletion in this pass that removes a
+   * BEHAVIOUR rather than a redundancy, so here is the argument.
    *
-   * The last of the header's truncations, and the one no stylesheet could fix. The tempo detail is
-   * dropped whole at a MEASURED breakpoint (styles.css §1150px) because the longest sentence it can
-   * hold is known in advance; a file name is not — "riff.wav" and "2024-11-03 rehearsal, second
-   * take, bridge only.wav" want 60px and 340px of the same row — so the decision has to be made
-   * against the actual string, after layout, which is here.
+   * What it did: after every layout it asked `header.scrollWidth > header.clientWidth` and, if
+   * the row had overflowed, set `display: none` on the take's name. The rule it served — a name
+   * is on screen WHOLE or not at all, never as "demo — trip…" — is unchanged and still enforced;
+   * what changed is that the question can no longer come back "no". The header is laid out in at
+   * least 1320 logical pixels at every window size (`ui/faceScale.ts`), its fixed contents come to
+   * well under that, and the spacer between the two groups is what gives first. A name long enough
+   * to overrun 1320px of row would have to be several hundred characters, and the honest answer
+   * there is a long name eating an empty middle, not a name that disappears.
    *
-   * THE TEST IS THE ROW'S, NOT THE NAME'S. `.filename` cannot shrink below its own text any more
-   * (`min-width: max-content`), so a header that cannot afford it OVERFLOWS — and that overflow is
-   * the honest question "is there room?" already answered by the layout engine, at whatever zoom
-   * the ladder has put this bar on. Hidden, it is one press away under Main menu > Current work,
-   * and the row goes back to fitting because the name was the only elastic thing left in it.
-   *
-   * Order matters: the drop-downs are cut to their words FIRST (they give up about 90px of
-   * reserved nothing between them), so the name is only dropped when the row is genuinely full
-   * rather than merely badly divided.
+   * It also cost something real while it existed: it was a layout READ on every resize frame, on
+   * every engine-chip state change and on every top-bar fit — and it was the last thing in the app
+   * whose visible behaviour depended on the VISUAL width of the window rather than on the design.
    */
-  private fitHeaderName(): void {
-    const header = this.root.querySelector<HTMLElement>('.app-header');
-    const name = header?.querySelector<HTMLElement>('.filename');
-    if (!header || !name) return;
-    // Shown first, always: the row is a different width than it was last time this ran, and a
-    // name hidden at 900px must come back when the window is dragged out to 1440.
-    name.style.display = '';
-    if (header.scrollWidth > header.clientWidth + 1) name.style.display = 'none';
-  }
 
   /*
    * `fitSelects` MOVED TO `ui/dom.ts`, unchanged, and this is the whole of why: the transport's
@@ -10443,10 +11198,18 @@ class App {
   /**
    * The same measurement, for any of the three bars. See `notationBarClipped` for the rule.
    *
-   * A hidden node is not a clipped one — `fitHeaderName` DROPS the take's name rather than cutting
-   * it, and a dropped name reports `clientWidth: 0`, which would otherwise read as the very fault
-   * it exists to prevent. `display: none` is the honest second state of "on screen whole or not on
-   * screen", so it is skipped here exactly as `.tempo-detail` is when its breakpoint hides it.
+   * A hidden node is not a clipped one, and hidden nodes are still skipped: a control the app has
+   * chosen not to draw at all (a tab-only box on a document with no tab, an engine chip with no
+   * engine behind it) reports `clientWidth: 0`, which would otherwise read as the very fault this
+   * exists to prevent. Nothing is hidden by WIDTH any more — the drop-at-a-breakpoint machinery
+   * and `fitHeaderName` are both deleted (G1) — so every skip here is now a genuine "this control
+   * is not part of this document" rather than "this window is too small for it".
+   *
+   * MEASURED IN LOGICAL PIXELS, which is now the only kind this code sees. `style.width` (what
+   * `fitSelects` wrote), `getComputedStyle` and `clientWidth` are all in the design's own pixels;
+   * the face's scale lives on `body` and does not enter the comparison at all. That is a real
+   * simplification over the ladder, under which `getBoundingClientRect()` was VISUAL while the
+   * padding beside it was logical, and the two were being compared.
    */
   private barMeasure: CanvasRenderingContext2D | null = null;
 
@@ -10461,7 +11224,10 @@ class App {
         if (!ctx) continue;
         const cs = style;
         ctx.font = cs.font || `${cs.fontSize} ${cs.fontFamily}`;
-        const box = parseFloat(node.style.width) || node.getBoundingClientRect().width;
+        // `offsetWidth` and not `getBoundingClientRect().width` for the fallback: both name the
+        // border box, but the rect is VISUAL under the face scale while the padding and the font
+        // this is about to be compared against are logical (G1).
+        const box = parseFloat(node.style.width) || node.offsetWidth;
         // THE STYLESHEET'S HALF OF THE BARGAIN, asserted rather than assumed. The chevron is
         // painted inside `padding-right`; if that padding ever falls below the arrow it is drawn
         // at, the arrow is on top of the last word and the text is unreadable without a single
@@ -10583,8 +11349,10 @@ class App {
       ...this.exportBar.buttons(),
       // THE GEAR, BIGGER AND NAMED. It was a bare glyph at icon size, indistinguishable at a
       // glance from the export buttons beside it. A settings panel is the one control in a
-      // header somebody actively hunts for, so it says what it is; the word collapses on the
-      // narrowest layouts (styles.css §.settings-gear) and the glyph stays.
+      // header somebody actively hunts for, so it says what it is — and it says it at EVERY
+      // window size now. The word used to be dropped below 620px of window; the one-proportion
+      // law lays this row out at its design width whatever the host does (G1), so there is no
+      // size at which the label has to go.
       el(
         'button',
         {
@@ -10691,8 +11459,7 @@ class App {
         ? { start: focused.selectionStart, end: focused.selectionEnd }
         : null;
 
-    replace(
-      this.root,
+    this.replaceScreen(
       header,
       waveStrip,
       this.buildTakeEdits(),
@@ -10909,7 +11676,7 @@ class App {
       // request rather than a promise and a 46px pane is still legible.
       this.pianoRoll.setShowAllNames(true);
       this.pianoRoll.setEditable(true);
-      this.pianoRoll.setDuration(rt.source?.durationSec ?? rt.score?.durationSec ?? 0);
+      this.pianoRoll.setDuration(this.documentDurationSec());
       // Before the score, for the reason given in `applyScoreToViews`: the origin decides where
       // the bar grid is drawn, and this roll is brand new and has never been told one.
       this.pianoRoll.setOriginSec(rt.score ? this.originSec(rt.score) : null);
@@ -10940,6 +11707,10 @@ class App {
       maxFret: this.settings.get().maxFret,
       onNoteClick: (hit) => this.onNoteClick(hit),
       onSeekRequest: (tick) => this.seekToTick(tick),
+      // DEBUG ONLY, and off unless its flag is set: the gesture recorder's way of writing a
+      // trace file out of the plugin, where there is no downloads folder and no devtools.
+      // See view/gestureRecorder.ts §"the one-step recipe".
+      exportFile: (name, bytes, mimeType) => this.bridge.exportFile(name, bytes, mimeType),
       // Scroll and zoom both land here, and so does the end of every render — a re-engrave
       // changes the content width, and a roll that only watched scrolls would go stale after
       // a zoom without ever looking wrong enough to notice.
@@ -11197,8 +11968,15 @@ class App {
             // Where the fader was left is part of coming back to the same app. Saved from
             // here rather than from the transport's own state stream, which also ticks 60
             // times a second during playback.
+            //
+            // THE DEBOUNCE STAYS HERE, and this is the control it was written for: a drag
+            // delivers `input` per frame, and the states it passes through are not decisions.
             this.scheduleSave();
-          }
+          },
+          // …and the DECISION is the release. `change` fires once, when the hand comes off, so
+          // the position the player actually chose is on the host's side of the bridge before
+          // they can reach for another plugin (F).
+          onChange: () => this.saveNow()
         }),
         el('span', { class: 'end', 'data-role': 'end-midi', text: 'MIDI' })
       ),
@@ -11214,7 +11992,7 @@ class App {
         // the header here would only destroy the element that is handling the event.
         onChange: () => {
           this.onViewSettingsChanged();
-          this.scheduleSave();
+          this.saveNow();
         }
       }),
 
@@ -11287,7 +12065,7 @@ class App {
     }
     this.rebuildNotation();
     this.renderMain();
-    this.scheduleSave();
+    this.saveNow();
   }
 
   private buildTempoSource(): HTMLElement {
@@ -11650,10 +12428,12 @@ class App {
     const source = this.runtime.get().source;
     if (!source) return;
     this.runtime.set({ source: { ...source, barOneSec: sec } });
-    // On release only. Saving every pixel of the drag would be a save per mousemove.
+    // On release only, and IMMEDIATELY on release. Saving every pixel of the drag would be a
+    // save per mousemove; debouncing the release would put a moved bar line inside the window
+    // where an editor teardown loses it (F).
     if (commit) {
       this.rebuildNotationDebounced();
-      this.scheduleSave();
+      this.saveNow();
     }
   }
 
@@ -11903,7 +12683,7 @@ class App {
       this.history = this.history.slice(0, this.historyIndex + 1);
       this.history.push('score');
       this.historyIndex = this.history.length - 1;
-      this.scheduleSave();
+      this.saveNow();
     }
     this.applyResult(result, keepSelected);
     this.refreshUndoRedo();
@@ -12032,6 +12812,20 @@ class App {
    * restoring it is a no-op, so this costs a take that never inserts a bar exactly nothing.
    */
   private perfBars: Array<number | undefined> = [undefined];
+  /**
+   * THE IMPORTED PARTS AT EACH PERFORMANCE STEP, parallel to `perfStack` — the other half of a
+   * bar operation's undo (workstream C).
+   *
+   * A bar op is one clock's worth of edit: it splices the take's notes AND every imported part,
+   * because they share one bar list. The parts do not live on the performance stack (they are
+   * not the take), so without this ⌘Z would put the take back a bar and leave the imported chart
+   * a bar to the right of it — which is the exact silent corruption the old "Imported parts share
+   * these bars" refusal existed to prevent, arriving through the door marked undo.
+   *
+   * `undefined` is a document with no imported parts, which is nearly all of them, and restoring
+   * it is a no-op — so this costs a single-part take exactly nothing.
+   */
+  private perfParts: Array<ImportedPart[] | undefined> = [undefined];
   /** The order the two layers were edited in, so one ⌘Z walks back through both. */
   private history: Array<'perf' | 'score'> = [];
   private historyIndex = -1;
@@ -12081,6 +12875,7 @@ class App {
     this.perfLabels = [null];
     this.perfCuts = [this.cuts()];
     this.perfBars = [this.runtime.get().source?.documentBars];
+    this.perfParts = [this.runtime.get().source?.importedParts];
     this.perfIndex = 0;
     this.history = [];
     this.historyIndex = -1;
@@ -12153,7 +12948,13 @@ class App {
   // glyph on the page rather than a second opinion about it.
 
   /**
-   * The written tick of the nearest BEAT to an engraved tick, in the score's own meter.
+   * The nearest BEAT to an ENGRAVED tick, in the score's own meter. IN: alphaTab. OUT: IR.
+   *
+   * THE DOMAIN CROSSING IS THE POINT, and it is announced in the name and the signature rather
+   * than left to be discovered: the argument is what the sheet publishes (alphaTab's 960 to a
+   * quarter) and the answer is in the units of the thing that answered it (`ir.bars`, at
+   * `ir.divisions`). See §"THE TWO TICK DOMAINS" at the foot of this file for the forty-times
+   * error this shape replaces.
    *
    * The sheet hands over an unrounded tick because rounding is a question about the METER and
    * the sheet does not hold the IR (see `SheetTarget.tick`). This is that question answered:
@@ -12161,11 +12962,11 @@ class App {
    * for a bar in n/d, so 6/8 rounds to eighths and 4/4 to quarters, which is what a player means
    * by "the nearest beat" in each.
    */
-  private nearestBeatTick(score: RiffScore, tick: number): number | null {
+  private nearestBeatIrTick(score: RiffScore, alphaTick: number): number | null {
     const bars = score.ir.bars;
     const divisions = score.ir.divisions || 12;
     if (!bars.length) return null;
-    const clamped = Math.max(0, tick);
+    const clamped = Math.max(0, alphaTickToIrTick(score, alphaTick));
     let bar = bars[0];
     for (const b of bars) {
       if (clamped >= b.startTick) bar = b;
@@ -12181,13 +12982,13 @@ class App {
     return from + Math.max(0, Math.min(maxBeats, beats)) * beatTicks;
   }
 
-  /** A sheet tick, rounded to the nearest beat and stated in FEED seconds. Null with no score. */
-  private beatSecAtTick(tick: number): number | null {
+  /** A sheet (alphaTab) tick, rounded to the nearest beat and stated in FEED seconds. */
+  private beatSecAtTick(alphaTick: number): number | null {
     const score = this.runtime.get().score;
     if (!score) return null;
-    const beat = this.nearestBeatTick(score, tick);
-    if (beat === null) return null;
-    return tickToSeconds(score, beat, this.originSec(score));
+    const irBeat = this.nearestBeatIrTick(score, alphaTick);
+    if (irBeat === null) return null;
+    return tickToSeconds(score, irTickToAlphaTick(score, irBeat), this.originSec(score));
   }
 
   /**
@@ -12201,8 +13002,15 @@ class App {
   private intentLengthSec(startSec: number, intent: NotationIntent): number | null {
     const score = this.runtime.get().score;
     if (!score) return null;
-    const ticks = notationIntentTicks(intent, score.ir.divisions);
-    if (ticks === null) return null;
+    // AT `ir.divisions`, DELIBERATELY, AND CONVERTED AFTERWARDS. The divisions passed here are
+    // not a unit choice, they are the PRINTABILITY TEST: `notationIntentTicks` returns null when
+    // the value does not divide the IR's tick grid exactly, which is how the dotted 1/32 is
+    // refused. Asking it in alphaTab's 960ths would make that value divide cleanly and quietly
+    // re-admit a glyph the menu greys out. So the question is asked in the IR's domain and only
+    // the ANSWER is converted — see §"THE TWO TICK DOMAINS".
+    const irTicks = notationIntentTicks(intent, score.ir.divisions);
+    if (irTicks === null) return null;
+    const ticks = irTickToAlphaTick(score, irTicks);
     const origin = this.originSec(score);
     const startTick = secondsToTick(score, startSec, origin);
     return tickToSeconds(score, startTick + ticks, origin) - tickToSeconds(score, startTick, origin);
@@ -12252,17 +13060,27 @@ class App {
 
   /**
    * BARS ARE STRUCTURE, so a bar operation is a note edit AND a document-length change, in one
-   * undo step.
+   * undo step — ON EVERY DOCUMENT, including a recorded take (workstream C).
    *
-   * `documentBars` is the floor the pipeline is given as `BuildInput.minimumBars`, and it now
-   * travels on the performance stack beside the notes and the cuts (see `perfBars`) — without
-   * that, undoing an inserted bar would put the notes back and leave the document a bar longer,
-   * which is a page that disagrees with its own history.
+   * WHAT THE OLD REFUSALS SAID AND WHY THEY ARE GONE. Insert and delete used to be greyed out on
+   * anything with audio behind it ("Bars are fixed by the recording") and on anything with an
+   * imported part on the page ("Imported parts share these bars"). Both were honest descriptions
+   * of a real difficulty and both had the wrong conclusion:
    *
-   * Refused on anything with a recording behind it, and the menu says so rather than hiding the
-   * items. The reason is in edit/performanceEdit.ts §BarOp: inserted silence cannot be expressed
-   * against an immutable waveform, and pretending otherwise would slide the notes a bar away
-   * from the audio they were transcribed from.
+   *   THE RECORDING. The argument was that inserted silence cannot be expressed against an
+   *   immutable waveform. True — and the owner's design says the waveform is a PHOTOGRAPH and
+   *   the score is the music, so after a bar operation the two are allowed to disagree. Nothing
+   *   in this path writes an audio duration, resamples anything or moves a peak; the waveform is
+   *   pixel-identical afterwards, which the probe asserts. See edit/performanceEdit.ts §BarOp.
+   *
+   *   THE IMPORTED PARTS. The argument was that one shared clock makes "insert into the live
+   *   part" incoherent. Also true — and the answer is to shift EVERY part, which is what
+   *   `applyBarOpToPartNotes` does below, rather than to refuse the operation on the take.
+   *
+   * `documentBars` is the floor the pipeline is given as `BuildInput.minimumBars`, and it travels
+   * on the performance stack beside the notes, the cuts and now the imported parts (`perfBars`,
+   * `perfParts`) — without that, undoing an inserted bar would put the notes back and leave the
+   * document a bar longer, which is a page that disagrees with its own history.
    */
   private canEditBars(): boolean {
     return this.barRefusal() === null;
@@ -12271,49 +13089,95 @@ class App {
   /**
    * Why a bar operation is refused, or null when it is not. The menu prints this verbatim.
    *
-   * Two refusals, and the second is not a smaller version of the first. A RECORDING cannot have
-   * silence inserted into it (edit/performanceEdit.ts §BarOp). An IMPORTED PART is a different
-   * refusal with the same shape: a multi-part score shares one master clock — one bar list, one
-   * meter map, one set of downbeats — so "insert a bar into the live part" is not a coherent
-   * request while somebody else's engraving is pinned to those same bars. Lengthening the
-   * document would silently re-bar the imported chart, which is exactly the paper-only rule.
+   * ONE REFUSAL LEFT, and it is about arithmetic rather than policy: with nothing engraved there
+   * is no bar to insert, because there is no way to say where one starts or how long it is. That
+   * is the state of a document that has not finished loading, and it fixes itself.
+   *
+   * ASKED OF THE SCORE, NOT OF `source.timeSignature`/`source.tempoBpm`. Those two are OVERRIDES
+   * — absent on every take until somebody types in the boxes — so testing them would refuse the
+   * operation on the ordinary recorded take, which is the one case this wave exists to enable.
+   * The engraved bar list is the document's own answer and it is always there.
    */
   private barRefusal(): string | null {
-    const source = this.runtime.get().source;
-    if (!source) return 'Bars are fixed by the recording';
-    if (source.documentBars === undefined || source.peaks || this.pcm) {
-      return 'Bars are fixed by the recording';
-    }
-    for (const part of scoreParts(this.runtime.get().score)) {
-      if (part.role === 'imported') return 'Imported parts share these bars';
-    }
+    if (!this.runtime.get().source?.detected) return 'No score to add bars to yet';
+    if (!this.runtime.get().score?.ir.bars.length) return 'This document has no bars yet';
     return null;
   }
+
+  /**
+   * The target bar's own interval, in FEED seconds, off the engraved score's bar list.
+   *
+   * NOT `barIndex * nominalBarLength`. That product is right only on a document with one tempo
+   * and one meter from end to end; anywhere else it names a second in the wrong bar, and names
+   * it further wrong the deeper into the take the player right-clicked. The IR's bars carry
+   * their own `startTick`/`durTicks`, and `tickToSeconds` walks the tempo map, so this is the
+   * document's own answer rather than a restatement of it. See §"THE TWO TICK DOMAINS" for the
+   * conversion, which is the same one `addNoteAt` makes.
+   */
+  private barIntervalSec(
+    score: RiffScore,
+    barIndex: number
+  ): { barStartSec: number; barLengthSec: number } | null {
+    const bar = score.ir.bars[Math.max(0, Math.min(score.ir.bars.length - 1, barIndex))];
+    if (!bar) return null;
+    const origin = this.originSec(score);
+    const from = tickToSeconds(score, irTickToAlphaTick(score, bar.startTick), origin);
+    const to = tickToSeconds(score, irTickToAlphaTick(score, bar.startTick + bar.durTicks), origin);
+    return to > from ? { barStartSec: from, barLengthSec: to - from } : null;
+  }
+
+  /** Stable ids for the pieces the splice law creates. Never collide with `n<i>` or `add<i>`. */
+  private splitNoteCount = 0;
 
   private applyBarOperation(op: BarOp): boolean {
     const source = this.runtime.get().source;
     const score = this.runtime.get().score;
     if (!this.canEditBars() || !source?.detected || !score) return false;
-    const bars = source.documentBars;
-    const meter = source.timeSignature;
-    if (!bars || !meter || !source.tempoBpm) return false;
-    const barLengthSec = meter.numerator * (4 / meter.denominator) * (60 / source.tempoBpm);
+    const interval = this.barIntervalSec(score, op.barIndex);
+    if (!interval) return false;
+    // A RECORDED TAKE DECLARES NO LENGTH UNTIL IT IS ASKED TO. `documentBars` is absent on every
+    // take that came out of the microphone, so the first bar operation adopts the count the
+    // engraver actually produced and from then on the document carries it — which is what makes
+    // an inserted empty bar survive the rebuild instead of being re-derived away.
+    const barCount = source.documentBars ?? score.ir.bars.length;
+    if (!(barCount > 0)) return false;
 
+    const ctx: BarOpContext = {
+      ...interval,
+      barCount,
+      splitId: (id) => `split${++this.splitNoteCount}~${id}`
+    };
     const feed = this.performanceFeed();
-    const result = applyBarOp(feed, op, { barLengthSec, barCount: bars });
+    const result = applyBarOp(feed, op, ctx);
     if (!result) return false;
     for (const id of result.touchedIds) this.userTouchedIds.add(id);
 
     const raw = source.detected.notes;
     const merged =
       feed === raw ? result.notes : mergeEditedOntoRaw(raw, result.notes, result.touchedIds);
-    // The document's new length, written before the commit so the rebuild inside it engraves the
-    // bar that was just added rather than the one that was there a moment ago.
-    const durationSec = result.barCount * barLengthSec;
+
+    // ONE CLOCK, EVERY PART. An imported chart is pinned to the same bar list, so it splices with
+    // the same arithmetic — the operation that used to be refused because of it.
+    const importedParts = source.importedParts?.map((part) => ({
+      ...part,
+      notes: applyBarOpToPartNotes(part.notes, op, ctx)
+    }));
+
+    // THE AUDIO DURATION IS NOT WRITTEN HERE, AND THAT IS THE WHOLE OF WORKSTREAM C.
+    // `source.durationSec` is the recording's length and stays the recording's length; the
+    // waveform draws it unchanged. What changes is the SCORE's length, which the pipeline
+    // reports as `RiffScore.durationSec` on the next build and nothing needs to store. The
+    // `detached` flag is the declaration that the two may now differ, and the pipeline consumes
+    // it as `BuildInput.detachedTimeline` — without it the audio-length guard answers "insert a
+    // bar" by deleting everything the insert pushed past the old end (pipeline/src/guards.ts).
     this.runtime.set({
-      source: { ...source, documentBars: result.barCount, durationSec }
+      source: {
+        ...source,
+        documentBars: result.barCount,
+        timelineDetached: true,
+        ...(importedParts ? { importedParts } : {})
+      }
     });
-    if (this.audioRef) this.audioRef = { ...this.audioRef, durationSec };
     this.commitPerformance(merged, result.label);
     const label = this.root.querySelector<HTMLElement>('[data-role="bar-count"]');
     if (label) label.textContent = `${result.barCount} bars`;
@@ -12445,14 +13309,20 @@ class App {
   private addNoteAt(target: SheetTarget): void {
     const score = this.runtime.get().score;
     if (!score || target.midi === null || target.tick === null) return;
-    const beat = this.nearestBeatTick(score, target.tick);
-    if (beat === null) return;
+    // IR ticks from here to the two `tickToSeconds` calls, which take alphaTab's — the bar list
+    // and the beat lattice below are the IR's own, so this arithmetic happens in the IR's domain
+    // and converts once, at the end. See §"THE TWO TICK DOMAINS".
+    const irBeat = this.nearestBeatIrTick(score, target.tick);
+    if (irBeat === null) return;
     const origin = this.originSec(score);
     const divisions = score.ir.divisions || 12;
-    const bar = score.ir.bars.find((b) => beat >= b.startTick && beat < b.startTick + b.durTicks);
+    const bar = score.ir.bars.find(
+      (b) => irBeat >= b.startTick && irBeat < b.startTick + b.durTicks
+    );
     const beatTicks = Math.max(1, Math.round((divisions * 4) / (bar?.timeSig?.[1] || 4)));
-    const startSec = tickToSeconds(score, beat, origin);
-    const durationSec = tickToSeconds(score, beat + beatTicks, origin) - startSec;
+    const startSec = tickToSeconds(score, irTickToAlphaTick(score, irBeat), origin);
+    const durationSec =
+      tickToSeconds(score, irTickToAlphaTick(score, irBeat + beatTicks), origin) - startSec;
     this.applySheetEdit({ kind: 'addNote', midi: target.midi, startSec, durationSec });
   }
 
@@ -12991,11 +13861,15 @@ class App {
 
     // Over the note when it is on screen, and over the roll's top-left when it is not — a
     // popover placed off screen because the player has scrolled elsewhere is a dead end.
-    const host = canvas?.getBoundingClientRect();
-    const size = pop.getBoundingClientRect();
+    // LOGICAL PIXELS THROUGHOUT (G1): the popover is `position: fixed` and `rect` is the roll's
+    // own painted geometry, which is already logical — so the host's box has to be too, or the
+    // two are added in different units.
+    const host = canvas ? logicalRect(canvas) : null;
+    const size = logicalRect(pop);
+    const view = faceViewport();
     const left = host && rect ? host.left + rect.x + rect.w / 2 - size.width / 2 : (host?.left ?? 8) + 12;
     const top = host && rect ? host.top + rect.y - size.height - 8 : (host?.top ?? 8) + 12;
-    pop.style.left = `${Math.max(8, Math.min(window.innerWidth - size.width - 8, left))}px`;
+    pop.style.left = `${Math.max(8, Math.min(view.width - size.width - 8, left))}px`;
     pop.style.top = `${Math.max(8, top)}px`;
   }
 
@@ -13027,7 +13901,7 @@ class App {
     for (const noteId of edit.noteIds) this.userTouchedIds.add(noteId);
     edit.reviewed = true;
     this.refreshAutoMarks();
-    this.scheduleSave();
+    this.saveNow();
   }
 
   /**
@@ -13044,12 +13918,14 @@ class App {
     this.perfLabels = this.perfLabels.slice(0, this.perfIndex + 1);
     this.perfCuts = this.perfCuts.slice(0, this.perfIndex + 1);
     this.perfBars = this.perfBars.slice(0, this.perfIndex + 1);
+    this.perfParts = this.perfParts.slice(0, this.perfIndex + 1);
     this.perfStack.push(notes);
     this.perfLabels.push(label);
     this.perfCuts.push(cuts);
     // Read AFTER the caller has written it: `applyBarOperation` sets the new length on the
     // runtime and then commits, so this snapshot is the length this step produced.
     this.perfBars.push(this.runtime.get().source?.documentBars);
+    this.perfParts.push(this.runtime.get().source?.importedParts);
     this.perfIndex = this.perfStack.length - 1;
     this.history = this.history.slice(0, this.historyIndex + 1);
     this.history.push('perf');
@@ -13060,20 +13936,40 @@ class App {
   }
 
   /**
-   * Put the document's declared length back where a history step had it. See `perfBars`.
+   * Put the document's STRUCTURE back where a history step had it — its declared bar count and
+   * every imported part's timing. See `perfBars` and `perfParts`.
    *
-   * A no-op — including the audio reference and the bar-count label — on any document that
-   * declares no length, which is every recorded take.
+   * NO AUDIO DURATION IS WRITTEN HERE. It used to recompute `source.durationSec` (and the audio
+   * reference's) from the restored bar count, which was harmless while bar operations only ever
+   * ran on documents that had no recording and is a corruption now that they run on takes: it
+   * would resize the waveform on the way back through the history. The score's own length is
+   * re-derived by the rebuild that follows, from the notes.
    */
-  private restoreDocumentBars(bars: number | undefined): void {
+  private restoreDocumentBars(bars: number | undefined, parts: ImportedPart[] | undefined): void {
     const source = this.runtime.get().source;
-    if (!source || bars === undefined || source.documentBars === undefined) return;
-    if (source.documentBars === bars) return;
-    const meter = source.timeSignature;
-    if (!meter || !source.tempoBpm) return;
-    const durationSec = bars * meter.numerator * (4 / meter.denominator) * (60 / source.tempoBpm);
-    this.runtime.set({ source: { ...source, documentBars: bars, durationSec } });
-    if (this.audioRef) this.audioRef = { ...this.audioRef, durationSec };
+    if (!source) return;
+    /*
+     * `undefined` IS A VALUE HERE, not "no opinion", and that distinction is a whole undo step.
+     *
+     * A recorded take declares no bar count at all until the first bar operation adopts one
+     * (`applyBarOperation`). So the history's step 0 for such a take holds `undefined`, and the
+     * old guard — which skipped whenever either side was undefined — meant undoing that very
+     * first insert put the notes back and left the document declaring a bar it no longer had.
+     * The score kept an empty bar on the end that nothing in its own history accounted for.
+     * Restoring `undefined` removes the floor and lets the engraver derive the length from the
+     * notes again, which is exactly the state the take was in before the insert.
+     */
+    const barsChanged = source.documentBars !== bars;
+    const partsChanged = parts !== source.importedParts;
+    if (!barsChanged && !partsChanged) return;
+    this.runtime.set({
+      source: {
+        ...source,
+        ...(barsChanged ? { documentBars: bars } : {}),
+        ...(partsChanged ? { importedParts: parts } : {})
+      }
+    });
+    if (!barsChanged || bars === undefined) return;
     const label = this.root.querySelector<HTMLElement>('[data-role="bar-count"]');
     if (label) label.textContent = `${bars} bars`;
   }
@@ -13097,7 +13993,7 @@ class App {
     // Undo and redo come through here, so the cut summary and the trim offer follow the cut
     // list wherever the history moves it (F16).
     this.refreshTakeEdits();
-    this.scheduleSave();
+    this.saveNow();
   }
 
   /**
@@ -13175,7 +14071,7 @@ class App {
       this.perfIndex = Math.max(0, this.perfIndex - 1);
       // Both halves of the step, or undoing a cut would put the notes back and leave the tape
       // still cut — see `perfCuts`.
-      this.restoreDocumentBars(this.perfBars[this.perfIndex]);
+      this.restoreDocumentBars(this.perfBars[this.perfIndex], this.perfParts[this.perfIndex]);
       this.setPerformance(this.perfStack[this.perfIndex], this.perfCuts[this.perfIndex] ?? NO_CUTS);
       this.refreshUndoRedo();
       return;
@@ -13191,7 +14087,7 @@ class App {
     // 200-action cap has retired the oldest edits: the saved document then said an edit had been
     // undone while the screen still showed it, and reopening the file changed the score.
     this.syncEditCursor();
-    if (this.editCursor !== before) this.scheduleSave();
+    if (this.editCursor !== before) this.saveNow();
     this.applyResult(result, null);
     this.refreshUndoRedo();
   }
@@ -13200,7 +14096,7 @@ class App {
     if (this.historyIndex < this.history.length - 1 && this.history[this.historyIndex + 1] === 'perf') {
       this.historyIndex++;
       this.perfIndex = Math.min(this.perfStack.length - 1, this.perfIndex + 1);
-      this.restoreDocumentBars(this.perfBars[this.perfIndex]);
+      this.restoreDocumentBars(this.perfBars[this.perfIndex], this.perfParts[this.perfIndex]);
       this.setPerformance(this.perfStack[this.perfIndex], this.perfCuts[this.perfIndex] ?? NO_CUTS);
       this.refreshUndoRedo();
       return;
@@ -13212,7 +14108,7 @@ class App {
     const before = this.editCursor;
     const result = this.undoStack.redo(ctx);
     this.syncEditCursor();
-    if (this.editCursor !== before) this.scheduleSave();
+    if (this.editCursor !== before) this.saveNow();
     this.applyResult(result, null);
   }
 
@@ -13428,6 +14324,15 @@ class App {
         runtime: this.runtime,
         onRebuild: () => this.rebuildNotation(),
         onViewChange: () => this.onViewSettingsChanged(),
+        // A THEME REACHES THE CANVASES ONLY THROUGH A REBUILD (G3). The chrome is CSS and moves
+        // the instant the tokens are rewritten; the piano roll and the waveform read their
+        // colours once, in their constructors, into a private table — and `renderMain()` is what
+        // destroys and rebuilds both of them. The engraving is SVG under the same tokens and
+        // follows on its own. See `ui/theme.ts`.
+        onThemeChange: () => {
+          if (this.runtime.get().screen === 'main') this.renderMain();
+          else this.renderOpening();
+        },
         onClose: () => this.toggleSettings(false),
         // Pressing "Use this engine" on a card is the same gesture as pressing a chip on the
         // main menu, and it must have the same consequence — see `chooseEngine()`. The panel
@@ -13619,28 +14524,28 @@ class App {
 
   private installGlobalHandlers(): void {
     /*
-     * THE HEADER RE-DECIDES ABOUT THE TAKE'S NAME WHEN THE WINDOW CHANGES SIZE (Z6).
+     * NOTHING IN THE CHROME RE-DECIDES ANYTHING ON RESIZE ANY MORE (G1).
      *
-     * `fitHeaderName()` answers "can this row afford the name?", and the answer is a function of
-     * the width — so it has to be asked again when the width moves. Nothing else in the fit does:
-     * `fitSelects` writes a width in CSS px against text in CSS px, and the `zoom` ladder scales
-     * both together, so a box cut to its words stays cut to its words at every rung.
+     * A rAF-coalesced resize handler used to re-run `fitHeaderName()` — "can this row afford the
+     * take's name at this window width?" — and it was the last question in the app whose answer
+     * depended on the size of the window rather than on the design. Under the one-proportion law
+     * the LAYOUT does not change with the window at all: the window changes ONE number
+     * (`--face-scale`), the same picture is painted larger or smaller, and every row that fitted
+     * at the base size still fits. The only resize listener left in the app is the law's own, in
+     * `ui/faceScale.ts`, and the only things that act on it are the two raster canvases, whose
+     * backing stores are in device pixels and therefore genuinely do change.
      *
-     * Coalesced onto one animation frame, because a window drag delivers a resize per frame and
-     * this reads layout. `passive`, since it never prevents anything.
+     * `fitSelects` IS re-run, but on the law's event rather than on a resize, and for a reason
+     * that had to be measured to be believed. A box fitted to its own words is a text width plus
+     * a FRAME, and the frame is padding plus BORDER — and a 1px border does not stay 1px. Chrome
+     * snaps a hairline to a whole DEVICE pixel and reports the computed value back divided by the
+     * zoom, so at face scale 0.31 `borderLeftWidth` reads 3.28px: measured on the roll's Grid box,
+     * the frame goes from 31 logical px at scale 1 to 35.6 at REAPER's floor, and a box written
+     * at 78 has 42px of room for 44px of text. Four pixels, and it is exactly the class of silent
+     * clipping this whole rule exists to prevent — so the fit is redone whenever the scale moves,
+     * which is the only time the frame can change.
      */
-    let nameFit = 0;
-    window.addEventListener(
-      'resize',
-      () => {
-        if (nameFit) return;
-        nameFit = requestAnimationFrame(() => {
-          nameFit = 0;
-          this.fitHeaderName();
-        });
-      },
-      { passive: true }
-    );
+    window.addEventListener(FACE_SCALE_EVENT, () => this.fitTopBars(), { passive: true });
 
     // Window-wide drop, so a file dropped anywhere works — and so the browser never
     // navigates away to the dropped file, which is what happens without preventDefault.
@@ -13762,6 +14667,54 @@ function tickToSeconds(score: RiffScore, tick: number, originSec: number): numbe
   const map = tempoMapOf(score);
   if (!map) return (tick / ALPHATAB_QUARTER_TICKS) * (60 / score.tempoBpm) + originSec;
   return map.tickToSec(tick * irTicksPerAlphaTick(map)) + originSec;
+}
+
+/**
+ * ===========================================================================================
+ * THE TWO TICK DOMAINS, AND THE ONE PLACE THEY ARE ALLOWED TO MEET (P2/P3)
+ * ===========================================================================================
+ *
+ * There are two tick counts in this app and they differ by a factor of forty:
+ *
+ *   ALPHATAB TICKS   960 to a quarter, always. Everything the ENGRAVING says about time is in
+ *                    them, because it comes off `Beat.absolutePlaybackStart` — so
+ *                    `TriView.contentXToTick`, `tickToContentX`, `SheetTarget.tick`, the drag
+ *                    ghost's tick, the playhead tick, `secondsToTick` and `tickToSeconds` above
+ *                    are all alphaTab ticks.
+ *   IR TICKS         `score.ir.divisions` to a quarter, typically 24. Everything the SCORE MODEL
+ *                    says about structure is in them: `ir.bars[i].startTick` and `.durTicks`,
+ *                    and `notationIntentTicks(intent, divisions)`.
+ *
+ * THE BUG THESE EXIST TO KILL. `nearestBeatTick` took an alphaTab tick straight off the sheet
+ * and compared it against `ir.bars[].startTick` — 24ths against 960ths — so a drop anywhere past
+ * the first fraction of a bar selected the LAST bar in the list, rounded to a beat lattice
+ * measured in the wrong unit, and handed the answer back to `tickToSeconds`, which read it as
+ * alphaTab ticks again. Both halves of the conversion were missing, and the two errors do not
+ * cancel: an added note landed at a deterministic wrong second and a horizontal drag put the
+ * dragged note at a deterministic wrong place — which is exactly what "it always takes the note
+ * back to wherever the second note is" describes.
+ *
+ * THE FIX IS THE BOUNDARY, NOT THE AXIS. `contentXToTick` is not redefined: it is the engraving's
+ * own answer about the engraving's own geometry and a dozen callers depend on it being alphaTab's
+ * number. Instead the two functions that need to speak to the IR convert on the way in and on the
+ * way out, through these two helpers, and their names say which domain they are in.
+ */
+function irTicksPerAlphaTickOf(score: RiffScore): number {
+  const map = tempoMapOf(score);
+  // The map's own divisions when there is one, for the same reason `irTicksPerAlphaTick` gives:
+  // the map applies its own positive-value fallback and a disagreement is a constant-factor error.
+  return (map ? map.divisions : score.ir.divisions || 12) / ALPHATAB_QUARTER_TICKS;
+}
+
+/** An engraved (alphaTab) tick, in the IR's own ticks — the domain `ir.bars` is measured in. */
+function alphaTickToIrTick(score: RiffScore, alphaTick: number): number {
+  return alphaTick * irTicksPerAlphaTickOf(score);
+}
+
+/** An IR tick, back in alphaTab's — the domain `tickToSeconds` and the engraving expect. */
+function irTickToAlphaTick(score: RiffScore, irTick: number): number {
+  const per = irTicksPerAlphaTickOf(score);
+  return per > 0 ? irTick / per : irTick;
 }
 
 /**

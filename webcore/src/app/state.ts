@@ -144,6 +144,20 @@ export interface AppSettings {
   /** Open-string MIDI notes, lowest string first, used only while `tabMode === 'custom'`. */
   customTuningMidi: number[];
   clefMode: ClefMode;
+  /**
+   * Whether the notation staff is drawn at all — "Clef: Off" (G2).
+   *
+   * ITS OWN BOOLEAN AND NOT A FIFTH `ClefMode`, deliberately. `clefMode` is a pipeline setting:
+   * it reaches `BuildSettings.clefMode`, decides how the music is SPELLED, and is written into
+   * the exported MusicXML. "No clef" is not a spelling, so a fifth value would have had to be
+   * translated back to a real clef at the pipeline boundary and would have leaked into files if
+   * anybody ever forgot. This is what it actually is: a fact about this screen. `ui/app.ts
+   * §projectStaffVisibility` hides the staff on the way to the renderer, the exported MusicXML
+   * and MIDI are untouched, and the clef the page WOULD use is still remembered underneath.
+   *
+   * Never false at the same time as `tabMode === 'off'` — see `sanitizeSettings`.
+   */
+  showStaff: boolean;
   /** The transcription quantizer's brief. Reaches the pipeline; see `NotationGrid`. */
   grid: NotationGrid;
   /**
@@ -346,6 +360,9 @@ export const DEFAULT_SETTINGS: AppSettings = {
   tuningId: DEFAULT_TUNING.id,
   customTuningMidi: [40, 45, 50, 55, 59, 64],
   clefMode: 'auto',
+  // The staff is what a page IS until somebody says otherwise. Additive over an older blob by
+  // construction (`mergeStoredSettings` spreads over these defaults), so no migration case.
+  showStaff: true,
   // 'free', NOT 'auto'. Every other value in this enum ROUNDS, and the argument against
   // defaulting to a named size — that an override forbids the quantizer everything finer, so a
   // triplet played against 1/8 loses a note — turns out to be an argument against defaulting to
@@ -480,6 +497,10 @@ export const TAKE_SCOPED_SETTING_KEYS = [
   'tuningId',
   'customTuningMidi',
   'clefMode',
+  // With the clef, because it is the same question asked one step further: how should THIS
+  // music be shown. A tab-only page chosen for a bass riff must not be what a piano sketch
+  // opens into.
+  'showStaff',
   'grid',
   'rollGrid',
   'rollSnap',
@@ -548,8 +569,36 @@ export interface SourceAudio {
   tempoBpm?: number;
   timeSignature?: { numerator: number; denominator: number };
   keyFifths?: number;
-  /** Empty documents use this to keep full-rest bars after every rebuild. */
+  /**
+   * The document's DECLARED bar count — the floor the pipeline engraves against
+   * (`BuildInput.minimumBars`).
+   *
+   * Empty documents have always used it to keep full-rest bars after every rebuild. A bar
+   * operation on a RECORDED take now sets it too, adopting the count the engraver produced, so
+   * that an inserted empty bar survives the next rebuild instead of being re-derived away.
+   */
   documentBars?: number;
+  /**
+   * THE SCORE'S TIMELINE IS ITS OWN, AND `durationSec` ABOVE IS NO LONGER AN AUTHORITY OVER IT.
+   *
+   * Set once, by the first bar insert or delete, and never cleared. Before it the notes and the
+   * recording share one clock and the audio's length bounds both. After it they are two clocks:
+   * `durationSec` stays the RECORDING's length — the waveform is an immutable photograph and
+   * nothing may resize it — while the notes are free to run past the end of the tape or stop
+   * short of it. The score's own length is not stored anywhere; it is re-derived on every build
+   * as `RiffScore.durationSec`, which is what makes the two impossible to get out of step.
+   *
+   * The pipeline consumes this as `BuildInput.detachedTimeline`. Without it the audio-length
+   * guards answer "insert a bar" by deleting everything the insert pushed past the old end
+   * (`pipeline/src/guards.ts`), and the snap layer clamps edited notes back inside the recording
+   * (`app/snap.ts`).
+   *
+   * ONE-WAY on purpose. Undoing the bar operation puts the notes and the bar count back, and
+   * leaves this set: a document that has once been detached has nothing to gain from being told
+   * the tape is the truth again, and re-attaching would re-arm exactly the guards that would
+   * delete the material a redo is about to restore.
+   */
+  timelineDetached?: boolean;
   /** Raw detections, kept so the notation can be rebuilt without re-transcribing. */
   detected?: { notes: InputNote[]; beats?: number[]; downbeats?: number[] };
   /**
@@ -1056,6 +1105,21 @@ function migrate(settings: AppSettings, stored: Partial<AppSettings>, floor = 0)
   settings.anchorFret = Math.max(0, Math.min(24, Math.round(Number(settings.anchorFret)) || DEFAULT_SETTINGS.anchorFret));
   if (!['off', 'bass', 'guitar', 'custom'].includes(settings.tabMode)) settings.tabMode = 'off';
   if (!['auto', 'treble', 'bass', 'grand'].includes(settings.clefMode)) settings.clefMode = 'auto';
+  if (typeof settings.showStaff !== 'boolean') settings.showStaff = DEFAULT_SETTINGS.showStaff;
+  /*
+   * THE OFF+OFF GUARD, THIRD COPY AND THE ONLY ONE THAT CANNOT BE WALKED ROUND (G2).
+   *
+   * Both menus disable the second Off (`ui/app.ts §buildNotationToolbar`), which is the right
+   * thing for a hand on a control and no protection at all against a blob: a `.riffsheet`
+   * written by a build where the rule differed, a hand-edited settings entry, or simply a
+   * document saved with the tab on and reopened after the tab was switched off elsewhere, would
+   * each arrive here with nothing left to engrave — a page that is blank for a reason nothing
+   * on screen explains, and with the control that would fix it disabled.
+   *
+   * THE STAFF WINS, because it is the thing every document can show. A tab needs strings; a
+   * take with no fretted instrument has no tablature to fall back on.
+   */
+  if (!settings.showStaff && settings.tabMode === 'off') settings.showStaff = true;
   settings.customTuningMidi = sanitizeCustomTuning(settings.customTuningMidi);
 
   // Removed controls must also disappear from the actual object produced by spreading older
@@ -1091,14 +1155,120 @@ export interface RecentFile {
   name: string;
   path: string;
   at: number;
+  /**
+   * WHAT THIS ENTRY IS, for deciding whether two of them are the same file (E1/E3).
+   *
+   * `file:<absolute path>` and nothing else, ever. The bridge's `AudioFileRef.identity` uses the
+   * same vocabulary and also mints `session:<token>` for audio that exists only in this process
+   * — a track capture, a dropped file the browser handed over as bytes, the recording inside an
+   * opened `.riffsheet`. THOSE NEVER APPEAR IN THIS LIST. A Recent entry is a promise that
+   * clicking it reopens the thing; a session take cannot keep that promise past the DAW closing,
+   * and an entry that apologises when it is clicked is worse than no entry.
+   *
+   * Optional only because entries written before this existed do not have it. `loadRecent()`
+   * gives every survivor one on the way past — see `migrateRecent`.
+   */
+  identity?: string;
 }
 
+/** `file:<absolute path>`, the only identity a Recent entry may carry. */
+export function fileIdentity(path: string): string {
+  return `file:${path}`;
+}
+
+/**
+ * Is this an absolute path — something a shell could reopen tomorrow?
+ *
+ * A browser `File` reports its own name as its path (`ui/app.ts §openFile`), so "riff.wav" and
+ * "/Users/me/riffs/riff.wav" both arrive here as strings and only one of them is a file anybody
+ * can find again. POSIX, Windows drive letters and UNC shares, which is every shell there is.
+ */
+export function isAbsolutePath(path: string): boolean {
+  return path.startsWith('/') || /^[A-Za-z]:[\\/]/.test(path) || path.startsWith('\\\\');
+}
+
+/**
+ * Is this path inside the app's own old takes cache?
+ *
+ * THE HOARD (P10). Until this wave the shell copied every opened file into
+ * `<app support>/Riffsheet/takes/` under a dated name and handed the page THAT path, so the
+ * Recent list filled with `2.wav-20260810-…`, `2.wav-20260812-…`, one per open of one file. The
+ * copying is gone; the entries it wrote are still in everybody's browser storage.
+ *
+ * MATCHED ON THE DIRECTORY PAIR, not on the dated filename. Codex's rule, adopted verbatim: an
+ * original path is NEVER inferred by stripping a timestamp suffix. `PcmStore` replaced its
+ * source reference with the cache path, so the original is genuinely not recoverable from the
+ * copy's name — a reconstruction would be a guess that opens the wrong file when it is wrong.
+ * These entries are DROPPED instead, and the files themselves are left alone on disk.
+ */
+export function isTakesCachePath(path: string): boolean {
+  return /[/\\]Riffsheet[/\\]takes[/\\]/.test(path);
+}
+
+/**
+ * ONE ENTRY PER REAL FILE (E3), and the migration that makes an existing list obey that.
+ *
+ * Four rules, in order:
+ *
+ *   1. an entry with no absolute path is dropped — it could never have been reopened;
+ *   2. an entry inside the takes cache is dropped, and no original is inferred from its name;
+ *   3. a `session:` identity is dropped, because those takes are session-only by decree;
+ *   4. what survives is keyed by `file:<path>` and DEDUPLICATED, newest kept.
+ *
+ * Rule 4 is the one the player asked for. The old list deduplicated by exact path string, and
+ * since every open minted a new dated copy the strings were all different — so the same file
+ * appeared as many times as it had been opened.
+ */
+function migrateRecent(stored: unknown): RecentFile[] {
+  if (!Array.isArray(stored)) return [];
+  const byIdentity = new Map<string, RecentFile>();
+  for (const raw of stored) {
+    if (!raw || typeof raw !== 'object') continue;
+    const entry = raw as Partial<RecentFile>;
+    const identity = typeof entry.identity === 'string' ? entry.identity : '';
+    if (identity.startsWith('session:')) continue;
+    const path =
+      identity.startsWith('file:') ? identity.slice(5) : typeof entry.path === 'string' ? entry.path : '';
+    if (!isAbsolutePath(path) || isTakesCachePath(path)) continue;
+    const name = typeof entry.name === 'string' && entry.name ? entry.name : path;
+    const at = Number(entry.at);
+    const key = fileIdentity(path);
+    const existing = byIdentity.get(key);
+    // Newest wins, whatever order the stored list happened to be in.
+    if (existing && existing.at >= (Number.isFinite(at) ? at : 0)) continue;
+    byIdentity.set(key, { name, path, at: Number.isFinite(at) ? at : 0, identity: key });
+  }
+  return [...byIdentity.values()].sort((a, b) => b.at - a.at).slice(0, RECENT_LIMIT);
+}
+
+/** How many the list holds. Eight was the number before identity existed; it is still eight. */
+const RECENT_LIMIT = 8;
+
+/**
+ * The list, migrated.
+ *
+ * The migration runs on every read rather than once behind a flag: it is a filter over at most
+ * eight entries, it is idempotent (a migrated list migrates to itself), and a one-time flag is
+ * one more piece of state that can be wrong. The result is written back when it differs, so the
+ * dated copies disappear from storage the first time the app opens rather than being filtered
+ * out of sight forever.
+ */
 export function loadRecent(): RecentFile[] {
+  let stored: unknown;
   try {
-    return JSON.parse(localStorage.getItem(RECENT_KEY) ?? '[]') as RecentFile[];
+    stored = JSON.parse(localStorage.getItem(RECENT_KEY) ?? '[]');
   } catch {
     return [];
   }
+  const list = migrateRecent(stored);
+  try {
+    const before = JSON.stringify(stored);
+    const after = JSON.stringify(list);
+    if (before !== after) localStorage.setItem(RECENT_KEY, after);
+  } catch {
+    /* private browsing or quota — the list is still correct in memory */
+  }
+  return list;
 }
 
 /**
@@ -1110,7 +1280,8 @@ export function loadRecent(): RecentFile[] {
  * actually been tried and failed.
  */
 export function forgetRecent(path: string): RecentFile[] {
-  const list = loadRecent().filter((r) => r.path !== path);
+  const identity = fileIdentity(path);
+  const list = loadRecent().filter((r) => r.path !== path && r.identity !== identity);
   try {
     localStorage.setItem(RECENT_KEY, JSON.stringify(list));
   } catch {
@@ -1119,8 +1290,26 @@ export function forgetRecent(path: string): RecentFile[] {
   return list;
 }
 
+/**
+ * Remember a file that was actually opened — if it is a file at all.
+ *
+ * THE REFUSALS ARE THE FEATURE (E1). A capture, a byte drop and the audio inside an opened
+ * `.riffsheet` all reach this with no durable path, and every one of them used to be written
+ * down under whatever string was to hand. Now they are silently not listed, because the list
+ * means "click to open this again" and nothing here could honour that: the samples live in this
+ * process and go when it does. (The `.riffsheet` FILE is listed — see
+ * `ui/app.ts §ingestRiffsheetDocument` — because that is a real file on a real path, and opening
+ * it brings its embedded recording with it.)
+ *
+ * Deduplicated by identity, so a file opened five times is one entry with the newest date.
+ */
 export function pushRecent(file: RecentFile): RecentFile[] {
-  const list = [file, ...loadRecent().filter((r) => r.path !== file.path)].slice(0, 8);
+  const current = loadRecent();
+  if (!isAbsolutePath(file.path) || isTakesCachePath(file.path)) return current;
+  const identity = file.identity && file.identity.startsWith('file:') ? file.identity : fileIdentity(file.path);
+  if (!identity.startsWith('file:')) return current;
+  const entry: RecentFile = { name: file.name || file.path, path: file.path, at: file.at, identity };
+  const list = [entry, ...current.filter((r) => r.identity !== identity)].slice(0, RECENT_LIMIT);
   try {
     localStorage.setItem(RECENT_KEY, JSON.stringify(list));
   } catch {

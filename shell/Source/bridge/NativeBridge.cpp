@@ -2,6 +2,7 @@
 #include "ScoreImageImporter.h"
 #include "TransferLimits.h"
 #include "PluginProcessor.h"
+#include "ui/PluginEditor.h"   // the editor size policy getShellInfo() reports
 #include "EngineLock.h"
 #include "ModelCatalog.h"
 #include "SystemProbe.h"
@@ -474,6 +475,11 @@ juce::WebBrowserComponent::Options NativeBridge::configure (juce::WebBrowserComp
         .withNativeFunction ("log",               bind (&NativeBridge::fnLog))
         .withNativeFunction ("getPersistedState", bind (&NativeBridge::fnGetPersistedState))
         .withNativeFunction ("setPersistedState", bind (&NativeBridge::fnSetPersistedState))
+        // The same blob PLUS what to do with it. Registration is the capability
+        // test as ever: a page on an older shell sees no such function and keeps
+        // its old behaviour (load the blob, ask about it), which is exactly the
+        // 'ask' branch this call would have given it.
+        .withNativeFunction ("getSessionRestore", bind (&NativeBridge::fnGetSessionRestore))
         .withNativeFunction ("engineStatus",      bind (&NativeBridge::fnEngineStatus))
         .withNativeFunction ("recheckEngine",     bind (&NativeBridge::fnRecheckEngine))
         // Registered here rather than emitted as events for a reason: an older
@@ -600,20 +606,41 @@ void NativeBridge::fnGetShellInfo (const juce::Array<juce::var>&, Completion com
         // the normal UI (RIFFSHEET_DEBUG=1; also appended to the URL as ?debug=1).
         { "debug", juce::SystemStats::getEnvironmentVariable ("RIFFSHEET_DEBUG", {}).getIntValue() != 0 },
         { "muscriptorBaseUrl", proc.getMuScriptor().getBaseUrl() },
-        { "pcmUrlPrefix", "/native/pcm/" } }));
+        { "pcmUrlPrefix", "/native/pcm/" },
+
+        // THE SIZE POLICY, so the page never has to guess which of the two
+        // numbers below it is living under. `minEditorWidth/Height` is the floor
+        // the window can actually reach; `preferredMin…` is the size the face is
+        // DESIGNED at (scale 1 under the one-proportion law), which is a REQUEST a
+        // plugin host may decline (REAPER does - it clips instead of refusing the
+        // drag, which is why it is not what a plugin asks for). `minimumEnforced` says
+        // which of the two was handed to the window manager, and is true only in
+        // the standalone, where the app owns its own frame.
+        // See PluginEditor.h for the measurements behind all four.
+        { "minEditorWidth",           RiffsheetAudioProcessorEditor::minEditorWidth },
+        { "minEditorHeight",          RiffsheetAudioProcessorEditor::minEditorHeight },
+        { "preferredMinEditorWidth",  RiffsheetAudioProcessorEditor::preferredMinEditorWidth },
+        { "preferredMinEditorHeight", RiffsheetAudioProcessorEditor::preferredMinEditorHeight },
+        { "minimumEnforced",          proc.wrapperType == juce::AudioProcessor::wrapperType_Standalone } }));
 }
 
 /**
-    The build's version string, and nothing else.
+    THE VERSION A PLAYER READS, which is not the version the bundle carries.
 
-    Same number getShellInfo() reports (RIFFSHEET_VERSION, set from the CMake
-    project version), deliberately: two places that could disagree about what
-    version this is would be a bug, so this is a narrower view of the one value
-    rather than a second source of it.
+    Riffsheet is versioned one-dot from 1.0 onwards: the brand block and About
+    print "v1.0". The plugin formats have no say in that and no choice either -
+    VST3 and AU both encode x.y.z - so CMake derives the display form from the
+    same project version (RIFFSHEET_VERSION_DISPLAY, see CMakeLists.txt) and this
+    call answers with it. One source, two renderings, and the webcore side does
+    no string surgery at all: it prints "v" + whatever this returns.
+
+    getShellInfo().version keeps the FULL x.y.z on purpose. That one is build
+    identity - what a bug report has to quote and what a compatibility check has
+    to compare - and a two-part number cannot serve as either.
 */
 void NativeBridge::fnGetAppVersion (const juce::Array<juce::var>&, Completion completion)
 {
-    completion (makeObject ({ { "ok", true }, { "version", RIFFSHEET_VERSION } }));
+    completion (makeObject ({ { "ok", true }, { "version", RIFFSHEET_VERSION_DISPLAY } }));
 }
 
 /**
@@ -683,10 +710,41 @@ juce::var NativeBridge::describeEntry (const std::shared_ptr<const PcmStore::Ent
     // One stat, not a read. See the sourceUrl fields below.
     const auto original = proc.getPcmStore().getOriginalInfo (entry->token);
 
+    // IS THERE A FILE THAT WILL STILL BE THERE TOMORROW?
+    //
+    // Only two things count as one: a file the user opened (their own path, in
+    // their own folder) and an old take in the app-support folder that some
+    // existing document still references. A staging temp we wrote for browser
+    // bytes does not - it dies with the entry - and a capture has no file at all
+    // since E2 stopped writing them.
+    //
+    // The page needs the distinction because it PERSISTS this path: into Recents,
+    // into a document, into DAW project state. A path that names a temp file, or
+    // a dated copy minted for one import, is a reference that will be broken or
+    // misleading the next time it is followed - which is exactly how Recents came
+    // to be full of "2.wav-20260812-<uuid>.wav". So a session-only take reports
+    // no path at all rather than a path that lies about its lifetime.
+    const auto durablePath = entry->sourceFile.existsAsFile() && ! entry->sourceFileIsTemp;
+
     return makeObject ({
         { "ok", true },
         { "token",            entry->token },
-        { "path",             entry->sourceFile.getFullPathName() },
+        { "path",             durablePath ? entry->sourceFile.getFullPathName() : juce::String() },
+
+        // WHAT THIS TAKE IS, for a page deciding whether two of them are the same
+        // take. Path identity, not a content hash: hashing hundreds of megabytes
+        // on every open would cost more than the whole import on the machine this
+        // is built for, and two opens of one file already share one path. A
+        // session take gets its token, which is unique per decode and therefore
+        // never collapses two recordings into one Recents row.
+        { "identity",         durablePath ? "file:" + entry->sourceFile.getFullPathName()
+                                          : "session:" + entry->token },
+        // True when this audio exists only in this process: a track capture, or
+        // bytes dropped/loaded from a document. It can be played, transcribed,
+        // edited and SAVED (a .riffsheet embeds it, Export writes it out) - it
+        // simply cannot be reopened by path afterwards, and must not be offered
+        // as a Recent file, because there is nothing to reopen.
+        { "sessionOnly",      ! durablePath },
         { "name",             entry->displayName },
         { "sampleRate",       entry->sampleRate },
         { "numFrames",        entry->mono.getNumSamples() },
@@ -712,11 +770,10 @@ juce::var NativeBridge::describeEntry (const std::shared_ptr<const PcmStore::Ent
 }
 
 void NativeBridge::decodeAndReply (const juce::File& file, double targetRate, Completion completion,
-                                   bool fileIsOurTemp, juce::String displayNameOverride,
-                                   bool forceOwnedCopy)
+                                   bool fileIsOurTemp, juce::String displayNameOverride)
 {
     workers.addJob ([this, file, targetRate, fileIsOurTemp,
-                     displayName = std::move (displayNameOverride), forceOwnedCopy,
+                     displayName = std::move (displayNameOverride),
                      reply = std::move (completion)]
                     {
                         juce::String error;
@@ -730,20 +787,11 @@ void NativeBridge::decodeAndReply (const juce::File& file, double targetRate, Co
                             return;
                         }
 
-                        // Browser file APIs provide bytes rather than a stable native path.
-                        // Promote our staged copy before exposing AudioRef.path: Recent/project
-                        // restore may persist that path, so it must be durable user data rather
-                        // than an entry-owned file in the system temp directory.
-                        if ((fileIsOurTemp || forceOwnedCopy)
-                            && ! proc.getPcmStore().persistTake (entry->token, error, 24,
-                                                                forceOwnedCopy).existsAsFile())
-                        {
-                            reply (makeError (error.isNotEmpty()
-                                                  ? error
-                                                  : "could not preserve the imported audio"));
-                            return;
-                        }
-
+                        // NOTHING IS COPIED ANYWHERE. A file the user opened is
+                        // answered by its own path; bytes the browser handed over
+                        // keep the staged temp this entry owns and are reported as
+                        // session-only, so nothing persists a path that will not
+                        // outlive the process. See describeEntry().
                         reply (describeEntry (entry));
                     });
 }
@@ -776,9 +824,13 @@ void NativeBridge::fnPickAudioFile (const juce::Array<juce::var>& args, Completi
                                   return;
                               }
 
+                              // Authorised, and NOT copied. The remembered-paths
+                              // record is what makes this file reopenable in a
+                              // later process; a copy in the takes folder was
+                              // never what made it work, only what made it
+                              // duplicate. See PcmStore.cpp on persistTake().
                               bridge->authorizeAudioPath (file);
-                              bridge->decodeAndReply (file, targetRate, std::move (completion),
-                                                      false, {}, true);
+                              bridge->decodeAndReply (file, targetRate, std::move (completion));
                           });
 }
 
@@ -816,8 +868,7 @@ void NativeBridge::fnPickInputFile (const juce::Array<juce::var>& args, Completi
                               if (! isByteInputFile (file))
                               {
                                   bridge->authorizeAudioPath (file);
-                                  bridge->decodeAndReply (file, targetRate, std::move (completion),
-                                                          false, {}, true);
+                                  bridge->decodeAndReply (file, targetRate, std::move (completion));
                                   return;
                               }
 
@@ -856,9 +907,12 @@ void NativeBridge::fnLoadAudioPath (const juce::Array<juce::var>& args, Completi
         return;
     }
 
-    const auto forceOwnedCopy = ! file.isAChildOf (SystemProbe::takesDirectory());
-    decodeAndReply (file, optionalRate (args, 1), std::move (completion),
-                    false, {}, forceOwnedCopy);
+    // Reopened where it stands. A path that points into the old takes folder is
+    // an existing document's reference and is read from there exactly as it is;
+    // a path anywhere else is the user's own file and is likewise read in place.
+    // Neither is copied, so reopening the same recording ten times leaves ten
+    // references to one file rather than ten files.
+    decodeAndReply (file, optionalRate (args, 1), std::move (completion));
 }
 
 /**
@@ -2036,6 +2090,53 @@ void NativeBridge::fnGetPersistedState (const juce::Array<juce::var>&, Completio
     completion (makeObject ({ { "ok",    true },
                               { "state", json.isEmpty() ? juce::var() : juce::var (json) },
                               { "bytes", (int) json.getNumBytesAsUTF8() } }));
+}
+
+/**
+    THE STATE, AND WHAT TO DO WITH IT - the call a booting page makes instead of
+    getPersistedState().
+
+    WHY IT EXISTS. Switching FX in REAPER destroys the editor and makes a new one.
+    The page then found a blob, could not tell where it came from, and asked "you
+    have unfinished work - resume, or start fresh?" about work the user had not
+    left at all: they had clicked one tab and clicked back. The blob cannot answer
+    that question because it is byte-identical in every case; only the processor
+    knows its provenance, and only until the process ends. See
+    RiffsheetAudioProcessor::RestoreMode.
+
+    `restoreMode` is:
+      "silent" - same process, new editor (or a plain page refresh). Restore
+                 immediately, show no menu and ask nothing. The PcmStore token in
+                 the blob is still live, so the audio comes back too.
+      "ask"    - the state arrived from outside since the last page booted: a
+                 project or preset load, a duplicated instance, a host undo. Ask
+                 once, exactly as before.
+      "none"   - nothing stored. The opening screen.
+
+    ONE-SHOT. Reading this consumes the "host loaded state" fact, so the question
+    is asked once and a later editor recreation in the same process is silent.
+    getPersistedState() deliberately does NOT consume it - it is the older, dumber
+    call and must stay side-effect free.
+*/
+void NativeBridge::fnGetSessionRestore (const juce::Array<juce::var>&, Completion completion)
+{
+    const auto mode = proc.consumeRestoreMode();
+    const auto json = proc.getPersistedWebState();
+
+    const auto modeName = mode == RiffsheetAudioProcessor::RestoreMode::silent ? "silent"
+                        : mode == RiffsheetAudioProcessor::RestoreMode::ask    ? "ask"
+                                                                               : "none";
+
+    completion (makeObject ({
+        { "ok",          true },
+        // null, not "", for the same reason getPersistedState() answers that way:
+        // "never stored" and "stored empty" are different facts.
+        { "state",       json.isEmpty() ? juce::var() : juce::var (json) },
+        { "restoreMode", modeName },
+        { "bytes",       (int) json.getNumBytesAsUTF8() },
+        // Diagnostics only. The decision above is already made; these are what a
+        // log line needs to explain it afterwards.
+        { "editorGeneration", proc.getEditorGeneration() } }));
 }
 
 void NativeBridge::fnSetPersistedState (const juce::Array<juce::var>& args, Completion completion)
@@ -3358,31 +3459,29 @@ void NativeBridge::fnCaptureStop (const juce::Array<juce::var>&, Completion comp
         return;
     }
 
-    // A five-minute mono take is tens of megabytes. Persist it away from the
-    // message thread, then reply only after its final, reopenable path exists.
-    workers.addJob ([this, result = std::move (captureResult), reply = std::move (completion)] () mutable
-                    {
-                        if (! proc.persistCapturedTake (result))
-                        {
-                            reply (makeError (result.error));
-                            return;
-                        }
+    // A CAPTURE IS NO LONGER WRITTEN TO DISK, so there is nothing here to move
+    // off the message thread any more. It used to write a several-minute WAV into
+    // the takes folder before replying - which is why this was a worker job, and
+    // why every recorded take, kept or not, left a file behind. The samples stay
+    // in the PcmStore entry, which lives on the processor and therefore outlives
+    // the editor; describeEntry() reports the take as session-only.
+    //
+    // THE HONEST CONSEQUENCE, stated here because the product must state it too:
+    // an unsaved capture does not survive this PROCESS. Closing the window and
+    // reopening it is fine (the processor and its store are still there); closing
+    // the project, or the DAW, is not. Saving a .riffsheet or exporting audio is
+    // what makes a capture durable, and both embed the recording at full depth
+    // through /native/source/<token>.
+    auto described = describeEntry (captureResult.entry);
 
-                        auto described = describeEntry (result.entry);
+    if (auto* obj = described.getDynamicObject())
+    {
+        obj->setProperty ("captureContext", captureResult.context);
+        obj->setProperty ("hitLimit", captureResult.hitLimit);
+        obj->setProperty ("isCapture", true);
+    }
 
-                        if (auto* obj = described.getDynamicObject())
-                        {
-                            // Explicitly use CaptureResult's durable path. The
-                            // entry carries it too, but this keeps the DTO seam
-                            // obvious and impossible to regress accidentally.
-                            obj->setProperty ("path", result.path.getFullPathName());
-                            obj->setProperty ("captureContext", result.context);
-                            obj->setProperty ("hitLimit", result.hitLimit);
-                            obj->setProperty ("isCapture", true);
-                        }
-
-                        reply (described);
-                    });
+    completion (described);
 }
 
 void NativeBridge::fnCaptureStatus (const juce::Array<juce::var>&, Completion completion)
@@ -3501,8 +3600,8 @@ void NativeBridge::stageBytesAndReply (const juce::String& displayName, const ju
                         }
 
                         // The original name is carried separately from the random staging name.
-                        // decodeAndReply promotes the decoded audio to durable app-support storage
-                        // before returning, while the entry cleans up this temporary input file.
+                        // The staging file stays entry-owned and is deleted with the take: bytes
+                        // that arrived without a path never gain one, and the reply says so.
                         decodeAndReply (temp, targetRate, std::move (reply), true, displayName);
                     });
 }
@@ -3623,8 +3722,7 @@ void NativeBridge::notifyFilesDropped (const juce::StringArray& paths)
                                     object->setProperty ("name", name);
 
                                 emit ("inputFileDropped", result);
-                            },
-                            false, {}, true);
+                            });
             return;
         }
     }

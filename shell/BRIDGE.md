@@ -126,20 +126,35 @@ build; they are always available regardless of which source is in use.
 
 ## 1b. The layout must be fluid — this is a hard requirement
 
-**A fresh window opens at 1100x700. Must stay usable down to 900x600. Must not
-break down to 360x280.**
+**A fresh window opens at 1320x700 — the size the face is DESIGNED at. Must stay
+whole down to 360x280.**
 
-(1100x700 since v1.1 — the old 1180x760 was more window than a riff needs on
-first open. It is only a DEFAULT: the size is user-resizable and persisted per
-instance, so nobody who has already dragged their window is affected. The single
-place it is defined is `defaultEditorWidth`/`defaultEditorHeight` in
-`Source/ui/PluginEditor.h`.)
+Three numbers, and it is worth being exact about which is which. All of them live
+in `Source/ui/PluginEditor.h`:
+
+| | value | what it is |
+|---|---|---|
+| `defaultEditorWidth/Height` | 1320x700 | what a FRESH instance opens at. Only a default: the size is user-resizable and persisted per instance, so nobody who has already dragged their window is affected. |
+| `preferredMinEditorWidth/Height` | 1320x700 | the minimum the shell REQUESTS. The same two numbers as `FACE_BASE_W`/`FACE_BASE_H` in `webcore/src/ui/faceScale.ts`, because that is the size at which the one-proportion law's scale factor is exactly 1. **Enforced only in the Standalone**, which owns its own window. |
+| `minEditorWidth/Height` | 360x280 | the hard floor actually handed to a plugin host, because a host that is given a minimum it does not like clips rather than refuses (below). |
+
+Since the one-proportion law landed, "stay usable when small" means something
+precise: the face is laid out at 1320x700 logical pixels **at every window size**
+and scaled by one factor, so nothing reflows, nothing is dropped and nothing
+clips — the same picture is simply smaller. What a small window costs is
+legibility, not layout.
+
+All five numbers are reported on `getShellInfo()` (with `minimumEnforced`), so
+the page can tell "the user made the window small" from "this is as small as it
+goes" instead of guessing.
 
 Why the low floor matters: REAPER does **not** refuse a drag that would take its
 FX window below the plugin's stated minimum. It shrinks the frame anyway and
 clips the editor — the page keeps its old layout and the user simply loses the
 right and bottom edges. That was reported from the field and it is why the
-shell's hard minimum is 360x280 rather than 900x600.
+shell's hard minimum handed to a plugin host is 360x280 rather than the size it
+would prefer. The preferred minimum is a **request**; only the Standalone can
+have it honoured.
 
 Measured on this Mac by dragging the window: REAPER's docked FX window spends
 about **232pt on the plug-in list** and **85pt on the header**, and refuses to go
@@ -153,7 +168,8 @@ So:
   otherwise the content's intrinsic width wins and the page overflows.
 - Wide things (score, tab, tables) scroll **inside their own container**, never
   by making the page itself wider than the viewport.
-- Collapse to a single column somewhere around 760px.
+- No breakpoints. Under the one-proportion law there is no width at which the
+  design is under pressure, so there is nothing for one to react to.
 - Test at 360x280 before calling a layout done. That is REAPER's own smallest
   docked FX window, minus its chrome — the smallest the page can ever be asked
   to render.
@@ -190,12 +206,19 @@ and finish via an event (see §3).
 ```ts
 getShellInfo(): Promise<{
   ok: true,
-  version: string,            // "0.1.0"
+  version: string,            // "1.0.0"  <- BUILD identity, always x.y.z
   juce: string,               // "JUCE v8.0.13"
   platform: string,           // "Mac OSX 26.4"
   webcoreSource: string,      // "bundled" | "disk:/path/to/dir"
   muscriptorBaseUrl: string,  // "http://127.0.0.1:8223"
   pcmUrlPrefix: string,       // "/native/pcm/"
+
+  // the editor size policy — see section 1b
+  minEditorWidth: number,           // 360  — the floor the window can reach
+  minEditorHeight: number,          // 280
+  preferredMinEditorWidth: number,  // 1320 — the size the face is designed at
+  preferredMinEditorHeight: number, // 700
+  minimumEnforced: boolean,         // true only in the Standalone
 }>
 ```
 
@@ -205,15 +228,28 @@ even when the app is about to adopt one on 8222. Nothing in webcore reads it.
 `engineStatus().port` is the truthful answer — `0` when nothing is running.
 
 ```ts
-getAppVersion(): Promise<{ ok: true, version: string }>   // "0.1.0"
+getAppVersion(): Promise<{ ok: true, version: string }>   // "1.0"
 ```
 
-The same string `getShellInfo().version` reports, from the same
-`RIFFSHEET_VERSION` (the CMake project version) — a narrower view of one value,
-never a second source of it. It exists so an About box can print the version
-without paying for the whole shell probe. Registration is the capability test as
-usual: an older shell answers `hasNativeFunction('getAppVersion')` with false and
-the page falls back to the host info it already has.
+**THE VERSION A PLAYER READS, and it is not the string `getShellInfo().version`
+carries.** Riffsheet is versioned one-dot from 1.0 onwards: the brand block and
+About print `v1.0`. The plugin formats have no say in that and no choice either —
+VST3 and AU both encode `x.y.z` — so `shell/CMakeLists.txt` keeps ONE
+`project(Riffsheet VERSION 1.0.0)` and derives the display form from it
+(`RIFFSHEET_VERSION_DISPLAY`, major.minor). This call answers with the display
+form; `getShellInfo().version` and the `"version"` property inside the plugin's
+own state blob keep the full `x.y.z`, because those are build identity — what a
+bug report quotes and what a compatibility check compares — and a two-part number
+serves as neither.
+
+**The page does no string surgery.** It prints `"v" + version`. A caller that
+trimmed a patch number off itself would be a second place where the versioning
+scheme is decided, and the two would eventually disagree.
+
+Registration is the capability test as usual: an older shell answers
+`hasNativeFunction('getAppVersion')` with false and the page falls back to its
+own build constant (`BUILD_VERSION` in `webcore/src/ui/app.ts`, kept in the same
+display form).
 
 ```ts
 openExternal(url: string): Promise<{ ok: true, url: string } | { ok: false, error: string }>
@@ -288,7 +324,9 @@ importDroppedFile(name: string, base64: string,
 type AudioRef = {
   ok: true,
   token: string,            // hand this to playbackLoad / transcribe
-  path: string,             // durable Riffsheet app-support WAV
+  path: string,             // a DURABLE path, or "" — see below
+  sessionOnly: boolean,     // true when this audio exists only in this process
+  identity: string,         // "file:<path>" | "session:<token>"
   name: string,
   sampleRate: number,       // rate of the PCM behind pcmUrl
   numFrames: number,
@@ -313,20 +351,65 @@ and printed-score formats return `InputBytes` for the web importer. This avoids 
 HTML `<input type="file">`, which is not reliable inside every DAW WebView. Byte inputs are
 limited to 64 MB and checked before allocation/base64 conversion.
 
-Every picked/dropped audio file is decoded and copied to Riffsheet's durable `takes` directory
-before its `AudioRef.path` is returned. `loadAudioPath` accepts one of those owned take paths, or a
-path this user has chosen in Riffsheet **at some point on this machine**. This is a trust boundary:
-a DAW project file can contain an untrusted web-state blob, so restore must never turn a string in
-that blob into an arbitrary filesystem read/upload.
+#### Nothing is copied anywhere — changed in v1.0
+
+**The shell no longer copies audio into its `takes` folder. Not a capture, not a
+dropped file, not an opened one.** It used to copy every one of them, minting a
+dated, UUID-stamped WAV per import, which is why that folder filled with
+duplicates of recordings the user already had and why Recents grew a fresh
+`2.wav-20260812-<uuid>.wav` on every open of the same file. `PcmStore::persistTake`
+and `RiffsheetAudioProcessor::persistCapturedTake` are both gone.
+
+What each path does now:
+
+| what arrived | where the audio lives | `path` | `sessionOnly` |
+|---|---|---|---|
+| a file the user opened (picker or OS drop) | their own file, untouched | their own path | `false` |
+| a track capture | the `PcmStore` entry, in memory | `""` | `true` |
+| browser bytes (HTML5 drop, `.riffsheet` audio) | a staging temp the entry owns and deletes with itself | `""` | `true` |
+
+`path` is **only ever a path that will still be there tomorrow**, because the page
+persists it — into Recents, into a document, into DAW project state. A path
+naming a temp file, or a copy minted for one import, is a reference that will be
+broken or misleading the next time it is followed. A session-only take therefore
+reports no path at all rather than one that lies about its lifetime.
+
+`identity` is what to compare when asking "are these two the same take?": path
+identity (`file:<absolute path>`), or the token for a session take
+(`session:<token>`), which never collapses two recordings into one row. It is not
+a content hash — hashing hundreds of megabytes on every open would cost more than
+the import, and two opens of one file already agree on their path.
+
+**A session-only take is not a lesser take.** It plays, transcribes, edits,
+exports, and a `.riffsheet` embeds its audio at full depth (below). What it
+cannot do is be reopened by path afterwards, which is exactly why it must not
+appear as a Recent file.
+
+**THE HONEST LIMIT, and the product must say it too: an unsaved capture does not
+survive the process.** Closing the plugin window and reopening it is fine — the
+`PcmStore` lives on the processor, so the samples are still there and session
+restore is silent (see "Per-instance state"). Closing the project, or the DAW, is
+not: the state blob is JSON with an 8 MB cap and has never carried PCM. Saving a
+`.riffsheet` or exporting audio is what makes a capture durable.
+
+**Old copies in the `takes` folder are left exactly where they are.** They are
+user data, existing documents and DAW projects reference them by path, and
+`isAuthorizedAudioPath` still accepts that directory so those keep opening.
+
+`loadAudioPath` accepts a path this user has chosen in Riffsheet **at some point on this
+machine** (or one of the old take paths). This is a trust boundary: a DAW project file can
+contain an untrusted web-state blob, so restore must never turn a string in that blob into an
+arbitrary filesystem read/upload. It is also what makes "never copy" safe: the durable record of
+opened paths, not a copy in an app folder, is what makes a file reopenable in a later process.
 
 `loadAudioBytes` is the path-free twin of `loadAudioPath`, for a v2 `.riffsheet` document, which
 carries its recording inside it. Restoring one gives the page samples but no `token`, so everything
 that runs in the SHELL — `transcribe` above all — was still tied to the original file being where
 the document said it was, which is the assumption embedding the audio existed to remove. This mints
 a take from the bytes instead: staged under a random name in the system temp directory, decoded
-exactly like `importDroppedFile` (with which it shares `NativeBridge::stageBytesAndReply`), and
-promoted to the durable `takes` directory before the `AudioRef` is returned; the staging file is
-owned by the `PcmStore::Entry` and dies with it.
+exactly like `importDroppedFile` (with which it shares `NativeBridge::stageBytesAndReply`). The
+staging file is owned by the `PcmStore::Entry` and dies with it, and the take comes back
+`sessionOnly: true` with no `path`: bytes that arrived without a durable path never gain one.
 
 Both of those calls are **capped at 550 MB of base64** (about 412 MB of audio) and are refused
 with a plain `{ ok:false, error }` above it rather than attempted; an allocation the machine
@@ -375,12 +458,13 @@ right). Pass `22050` when you only want a smaller array to draw a waveform from.
 It does not affect transcription quality: `transcribe()` uploads the source file,
 not this buffer.
 
-`importDroppedFile` receives browser bytes, not a reopenable native path. Before
-it replies, the shell atomically writes the decoded audio as a 24-bit WAV under
-Riffsheet's application-support `takes` folder. The returned `name` remains the
-browser's original filename; `path` is durable user data that survives reloads
-and reboots and is never removed as temporary data. Only the staging input is
-entry-owned and cleaned up automatically.
+`importDroppedFile` receives browser bytes, not a reopenable native path — and is
+answered honestly rather than by manufacturing one. The returned `name` remains
+the browser's original filename, `path` is `""` and `sessionOnly` is `true`; the
+staging file is entry-owned and cleaned up automatically. (Before v1.0 the shell
+wrote a 24-bit WAV into the `takes` folder here so it could report a path. That
+path was durable and the audio behind it was real; what it was not was something
+the user had asked to keep.)
 
 #### How long a token lives — changed in v1.3
 
@@ -1512,11 +1596,17 @@ type CaptureState = {
 Records the plugin's **input** — the track's own audio, before anything Riffsheet
 adds. Mono-summed, kept at the host's sample rate, no resampling.
 
-The returned `AudioRef.path` is a finished 24-bit WAV under Riffsheet's
-application-support `takes` folder. It is written through a same-folder partial
-and renamed only after the WAV header is flushed. Unlike a PCM token, this path
-survives a process/project reload; unlike transcription scratch files, durable
-takes are user data and are never deleted automatically.
+**A capture is not written to disk — changed in v1.0.** It used to be finished as
+a 24-bit WAV in the application-support `takes` folder before `captureStop()`
+would answer, which is why every take a player recorded and threw away was kept
+for ever. The returned `AudioRef` now has `path: ""` and `sessionOnly: true`: the
+samples live in the `PcmStore` entry, which lives on the **processor**, so a
+capture survives the editor being destroyed and recreated (and comes back through
+the `silent` restore above) but does **not** survive the process. Saving a
+`.riffsheet` or exporting audio is what makes it durable, and both get the take at
+full depth — `sourceUrl` renders the recorded buffer to a 24-bit WAV **in memory**
+on demand, so nothing is downgraded and no file is minted for a take nobody
+saves.
 
 **The shell does not trim.** You get the raw take including leading silence,
 because webcore and the pipeline need the true offsets to line the score up with
@@ -1645,6 +1735,15 @@ getPersistedState(): Promise<{ ok: true, state: string | null, bytes: number }>
 setPersistedState(json: string | null): Promise<
     { ok: true,  bytes: number }
   | { ok: false, error: string }>        // over the 8 MB cap; the old blob is kept
+
+// v1.0 — the call a booting page should make INSTEAD of getPersistedState()
+getSessionRestore(): Promise<{
+  ok: true,
+  state: string | null,                     // the same blob
+  restoreMode: 'silent' | 'ask' | 'none',   // ...and what to do with it
+  bytes: number,
+  editorGeneration: number,                 // diagnostic: 1 is this processor's first editor
+}>
 ```
 
 **Read this before touching anything about page lifetime.** In REAPER, clicking
@@ -1676,6 +1775,66 @@ meaningful change and reads once on boot.
   is a truthful capability test. An older shell simply does not offer them and the
   page degrades to "no session restore", which is the pre-existing behaviour.
 
+#### `getSessionRestore` — the blob AND its provenance (v1.0)
+
+**THE BUG THIS EXISTS FOR.** Switch to another FX in REAPER's window and back, and
+Riffsheet threw away the screen and asked *"you have unfinished work — resume, or
+start fresh?"* about work that had never stopped: the user clicked one tab and
+clicked back. The page could not do better, because the blob is **byte-identical**
+in three situations that want three different answers:
+
+| what actually happened | what the page should do |
+|---|---|
+| the same processor made a new editor (FX switch, window reopened, page refresh) | put it straight back — no menu, no question |
+| a project/preset was loaded, an instance duplicated, a host undo replayed | ask once |
+| a fresh instance with nothing behind it | the opening screen |
+
+Only the host can tell them apart, and only while its process lives. So the
+processor keeps two facts that are **deliberately never serialized**
+(`RiffsheetAudioProcessor::RestoreMode`):
+
+- `editorGeneration` — how many editors this processor has made;
+- `hostStateLoadedSinceEditor` — set by `setStateInformation()`, i.e. "this state
+  came from outside", and **consumed by this call**.
+
+A flag inside the blob could not do this job: it would be restored along with the
+blob into case two and turn it into case one for ever after.
+
+The rule is then one line — *state that arrived from outside asks; state this
+process was already holding does not*:
+
+```
+state empty                          -> 'none'
+host loaded state since the last read -> 'ask'    (and the fact is now consumed)
+otherwise                             -> 'silent'
+```
+
+**Await it before rendering anything.** The whole point of `silent` is that no
+opening screen is ever drawn; a menu that appears for 200 ms and is then replaced
+is the same bug with better timing.
+
+**One shot.** Reading consumes the "arrived from outside" fact, so the question
+is asked once and every later editor recreation in that process is silent. A host
+that loads a preset while the editor is open sets the fact and triggers a page
+refresh, and it is that refreshed page which is asked — which is why the fact is
+consumed on read rather than cleared when an editor is created.
+
+`getPersistedState` is unchanged and stays **side-effect free**; it can still be
+called freely. A shell without `getSessionRestore` is a truthful "this build
+cannot tell those cases apart", and the page falls back to *load the blob and
+ask*, which is exactly what it always did.
+
+**Flush timing is the other half of "the exact prior state".** Saves are
+debounced (700 ms, `webcore/src/app/persist.ts`), and an editor can be destroyed
+without warning — so a discrete edit made inside that window would be lost, and
+`silent` would confidently restore a document one edit out of date. Discrete,
+committed edits therefore go out immediately (`SessionStore.saveNow`, itself
+bounded so a held key cannot become one bridge round trip per keystroke) and only
+continuous gestures keep the debounce. A `pagehide`/`beforeunload`/hidden-window
+hook flushes what is queued for the endings a page can actually observe; a plugin
+editor being freed underneath the WebView is **not** one of them, which is why
+correctness rests on the immediate path and not on that hook.
+
 **What webcore puts in there, and why it is small:** the detected notes, not the
 score. The score is a pure function of the notes, the settings and the bar-1
 position, and rebuilding it costs milliseconds against seconds for a
@@ -1687,9 +1846,22 @@ re-fetching a few million floats.
 good for the life of the process. webcore stores the token *and* the path and
 tries them in that order: the token covers the editor-destroyed case (the
 `PcmStore` is still sitting on the processor), `loadAudioPath` covers the
-project-reload case. Every captured, picked or dropped recording is promoted to
-the owned `takes` directory first, so restore remains functional without granting
-an untrusted project-state blob permission to read arbitrary filesystem paths.
+project-reload case.
+
+Since v1.0 nothing is copied to make that second path work (see "Nothing is
+copied anywhere"), and the consequences are exact rather than hopeful:
+
+- a take opened from a file comes back by path, from the user's own file, because
+  the durable record of opened paths — not a copy in an app folder — is what
+  authorises it;
+- a capture or a byte-drop has no path by design. It comes back by TOKEN after an
+  editor recreation, which is the `silent` case above and the case that matters
+  daily; after a process restart it is gone unless the work was saved as a
+  `.riffsheet` (which embeds the recording) or exported.
+
+That second bullet is a product decision, not an oversight, and it is the one
+thing the UI must be truthful about: the state blob is capped JSON and has never
+been able to carry PCM.
 
 ---
 
@@ -1982,7 +2154,8 @@ is a truthful capability test rather than a call that might reject.
 
 `~/Library/Application Support/Riffsheet/` (`%APPDATA%\Riffsheet` on Windows,
 `~/.config/Riffsheet` on Linux). All of it is small, readable, and safe to
-delete while Riffsheet is not running.
+delete while Riffsheet is not running — with one exception, `takes/`, which holds
+audio older builds copied there and which existing documents may reference.
 
 | File | What it is |
 |---|---|
@@ -1991,6 +2164,8 @@ delete while Riffsheet is not running.
 | `queue/*.ticket` | one per waiter, named with the millisecond it arrived. Oldest goes next. A ticket whose process is gone, or whose heartbeat is over ten seconds old, is deleted by whoever notices. |
 | `servers.json` | every MuScriptor server Riffsheet started: server pid, port, the Riffsheet that owns it, and the model. |
 | `engine.json` | the two settings a Finder-launched DAW can actually read: `venv` (where MuScriptor was found) and `selectedEngine` (`'auto'` or an engine id, written by `selectEngine`). Hand-editable; each writer preserves the other's key. |
+| `opened-files.json` | every audio path this user has chosen in Riffsheet, newest first, capped at 64. It is what makes `loadAudioPath` able to reopen a file in a later process, and since v1.0 it is the ONLY thing that does — nothing is copied any more. |
+| `takes/` | **nothing is written here any more** (v1.0). Copies made by older builds are left exactly as they are: they are user data, and documents and DAW projects reference them by path, so the directory stays readable and `loadAudioPath` still accepts it. |
 
 **The orphan-server fix.** Riffsheet used to kill only the child it started, and
 only on a clean shutdown — so a force-quit left a server running with 1.5 GB and

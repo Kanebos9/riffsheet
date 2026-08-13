@@ -39,6 +39,8 @@ import type {
   OriginalAudio,
   PickedInputFile,
   PlaybackState,
+  SessionRestore,
+  SessionRestoreMode,
   TranscribeOptions,
   TranscribeProgress,
   TranscribeResult
@@ -154,7 +156,12 @@ function onEvent(name: string, handler: (payload: never) => void): () => void {
 
 interface ShellAudioRef {
   token: string;
+  /** A DURABLE path or "". The shell copies nothing now, so a capture, a dropped file and
+      the audio inside an opened document all report "" — see AudioFileRef.path. */
   path: string;
+  /** Absent on shells older than the no-copy change; see `toAudioFileRef` for the fallback. */
+  sessionOnly?: boolean;
+  identity?: string;
   name: string;
   sampleRate: number;
   numFrames: number;
@@ -601,7 +608,19 @@ function toAudioFileRef(ref: ShellAudioRef): AudioFileRef {
     sampleRate: ref.sampleRate,
     token: ref.token,
     pcmUrl: ref.pcmUrl,
-    numFrames: ref.numFrames
+    numFrames: ref.numFrames,
+    // Both defaulted from the path rather than trusted, because a shell older than the
+    // no-copy change sends neither: on that shell every take had been copied somewhere
+    // durable, so "there is a path" and "it will still be there" were the same fact.
+    sessionOnly: typeof ref.sessionOnly === 'boolean' ? ref.sessionOnly : !ref.path,
+    identity:
+      typeof ref.identity === 'string' && ref.identity.length > 0
+        ? ref.identity
+        : ref.path
+          ? `file:${ref.path}`
+          : ref.token
+            ? `session:${ref.token}`
+            : undefined
   };
 }
 
@@ -1422,6 +1441,31 @@ export function createJuceBridge(): NativeBridge {
     setPersistedState: hasNativeFunction('setPersistedState')
       ? async (json: string): Promise<void> => {
           await call('setPersistedState', json);
+        }
+      : undefined,
+
+    // The blob AND its provenance, in one call the boot awaits before it draws anything.
+    // Gated like every other optional call — and here the gate is what a caller reads as
+    // "this shell cannot tell a recreated editor from a reopened project", which is a real
+    // answer: fall back to getPersistedState and ask, exactly as before.
+    //
+    // The mode is validated rather than trusted. A shell that grew a fourth word must not be
+    // able to turn a restore into `undefined` on this side; anything unrecognised means the
+    // conservative branch, which is asking.
+    getSessionRestore: hasNativeFunction('getSessionRestore')
+      ? async (): Promise<SessionRestore> => {
+          const result = await call<{ state?: string | null; restoreMode?: string }>(
+            'getSessionRestore'
+          ).catch(() => null);
+          const state =
+            typeof result?.state === 'string' && result.state.length > 0 ? result.state : null;
+          const mode = result?.restoreMode;
+          const restoreMode: SessionRestoreMode =
+            mode === 'silent' || mode === 'ask' || mode === 'none' ? mode : 'ask';
+          // "Restore silently" with nothing to restore is not a state the caller should have
+          // to handle; neither is "there is nothing here" with a blob in hand.
+          if (!state) return { state: null, restoreMode: 'none' };
+          return { state, restoreMode: restoreMode === 'none' ? 'ask' : restoreMode };
         }
       : undefined
   };

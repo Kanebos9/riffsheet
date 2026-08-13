@@ -566,28 +566,14 @@ RiffsheetAudioProcessor::CaptureResult RiffsheetAudioProcessor::captureStop()
     return result;
 }
 
-bool RiffsheetAudioProcessor::persistCapturedTake (CaptureResult& result)
-{
-    if (! result.ok || result.entry == nullptr)
-    {
-        result.ok = false;
-        if (result.error.isEmpty())
-            result.error = "there is no captured audio to save";
-        return false;
-    }
-
-    juce::String error;
-    result.path = pcmStore.persistTake (result.entry->token, error, 24);
-
-    if (! result.path.existsAsFile())
-    {
-        result.ok = false;
-        result.error = error.isNotEmpty() ? error : "could not save the captured audio";
-        return false;
-    }
-
-    return true;
-}
+/* persistCapturedTake() USED TO LIVE HERE. It wrote the take to a durable WAV in
+   <Application Support>/Riffsheet/takes before the bridge would answer
+   captureStop(), which is what turned every recorded take - including the ones
+   the player listened to once and threw away - into a file kept for ever. The
+   samples now stay in the PcmStore entry captureStop() returns; see
+   NativeBridge::fnCaptureStop for what the page is told about that, and
+   PcmStore::getOriginalFileBytes for how a capture is still embedded, at full
+   depth, when a document is actually saved. */
 
 RiffsheetAudioProcessor::HostInfo RiffsheetAudioProcessor::getHostInfo() const
 {
@@ -628,7 +614,26 @@ bool RiffsheetAudioProcessor::setPersistedWebState (const juce::String& json)
 //==============================================================================
 juce::AudioProcessorEditor* RiffsheetAudioProcessor::createEditor()
 {
+    // Counted, and deliberately NOT a reset of hostStateLoadedSinceEditor: a host
+    // that loads a project and then opens the window does both in that order, and
+    // clearing the fact here would turn the one case that must ask into the case
+    // that restores in silence.
+    ++editorGeneration;
     return new RiffsheetAudioProcessorEditor (*this);
+}
+
+RiffsheetAudioProcessor::RestoreMode RiffsheetAudioProcessor::consumeRestoreMode()
+{
+    // Consumed unconditionally, including when there is nothing to restore: a
+    // host that loaded an EMPTY state has still "loaded state", and leaving that
+    // fact set would make the next editor recreation - which is the silent case -
+    // ask a question about work the user never lost.
+    const auto hostLoaded = hostStateLoadedSinceEditor.exchange (false);
+
+    if (getPersistedWebState().isEmpty())
+        return RestoreMode::none;
+
+    return hostLoaded ? RestoreMode::ask : RestoreMode::silent;
 }
 
 void RiffsheetAudioProcessor::handleAsyncUpdate()
@@ -682,6 +687,13 @@ void RiffsheetAudioProcessor::setStateInformation (const void* data, int sizeInB
     // this slot; that stale state would be exactly what the refresh saves back.
     if (! setPersistedWebState (restoredWebState))
         setPersistedWebState ({});
+
+    // THE FACT THAT MAKES SILENT RESTORE SAFE. Everything else about this state
+    // is indistinguishable from state the page itself parked here a moment ago;
+    // this says it arrived from outside - a project, a preset, a duplicated
+    // instance, a host undo - and is therefore the one case that asks. Set before
+    // the refresh below, so the page that reboots reads it. See RestoreMode.
+    hostStateLoadedSinceEditor = true;
 
     // A host may load a project/preset while the editor remains open. The page
     // currently on screen still contains the previous instance state and would

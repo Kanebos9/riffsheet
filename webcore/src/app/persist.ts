@@ -34,6 +34,7 @@ import type { NativeBridge } from '../bridge';
 // From `bridge/types` directly rather than the barrel: the barrel pulls in the JUCE and mock
 // bridges, and this module is loaded by the headless test scripts too.
 import { RIFFSHEET_LIMITS } from '../bridge/types';
+import type { SessionRestoreMode } from '../bridge/types';
 import type { TrimResult } from '../audio/trim';
 import type { AppSettings, HostGrid, SourceAudio } from './state';
 import { cleanPartName, MAX_SCORE_PARTS, type ImportedPart } from '../score/parts';
@@ -1371,33 +1372,99 @@ export function hasRestorableTake(session: PersistedSession | null): boolean {
  *
  * Writes are debounced and fire-and-forget. Nothing in the UI may ever wait on a save — the
  * save exists so the user does not lose work, not so they can watch it happen.
+ *
+ * TWO SPEEDS, AND THE DIFFERENCE MATTERS. A debounce assumes there will be a later moment to
+ * write in. In a DAW there may not be: the editor is destroyed without warning and without a
+ * chance to finish anything, so an edit made 200 ms before the user clicks another FX would be
+ * inside the window and simply lost — the restore then puts back a document one edit out of
+ * date, which is worse than not restoring at all because nothing says so. Discrete, committed
+ * edits therefore go out immediately (`saveNow`); only continuous gestures — a fader being
+ * dragged, a note being moved — keep the debounce, because those genuinely do produce a
+ * hundred intermediate states nobody needs written down.
  */
 export class SessionStore {
   private timer: number | undefined;
   private pending: PersistedSession | null = null;
   private inFlight: Promise<void> = Promise.resolve();
   private warned = false;
+  /** When the last immediate write went out. See `saveNow`'s coalescing window. */
+  private lastImmediateAt = 0;
 
   constructor(
     private bridge: NativeBridge,
-    private debounceMs = 700
-  ) {}
+    private debounceMs = 700,
+    /**
+     * The floor between two immediate writes.
+     *
+     * `saveNow` is called on edit COMMIT, and a commit can repeat as fast as a held key: a
+     * bridge round trip per keystroke would be a message-thread call per keystroke inside the
+     * DAW. So a second immediate write inside this window degrades to a debounce of exactly
+     * this length — still an order of magnitude tighter than 700 ms, and still bounded.
+     */
+    private immediateGapMs = 120
+  ) {
+    this.installTeardownFlush();
+  }
 
   get canSave(): boolean {
     return typeof this.bridge.setPersistedState === 'function';
   }
 
   get canLoad(): boolean {
-    return typeof this.bridge.getPersistedState === 'function';
+    return typeof this.bridge.getPersistedState === 'function' ||
+      typeof this.bridge.getSessionRestore === 'function';
   }
 
+  /**
+   * The blob and nothing else — for a caller that has already decided what to do with it.
+   *
+   * `loadRestore()` is the one a boot should use. This stays because "read the state" and
+   * "read the state AND its provenance" are different questions, and because the provenance
+   * half is one-shot: a second reader must not be able to consume the answer the boot needs.
+   */
   async load(): Promise<PersistedSession | null> {
-    if (!this.bridge.getPersistedState) return null;
     try {
-      return readSession(await this.bridge.getPersistedState());
+      if (this.bridge.getPersistedState) {
+        return readSession(await this.bridge.getPersistedState());
+      }
+      // A host that offers only the newer call. Reading through it costs the provenance,
+      // which is why this is the fallback and not the first choice.
+      if (this.bridge.getSessionRestore) {
+        return readSession((await this.bridge.getSessionRestore()).state);
+      }
+      return null;
     } catch (e) {
       console.warn('[riffsheet] could not read the stored session', e);
       return null;
+    }
+  }
+
+  /**
+   * The blob AND what the host says should be done with it.
+   *
+   * THE CALL A BOOT SHOULD AWAIT BEFORE IT DRAWS. `mode` is 'silent' when this is the same
+   * process putting back an editor it just destroyed — restore it and show no menu and no
+   * question; 'ask' when the state arrived from outside (a project load, a preset, a
+   * duplicated instance); 'none' when there is nothing. See bridge/types.ts SessionRestore.
+   *
+   * Falls back on a host that cannot tell those apart — a browser tab, an older shell — to
+   * "there is a blob, ask about it", which is the behaviour that has always existed.
+   */
+  async loadRestore(): Promise<{ session: PersistedSession | null; mode: SessionRestoreMode }> {
+    try {
+      if (this.bridge.getSessionRestore) {
+        const answer = await this.bridge.getSessionRestore();
+        const session = readSession(answer.state);
+        // A blob that will not parse is not a session, whatever the host thinks of its
+        // provenance: there is nothing to restore silently or to ask about.
+        if (!session) return { session: null, mode: 'none' };
+        return { session, mode: answer.restoreMode === 'none' ? 'ask' : answer.restoreMode };
+      }
+      const session = await this.load();
+      return { session, mode: session ? 'ask' : 'none' };
+    } catch (e) {
+      console.warn('[riffsheet] could not read the stored session', e);
+      return { session: null, mode: 'none' };
     }
   }
 
@@ -1407,6 +1474,36 @@ export class SessionStore {
     this.pending = session;
     if (this.timer !== undefined) clearTimeout(this.timer);
     this.timer = window.setTimeout(() => void this.flush(), this.debounceMs);
+  }
+
+  /**
+   * Write now — for an edit the user has COMMITTED.
+   *
+   * Not a faster `save()`: a different promise. `save()` says "this will be written soon
+   * enough"; this says "if the editor dies in the next instant, this edit must still be
+   * there". Use it where a discrete change lands — a note added, deleted or retimed, a bar
+   * inserted, an undo, a redo, a take opened or closed — and keep `save()` for the states a
+   * gesture passes THROUGH on its way to one of those.
+   *
+   * Bounded, so "on commit" cannot become "on every frame of a held key": a second immediate
+   * write inside `immediateGapMs` becomes a short debounce instead of a second round trip.
+   * Returns the write's promise so a caller that genuinely must wait (teardown) can.
+   */
+  saveNow(session: PersistedSession): Promise<void> {
+    if (!this.canSave) return Promise.resolve();
+    this.pending = session;
+
+    const now = Date.now();
+    const since = now - this.lastImmediateAt;
+
+    if (since < this.immediateGapMs) {
+      if (this.timer !== undefined) clearTimeout(this.timer);
+      this.timer = window.setTimeout(() => void this.flush(), this.immediateGapMs - since);
+      return this.inFlight;
+    }
+
+    this.lastImmediateAt = now;
+    return this.flush();
   }
 
   /** Write whatever is queued right now. Resolves once it has actually been handed over. */
@@ -1435,6 +1532,55 @@ export class SessionStore {
       }
     });
     return this.inFlight;
+  }
+
+  /**
+   * The last chance: write anything still queued before this page stops existing.
+   *
+   * WHAT IT CAN AND CANNOT DO. It catches the ordinary endings — the tab closing, the window
+   * being hidden, a page refresh (which is exactly what the shell does to a live editor when
+   * the host loads a project). It cannot catch a plugin editor being destroyed underneath us:
+   * the host frees the WebView synchronously and there is no event, in any browser engine,
+   * that a page can complete an asynchronous bridge call from. That is precisely why discrete
+   * edits do not rely on this at all and go out through `saveNow()` when they are committed;
+   * this exists so a continuous gesture that ended a moment ago is not lost as well.
+   *
+   * Installed by the constructor rather than left to a caller: the one thing this must not
+   * depend on is somebody remembering to switch it on. Returns nothing; `dispose()` removes it.
+   */
+  private installTeardownFlush(): void {
+    if (typeof window === 'undefined' || typeof document === 'undefined') return;
+
+    const flush = () => void this.flush();
+    // Three, because no single one of them fires everywhere. `pagehide` is the reliable one in
+    // WebKit (WKWebView included), `beforeunload` covers a refresh, and `visibilitychange` is
+    // the only one that fires when a window is hidden without being unloaded — which in a DAW
+    // is most of the endings that matter.
+    const onHidden = () => {
+      if (document.visibilityState === 'hidden') flush();
+    };
+
+    window.addEventListener('pagehide', flush);
+    window.addEventListener('beforeunload', flush);
+    document.addEventListener('visibilitychange', onHidden);
+
+    this.removeTeardownFlush = () => {
+      window.removeEventListener('pagehide', flush);
+      window.removeEventListener('beforeunload', flush);
+      document.removeEventListener('visibilitychange', onHidden);
+      this.removeTeardownFlush = undefined;
+    };
+  }
+
+  private removeTeardownFlush: (() => void) | undefined;
+
+  /** Stop listening for teardown. For a test, or a store being replaced. */
+  dispose(): void {
+    this.removeTeardownFlush?.();
+    if (this.timer !== undefined) {
+      clearTimeout(this.timer);
+      this.timer = undefined;
+    }
   }
 
   /** Deliberately close the current work and remove the host-owned recovery copy. */

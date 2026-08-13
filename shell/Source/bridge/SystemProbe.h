@@ -37,10 +37,14 @@ namespace SystemProbe
 
     /** <appSupportDirectory>/takes (created if missing).
 
-        Captured audio and browser-provided audio without a stable native path
-        are written here as real 24-bit WAVs. These are durable user data that
-        survive a closed project or reboot and are never temp cleanup targets.
-        See PcmStore::persistTake(). */
+        NOTHING IS WRITTEN HERE ANY MORE. Riffsheet used to copy every capture,
+        every drop and every opened file into this folder as a dated 24-bit WAV;
+        that is what filled it with duplicates and is gone (see PcmStore.cpp,
+        where persistTake() used to be). The directory itself stays, and stays
+        readable: existing documents and DAW projects reference files inside it
+        by path, and NativeBridge::isAuthorizedAudioPath() still accepts it so
+        those keep opening. Its contents are user data - never a cleanup
+        target. */
     juce::File takesDirectory();
 
     //== processes =============================================================

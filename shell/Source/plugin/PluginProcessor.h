@@ -239,20 +239,18 @@ public:
     {
         bool ok = false;
         juce::String error;
+        /** THE WHOLE TAKE, and the only copy of it. A capture is not written to
+            disk any more (see PcmStore.cpp where persistTake() used to be): the
+            samples live in this entry, the entry lives in the store, and the
+            store lives on the processor - so the recording survives the editor
+            being destroyed and does NOT survive the process ending. */
         std::shared_ptr<const PcmStore::Entry> entry;
-        /** Durable WAV written under SystemProbe::takesDirectory(). Empty until
-            persistCapturedTake() completes on the bridge worker. */
-        juce::File path;
         juce::var context;      // host timeline; see TrackCapture::buildContext
         bool hitLimit = false;
     };
 
     bool captureStart (bool armToTransport, double maxSeconds, juce::String& error);
     CaptureResult captureStop();
-    /** Finish a capture by writing its durable WAV. Safe on a worker thread;
-        deliberately separate from captureStop() so the DAW message thread is
-        never blocked writing a several-minute take. */
-    bool persistCapturedTake (CaptureResult& result);
     TrackCapture& getCapture() noexcept { return capture; }
 
     //==============================================================================
@@ -287,6 +285,45 @@ public:
     /** 8 MB. A riff's notes, peaks and edit log come to a few tens of KB; the cap
         exists to catch a bug, not to constrain honest use. */
     static constexpr int maxPersistedWebStateBytes = 8 * 1024 * 1024;
+
+    //==============================================================================
+    /** What a page that has just booted should DO with the blob above.
+
+        THE BLOB ALONE CANNOT SAY. "There is state" is true in three situations
+        that want three different answers, and the state is byte-identical in all
+        three:
+
+          - the same processor made a new editor (REAPER: you clicked another FX
+            and came back) - the work never went anywhere and must simply be back
+            on screen, instantly and without a question;
+          - a project or preset was just loaded into this instance - genuinely
+            new work arriving, and asking once is right;
+          - a fresh instance with nothing behind it - the opening screen.
+
+        So provenance is kept here, NOT in the blob: a flag written into the
+        serialized state would itself be restored into case two and turn it into
+        case one forever after. Both facts below are deliberately absent from
+        getStateInformation().  */
+    enum class RestoreMode
+    {
+        none,     ///< nothing worth restoring; show the opening screen
+        silent,   ///< same process, new editor: put the work straight back
+        ask       ///< host-loaded state: ask once before taking it over
+    };
+
+    /** The mode for the page booting RIGHT NOW, consuming the one-shot
+        "host loaded state since the last editor" fact as it goes.
+
+        Consumed on read rather than on editor creation because a host may load a
+        preset while the editor is open: that path refreshes the page without
+        making a new editor, and the refreshed page is exactly the one that has to
+        be asked. Message thread (it is a bridge call), but safe anywhere. */
+    RestoreMode consumeRestoreMode();
+
+    /** How many editors this processor has made. 1 is the first. Diagnostic - the
+        restore decision is `consumeRestoreMode()`'s, not a comparison on this -
+        but it is what makes "the editor was recreated" visible in a log. */
+    int getEditorGeneration() const noexcept { return editorGeneration.load(); }
 
 private:
     /** setStateInformation() may be called off the message thread. Defer the
@@ -361,6 +398,15 @@ private:
     // it takes a lock like everything else shared across threads here.
     mutable juce::CriticalSection webStateLock;
     juce::String persistedWebState;
+
+    // --- restore provenance. NEVER SERIALIZED. See RestoreMode. --------------
+    //
+    // Both are facts about THIS PROCESS's history, and both must die with it:
+    // written into the project file they would describe the machine that saved
+    // it rather than the one opening it, and the silent path would then swallow
+    // the one prompt a genuinely reopened project is supposed to show.
+    std::atomic<int>  editorGeneration { 0 };
+    std::atomic<bool> hostStateLoadedSinceEditor { false };
 
     // --- host playhead snapshot ---------------------------------------------
     mutable juce::CriticalSection hostInfoLock;

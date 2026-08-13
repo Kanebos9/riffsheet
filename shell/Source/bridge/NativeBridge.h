@@ -75,6 +75,7 @@ private:
     void fnLog               (const juce::Array<juce::var>&, Completion);
     void fnGetPersistedState (const juce::Array<juce::var>&, Completion);
     void fnSetPersistedState (const juce::Array<juce::var>&, Completion);
+    void fnGetSessionRestore (const juce::Array<juce::var>&, Completion);
     void fnEngineStatus      (const juce::Array<juce::var>&, Completion);
     void fnRecheckEngine     (const juce::Array<juce::var>&, Completion);
     void fnListEngines       (const juce::Array<juce::var>&, Completion);
@@ -94,21 +95,21 @@ private:
     void fnOpenExternal      (const juce::Array<juce::var>&, Completion);
 
     // --- helpers -------------------------------------------------------------
-    /** `fileIsOurTemp` marks browser-provided bytes staged by the shell. They
-        are promoted to durable app-support audio before the reply; the staging
-        file remains entry-owned and is removed when the entry dies. */
+    /** `fileIsOurTemp` marks browser-provided bytes staged by the shell. The
+        staging file remains entry-owned and is removed when the entry dies -
+        which is now the whole of its life story: nothing is copied into the
+        takes folder any more, and such a take is reported to the page as
+        session-only (see describeEntry). */
     void decodeAndReply (const juce::File& file, double targetRate, Completion completion,
-                         bool fileIsOurTemp = false, juce::String displayNameOverride = {},
-                         bool forceOwnedCopy = false);
+                         bool fileIsOurTemp = false, juce::String displayNameOverride = {});
 
     /** Bytes in, AudioRef out: stages base64 audio under a unique name in the
         system temp directory and hands it to decodeAndReply() as our own temp.
 
-        The staging file is never in a user folder and never outlives the take -
-        decodeAndReply() promotes the decoded audio to durable app-support
-        storage, and the staging file stays entry-owned so ~PcmStore::Entry
-        deletes it. Shared by importDroppedFile() and loadAudioBytes() so the
-        two cannot drift; `stageTag` only distinguishes them in /tmp listings.
+        The staging file is never in a user folder and never outlives the take:
+        it stays entry-owned so ~PcmStore::Entry deletes it. Shared by
+        importDroppedFile() and loadAudioBytes() so the two cannot drift;
+        `stageTag` only distinguishes them in /tmp listings.
 
         Everything happens on `workers`, never on the caller's thread: the
         decode and the write both scale with the payload, and this is reached

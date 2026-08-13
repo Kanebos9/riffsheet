@@ -4,7 +4,20 @@
 # earlier JUCE project by the same author on the same toolchain; where that
 # matters, the comment below says so.
 cmake_minimum_required(VERSION 3.22)
-project(Riffsheet VERSION 0.1.0)
+project(Riffsheet VERSION 1.0.0)
+
+# TWO VERSION STRINGS, ONE SOURCE. The plugin formats demand x.y.z - VST3 and AU
+# both encode a three-part number and JUCE writes PROJECT_VERSION straight into
+# the bundle - but the product is versioned one-dot from 1.0 onwards, so every
+# surface a PLAYER reads says "v1.0" and never "v1.0.0". Derived here rather than
+# typed twice: bumping project(... VERSION ...) above is the only edit a release
+# needs, and the two can never disagree.
+#
+# Who prints which: getAppVersion() (the brand block, About) answers with the
+# display form; getShellInfo().version and the state blob's "version" property
+# keep the full x.y.z, because those are build identity for diagnostics and
+# compatibility, not something anyone reads as the product's name.
+set(RIFFSHEET_VERSION_DISPLAY "${PROJECT_VERSION_MAJOR}.${PROJECT_VERSION_MINOR}")
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -413,6 +426,7 @@ target_compile_definitions(Riffsheet PUBLIC
     JUCE_VST3_CAN_REPLACE_VST2=0
     JUCE_MODAL_LOOPS_PERMITTED=0
     RIFFSHEET_VERSION="${PROJECT_VERSION}"
+    RIFFSHEET_VERSION_DISPLAY="${RIFFSHEET_VERSION_DISPLAY}"
 )
 
 # NEEDS_WEBVIEW2 above finds and links WebView2LoaderStatic.lib, but JUCE keeps

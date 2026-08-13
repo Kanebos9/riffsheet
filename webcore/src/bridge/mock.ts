@@ -23,6 +23,7 @@ import type {
   NativeBridge,
   OriginalAudio,
   PlaybackState,
+  SessionRestore,
   TranscribeOptions,
   TranscribeProgress,
   TranscribeResult
@@ -1376,6 +1377,20 @@ export function createMockBridge(options: MockOptions = {}): NativeBridge {
       } catch {
         /* quota or private browsing — the session just does not persist */
       }
+    },
+
+    /**
+     * A browser tab is ALWAYS the "ask" case, and that is not a limitation being papered over.
+     *
+     * The silent branch means "this process still holds the work you were looking at a moment
+     * ago" — a plugin editor destroyed and remade inside a live DAW. A reloaded tab is the
+     * other thing entirely: a new process reading a blob out of localStorage, which is the
+     * project-reopened case, and the case that has always asked. So the mock answers honestly
+     * rather than making dev feel better than the product.
+     */
+    async getSessionRestore(): Promise<SessionRestore> {
+      const state = await this.getPersistedState!();
+      return { state, restoreMode: state ? 'ask' : 'none' };
     }
   };
 }

@@ -1,6 +1,6 @@
 {
   "name": "riffsheet-webcore",
-  "version": "0.1.0",
+  "version": "1.0.0",
   "private": true,
   "license": "AGPL-3.0-only",
   "type": "module",
@@ -21,8 +21,9 @@
     "test:parts": "node scripts/run-ts-tests.mjs scripts/parts-test.ts",
     "test:gesture": "node scripts/run-ts-tests.mjs scripts/gesture-test.ts",
     "test:edit-units": "node scripts/run-ts-tests.mjs src/edit/cuts.test.ts src/edit/editBrain.test.ts src/edit/performanceEdit.test.ts",
+    "test:ui-units": "node scripts/run-ts-tests.mjs src/ui/theme.test.ts",
     "probe:sheet-edit": "node scripts/sheet-edit-probe.mjs",
-    "test:regressions": "node scripts/run-ts-tests.mjs scripts/midi-import-test.ts scripts/grand-staff-test.ts scripts/sampler-loop-test.ts scripts/transport-clock-test.ts scripts/roll-snap-test.ts scripts/riffsheet-doc-test.ts scripts/view-units-test.ts scripts/parts-test.ts scripts/gesture-test.ts",
+    "test:regressions": "node scripts/run-ts-tests.mjs scripts/midi-import-test.ts scripts/grand-staff-test.ts scripts/sampler-loop-test.ts scripts/transport-clock-test.ts scripts/roll-snap-test.ts scripts/riffsheet-doc-test.ts scripts/view-units-test.ts scripts/parts-test.ts scripts/gesture-test.ts src/ui/theme.test.ts",
     "build:debug": "RIFFSHEET_SOURCEMAP=1 vite build"
   },
   "dependencies": {

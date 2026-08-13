@@ -69,7 +69,12 @@ public:
     struct Entry
     {
         juce::String token;
-        juce::File   sourceFile;      // durable for captures/imports after persistTake()
+        /** A file this audio can be re-read from, or nothing.
+            THE USER'S OWN FILE when they opened one; a temp WAV this entry owns
+            when the audio arrived as bytes or was rendered for an engine upload;
+            EMPTY for a track capture, which now lives only in `mono` (see the
+            note where persistTake() used to be in the .cpp). */
+        juce::File   sourceFile;
 
         /** True when `sourceFile` is a temp file WE wrote (a capture rendered by
             ensureSourceFile, or a dropped file staged by importDroppedFile) and
@@ -85,33 +90,38 @@ public:
         /** THE RECORDING THE USER ACTUALLY GAVE US, byte for byte, when we still
             have it - which is NOT the same file as `sourceFile`.
 
-            WHY THE TWO ARE DIFFERENT NOW. `sourceFile` is "a file on disk this
-            entry can be re-read from", and `persistTake()` deliberately
-            overwrites it with a take of our own making: the picker path calls it
-            with forceOwnedCopy, which used to re-encode the DOWNMIXED, RESAMPLED
-            analysis buffer as a 24-bit mono WAV and point `sourceFile` at that.
-            From that moment nothing native knew where the user's file was, the
-            page had no bytes of its own, and saving a document therefore
-            embedded a 16-bit mono re-encode of a resampled mono mixdown while
-            the format's own documentation promised the imported file "copied
-            verbatim". A 24-bit/96 kHz stereo master became 16-bit/44.1 kHz mono
-            inside a `.riffsheet`, silently.
+            WHY THE TWO ARE DIFFERENT. `sourceFile` is "a file on disk this entry
+            can be re-read from" and may be something WE wrote: a temp WAV
+            rendered so an engine had a file to upload. The since-deleted
+            persistTake() went further and pointed it at a 24-bit mono re-encode
+            of the DOWNMIXED, RESAMPLED analysis buffer, from which moment nothing
+            native knew where the user's file was - so a `.riffsheet` promising
+            the imported file "copied verbatim" embedded a mono 44.1 kHz
+            re-encode of a 96 kHz stereo master, silently.
 
             So this field is kept separately and is never pointed at anything
             derived. It is the file the ORIGINAL BYTES are in - the user's own
-            file, or an untouched copy of it in the takes folder - and it is what
-            /native/source/<token> serves to the page at save time. Empty when
-            there is no such file (a track capture never had one). */
+            file - and it is what /native/source/<token> serves to the page at
+            save time.
+
+            EMPTY FOR A TRACK CAPTURE, which never had a file and no longer gets
+            one. That case is not "no original": the capture buffer in `mono` IS
+            the recording, at the rate it was recorded at, and getOriginalInfo() /
+            getOriginalFileBytes() answer for it by encoding that buffer on
+            demand. Empty AND no samples is the only genuinely absent case. */
         juce::File   originalFile;
 
         /** True when `originalFile` holds the authoritative recording rather
             than something derived from the analysis buffer.
 
             False - and this is the honest case, not a failure - when all that
-            survives is a re-encode: a capture that has been rendered to WAV, or
-            an original too large to keep a copy of. The page shows different
-            words and embeds different bytes depending on this, which is the
-            whole point: "verbatim" has to be a fact, not a hope. */
+            survives is a re-encode, or an original too large to keep. The page
+            shows different words and embeds different bytes depending on this,
+            which is the whole point: "verbatim" has to be a fact, not a hope.
+
+            A capture does not consult this field at all: it has no
+            `originalFile`, and getOriginalInfo() answers for it from `mono`,
+            which is the recording itself. */
         bool         originalIsVerbatim = false;
 
         juce::String displayName;
@@ -202,34 +212,28 @@ public:
         must keep a shared_ptr (see get()) for as long as the path is in use. */
     juce::File ensureSourceFile (const juce::String& token, juce::String& error);
 
-    /** Writes decoded audio to <Application Support>/Riffsheet/takes as a
-        durable WAV and makes it this entry's source file. Used for captures
-        and for browser-provided audio whose only native path was staging data.
-
-        The write goes to a UUID-named partial in the same directory and is
-        renamed only after the WAV header has been flushed, so a crash cannot
-        leave a half-written file at the path persisted in a DAW project. The
-        returned file is NEVER owned or deleted by the Entry. `bitsPerSample`
-        is restricted to 16 or 24; durable user audio uses 24.
-
-        `forceOwnedCopy` also copies a readable external source. Picker/import
-        paths use this before persisting AudioRef.path, so an untrusted DAW state
-        never needs authority to reopen an arbitrary filesystem path. */
-    juce::File persistTake (const juce::String& token,
-                            juce::String& error,
-                            int bitsPerSample = 24,
-                            bool forceOwnedCopy = false);
+    /* persistTake() is GONE. Nothing copies audio into
+       <Application Support>/Riffsheet/takes any more - not a capture, not a
+       dropped file, not an opened one. See the block where it used to be in
+       PcmStore.cpp for what each of those paths does instead, and why the old
+       copies already in that folder are left exactly where they are. */
 
     /** Raw bytes for the /native/pcm/<token>.f32 route, or nullopt. */
     std::optional<std::vector<std::byte>> getRawFloatBytes (const juce::String& token) const;
 
     /** What the page needs in order to talk about the original recording without
         reading it: whether one survives, how big it is and what it is called.
-        Cheap - one stat. */
+        Cheap - one stat, or for a capture one multiplication (there is no file to
+        stat; the recording is the buffer, and `bytes` is what encoding it would
+        cost). */
     struct OriginalInfo
     {
-        bool available = false;      // there is a file and it is within the limit
-        bool verbatim = false;       // ...and it is the user's own bytes, not a re-encode
+        // "there is one, and it fits" - a file within the limit, or a capture
+        // whose buffer would encode to something within it.
+        bool available = false;
+        // ...and it is the recording itself, not something derived from the
+        // analysis buffer: the user's own bytes, or a capture's own samples.
+        bool verbatim = false;
         juce::int64 bytes = 0;
         juce::String name;           // with its real extension: "riff.flac", not "riff.wav"
     };
@@ -273,9 +277,9 @@ private:
 
     mutable juce::CriticalSection lock;
 
-    /** Serialises source-file creation/promotion. Audio samples are immutable,
-        but `ensureSourceFile()` and `persistTake()` may run on worker threads
-        and must not race while changing the file behind an entry. */
+    /** Serialises source-file creation. Audio samples are immutable, but
+        `ensureSourceFile()` may run on worker threads and must not race while
+        changing the file behind an entry. */
     juce::CriticalSection sourceFileLock;
 
     // An INDEX, not an owner - see the LIFETIME note above. Mutable because

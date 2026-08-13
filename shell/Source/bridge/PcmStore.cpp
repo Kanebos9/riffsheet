@@ -264,9 +264,9 @@ std::shared_ptr<const PcmStore::Entry> PcmStore::decodeAndStore (const juce::Fil
         auto entry = std::make_shared<Entry>();
         entry->sourceFile       = file;
         // The bytes we decoded ARE the original, whatever happens to
-        // `sourceFile` later. See the field's comment: persistTake() is allowed
-        // to repoint sourceFile at a take of our own making, and before this
-        // line existed that was the moment the user's real recording became
+        // `sourceFile` later. See the field's comment: `sourceFile` may end up
+        // pointing at a temp WAV we rendered for an engine upload, and before
+        // this line existed that was the moment the user's real recording became
         // unreachable to everything above.
         entry->originalFile     = file;
         entry->originalIsVerbatim = true;
@@ -414,191 +414,30 @@ juce::File PcmStore::ensureSourceFile (const juce::String& token, juce::String& 
     return temp;
 }
 
-juce::File PcmStore::persistTake (const juce::String& token,
-                                  juce::String& error,
-                                  int bitsPerSample,
-                                  bool forceOwnedCopy)
-{
-    const juce::ScopedLock sourceSl (sourceFileLock);
+/* persistTake() USED TO LIVE HERE, and its removal is the point of E2.
 
-    if (bitsPerSample != 16 && bitsPerSample != 24)
-    {
-        error = "capture WAV depth must be 16 or 24 bits";
-        return {};
-    }
+   It wrote every capture, every dropped file and every opened file into
+   <Application Support>/Riffsheet/takes as a dated, UUID-stamped copy, so that
+   `sourceFile` was always a path this application owned. That is what filled the
+   folder with duplicates of recordings the user already had - one more copy per
+   open of the same file - and put those copies in Recents under names like
+   "2.wav-20260812-<uuid>.wav".
 
-    std::shared_ptr<Entry> entry;
+   What replaced it, path by path:
+     - an opened file keeps ITS OWN path. Reopening it later is authorised by
+       NativeBridge's remembered-paths record, which outlives the process and was
+       already the mechanism that made a picked file reopenable;
+     - a capture keeps nothing on disk at all. Its samples live in this entry for
+       as long as the process does, and a document save renders them through
+       getOriginalFileBytes();
+     - bytes handed over by the browser (a drop, or the audio inside a .riffsheet)
+       keep the staged temp file they were decoded from, which the entry owns and
+       deletes with itself.
 
-    {
-        const juce::ScopedLock sl (lock);
-        const auto it = entries.find (token);
+   Old copies already in the takes folder are NOT touched: they are user data,
+   some DAW projects reference them by path, and isAuthorizedAudioPath() still
+   accepts that directory so those projects keep working. */
 
-        if (it != entries.end())
-            entry = it->second.lock();
-    }
-
-    if (entry == nullptr)
-    {
-        error = "unknown pcm token: " + token;
-        return {};
-    }
-
-    // Already durable. This also makes the operation idempotent if a native
-    // completion is retried after the write succeeded.
-    if (entry->sourceFile.existsAsFile() && ! entry->sourceFileIsTemp && ! forceOwnedCopy)
-        return entry->sourceFile;
-
-    if (entry->mono.getNumSamples() <= 0 || entry->sampleRate <= 0.0)
-    {
-        error = "the decoded audio is empty";
-        return {};
-    }
-
-    const auto directory = SystemProbe::takesDirectory();
-
-    if (! directory.isDirectory())
-    {
-        error = "could not create the Riffsheet takes folder at " + directory.getFullPathName();
-        return {};
-    }
-
-    const auto now = juce::Time::getCurrentTime();
-    const auto stamp = juce::String::formatted ("%04d%02d%02d-%02d%02d%02d",
-                                                now.getYear(), now.getMonth() + 1, now.getDayOfMonth(),
-                                                now.getHours(), now.getMinutes(), now.getSeconds());
-    auto stem = juce::File::createLegalFileName (entry->displayName).trim();
-    if (stem.isEmpty())
-        stem = "Riffsheet take";
-    stem = stem.substring (0, 64);
-
-    // UUID rather than getNonexistentChildFile(): multiple plugin instances can
-    // stop captures simultaneously, and check-then-create is a race.
-    const auto id = juce::Uuid().toString();
-
-    // ---- the verbatim route -------------------------------------------------
-    //
-    // COPY THE USER'S FILE, DO NOT RE-ENCODE IT. This branch is what makes the
-    // takes folder hold the recording rather than a photocopy of the analysis
-    // buffer. The old code always wrote `entry->mono` - already folded to mono
-    // and already resampled to 44.1 kHz - as a 24-bit WAV and pointed
-    // `sourceFile` at it, so a 24-bit/96 kHz stereo file was downgraded on the
-    // way in and everything downstream (the document's embedded audio, the
-    // "Original" side of the A/B fader, Export ▸ Audio) inherited the downgrade.
-    //
-    // The bytes are copied rather than merely referenced for the reason
-    // forceOwnedCopy exists at all: what gets persisted into a DAW project must
-    // be a path this application owns, so restoring a shared project never needs
-    // authority over an arbitrary place on the filesystem.
-    //
-    // Size-bounded, and the fallback below is not a failure: a source bigger
-    // than the shared import ceiling keeps the old re-encode, keeps
-    // `originalFile` pointing at wherever the user's own file is, and lets
-    // getOriginalInfo() report `available = false` so the page says what it did
-    // instead of claiming a fidelity it has not got.
-    if (forceOwnedCopy
-        && entry->originalIsVerbatim
-        && entry->originalFile.existsAsFile()
-        && ! entry->originalFile.isAChildOf (directory)
-        && entry->originalFile.getSize() > 0
-        && entry->originalFile.getSize() <= riffsheet::limits::containerBytes)
-    {
-        auto extension = entry->originalFile.getFileExtension();
-
-        if (extension.isEmpty())
-            extension = ".wav";
-
-        const auto verbatimTarget = directory.getChildFile (stem + "-" + stamp + "-" + id + extension);
-        const auto verbatimPartial = directory.getChildFile ("." + verbatimTarget.getFileName() + ".partial");
-
-        verbatimPartial.deleteFile();
-
-        // Copy-then-rename, the same crash rule the WAV writer below follows: a
-        // half-copied file must never appear at the path a project records.
-        if (entry->originalFile.copyFileTo (verbatimPartial)
-            && verbatimPartial.moveFileTo (verbatimTarget))
-        {
-            const juce::ScopedLock sl (lock);
-            entry->sourceFile = verbatimTarget;
-            entry->sourceFileIsTemp = false;
-            entry->originalFile = verbatimTarget;
-            entry->originalIsVerbatim = true;
-            return verbatimTarget;
-        }
-
-        verbatimPartial.deleteFile();
-        // Fall through and re-encode. A copy that failed on disk space is still
-        // better answered with a smaller derived take than with an error.
-    }
-
-    const auto target = directory.getChildFile (stem + "-" + stamp + "-" + id + ".wav");
-    const auto partial = directory.getChildFile ("." + target.getFileName() + ".partial");
-
-    partial.deleteFile();
-    auto stream = std::unique_ptr<juce::FileOutputStream> (partial.createOutputStream());
-
-    if (stream == nullptr || ! stream->openedOk())
-    {
-        error = "could not create " + partial.getFullPathName();
-        stream.reset();
-        partial.deleteFile();
-        return {};
-    }
-
-    stream->setPosition (0);
-    stream->truncate();
-
-    juce::WavAudioFormat wav;
-    std::unique_ptr<juce::AudioFormatWriter> writer (
-        wav.createWriterFor (stream.get(), entry->sampleRate, 1, bitsPerSample, {}, 0));
-
-    if (writer == nullptr)
-    {
-        error = "could not create a WAV writer for " + partial.getFullPathName();
-        stream.reset();
-        partial.deleteFile();
-        return {};
-    }
-
-    stream.release(); // writer owns and closes it
-    const auto wrote = writer->writeFromAudioSampleBuffer (entry->mono, 0, entry->mono.getNumSamples());
-    writer.reset(); // flush the WAV header before making the final path visible
-
-    if (! wrote)
-    {
-        error = "could not write " + partial.getFullPathName();
-        partial.deleteFile();
-        return {};
-    }
-
-    if (! partial.moveFileTo (target))
-    {
-        error = "could not finish the captured WAV at " + target.getFullPathName();
-        partial.deleteFile();
-        return {};
-    }
-
-    {
-        const juce::ScopedLock sl (lock);
-        entry->sourceFile = target;
-        // Durable takes may be referenced by saved projects months later. They
-        // are user data, never scratch owned by the in-memory entry.
-        entry->sourceFileIsTemp = false;
-
-        // A take that never had a file of its own - a track capture - has no
-        // earlier original to preserve, so THIS is its original: the recorded
-        // buffer written out whole, at 24 bits, neither downmixed nor resampled
-        // on the way. An entry that DOES have an original keeps pointing at it;
-        // this WAV is derived from the analysis buffer and must never be
-        // presented as the recording.
-        if (entry->originalFile == juce::File())
-        {
-            entry->originalFile = target;
-            entry->originalIsVerbatim = (bitsPerSample >= 24);
-        }
-    }
-
-    return target;
-}
 
 std::shared_ptr<const PcmStore::Entry> PcmStore::get (const juce::String& token) const
 {
@@ -650,6 +489,72 @@ std::optional<std::vector<std::byte>> PcmStore::getRawFloatBytes (const juce::St
     }
 }
 
+/**
+    How big the in-memory rendering of a capture would be, as a WAV.
+
+    A PREDICTION, used to decide whether to offer it at all - 44 bytes of canonical
+    PCM header plus three bytes per frame. The encoder below may spend a handful
+    more on chunk alignment; nothing consumes this as a length (webcore reads
+    `sourceUrl` and fetches until the stream ends), and the ceiling it is compared
+    against has megabytes of slack.
+*/
+static juce::int64 predictedWavBytes (const PcmStore::Entry& entry, int bitsPerSample) noexcept
+{
+    return 44 + (juce::int64) entry.mono.getNumSamples() * (juce::int64) (bitsPerSample / 8);
+}
+
+/** True when this entry's samples ARE the recording rather than an analysis copy.
+
+    A track capture never had a file: `storeMono()` parks the recorded buffer at
+    the rate it was recorded at, neither downmixed by us nor resampled, and
+    `originalFile` is left empty precisely so nothing derived can be mistaken for
+    an original. An entry that HAS an original and merely cannot reach it (the
+    user moved the file) is the opposite case - its `mono` is the 44.1 kHz mono
+    analysis buffer, and offering that as "the original" would be a lie. */
+static bool isSessionCapture (const PcmStore::Entry& entry) noexcept
+{
+    return entry.originalFile == juce::File() && entry.mono.getNumSamples() > 0
+        && entry.sampleRate > 0.0;
+}
+
+/** The entry's samples as a WAV, in memory, with no file anywhere in the story.
+
+    juce::MemoryOutputStream rather than a temp file because the caller is a
+    resource route that is about to hand these bytes to the WebView: writing them
+    to disk first would mean a write, a read and a file to clean up, for a payload
+    that exists for the length of one fetch. nullopt on allocation failure, which
+    the route reports as an ordinary fetch failure. */
+static std::optional<std::vector<std::byte>> encodeMonoAsWav (const PcmStore::Entry& entry,
+                                                              int bitsPerSample)
+{
+    try
+    {
+        juce::MemoryBlock block;
+
+        {
+            auto stream = std::make_unique<juce::MemoryOutputStream> (block, false);
+            juce::WavAudioFormat wav;
+            std::unique_ptr<juce::AudioFormatWriter> writer (
+                wav.createWriterFor (stream.get(), entry.sampleRate, 1, bitsPerSample, {}, 0));
+
+            if (writer == nullptr)
+                return std::nullopt;
+
+            stream.release();   // the writer owns it now, and flushes on destruction
+
+            if (! writer->writeFromAudioSampleBuffer (entry.mono, 0, entry.mono.getNumSamples()))
+                return std::nullopt;
+        }
+
+        const auto* data = static_cast<const std::byte*> (block.getData());
+        return std::vector<std::byte> (data, data + block.getSize());
+    }
+    catch (const std::bad_alloc&)
+    {
+        return std::nullopt;
+    }
+}
+
 PcmStore::OriginalInfo PcmStore::getOriginalInfo (const juce::String& token) const
 {
     OriginalInfo info;
@@ -659,6 +564,24 @@ PcmStore::OriginalInfo PcmStore::getOriginalInfo (const juce::String& token) con
         return info;
 
     const auto file = entry->originalFile;
+
+    // A CAPTURE HAS NO FILE AND NO LONGER GETS ONE. Captured takes used to be
+    // written into the takes folder the moment recording stopped, which is what
+    // made that folder fill up with audio nobody had asked to keep. The recording
+    // now lives in this entry and nowhere else, so the "original" a document save
+    // embeds is rendered from it on demand - see getOriginalFileBytes(). It is
+    // the same bytes the old durable WAV held, minus the file.
+    if (! file.existsAsFile() && isSessionCapture (*entry))
+    {
+        info.bytes = predictedWavBytes (*entry, 24);
+        info.name = juce::File::createLegalFileName (entry->displayName).trim() + ".wav";
+        // The recorded buffer itself, at its own rate, at 24 bits: nothing was
+        // folded, resampled or re-encoded on the way in, which is the whole
+        // meaning of this flag.
+        info.verbatim = true;
+        info.available = info.bytes > 0 && info.bytes <= riffsheet::limits::containerBytes;
+        return info;
+    }
 
     if (! file.existsAsFile())
         return info;
@@ -684,6 +607,18 @@ std::optional<std::vector<std::byte>> PcmStore::getOriginalFileBytes (const juce
         return std::nullopt;
 
     const auto file = entry->originalFile;
+
+    // The capture case: render the recorded buffer to a 24-bit WAV in memory,
+    // once, at the moment somebody is actually saving a document. No file is
+    // minted for it - that is the whole point of E2 - and a take nobody saves is
+    // never encoded at all, exactly as a take nobody saves is never read.
+    if (! file.existsAsFile() && isSessionCapture (*entry))
+    {
+        if (predictedWavBytes (*entry, 24) > riffsheet::limits::containerBytes)
+            return std::nullopt;
+
+        return encodeMonoAsWav (*entry, 24);
+    }
 
     if (! file.existsAsFile())
         return std::nullopt;

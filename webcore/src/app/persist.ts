@@ -39,6 +39,8 @@ import type { TrimResult } from '../audio/trim';
 import type { AppSettings, HostGrid, SourceAudio } from './state';
 import { cleanPartName, MAX_SCORE_PARTS, type ImportedPart } from '../score/parts';
 import { normalizeCuts, type CutSpan } from '../edit/cuts';
+import { rational, type Rational, type RippleOp } from '../edit/ripple';
+import { MAX_DOCUMENT_BARS } from '../edit/performanceEdit';
 
 /** Raise this AND add a case in `readSession()` when the shape has to change under people. */
 export const SESSION_VERSION = 1;
@@ -70,6 +72,24 @@ export interface PersistedPeaks {
   max: string;
 }
 
+/**
+ * ONE RIPPLE OPERATION, on the wire.
+ *
+ * Rationals travel as `[numerator, denominator]` pairs rather than as decimals: the whole point of
+ * the layer is that a hundred edits accumulate without residue, and writing `0.3333333333333333`
+ * into the file would spend that exactness on the first save.
+ */
+export interface PersistedRippleOp {
+  id: string;
+  seam: [number, number];
+  delta: [number, number];
+  chordIds?: string[];
+  chordEnd?: [number, number];
+  split?: boolean;
+  dropSpan?: boolean;
+  label?: string;
+}
+
 export interface PersistedSource {
   name: string;
   durationSec: number;
@@ -80,6 +100,34 @@ export interface PersistedSource {
   timeSignature?: { numerator: number; denominator: number };
   keyFifths?: number;
   documentBars?: number;
+  /**
+   * THE SHIP-BLOCKER THIS FIELD FIXES (codex-ripple-critique §5).
+   *
+   * `SourceAudio.timelineDetached` is what tells the pipeline the score's clock and the recording's
+   * clock have parted company (`BuildInput.detachedTimeline`) and what stops the snap layer from
+   * clamping notes back inside the tape. It was defined, set by every bar operation, and written to
+   * NEITHER the session blob nor the portable document — so reopening a bar-edited file re-armed
+   * every guard the edit had disarmed, and the material past the old audio end was clamped into a
+   * heap on the last line inside the recording or dropped outright. The document said one thing on
+   * screen and another after a restart.
+   *
+   * Omitted when false, so a take nobody has detached serialises to the bytes it always did.
+   */
+  timelineDetached?: boolean;
+  /**
+   * THE STRUCTURAL SCORE-TIME LAYER — the ripple log (`edit/ripple.ts`, `state.ts §rippleOps`).
+   *
+   * It HAS to be written and it cannot be recomputed: a ripple is a decision, exactly as a cut is.
+   * Leaving it out would reopen the document with every note back at its played position while the
+   * notation edits — keyed on ids the ripple deliberately does not renumber — replayed on top.
+   *
+   * NEW IN DOCUMENT v5, and the reason for the bump: a v4 reader handed one of these would show the
+   * unrippled take and then write the file back without the log, silently discarding the music the
+   * player wrote. That is exactly the test the version note below sets for a bump.
+   */
+  rippleOps?: PersistedRippleOp[];
+  /** The structural end in exact IR ticks, as `n/d`. See `state.ts §documentEndTick`. */
+  documentEndTick?: { n: number; d: number };
   peaks?: PersistedPeaks;
   /** The detections. THIS is what makes a restore free — no re-transcription. */
   detected?: { notes: InputNote[]; beats?: number[]; downbeats?: number[] };
@@ -214,6 +262,12 @@ export function encodeSource(source: SourceAudio | null): PersistedSource | null
     timeSignature: source.timeSignature,
     keyFifths: source.keyFifths,
     documentBars: source.documentBars,
+    // Omitted rather than written `false`, so an ordinary take's bytes do not change.
+    timelineDetached: source.timelineDetached ? true : undefined,
+    rippleOps: source.rippleOps?.length ? source.rippleOps.map(encodeRippleOp) : undefined,
+    documentEndTick: source.documentEndTick
+      ? { n: source.documentEndTick.n, d: source.documentEndTick.d }
+      : undefined,
     peaks: encodePeaks(source.peaks),
     // Note times are NOT rounded. They are the input the whole sheet is quantised from, and
     // a note sitting on a grid boundary must land on the same side of it after a restore.
@@ -258,7 +312,17 @@ export function decodeSource(source: PersistedSource | null | undefined): Source
     tempoBpm: finiteInRange(source.tempoBpm, 20, 400),
     timeSignature: validTimeSignature(source.timeSignature),
     keyFifths: finiteInRange(source.keyFifths, -7, 7, true),
-    documentBars: finiteInRange(source.documentBars, 1, 512, true),
+    /*
+     * 256, NOT 512 — the pipeline's own cap (`resolveMinimumBars` clamps to 1..256). The two
+     * disagreed: webcore accepted a 512-bar floor here and `applyBarOp` produced one, and the
+     * pipeline then silently engraved 256. A document could therefore declare a length it could
+     * not have, and every consumer that trusted the declaration was wrong about where the score
+     * ended. Resolved in webcore because the pipeline is the authority and is read-only.
+     */
+    documentBars: finiteInRange(source.documentBars, 1, MAX_DOCUMENT_BARS, true),
+    timelineDetached: source.timelineDetached === true ? true : undefined,
+    rippleOps: decodeRippleOps(source.rippleOps),
+    documentEndTick: decodeRational(source.documentEndTick),
     detected: Array.isArray(source.detected?.notes)
       ? { notes: source.detected.notes, beats: source.detected.beats, downbeats: source.detected.downbeats }
       : undefined,
@@ -282,6 +346,62 @@ export function decodeSource(source: PersistedSource | null | undefined): Source
     // is what keeps the round trip byte-stable.
     livePartName: cleanPartName(source.livePartName) || undefined
   };
+}
+
+function encodeRippleOp(op: RippleOp): PersistedRippleOp {
+  return {
+    id: op.id,
+    seam: [op.seamTick.n, op.seamTick.d],
+    delta: [op.deltaTick.n, op.deltaTick.d],
+    ...(op.chordIds?.length ? { chordIds: op.chordIds.slice() } : {}),
+    ...(op.chordEndTick ? { chordEnd: [op.chordEndTick.n, op.chordEndTick.d] as [number, number] } : {}),
+    ...(op.split ? { split: true } : {}),
+    ...(op.dropSpan ? { dropSpan: true } : {}),
+    ...(op.label ? { label: op.label } : {})
+  };
+}
+
+function decodeRational(value: unknown): Rational | undefined {
+  if (Array.isArray(value)) {
+    const [n, d] = value as [unknown, unknown];
+    return Number.isFinite(Number(n)) && Number(d) > 0 ? rational(Number(n), Number(d)) : undefined;
+  }
+  if (!value || typeof value !== 'object') return undefined;
+  const v = value as { n?: unknown; d?: unknown };
+  if (!Number.isFinite(Number(v.n)) || !(Number(v.d) > 0)) return undefined;
+  return rational(Number(v.n), Number(v.d));
+}
+
+/**
+ * THROUGH THE SAME GATE THE LIVE APP USES. An operation with no seam, no delta or a zero
+ * denominator is not a splice, and `applyRippleOps` would either do nothing with it or divide by
+ * zero — so a hand-edited or truncated blob loses the broken entry rather than the document.
+ */
+function decodeRippleOps(value: unknown): RippleOp[] | undefined {
+  if (!Array.isArray(value)) return undefined;
+  const ops: RippleOp[] = [];
+  for (const raw of value) {
+    if (!raw || typeof raw !== 'object') continue;
+    const op = raw as Partial<PersistedRippleOp>;
+    if (typeof op.id !== 'string' || !op.id) continue;
+    const seamTick = decodeRational(op.seam);
+    const deltaTick = decodeRational(op.delta);
+    if (!seamTick || !deltaTick) continue;
+    const chordEndTick = decodeRational(op.chordEnd);
+    ops.push({
+      id: op.id,
+      seamTick,
+      deltaTick,
+      ...(Array.isArray(op.chordIds)
+        ? { chordIds: op.chordIds.filter((id): id is string => typeof id === 'string' && !!id) }
+        : {}),
+      ...(chordEndTick ? { chordEndTick } : {}),
+      ...(op.split === true ? { split: true as const } : {}),
+      ...(op.dropSpan === true ? { dropSpan: true as const } : {}),
+      ...(typeof op.label === 'string' && op.label ? { label: op.label } : {})
+    });
+  }
+  return ops.length ? ops : undefined;
 }
 
 function decodeImportedParts(value: unknown): ImportedPart[] | undefined {
@@ -332,8 +452,14 @@ function validTimeSignature(value: unknown): { numerator: number; denominator: n
  *
  * v4 is v3 plus PARTS (`PersistedSource.importedParts` / `partOrder`). Nothing about the
  * container changed, and a v3 document is read as exactly what it is: a score with one part.
+ *
+ * v5 is v4 plus the STRUCTURAL SCORE-TIME LAYER: `timelineDetached`, `rippleOps` and
+ * `documentEndTick`. The bump is for the same reason v4's was and passes the same test — a v4
+ * reader handed one of these would show the take with every ripple undone and the timeline
+ * re-attached, and would then write the file back WITHOUT them. That is a reader being wrong about
+ * the music and then destroying the evidence, which is exactly what the version gate is for.
  */
-export const RIFFSHEET_DOCUMENT_VERSION = 4;
+export const RIFFSHEET_DOCUMENT_VERSION = 5;
 
 /**
  * THE CONTAINER, and why it changed twice.

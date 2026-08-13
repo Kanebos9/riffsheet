@@ -12,6 +12,7 @@ import { DEFAULT_ROLL_HEIGHT_PX } from '../view/pianoroll';
 import type { SynthVoice } from '../audio/synth';
 import type { TrimResult } from '../audio/trim';
 import type { CutSpan } from '../edit/cuts';
+import type { Rational, RippleOp } from '../edit/ripple';
 import type { ImportedPart } from '../score/parts';
 import type { HostInfo } from '../bridge';
 
@@ -599,6 +600,36 @@ export interface SourceAudio {
    * delete the material a redo is about to restore.
    */
   timelineDetached?: boolean;
+  /**
+   * THE STRUCTURAL SCORE-TIME LAYER — the ripple log (`edit/ripple.ts`).
+   *
+   * An ORDERED list of rational splices of the score's timeline, applied to the derived feed AFTER
+   * cuts and AFTER snap and before anything reads it. This is the document's own answer to "how
+   * long is this note and what did that do to everything after it", and it is stored rather than
+   * baked into `detected.notes` for two reasons that both cost data if ignored:
+   *
+   *   THE SNAP is a layer. Writing a rippled feed back into the recording would promote every
+   *            snapped position into it and the switch could never be turned off again.
+   *   THE CUT  hides notes from the feed. A materialised per-note offset cannot be computed for a
+   *            note that was not there, so undoing the cut would reveal it at the wrong time. An
+   *            operation log applies to it the moment it comes back.
+   *
+   * Absent on every document nobody has rippled, and `applyRippleOps` hands an empty log's input
+   * straight back by reference — so the whole layer is inert until it is used.
+   */
+  rippleOps?: RippleOp[];
+  /**
+   * WHERE THE DOCUMENT ENDS, in exact IR ticks — the other half of `documentBars`.
+   *
+   * `documentBars` is a FLOOR (`BuildInput.minimumBars` is documented as "at least this many"), and
+   * an integer bar count cannot say that a document grew by a quarter note inside 4/4. This can,
+   * and it is what `documentDurationSec()` reads so that the shared viewport and the snap bound
+   * know the score is longer BEFORE the rebuild has re-measured it — without which a freshly
+   * rippled tail is clamped against the length the document had a moment ago.
+   *
+   * Absent until something structural moves the end.
+   */
+  documentEndTick?: Rational;
   /** Raw detections, kept so the notation can be rebuilt without re-transcribing. */
   detected?: { notes: InputNote[]; beats?: number[]; downbeats?: number[] };
   /**

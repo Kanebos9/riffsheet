@@ -30,7 +30,7 @@ import {
   toVisual
 } from './faceScale';
 import { installTooltipLayer, t, TIPS } from './tips';
-import { applyTheme, loadTheme } from './theme';
+import { applyTheme, loadTheme, setTheme } from './theme';
 import {
   getBridge,
   importDroppedFileNative,
@@ -66,6 +66,7 @@ import {
   engravedPxPerSec,
   fullViewport,
   intersectLimits,
+  preservedScaleWindow,
   reduceViewport,
   sheetSpanLimits,
   viewportSaturation,
@@ -74,6 +75,7 @@ import {
   MIN_WINDOW_SEC,
   TIME_ZOOM_IN_FACTOR,
   TIME_ZOOM_OUT_FACTOR,
+  type RebuildViewportPolicy,
   type TimeLimits,
   type TimelineViewport,
   type ViewportCommand
@@ -94,16 +96,53 @@ import { applyRollEditToNotes } from '../edit/rollPerformance';
 // for what that costs on a snapped or a cut take, and why the victims of a collision have to be
 // named rather than inferred from the command.
 import {
-  applyBarOp,
-  applyBarOpToPartNotes,
   applySheetEditToNotes,
+  durationLabel,
   durationMenuLabel,
   mergePerformanceEditOntoCutTake,
+  MAX_DOCUMENT_BARS,
   type BarOp,
-  type BarOpContext,
   type SheetEdit
 } from '../edit/performanceEdit';
+/**
+ * THE RIPPLE — the structural score-time layer. See `edit/ripple.ts`, which carries the whole law.
+ *
+ * It is imported here rather than reached through `performanceEdit.ts` because it is not a
+ * reducer: nothing it does is written back into the recording. The app owns the log, applies it in
+ * `performanceFeed()` and snapshots it on the performance stack, which are three jobs only this
+ * file can do.
+ */
+import {
+  applyRippleOps,
+  planDurationRipple,
+  ratFromTick,
+  ratValue,
+  rational,
+  rippleEndTick,
+  rippleMovedIds,
+  spliceSourceBars,
+  unrippleNotes,
+  type Rational,
+  type RippleOp,
+  type RippleTickMap,
+  type WrittenSpan
+} from '../edit/ripple';
 import { closeSheetMenu, showSheetMenu, sheetMenuProbe, type SheetMenuItem } from '../edit/sheetMenu';
+
+/**
+ * THE DOCUMENT'S STRUCTURE AT ONE HISTORY STEP. See `App.perfStructure`.
+ *
+ * Everything a structural edit changes and the notes do not: the bar floor the pipeline engraves
+ * against, every imported part's timing, the ripple log, and the structural end. One object rather
+ * than four parallel arrays, because they move together on every push, truncation and step, and
+ * four things that must be kept in step is three chances to forget one.
+ */
+interface PerfStructure {
+  bars?: number;
+  parts?: ImportedPart[];
+  ripples?: RippleOp[];
+  endTick?: Rational;
+}
 import {
   addCut,
   applyCutsToPeaks,
@@ -133,6 +172,20 @@ import { selfTest as pitchSelfTest } from '../audio/pitch';
 import { detectOnsets, type OnsetResult } from '../audio/onsets';
 import { EngineHost, isEngineCancelled, type EngineJobHandle } from '../audio/engineHost';
 import { soundingMidi } from '../score/fromPipeline';
+// THE CORRESPONDENCE SEAM (see each file's header): one identity authority, one chord-membership
+// authority, and one total sheet<->roll projection per revision.
+import { NoteIdAllocator } from '../app/identity';
+import { chordMemberIds, collectChordEvents, EMPTY_CHORD_EVENTS, type ChordEventTable } from '../edit/chordEvents';
+import {
+  adoptProjection,
+  isSelectable,
+  projectionCounts,
+  sheetProxyFor,
+  sheetSilenceReason,
+  staleIntentIds,
+  EMPTY_PROJECTION,
+  type Projection
+} from '../score/projection';
 import {
   buildPartedRiffScore,
   cleanPartName,
@@ -544,6 +597,21 @@ class App {
    * a calibration that moved when you scrolled is how a scroll became a zoom.
    */
   private sheetRef: { pxPerSec: number; scale: number } | null = null;
+  /**
+   * A `preserve-sheet-scale` rebuild that has been asked for and not yet answered.
+   *
+   * BOUND TO THE RENDER GENERATION (`revision`), which is the whole of why this is a field rather
+   * than a flag. A rebuild is not one call: the score is built here, alphaTab engraves it a moment
+   * later, and `onSheetRenderSettled` is where the answer has to be given. Anything in between —
+   * a second rebuild, a failed build, a settled render belonging to the PREVIOUS score — must not
+   * be able to spend this policy on the wrong engraving, and comparing an integer is the only way
+   * to be sure of that which does not involve a clock.
+   *
+   * `anchorTick` is WRITTEN, deliberately. Seconds are exactly what the tempo change moves, so an
+   * anchor in seconds would name a different bar on the other side of the rebuild; a tick names
+   * the same note before and after.
+   */
+  private pendingRebuild: { generation: number; anchorTick: number; anchorFrac: number } | null = null;
   /** True while `applyViewport` is writing the window into the panes. Guards re-entry. */
   private applyingViewport = false;
   /** Every command that reached the reducer, in order. Read by `__RIFFSHEET_VIEWPORT__`. */
@@ -3899,8 +3967,7 @@ class App {
     this.rollView = null;
     // A new performance means the old note ids describe nothing. Both undo layers go with it,
     // and so does everything the auto-edit pass had to say about the take being replaced.
-    this.addedNoteCount = 0;
-    this.autoNoteCount = 0;
+    this.noteIds.reset();
     this.autoPassPending = false;
     this.clearAutoEdits();
     this.resetHistories();
@@ -5258,7 +5325,31 @@ class App {
         timelineDetached: !!rt.source?.timelineDetached,
         importedPartNotes: (rt.source?.importedParts ?? []).map((p) =>
           p.notes.map((n) => r4(n.startSec))
-        )
+        ),
+        /*
+         * THE STRUCTURAL LAYER (`edit/ripple.ts`), published so the probe asserts the STORAGE and
+         * not only the picture. A ripple that moved the right rectangles by writing them into the
+         * recording would look identical on screen and be the exact defect the layer exists to
+         * prevent, so the probe checks the log, the recording and the split touched contract.
+         */
+        rippleOps: (rt.source?.rippleOps ?? []).map((op) => ({
+          id: op.id,
+          seam: r4(ratValue(op.seamTick)),
+          delta: r4(ratValue(op.deltaTick)),
+          chordIds: op.chordIds ?? null,
+          split: !!op.split,
+          dropSpan: !!op.dropSpan
+        })),
+        documentEndTick: rt.source?.documentEndTick ? r4(ratValue(rt.source.documentEndTick)) : null,
+        /** Every id the last ripple MOVED, and every id it claimed the player AUTHORED. */
+        rippleWriteback: [...this.lastRippleWriteback].sort(),
+        userTouched: [...this.userTouchedIds].sort(),
+        /** The recording, untouched by any ripple — the assertion the whole layer exists for. */
+        rawStarts: Object.fromEntries(
+          (rt.source?.detected?.notes ?? []).map((n) => [n.id ?? '', r4(n.startSec)])
+        ),
+        /** What the ROLL is drawing, from the same feed — so "the roll mirrors the sheet" is testable. */
+        rollNotes: this.rollFeedNotes().map((n) => ({ id: n.id, startSec: r4(n.startSec), endSec: r4(n.endSec) }))
       };
     };
 
@@ -5359,11 +5450,32 @@ class App {
     };
 
     /**
-     * Is a note drawn on the roll directly under the notehead that produced it?
+     * HOW FAR THE ROLL'S PICTURE OF A NOTE SITS FROM THE PAGE'S, in pixels, per note.
      *
-     * The user's first complaint, made checkable. For each of the first few notes it reports
-     * the roll's x and the sheet's x for the SAME note id, on screen, and the gap between
-     * them. Zero is the claim; anything else is the bug, in pixels.
+     * THE CLAIM THIS USED TO MAKE IS WITHDRAWN, and it was the stale side of a contradiction the
+     * codebase was holding in two places at once. It read:
+     *
+     *     "Is a note drawn on the roll directly under the notehead that produced it?
+     *      The user's first complaint, made checkable. For each of the first few notes it reports
+     *      the roll's x and the sheet's x for the SAME note id, on screen, and the gap between
+     *      them. Zero is the claim; anything else is the bug, in pixels."
+     *
+     * ZERO IS NOT ACHIEVABLE AND IS NOT WANTED. The roll shows PERFORMED SECONDS on a linear
+     * ruler — that is the standing principle, stated where the roll is fed
+     * (§"THE ROLL SHOWS THE PERFORMANCE, NOT THE PAGE") and enforced by constructing it with no
+     * `sheetMap` at all, because putting it on the engraving's x-axis made adding one note
+     * re-space its neighbours. The sheet is engraved, and an engraving is deliberately not linear
+     * in time: alphaTab gives a rhythmically dense bar more pixels than a sparse one, and
+     * quantization moves written onsets off the seconds they were played at. Two pictures, two
+     * x-axes, both correct. Demanding pixel identity between them is demanding that one of them
+     * stop being what it is.
+     *
+     * WHAT IS ACTUALLY PROMISED — the endpoint-mapping contract, which `scripts/verify.mjs`
+     * §ALIGN_TOLERANCE_PX already asserts and explains: with Align on, the two agree EXACTLY at
+     * the edges of the visible span and drift in between by the engraving's own unevenness. So
+     * the number this reports is a residual to be bounded, not an error to be driven to zero, and
+     * the bound belongs to the harness that knows the fixture. Reporting it as a "gap" against an
+     * implicit zero is what made a correct behaviour read as a bug.
      */
     (window as unknown as Record<string, unknown>).__RIFFSHEET_ALIGN__ = () => {
       const roll = this.pianoRoll;
@@ -5389,16 +5501,30 @@ class App {
             // constant offset here would be a fudge factor hiding a real disagreement.
             rollX: r.x,
             sheetX: sheetScreenX,
-            deltaPx: sheetScreenX === null ? null : Number((r.x - sheetScreenX).toFixed(2))
+            // NAMED `residualPx`, not `deltaPx`. A delta implies a target of zero; this is the
+            // unevenness of the engraving under a linear ruler, which is expected and bounded
+            // rather than wrong. See the header.
+            residualPx: sheetScreenX === null ? null : Number((r.x - sheetScreenX).toFixed(2))
           };
         });
-      const deltas = rows.map((r) => r.deltaPx).filter((d): d is number => typeof d === 'number');
+      const residuals = rows
+        .map((r) => r.residualPx)
+        .filter((d): d is number => typeof d === 'number');
       return {
         linked: rollProbe.linkedActive,
         zoom: tv.getZoom(),
         scrollLeft: map.scrollLeft,
-        compared: deltas.length,
-        worstDeltaPx: deltas.length ? Math.max(...deltas.map(Math.abs)) : null,
+        compared: residuals.length,
+        /**
+         * The largest residual among the notes compared.
+         *
+         * `worstDeltaPx` was the old name and `scripts/verify.mjs` still reads it, so it is kept
+         * as well as the honest one rather than instead of it — a rename that silently makes an
+         * assertion read `undefined` would turn a bounded check into a passing no-op, which is a
+         * worse failure than the misleading name was.
+         */
+        worstDeltaPx: residuals.length ? Math.max(...residuals.map(Math.abs)) : null,
+        worstResidualPx: residuals.length ? Math.max(...residuals.map(Math.abs)) : null,
         rows
       };
     };
@@ -5407,6 +5533,98 @@ class App {
     // count, so a synthetic click can be aimed at a real note.
     (window as unknown as Record<string, unknown>).__RIFFSHEET_ROLLRECTS__ = () =>
       this.pianoRoll?.paintedRects() ?? null;
+
+    /**
+     * THE CORRESPONDENCE SEAM, MADE ASSERTABLE — identity, membership, projection, selection.
+     *
+     * One probe for the whole model, because the model's claims are about the RELATIONSHIPS
+     * between these four and a probe per part could not state them. What it answers:
+     *
+     *   "is there one selection authority?"  — `selection` is the authority's, `sheetSelection`
+     *      and `rollSelection` are the views' copies. The invariant is that the views' answers
+     *      are the authority's, mapped through the projection; a divergence is visible as a
+     *      disagreement between these three lists rather than as a wrong ring somebody has to
+     *      notice on screen.
+     *   "did a stale hit get rejected?" — `staleHitRejections`, which is the dead-click gate
+     *      reporting that it fired. Zero through a normal session.
+     *   "can every note be accounted for?" — `projection`, which is total over the feed.
+     *   "is the id space sound?" — `ids`, whose `known` count must equal the feed's length when
+     *      no note shares a name with another.
+     */
+    /*
+     * TWO DRIVERS FOR THE SEAM PROBE, and they exist because the conditions they reach cannot be
+     * produced through the interface.
+     *
+     * `__RIFFSHEET_REBUILD__` asks for a rebuild while the sheet host is HIDDEN — the state in
+     * which alphaTab declines to complete a render and therefore leaves its bounds describing the
+     * previous engraving. That is the dead click's mechanism (finding 8), and there is no chip or
+     * menu that produces it on demand: it happens when a rebuild races a pane becoming visible.
+     *
+     * `__RIFFSHEET_SETTHEME__` is a theme switch without the settings panel, so the probe can
+     * exercise the full `renderMain` remount — both canvases destroyed and rebuilt — without
+     * depending on the panel's own layout, which is a different feature's business.
+     */
+    /**
+     * Write the selection directly — the authority's own setter, exposed.
+     *
+     * For probes that need a KNOWN selection state rather than one produced by a gesture: the
+     * waveform's immutability check needs the bracket held constant while it compares peaks, and
+     * the seam probe needs to assert that every view followed a write it did not make itself.
+     */
+    (window as unknown as Record<string, unknown>).__RIFFSHEET_SELECT__ = (ids: string[]) => {
+      this.selectNoteIds(Array.isArray(ids) ? ids : []);
+      return this.runtime.get().selection;
+    };
+
+    (window as unknown as Record<string, unknown>).__RIFFSHEET_REBUILD__ = () => {
+      this.rebuildNotation();
+      return true;
+    };
+    (window as unknown as Record<string, unknown>).__RIFFSHEET_SETTHEME__ = (id: string) => {
+      setTheme(id, () => this.renderMain());
+      return true;
+    };
+
+    (window as unknown as Record<string, unknown>).__RIFFSHEET_SEAM__ = () => {
+      const selection = this.runtime.get().selection;
+      const feed = this.performanceFeed();
+      const seen = new Set<string>();
+      const duplicateIds: string[] = [];
+      for (const n of feed) {
+        if (!n.id) continue;
+        if (seen.has(n.id)) duplicateIds.push(n.id);
+        else seen.add(n.id);
+      }
+      return {
+        revision: this.revision,
+        selection,
+        sheetSelection: this.triview?.selection ?? null,
+        rollSelection: this.pianoRoll?.selectedIds ?? null,
+        // Why the page is not ringing a selected note as itself, when it is not. Empty on an
+        // ordinary selection; one entry per merged/dropped note otherwise.
+        sheetSilence: selection
+          .map((id) => ({ id, reason: sheetSilenceReason(this.projection, id) }))
+          .filter((r) => r.reason !== null),
+        selectable: selection.map((id) => isSelectable(this.projection, id)),
+        waveformRange: this.selection,
+        projection: {
+          ...projectionCounts(this.projection),
+          revision: this.projection.revision,
+          inputs: this.projection.inputIds.length
+        },
+        chordEvents: {
+          count: this.chordEventTable.events.length,
+          // The membership answer for the current selection — the thing a duration edit will act
+          // on, stated before it acts.
+          membersOfSelection: selection.length
+            ? (this.chordEventTable.events[this.chordEventTable.byNoteId.get(selection[0]) ?? -1]
+                ?.memberIds ?? [selection[0]])
+            : []
+        },
+        ids: { ...this.noteIds.probe(), feed: feed.length, duplicateIds },
+        sheet: this.triview?.revisionProbe() ?? null
+      };
+    };
 
     // The tuner's own view of itself, and the pitch detector's accuracy measured HERE rather
     // than on the machine it was written on — the second one makes the accuracy table in the
@@ -5455,6 +5673,24 @@ class App {
         })(),
         sheetScrollLeft: this.triview?.viewport()?.scrollLeft ?? null,
         sheetRef: this.sheetRef ? { pxPerSec: r4(this.sheetRef.pxPerSec), scale: r4(this.sheetRef.scale) } : null,
+        // What the last tempo/meter rebuild came to: the size it held, the span it wanted at that
+        // size, and the span the shared limits granted it. `sizeHeld: false` is the documented
+        // hard edge — a slow tempo whose natural span is longer than the document — and a probe
+        // can tell that apart from the bug it replaced, which held nothing and said nothing.
+        rebuildRebase: this.rebuildRebase
+          ? {
+              scale: r4(this.rebuildRebase.scale),
+              wantedSpanSec: r4(this.rebuildRebase.wantedSpanSec),
+              grantedSpanSec: r4(this.rebuildRebase.grantedSpanSec),
+              sizeHeld: this.rebuildRebase.sizeHeld
+            }
+          : null,
+        // The two extents behind `viewportLimits().durationSec`, so "the window cannot reach the
+        // last bar" is readable rather than inferred.
+        documentSec: {
+          audio: r4(this.runtime.get().source?.durationSec ?? 0),
+          score: r4(this.runtime.get().score?.durationSec ?? 0)
+        },
         // Both halves of the scrollbar's arithmetic, so `press-identity` can be checked without
         // guessing which pixels the thumb owns (finding 1).
         scrollbar:
@@ -7179,7 +7415,7 @@ class App {
           snapSec: this.pianoRoll?.probe().snapSec ?? 0.25,
           durationSec: source?.durationSec ?? 10
         });
-        const applied = applyAutoEdits(widened, plan, () => `auto${++this.autoNoteCount}`);
+        const applied = applyAutoEdits(widened, plan, () => this.noteIds.next('auto'));
         this.autoEdits = applied.applied.map((edit, i) => ({ ...edit, id: `probe${i}`, reviewed: false }));
         this.autoAttention = plan.attention;
         this.autoReviewCursor = 0;
@@ -8939,6 +9175,18 @@ class App {
   }
 
   private performanceFeed(): InputNote[] {
+    return this.rippled(this.snappedFeed());
+  }
+
+  /**
+   * The take with the cuts closed up and the snap applied — everything BELOW the structural layer.
+   *
+   * Split out of `performanceFeed()` when the ripple landed, so that every one of the four early
+   * returns below goes through `rippled()` exactly once. Applying the log only on the snapped path
+   * — which is what a `return this.rippled(…)` on the last line alone would have done — leaves a
+   * take with Snap on Off showing no ripple at all, on both surfaces.
+   */
+  private snappedFeed(): InputNote[] {
     const source = this.editedSource();
     const raw = source?.detected?.notes ?? [];
     const s = this.settings.get();
@@ -8970,6 +9218,224 @@ class App {
       : snapPerformanceToGrid(raw, unitSec, basis.originSec, basis.tempoBpm, boundSec);
   }
 
+  // =========================================================================
+  // The structural score-time layer (`edit/ripple.ts`)
+  // =========================================================================
+
+  /**
+   * The tick↔seconds map, in IR ticks, off the live score.
+   *
+   * NOT A SCALAR BPM. Both directions walk `ir.tempo.changes` through `tickToSeconds` /
+   * `secondsToTick`, so a displacement of n ticks is n ticks wherever it lands — which is the
+   * whole reason the ripple law is stated in ticks. See §"THE TWO TICK DOMAINS" for why the
+   * conversion to and from alphaTab's 960ths is at the boundary and not inside.
+   *
+   * Null before anything has been engraved, which is when there is nothing to ripple either.
+   */
+  private rippleMap(): RippleTickMap | null {
+    const score = this.runtime.get().score;
+    if (!score) return null;
+    const origin = this.originSec(score);
+    return {
+      toTick: (sec) => alphaTickToIrTick(score, secondsToTick(score, sec, origin)),
+      toSec: (tick) => tickToSeconds(score, irTickToAlphaTick(score, tick), origin)
+    };
+  }
+
+  /** The log this document is carrying. Empty on every document nobody has rippled. */
+  private rippleOps(): RippleOp[] {
+    return this.runtime.get().source?.rippleOps ?? [];
+  }
+
+  /**
+   * THE LOG, APPLIED — the last station of `performanceFeed()`.
+   *
+   * AFTER CUTS AND AFTER SNAP, on purpose and in that order. Cuts stay in audio coordinates and
+   * are never rippled: a score note is allowed to drift from its waveform peak, but it may never
+   * change whether its source attack was inside a cut, and mutating the same seconds the cut
+   * mapping reads would do exactly that. Snap measures from the recording every time, so it has to
+   * see the take rather than the take plus a structural splice.
+   *
+   * ONE RESULT, BOTH CONSUMERS. The roll (`rollFeedNotes`) and the pipeline (`rebuildNotation`)
+   * are both drawn from this function's output, so "the roll mirrors the sheet" is structural
+   * rather than a second implementation kept in step by hand.
+   *
+   * IDENTITY WHEN THERE IS NO LOG, so an un-rippled take hands playback the very array it was
+   * given — the promise `__RIFFSHEET_SNAPFEED__` proves.
+   */
+  private rippled(notes: InputNote[]): InputNote[] {
+    const ops = this.rippleOps();
+    if (!ops.length) return notes;
+    const map = this.rippleMap();
+    const score = this.runtime.get().score;
+    if (!map || !score) return notes;
+    return applyRippleOps(notes, ops, {
+      map,
+      divisions: score.ir.divisions || 12,
+      splitId: (opId, noteId) => `rip:${opId}:${noteId}`
+    });
+  }
+
+  /**
+   * THE LOG, RUN BACKWARDS — the station every write-back road has to pass through.
+   *
+   * A gesture is made against the FEED and stored in the RECORDING, and the ripple sits between
+   * the two exactly as the cut list does. `edit/cuts.ts` has had `editedToAudioSec` for this all
+   * along; this is its counterpart one layer up. Without it a note added to a lengthened score is
+   * recorded at the second it was dropped at, the next feed derivation applies the log to it, and
+   * the note appears somewhere other than under the pixel that was clicked.
+   *
+   * Applied to the whole edited list rather than to the named notes only: the merges below take
+   * the untouched ones from the recording anyway, so this is exact either way and there is no
+   * second rule to keep in step.
+   */
+  private unrippled(notes: InputNote[]): InputNote[] {
+    const ops = this.rippleOps();
+    if (!ops.length) return notes;
+    const map = this.rippleMap();
+    return map ? unrippleNotes(notes, ops, map) : notes;
+  }
+
+  /**
+   * EVERY NOTE'S ENGRAVED SPAN, tied continuations coalesced — the ID→logical-written-span index.
+   *
+   * WHY IT IS NOT `intentOf()`. That reads the written value off the beat carrying the ATTACK, so
+   * a note tied across a barline reports the first piece's glyph and nothing about the rest. A
+   * ripple needs the whole logical value: lengthening a note that is written as a half tied to an
+   * eighth has to push the score by the new value minus THAT, not minus a half.
+   *
+   * Built on demand from `score.ir` rather than cached, because it is read once per duration edit
+   * and a cache would be one more thing that can describe the previous engraving.
+   */
+  private writtenSpans(): Map<string, WrittenSpan> {
+    const out = new Map<string, WrittenSpan>();
+    const score = this.runtime.get().score;
+    if (!score) return out;
+    for (const bar of score.ir.bars ?? []) {
+      for (const voice of bar.voices ?? []) {
+        for (const beat of voice.beats ?? []) {
+          if (beat.isRest) continue;
+          const startTick = bar.startTick + beat.startTick;
+          const endTick = startTick + beat.durTicks;
+          for (const note of beat.notes ?? []) {
+            const at = out.get(note.id);
+            if (!at) out.set(note.id, { startTick, endTick });
+            else out.set(note.id, { startTick: Math.min(at.startTick, startTick), endTick: Math.max(at.endTick, endTick) });
+          }
+        }
+      }
+    }
+    return out;
+  }
+
+  /** Where the material actually stops, in IR ticks — the floor `documentEndTick` may not go under. */
+  private contentEndTick(): number {
+    const map = this.rippleMap();
+    if (!map) return 0;
+    let end = 0;
+    for (const n of this.performanceFeed()) end = Math.max(end, map.toTick(n.endSec));
+    return end;
+  }
+
+  /**
+   * COMMIT ONE STRUCTURAL OPERATION, as a single undo transaction.
+   *
+   * Everything a ripple changes moves together or the document contradicts its own history: the
+   * log, the detached flag, the structural end, the declared bar floor, every imported part's
+   * timing, and the notes (which, for a duration ripple, change only by gaining an intent). One
+   * `commitPerformance` at the end pushes all of it as one step — see `perfStructure`.
+   */
+  private commitRipple(
+    op: RippleOp,
+    label: string,
+    options: {
+      notes?: InputNote[];
+      barCount?: number;
+      /** A bar operation also splices the ruler an imported symbolic part is engraved against. */
+      barSplice?: { kind: 'insertBar' | 'deleteBar'; seamSec: number };
+    } = {}
+  ): boolean {
+    const source = this.runtime.get().source;
+    const score = this.runtime.get().score;
+    const map = this.rippleMap();
+    if (!source?.detected || !score || !map) return false;
+
+    const ops = [...this.rippleOps(), op];
+    const contentEnd = this.contentEndTick();
+    const baseEnd = source.documentEndTick ?? ratFromTick(Math.max(contentEnd, map.toTick(source.durationSec)));
+    const documentEndTick = rippleEndTick([op], baseEnd, contentEnd);
+
+    /*
+     * ONE CLOCK, EVERY PART. An imported chart is pinned to the same bar list, so it takes the same
+     * operation — and, for a bar operation, the same splice of its own `sourceBars` ruler. Moving
+     * only the seconds is the audit's bar-op critical: `buildScore` engraves the exact symbolic
+     * path off `sourceTiming` against `sourceBars`, so a part whose notes moved and whose ruler did
+     * not is put straight back where it started.
+     */
+    const splice = options.barSplice;
+    const importedParts = source.importedParts?.map((part) => {
+      // THE SEAM IN THIS PART'S OWN SOURCE TICKS, measured against its notes BEFORE the operation
+      // moved them. Measuring afterwards would locate the seam against positions the operation
+      // itself had just displaced, which is a seam a bar further on for every insert.
+      const seamSourceTick = splice ? this.sourceTickAt(part.notes, splice.seamSec) : 0;
+      const notes = applyRippleOps(part.notes, [op], { map, divisions: score.ir.divisions || 12 });
+      if (!splice) return { ...part, notes };
+      return {
+        ...part,
+        notes: notes.map((n) =>
+          n.sourceBars?.length
+            ? { ...n, sourceBars: spliceSourceBars(n.sourceBars, splice.kind, seamSourceTick) }
+            : n
+        )
+      };
+    });
+
+    this.runtime.set({
+      source: {
+        ...source,
+        rippleOps: ops,
+        documentEndTick,
+        // BEFORE THE FIRST REBUILD, not after it. The snap layer bounds against
+        // `documentDurationSec()`, and until this is set that number is still the recording's — so
+        // a freshly rippled tail would be clamped against a length the document no longer has.
+        timelineDetached: true,
+        ...(options.barCount !== undefined ? { documentBars: options.barCount } : {}),
+        ...(importedParts ? { importedParts } : {})
+      }
+    });
+    this.commitPerformance(options.notes ?? source.detected.notes, label);
+    return true;
+  }
+
+  /**
+   * A feed second, in ONE IMPORTED PART's own source ticks.
+   *
+   * THE PART'S OWN CLOCK, not the IR's. Its PPQ is its own, so the conversion is anchored on a
+   * note that carries both — a feed second AND a `sourceTiming.startTick` — and the distance is
+   * carried across at that part's own ratio. Judging "where is the seam" by assuming the part
+   * shares the IR's divisions is the arithmetic that puts an inserted bar in the wrong measure of
+   * an imported chart.
+   *
+   * ANCHORED ON THE NEAREST NOTE AT OR BEFORE THE SEAM, so the answer does not depend on the tempo
+   * map being identical between the anchor and the seam over a long distance.
+   */
+  private sourceTickAt(notes: ReadonlyArray<InputNote>, seamSec: number): number {
+    const map = this.rippleMap();
+    if (!map) return 0;
+    const score = this.runtime.get().score;
+    const divisions = score?.ir.divisions || 12;
+    let anchor: InputNote | null = null;
+    for (const n of notes) {
+      if (!n.sourceTiming || !(n.sourceTiming.ppq > 0)) continue;
+      if (!anchor || (n.startSec <= seamSec && n.startSec > anchor.startSec)) anchor = n;
+    }
+    const timing = anchor?.sourceTiming;
+    if (!anchor || !timing) return 0;
+    const seamIrTick = map.toTick(seamSec);
+    const anchorIrTick = map.toTick(anchor.startSec);
+    return Math.max(0, Math.round(timing.startTick + ((seamIrTick - anchorIrTick) * timing.ppq) / divisions));
+  }
+
   /**
    * The same feed in the roll's own shape.
    *
@@ -8988,11 +9454,82 @@ class App {
     }));
   }
 
-  private rebuildNotation(options?: { keepEdits?: boolean }): void {
+  /**
+   * DROP A `notationIntent` THE PAGE HAS CONTRADICTED (audit finding 14).
+   *
+   * @see staleIntentIds
+   *
+   * THE DIVISION OF LABOUR, and it is the pipeline's: it REPORTS that a declaration did not decide
+   * a note's written value (`projection.byId[id].intentIgnored`), and the owner of the stored
+   * declaration — this seam — is what clears it. The pipeline cannot: it is a pure function of its
+   * input, and the intent lives in this document.
+   *
+   * WHAT WENT WRONG WITHOUT IT. There was no invariant at all saying whether a timing mutation
+   * preserves, recomputes or clears a written value, so every one of them preserved it by default:
+   * a roll resize, a snap, a cut ripple, a bar splice. Set a note to Quarter from the sheet, then
+   * drag its rectangle to an eighth, and the roll, the sampler and the exported audio all say
+   * eighth while the page prints a quarter — indefinitely, because the intent overrides the
+   * measured duration for performed notes and nothing ever retired it.
+   *
+   * ONLY `not-carried` — see `staleIntentIds`, which carries the argument for each of the other
+   * four reasons. That is the one that means the engraved span could not hold the declared value,
+   * which is exactly "a timing edit invalidated this claim".
+   *
+   * THE LOOP CONVERGES. Clearing makes the next build MEASURE the note instead of honouring a
+   * claim it just contradicted, and a measured note is carried by definition — so the flag cannot
+   * be raised again for the same note by the same edit. This writes the source directly rather
+   * than going through the undo stack: retiring a claim the page has already refused is not an
+   * edit the player made and must not be a step they have to walk back.
+   */
+  private clearStaleIntents(): void {
+    const stale = new Set(staleIntentIds(this.projection));
+    if (!stale.size) return;
+    /*
+     * THE RUNTIME'S OWN SOURCE, not `editedSource()`. The latter is a DERIVED copy whenever the
+     * take has cuts in it, so writing there would be discarded on the next cache miss and the
+     * stale claim would come back. Note ids survive the cut and snap mappings unchanged, which is
+     * what makes a set gathered in feed space usable against the raw notes.
+     */
+    const source = this.runtime.get().source;
+    const raw = source?.detected?.notes;
+    if (!source?.detected || !raw) return;
+    let changed = false;
+    const next = raw.map((n) => {
+      if (!n.id || !stale.has(n.id) || n.notationIntent === undefined) return n;
+      changed = true;
+      // REPLACED, never mutated: the undo stack holds arrays of these references, and mutating
+      // one in place would rewrite history as well as the present.
+      const { notationIntent: _retired, ...rest } = n;
+      return rest as InputNote;
+    });
+    if (!changed) return;
+    source.detected.notes = next;
+    /*
+     * NO REBUILD IS REQUESTED, deliberately, and this is the reason the loop cannot run away.
+     *
+     * The page on screen is ALREADY correct: this build measured the note, which is precisely
+     * what `not-carried` reports. All that was wrong was the document still carrying a claim the
+     * page had refused. Asking for another build to "apply" the clear would engrave the identical
+     * score and re-enter this function, and the only thing standing between that and a loop would
+     * be the change-detection above. Writing the document and stopping needs no such argument.
+     */
+  }
+
+  private rebuildNotation(options?: { keepEdits?: boolean; viewportPolicy?: RebuildViewportPolicy }): void {
     // A MENU DESCRIBES NOTES THAT ARE ABOUT TO BE REPLACED. Every id it closes over belongs to
     // the graph this rebuild throws away, so it goes with it rather than acting on a note that
     // is no longer there. Picking an item already closes it; this is for every other rebuild.
     closeSheetMenu();
+    /*
+     * THE ANCHOR IS TAKEN BEFORE THE CLOCK MOVES, because after it there is nothing left to take
+     * it from. `viewport.fromSec` is a second on the OLD tick<->seconds map; one line further on
+     * the new score exists and the same number names a different bar. Converting it here, against
+     * the score that is still on screen, turns it into the one thing the rebuild cannot change:
+     * a written tick.
+     *
+     * Null for every ordinary rebuild, which is `follow-window` and needs no anchor.
+     */
+    const anchor = options?.viewportPolicy === 'preserve-sheet-scale' ? this.captureSheetAnchor() : null;
     // THE EDITED TAKE (F16), so the beats, the duration and the bar-1 anchor the pipeline is
     // handed all describe the same music as the notes it is handed. Identical to
     // `runtime.source` until the player cuts something out.
@@ -9003,8 +9540,65 @@ class App {
       // THE FEED, not the raw notes. With the snap off these are the same array; with it on the
       // sheet is written from what the roll is showing, which is the whole of "the sheet follows
       // the roll" and the reason there is no second path from the performance to the pipeline.
-      const score = this.buildScoreFrom(source, this.performanceFeed());
-      this.runtime.set({ score, selection: [] });
+      const feed = this.performanceFeed();
+      /*
+       * EVERY NAME THIS DOCUMENT IS USING, LEARNED BEFORE THE PLAYER CAN MINT ANOTHER.
+       *
+       * Here rather than only at restore because this is the one function every rebuild goes
+       * through, whatever brought it about — a restored session, an opened `.riffsheet`, a MIDI
+       * import, an undo to a state that predates this process. Seeding is monotonic and
+       * idempotent (`app/identity.ts`), so running it on every build costs a pass over the feed
+       * and cannot go wrong; catching every ingress by hand is what went wrong before.
+       */
+      this.noteIds.seed(feed);
+      for (const part of source.importedParts ?? []) this.noteIds.seed(part.notes);
+
+      const score = this.buildScoreFrom(source, feed);
+      /*
+       * ONE REVISION, PUBLISHED AS ONE THING (audit findings 5, 7 and 8).
+       *
+       * Three tables describe this build and they are only meaningful together:
+       *   - the SCORE, which the views engrave;
+       *   - the CHORD EVENTS, which say which notes the page writes as one stack, so the editor
+       *     never has to guess (`edit/chordEvents.ts`);
+       *   - the PROJECTION, which says what became of every input id — engraved, merged into
+       *     another note, or dropped and why (`score/projection.ts`).
+       *
+       * They are assigned before `applyScoreToViews` and never individually afterwards, so there
+       * is no window in which a consumer can read one against another build's companion.
+       */
+      this.revision++;
+      /*
+       * THE POLICY IS STAMPED WITH THE GENERATION IT BELONGS TO, here and nowhere else — after
+       * the build has succeeded, so a build that threw leaves no instruction behind for the next
+       * one to obey, and unconditionally, so an ordinary rebuild CLEARS a policy that was never
+       * answered rather than letting it hang over an engraving it was not asked about.
+       */
+      this.pendingRebuild = anchor ? { generation: this.revision, ...anchor } : null;
+      this.chordEventTable = collectChordEvents(feed, beatPeriodOf(score));
+      this.projection = adoptProjection(this.revision, feed, score.projection);
+      // A written value the page could not carry is a stale claim, not a preference. Cleared here
+      // — the pipeline reports, this seam clears. See `clearStaleIntents`.
+      this.clearStaleIntents();
+      /*
+       * SELECTION SURVIVES THE REBUILD. It used to be cleared here — `selection: []` — and that
+       * one word is half of audit finding 7.
+       *
+       * Clearing the RUNTIME's selection did not clear the views': `TriView.load` deliberately
+       * retained its own array and `PianoRoll.setPerformanceNotes` retained its own Set. So after
+       * every edit the app believed nothing was selected while the sheet and the roll were still
+       * drawing rings — three authorities, two answers. And it was the wrong answer on its own
+       * terms: note ids are stable across a rebuild by construction (design notes §4.8), which is
+       * the very property the notation edit-log replay below depends on, so the note the player
+       * had selected is still there and still theirs.
+       *
+       * FILTERED, not preserved wholesale: an id the new feed does not contain — the note was the
+       * one just deleted — must not survive, or the selection would name something undrawable and
+       * the waveform bracket would sit over nothing.
+       */
+      const live = new Set(feed.map((n) => n.id).filter((id): id is string => !!id));
+      const keptSelection = this.runtime.get().selection.filter((id) => live.has(id));
+      this.runtime.set({ score, selection: keptSelection });
 
       // The undo stack keys on note ids, but the alphaTab objects those ids resolved to have
       // just been replaced wholesale, so the stack's MEMENTOS cannot survive a rebuild — which is
@@ -9260,8 +9854,30 @@ class App {
     const rt = this.runtime.get();
     const audioSec = rt.source?.durationSec ?? 0;
     const scoreSec = rt.score?.durationSec ?? 0;
-    if (rt.source?.timelineDetached) return Math.max(audioSec, scoreSec);
+    if (rt.source?.timelineDetached) {
+      /*
+       * …AND THE STRUCTURAL END, which is the only one of the three that is already correct DURING
+       * the edit that produced it (`SourceAudio.documentEndTick`).
+       *
+       * `score.durationSec` is re-measured by the next build, so between committing a ripple and
+       * that build it still describes the document a moment ago — and `performanceFeed()` reads
+       * this number as the snap layer's bound, which would then pull the freshly rippled tail back
+       * onto the last line inside the OLD length. Reading the declared end first closes that gap
+       * without storing a third authority: after the rebuild all three agree.
+       */
+      const structuralSec = this.structuralEndSec();
+      return Math.max(audioSec, scoreSec, structuralSec);
+    }
     return rt.source ? audioSec : scoreSec;
+  }
+
+  /** `documentEndTick` in seconds, or 0 when the document declares no structural end. */
+  private structuralEndSec(): number {
+    const end = this.runtime.get().source?.documentEndTick;
+    const map = this.rippleMap();
+    if (!end || !map) return 0;
+    const sec = map.toSec(ratValue(end));
+    return Number.isFinite(sec) ? Math.max(0, sec) : 0;
   }
 
   private viewportLimits(): TimeLimits {
@@ -9332,6 +9948,93 @@ class App {
       source: 'sheet'
     });
   }
+
+  /**
+   * WHERE THE PAGE IS, in a currency a tempo change cannot devalue: a written tick.
+   *
+   * The LEFTMOST VISIBLE one, and it is the only point on the page worth anchoring to — the sheet
+   * and the roll are pinned exactly at the sheet's left music edge and nowhere else (everything
+   * right of it drifts by the engraving's own unevenness, §alignAnchors). Anchoring the middle or
+   * the playhead would hold a point the two pictures already disagree about by a few pixels, and
+   * spend the one they agree about exactly to do it.
+   *
+   * Taken from the authoritative window rather than from the scroller, so it is the second the app
+   * BELIEVES is at the edge, not the one the last render happened to land on.
+   */
+  private captureSheetAnchor(): { anchorTick: number; anchorFrac: number } | null {
+    const score = this.runtime.get().score;
+    const v = this.viewport;
+    if (!score || !v) return null;
+    const tick = secondsToTick(score, v.fromSec, this.originSec(score));
+    if (!Number.isFinite(tick)) return null;
+    return { anchorTick: tick, anchorFrac: 0 };
+  }
+
+  /**
+   * THE TEMPO REBUILD'S ONE WINDOW: same size, same anchor, however many seconds that now is.
+   *
+   * Called once per `preserve-sheet-scale` rebuild, from the settled render of the score it was
+   * asked for, and BEFORE anything has pushed the old span at the new engraving — which is the
+   * step that matters. Running `applyViewportToSheet` first with the stale span would ask
+   * `absoluteSheetScale` for four times the zoom, alphaTab would engrave it, and the enlarged
+   * frame the player reported would have happened whatever this did afterwards.
+   *
+   * WHAT IT ASKS FOR is the span the sheet is showing AT THE SCALE IT IS ALREADY AT, off the
+   * calibration measured moments ago on this very engraving. Because `preservedScaleWindow` is
+   * `absoluteSheetScale`'s inverse, the `showSpan` this raises comes back through
+   * `applyViewportToSheet` as the identity: the same scale, no re-render, and a scroll to the
+   * anchor tick. One revision, one frame, nothing transient.
+   *
+   * IT CAN FAIL TO HOLD THE SIZE, and says so by returning false rather than pretending. The
+   * window it wants can be wider than the shared limits allow — a slow tempo writes the same
+   * performance across more seconds than the document is long — and `clampWindow` then reduces it,
+   * after which `applyViewportToSheet` legitimately re-scales to show what it was given. That is
+   * the three-way constraint at its hard edge (size, old window, alignment: pick two), and the
+   * honest answer at full-take saturation is that the size moves. Published through
+   * `__RIFFSHEET_VIEWPORT__.rebuildRebase` so a probe can see which of the two happened.
+   */
+  private rebaseViewportAtSheetScale(pending: { anchorTick: number; anchorFrac: number }): boolean {
+    const tv = this.triview;
+    const score = this.runtime.get().score;
+    const ref = this.sheetRef;
+    const view = tv?.viewport();
+    if (!tv || !score || !ref || !view || !(ref.pxPerSec > 0) || !(ref.scale > 0)) return false;
+    const plotWidth = Math.max(1, view.viewportWidth - TIMELINE_GUTTER_PX);
+    // The calibration was measured at `ref.scale`; read it at the scale the sheet is at now, the
+    // same correction `applyViewportToSheet` makes on the way out.
+    const pxPerSec = ref.pxPerSec * (tv.getZoom() / ref.scale);
+    const win = preservedScaleWindow(
+      tickToSeconds(score, pending.anchorTick, this.originSec(score)),
+      pending.anchorFrac,
+      pxPerSec,
+      plotWidth,
+      this.viewportLimits()
+    );
+    if (!win) return false;
+    const wantedSpan = plotWidth / pxPerSec;
+    this.rebuildRebase = {
+      scale: tv.getZoom(),
+      wantedSpanSec: wantedSpan,
+      grantedSpanSec: win.toSec - win.fromSec,
+      // Whether the size really was held, which is the claim — not whether a command was sent.
+      sizeHeld: Math.abs(win.toSec - win.fromSec - wantedSpan) < Math.max(1e-6, wantedSpan * 0.005)
+    };
+    const before = this.viewport?.revision;
+    this.dispatchViewport({ kind: 'showSpan', fromSec: win.fromSec, toSec: win.toSec, source: 'system' });
+    // A tempo that happens to land on the window already held is an identity in the reducer, and
+    // an identity raises no command — but the ENGRAVING still moved under it, so the scroll owed
+    // to the re-engrave is still owed. Re-assert it exactly as an ordinary rebuild would.
+    if (this.viewport?.revision === before) this.applyViewport();
+    return true;
+  }
+
+  /** What the last `preserve-sheet-scale` rebuild came to. Read by `__RIFFSHEET_VIEWPORT__`. */
+  private rebuildRebase: {
+    scale: number;
+    wantedSpanSec: number;
+    grantedSpanSec: number;
+    sizeHeld: boolean;
+  } | null = null;
 
   /**
    * The sheet's half: a scale that makes the pane show `span` seconds, and a tick at its edge.
@@ -9419,6 +10122,26 @@ class App {
     if (this.applyingViewport) {
       this.syncViewports();
       return;
+    }
+
+    /*
+     * THE CLOCK MOVED, SO THE WINDOW DOES AND THE SIZE DOES NOT (§rebaseViewportAtSheetScale).
+     *
+     * Here — after the recalibration, which this needs, and before `applyViewport`, which is the
+     * step that would otherwise hand the new engraving the old span and re-zoom it. The generation
+     * test is what keeps it honest across the several settled renders one rebuild can produce:
+     * exactly one of them belongs to the score the policy was asked for, and the policy is spent
+     * on that one whether or not the rebase can hold the size.
+     */
+    const pending = this.pendingRebuild;
+    if (pending && pending.generation === this.revision && this.viewport !== null) {
+      this.pendingRebuild = null;
+      // Falls through on purpose when the rebase declines (no calibration yet): the ordinary
+      // re-assert below is then exactly the right thing, and is what every other rebuild gets.
+      if (this.rebaseViewportAtSheetScale(pending)) {
+        this.syncViewports();
+        return;
+      }
     }
 
     if (this.viewport === null) {
@@ -9671,7 +10394,23 @@ class App {
     // simply scrolls the sheet back to the authoritative `fromSec` once the new engraving exists.
     this.refreshTempoBox();
     this.projectStaffVisibility(score);
-    this.triview?.load(score);
+    /*
+     * THE SELECTION TRAVELS WITH THE SCORE (audit finding 7).
+     *
+     * This function is the ONE place every rebuild goes through, so it is the one place that can
+     * make "the views agree with the authority" true by construction rather than by four callers
+     * remembering. Before this there were four selection authorities and they diverged predictably:
+     * `rebuildNotation` cleared the runtime's and neither view's, `TriView.load` retained its own
+     * across a score replacement, `PianoRoll.setPerformanceNotes` retained its own across a note
+     * replacement, and `renderMain` destroyed both views and rebuilt them empty while the runtime
+     * and the waveform still held a selection.
+     *
+     * `DocumentState.selection` in the runtime store is now the only authority. The views receive
+     * it as a render input, atomically with the score and the notes it applies to, and hold no
+     * opinion of their own that could survive a rebuild.
+     */
+    const selection = this.runtime.get().selection;
+    this.triview?.load(score, this.sheetSelectionFor(selection));
     this.renderEveryPart();
     // ONE ORIGIN, PUSHED BEFORE ANYTHING THAT READS IT (codex-critique §7).
     //
@@ -9708,6 +10447,11 @@ class App {
     // `PerformanceNote` is the other; they are structurally compatible on purpose, so the two
     // files agree without either importing the other's types.
     this.pianoRoll?.setPerformanceNotes(this.rollFeedNotes());
+    // ...and the authority's selection onto the notes that have just replaced the roll's. Second
+    // half of the atomic publish above: `setPerformanceNotes` used to leave the roll's own private
+    // set standing, so ids it no longer had rectangles for stayed "selected" in a Set nothing
+    // could draw.
+    this.pianoRoll?.setSelection([...selection]);
     this.pushScoreNotes(score);
     this.transport.setVoice(this.settings.get().playbackVoice);
     this.syncKeyPicker();
@@ -11781,6 +12525,13 @@ class App {
     // after exactly one extra engrave and is a no-op on every single-part take.
     this.triview.api.postRenderFinished.on(() => this.renderEveryPart());
     if (rt.score) this.applyScoreToViews(rt.score);
+    // THE WAVEFORM'S BRACKET, RECOMPUTED FROM THE NOTES rather than restored from a remembered
+    // span (audit finding 27). The range was worked out once, when the selection was written, and
+    // then carried through every subsequent edit: select a note, drag it later on the roll, and
+    // the sheet and roll moved while the bracket stayed over the stretch of tape the note used to
+    // occupy. Here — after the views exist and the notes are current — it can simply be asked
+    // again, which makes it a projection of the selection rather than a fourth authority.
+    this.refreshSelectionRange();
 
     if (rt.progress !== null) this.showProgressOverlay(sheet);
 
@@ -12063,7 +12814,9 @@ class App {
         this.runtime.set({ source: { ...source, tempoBpm: undefined, timeSignature: undefined } });
       }
     }
-    this.rebuildNotation();
+    // WHERE THE TEMPO COMES FROM IS A TEMPO CHANGE, so it takes the same policy as typing one:
+    // the number under the page may move, the page's size may not.
+    this.rebuildNotation({ viewportPolicy: 'preserve-sheet-scale' });
     this.renderMain();
     this.saveNow();
   }
@@ -12138,7 +12891,10 @@ class App {
             v / beatUnit(this.runtime.get().score?.timeSignature ?? source?.timeSignature).perQuarter;
           if (source) this.runtime.set({ source: { ...source, tempoBpm: quarters } });
           this.releaseHostGrid('tempo');
-          this.rebuildNotation();
+          // BPM CHANGES TIME, NOT TYPOGRAPHY. This box moves the tick<->seconds map and nothing
+          // else, so the engraving keeps its size and the shared window is rebased around the
+          // bar at the left edge instead. See `timeAxis.RebuildViewportPolicy`.
+          this.rebuildNotation({ viewportPolicy: 'preserve-sheet-scale' });
         }
       }),
       // THE UNIT, next to the number. "120" on its own is ambiguous the moment the sheet is
@@ -12166,7 +12922,11 @@ class App {
             const source = this.runtime.get().source;
             if (source) this.runtime.set({ source: { ...source, timeSignature: { numerator: n, denominator: d } } });
             this.releaseHostGrid('time signature');
-            this.rebuildNotation();
+            // THE SAME LAW AS THE BPM BOX, and for the same reason: re-stating the tempo in a new
+            // beat re-maps ticks onto seconds (a 6/8 pulse against a 4/4 one is worth 1.5x), which
+            // used to reach `absoluteSheetScale` as a request to re-zoom the page. Measured on the
+            // triplet demo before this: display.scale 0.975 -> 0.803 on a 4/4 -> 6/8 relabelling.
+            this.rebuildNotation({ viewportPolicy: 'preserve-sheet-scale' });
             this.renderMain();
           }
         },
@@ -12472,27 +13232,92 @@ class App {
       return;
     }
     const noteId = hit.noteId;
-    // An imported part is notation only in v1: it can be looked at and printed, and it is not a
-    // selection the roll, the waveform or an edit action could do anything with. Clicking one
-    // seeks, exactly as clicking an empty beat does.
+    /*
+     * SELECTABILITY IS NOT EDITABILITY (audit finding 9).
+     *
+     * An imported part used to be unselectable: clicking one seeked and highlighted nothing, on
+     * the reasoning that it has no editable roll projection. That conflates two questions. "Can I
+     * point at this?" is about the DOCUMENT and the answer is always yes — the player can see the
+     * notehead, and a click that visibly does nothing reads as a broken interface, which is
+     * exactly half of the owner's "clicking a sheet note sometimes highlights nothing".
+     * "Can I change this?" is about the part's provenance and the answer for an import is still
+     * no; that is enforced where edits are applied, not by refusing to acknowledge the click.
+     *
+     * So: it selects AND it seeks. The seek is what a read-only part can usefully do with a
+     * click, and the ring is the app admitting which note was clicked.
+     */
     if (this.isImportedNoteId(noteId)) {
       this.seekToTick(hit.beat.absolutePlaybackStart);
+      this.selectNoteIds([noteId]);
       return;
     }
     this.selectNoteIds([noteId]);
   }
 
-  /** One selection writer for waveform, roll, staff and TAB. */
+  /**
+   * THE ONE SELECTION WRITER. Authority first, then every view that draws it.
+   *
+   * The order is the contract: `runtime.set` is what makes it TRUE, and the three calls after it
+   * are projections of that truth onto surfaces. Nothing else in the app may write a selection —
+   * the views' own setters are inputs, not authorities (`view/triview.ts §selectedIds`), and
+   * every rebuild path re-reads this authority through `applyScoreToViews`.
+   */
   private selectNoteIds(ids: string[], updateWaveform = true): void {
     const unique = [...new Set(ids.filter(Boolean))];
     this.runtime.set({ selection: unique });
-    this.triview?.setSelection(unique);
+    this.triview?.setSelection(this.sheetSelectionFor(unique));
     this.pianoRoll?.setSelection(unique);
     if (!updateWaveform) return;
-    const range = this.pianoRoll?.audioRangeForIds(unique) ?? this.audioRangeForSourceIds(unique);
-    this.selection = range;
     this.tunerSelection = null;
     this.closeTuner();
+    this.refreshSelectionRange();
+  }
+
+  /**
+   * The waveform's bracket, asked of the CURRENT notes.
+   *
+   * Split out of `selectNoteIds` so that a rebuild can call it too. It used to be inline there
+   * and therefore ran exactly once per selection change, which meant every edit that moved or
+   * resized a selected note left the bracket describing where that note used to be (finding 27).
+   * A derived value that is only computed at one of the two moments it depends on is a cache, and
+   * this one had no invalidation.
+   */
+  /**
+   * THE SELECTION, TRANSLATED INTO WHAT THE PAGE CAN ACTUALLY RING (audit finding 5).
+   *
+   * The roll draws every event in the feed; the sheet draws what survived engraving. A note the
+   * build MERGED — a second detection of a pitch already in the chord, or the losing side of a
+   * quantization collision — has no notehead of its own, so `idToNotes` had nothing for it and the
+   * sheet drew a highlight around nothing at all. The roll lit up, the page did not, and there was
+   * no way to tell that from a broken selection.
+   *
+   * It is not nothing, though: the projection names the note whose glyph SPEAKS for it, resolved
+   * transitively by the pipeline so it is always an engraved id. Ringing that notehead is the
+   * truthful answer — "your note is written there, inside this one" — and it is the difference
+   * between an interface that explains itself and one that appears to ignore you.
+   *
+   * A `dropped` note has no proxy, because there is genuinely nothing on the page to point at. It
+   * falls out of the sheet's list and stays selected everywhere else: the roll rings it, the
+   * waveform brackets it, Delete still removes it. `sheetSilenceReason` is what says why, and it
+   * is reported on the selection probe.
+   */
+  private sheetSelectionFor(ids: ReadonlyArray<string>): string[] {
+    const out: string[] = [];
+    for (const id of ids) {
+      // No projection yet (before the first build) means fall back to the id itself rather than
+      // to an empty list — an unknown page is not the same claim as an absent note.
+      const proxy = this.projection.entries.size ? sheetProxyFor(this.projection, id) : id;
+      if (proxy && !out.includes(proxy)) out.push(proxy);
+    }
+    return out;
+  }
+
+  private refreshSelectionRange(): void {
+    const ids = this.runtime.get().selection;
+    const range = ids.length
+      ? (this.pianoRoll?.audioRangeForIds(ids) ?? this.audioRangeForSourceIds(ids))
+      : null;
+    this.selection = range;
     this.waveform?.setSelection(range?.fromSec ?? null, range?.toSec ?? null);
   }
 
@@ -12762,8 +13587,41 @@ class App {
   private autoEdits: Array<AppliedAutoEdit & { id: string; reviewed: boolean }> = [];
   /** What it noticed and did NOT act on — the toggle being off, or a guardrail refusing. */
   private autoAttention: AttentionMark[] = [];
-  /** Ids for the notes it creates. A namespace of its own, so nothing can collide. */
-  private autoNoteCount = 0;
+  /**
+   * IDS FOR EVERY NOTE THIS APP MINTS — one allocator, seeded from the document.
+   *
+   * THREE COUNTERS STOOD HERE, in three places (`autoNoteCount`, `addedNoteCount`,
+   * `splitNoteCount`), each initialised to zero at construction and each reset when a new take
+   * arrived. What none of them was ever told is what names a RESTORED document had already spent:
+   * `restoreSession` installed the persisted notes and left the counters at zero, so a take saved
+   * with `add1` in it minted `add1` again for the very next note the player drew.
+   *
+   * Two notes, one name — and every layer that keys on ids then treats them as one note. The
+   * duration command resolves to a SET of ids and rewrites every note carrying one of them, and
+   * `score/fromPipeline.ts` chains every glyph sharing an id into one held note. So editing
+   * either of the two also edited the other, minutes apart on the timeline, which is the owner's
+   * "changing one duration changes another note" arriving by a route with nothing to do with
+   * chords. Audit finding 3.
+   *
+   * `app/identity.ts` carries the argument and the seeding rule. Everything that installs notes
+   * this app did not just mint must `seed()` before minting again.
+   */
+  private noteIds = new NoteIdAllocator();
+
+  /*
+   * ---------------------------------------------------------------------------------------------
+   * THE CURRENT REVISION, AND THE TWO TABLES THAT DESCRIBE IT.
+   *
+   * Written together in `rebuildNotation` and nowhere else, so they cannot describe different
+   * builds. Read by the editor (membership), by selection (what the page can show), and by the
+   * probes. See `score/projection.ts` for why the revision has to be stamped at all.
+   * ---------------------------------------------------------------------------------------------
+   */
+  private revision = 0;
+  /** Which notes the PAGE writes as one stack. The editor's only membership authority. */
+  private chordEventTable: ChordEventTable = EMPTY_CHORD_EVENTS;
+  /** What became of every note the build was handed — engraved, merged into another, or dropped. */
+  private projection: Projection = EMPTY_PROJECTION;
   /** Set once a transcription lands; cleared when the pass has run against it. */
   private autoPassPending = false;
   /**
@@ -12801,36 +13659,25 @@ class App {
    */
   private perfCuts: CutSpan[][] = [NO_CUTS];
   /**
-   * THE DOCUMENT'S DECLARED LENGTH at each performance step, parallel to `perfStack` (Z4c).
+   * THE DOCUMENT'S STRUCTURE at each performance step, parallel to `perfStack` — ONE snapshot.
    *
-   * A bar insert is not only a note edit: it changes `SourceAudio.documentBars`, which is the
-   * `BuildInput.minimumBars` floor the pipeline engraves against. Undo used to restore the notes
-   * and leave the length alone, so walking back an inserted bar gave a document one bar longer
-   * than its own history said it was. Structural state joins the transaction here.
+   * WHY ONE AND NOT FOUR. This began as `perfBars` (Z4c: a bar insert changes
+   * `SourceAudio.documentBars`, the `BuildInput.minimumBars` floor, so undoing one used to put the
+   * notes back and leave the document a bar longer than its own history said it was) and grew
+   * `perfParts` beside it (workstream C: a bar op splices every imported part too, because they
+   * share one bar list — without it ⌘Z left the imported chart a bar to the right of the take).
+   * The ripple adds two more fields, and four loosely synchronised arrays that must be truncated,
+   * pushed and stepped in lockstep is three chances to forget. They are one object.
    *
-   * `undefined` is a document that declares no length at all — every recorded take — and
-   * restoring it is a no-op, so this costs a take that never inserts a bar exactly nothing.
+   * EVERY FIELD IS OPTIONAL AND `undefined` IS A VALUE. A recorded take declares no bar count, no
+   * parts and no log; restoring `undefined` is what REMOVES the floor again rather than leaving
+   * the very first bar insert un-undoable. See `restoreStructure`.
    */
-  private perfBars: Array<number | undefined> = [undefined];
-  /**
-   * THE IMPORTED PARTS AT EACH PERFORMANCE STEP, parallel to `perfStack` — the other half of a
-   * bar operation's undo (workstream C).
-   *
-   * A bar op is one clock's worth of edit: it splices the take's notes AND every imported part,
-   * because they share one bar list. The parts do not live on the performance stack (they are
-   * not the take), so without this ⌘Z would put the take back a bar and leave the imported chart
-   * a bar to the right of it — which is the exact silent corruption the old "Imported parts share
-   * these bars" refusal existed to prevent, arriving through the door marked undo.
-   *
-   * `undefined` is a document with no imported parts, which is nearly all of them, and restoring
-   * it is a no-op — so this costs a single-part take exactly nothing.
-   */
-  private perfParts: Array<ImportedPart[] | undefined> = [undefined];
+  private perfStructure: PerfStructure[] = [{}];
   /** The order the two layers were edited in, so one ⌘Z walks back through both. */
   private history: Array<'perf' | 'score'> = [];
   private historyIndex = -1;
-  /** Ids for notes the player adds. Never collides with the engine's `n<index>` ids. */
-  private addedNoteCount = 0;
+  // Ids for notes the player adds come from `this.noteIds` — see its declaration.
 
   /**
    * Keep the interleaving record honest after a replay.
@@ -12874,8 +13721,7 @@ class App {
     this.perfStack = [notes];
     this.perfLabels = [null];
     this.perfCuts = [this.cuts()];
-    this.perfBars = [this.runtime.get().source?.documentBars];
-    this.perfParts = [this.runtime.get().source?.importedParts];
+    this.perfStructure = [this.structureNow()];
     this.perfIndex = 0;
     this.history = [];
     this.historyIndex = -1;
@@ -12903,7 +13749,7 @@ class App {
     const result = applyRollEditToNotes(feed, edit, {
       originSec: this.originSec(score),
       tempoBpm: score.tempoBpm,
-      newNoteId: () => `add${++this.addedNoteCount}`
+      newNoteId: () => this.noteIds.next('add')
     });
     if (!result) return;
 
@@ -12925,16 +13771,20 @@ class App {
     // become destructive after all. So the cut path starts from the RECORDING and writes only
     // the named notes into it.
     const cuts = this.cuts();
+    // THE LOG, RUN BACKWARDS FIRST. The gesture's seconds are FEED seconds and the recording is
+    // not; see `unrippled`. On a document with no log this is the identity and the road below is
+    // the road it always was.
+    const edited = this.unrippled(result.notes);
     this.commitPerformance(
       cuts.length
-        ? mergeRollEditOntoCutTake(raw, result.notes, touched, cuts)
+        ? mergeRollEditOntoCutTake(raw, edited, touched, cuts)
         : // Only the notes the gesture NAMED keep their edited position; every other note goes
           // back to the recording. Committing `result.notes` wholesale would quietly promote the
           // snapped position of every untouched note into the raw take, and one drag would cost
           // the player the ability to ever switch the snap off again.
-          feed === raw
+          feed === raw && edited === result.notes
           ? result.notes
-          : mergeEditedOntoRaw(raw, result.notes, touched),
+          : mergeEditedOntoRaw(raw, edited, touched),
       result.label
     );
   }
@@ -13029,6 +13879,8 @@ class App {
     const source = this.runtime.get().source;
     const score = this.runtime.get().score;
     if (!source?.detected || !score) return false;
+    // A DURATION IS A STRUCTURAL EDIT NOW, not a reducer over the feed. See `applyDurationRipple`.
+    if (edit.kind === 'setDuration') return this.applyDurationRipple(edit.noteId, edit.intent);
 
     const raw = source.detected.notes;
     // WHAT THE PLAYER WAS LOOKING AT, exactly as the roll's road does it: the sheet is engraved
@@ -13037,8 +13889,20 @@ class App {
     const result = applySheetEditToNotes(feed, edit, {
       originSec: this.originSec(score),
       tempoBpm: score.tempoBpm,
-      newNoteId: () => `add${++this.addedNoteCount}`,
-      intentLengthSec: (startSec, intent) => this.intentLengthSec(startSec, intent)
+      newNoteId: () => this.noteIds.next('add'),
+      intentLengthSec: (startSec, intent) => this.intentLengthSec(startSec, intent),
+      /*
+       * THE PAGE'S OWN CHORD GROUPING, published with this revision (audit finding 2).
+       *
+       * The reducer used to re-derive membership from a flat ±35 ms window around whichever note
+       * was clicked. That is a different RELATION from the greedy partition the engraver runs, not
+       * a looser version of it, and it disagreed in both directions — chaining across a group
+       * boundary the page had drawn, and refusing a group the page had made at a slow tempo. The
+       * table is the engraver's own answer for the feed this sheet was engraved from, so the
+       * editor's idea of a chord IS the page's idea of a chord, by construction rather than by a
+       * shared constant.
+       */
+      chordEvents: this.chordEventTable
     });
     if (!result) return false;
 
@@ -13047,16 +13911,131 @@ class App {
     for (const id of result.touchedIds) this.userTouchedIds.add(id);
 
     const cuts = this.cuts();
+    // …AND THE SAME INVERSE THE ROLL'S ROAD TAKES. One rule, two roads. See `unrippled`.
+    const edited = this.unrippled(result.notes);
     this.commitPerformance(
       cuts.length
-        ? mergePerformanceEditOntoCutTake(raw, result.notes, result.touchedIds, cuts)
-        : feed === raw
+        ? mergePerformanceEditOntoCutTake(raw, edited, result.touchedIds, cuts)
+        : feed === raw && edited === result.notes
           ? result.notes
-          : mergeEditedOntoRaw(raw, result.notes, result.touchedIds),
+          : mergeEditedOntoRaw(raw, edited, result.touchedIds),
       result.label
     );
     return true;
   }
+
+  /**
+   * ==================== THE RIPPLE: ONE DURATION, THE WHOLE REST OF THE SCORE ====================
+   *
+   * THE THREE ANSWERS THIS REPLACES, in the order they were given and refused:
+   *
+   *   EDITED-NOTE-WINS  the chosen value was taken and the neighbours it now covered were DELETED
+   *                     ("swallowed") or beheaded. Choosing Whole for a note at the top of a take
+   *                     removed the next two seconds of music. The audit's first Critical.
+   *   NEIGHBOUR-WINS    the chosen value was clamped back to the next attack, so picking Whole
+   *                     silently gave the player a sixteenth. A different wrong answer.
+   *   NEITHER           the interim: the chord took the value and nothing else moved, so the
+   *                     performance kept an overlap the engraver then truncated on the page. Safe,
+   *                     and not what anybody means by lengthening a note in a line of music.
+   *
+   * The answer is that the rest of the score MOVES. `edit/ripple.ts` holds the law; this is the
+   * three jobs the app owns:
+   *
+   *   1. ASK THE PAGE what the note is written as — the engraved span with tied continuations
+   *      coalesced (`writtenSpans`), never `endSec - startSec`, which is articulation.
+   *   2. ASK THE PUBLISHED CHORD TABLE who changes with it (`chordEventTable`), so the atom is the
+   *      stack the player is looking at rather than whatever happens to be within 35 ms.
+   *   3. COMMIT ONE TRANSACTION: the intent on the chord, the operation on the log, the structural
+   *      end, the parts, and the detached flag — one ⌘Z puts all of it back.
+   *
+   * THE TOUCHED CONTRACT IS SPLIT, and this is the trap the critique named by line number. The
+   * old code added every touched id to `userTouchedIds`, which is what exempts a note from the
+   * automatic edit pass forever. A ripple "touches" the entire tail of the take, so ONE duration
+   * pick would have permanently switched the auto-edit pass off for almost the whole document.
+   *
+   *   writebackIds  every note the operation moves. Nothing is written back — the log is the
+   *                 storage — so this exists to be reported, not to be spent.
+   *   authoredIds   the chord the player actually chose a value for. THAT is what the pass must
+   *                 leave alone, and it is all that goes into `userTouchedIds`.
+   *
+   * A REFUSAL IS A REFUSAL. When the pull would leave a note that is still sounding across the
+   * seam with nothing printable left, the plan says so and the edit does not happen — with the
+   * reason shown, rather than a silent trim or a deleted note.
+   */
+  private applyDurationRipple(noteId: string, intent: NotationIntent): boolean {
+    const source = this.runtime.get().source;
+    const score = this.runtime.get().score;
+    const map = this.rippleMap();
+    if (!source?.detected || !score || !map) return false;
+
+    const feed = this.performanceFeed();
+    const at = feed.find((n) => n.id === noteId);
+    if (!at) return false;
+    // AT `ir.divisions`, DELIBERATELY: `notationIntentTicks` returns null when the value does not
+    // divide the IR's tick grid exactly, which is how the dotted 1/32 is refused. See
+    // `intentLengthSec` for the whole of that argument.
+    const newLengthTicks = notationIntentTicks(intent, score.ir.divisions);
+    if (newLengthTicks === null) return false;
+
+    const chordIds = chordMemberIds(this.chordEventTable, noteId);
+    const spans = this.writtenSpans();
+    // THE ATOM'S WRITTEN SPAN is the union of its members' — a strummed chord is one slot even
+    // when the engraver gave one member a tie the others did not need.
+    let written: WrittenSpan | null = null;
+    for (const id of chordIds) {
+      const span = spans.get(id);
+      if (!span) continue;
+      written = written
+        ? { startTick: Math.min(written.startTick, span.startTick), endTick: Math.max(written.endTick, span.endTick) }
+        : span;
+    }
+
+    const plan = planDurationRipple({
+      feed,
+      chordIds,
+      newLengthTicks,
+      written,
+      map,
+      opId: `r${++this.rippleSeq}`,
+      label: durationLabel(intent)
+    });
+    if (plan.rejected) {
+      // A REFUSAL IS SHOWN. The whole argument for rejecting rather than trimming is that the
+      // player can then do something about it, which they cannot do about a silent trim.
+      this.toast('info', 'Cannot change that duration', plan.rejected);
+      return false;
+    }
+    if (!plan.op) return false;
+
+    /*
+     * THE ONLY THING WRITTEN INTO THE RECORDING IS THE DECLARATION.
+     *
+     * Not the new end — the log states that, and writing it into `source.detected.notes` would
+     * promote a snapped, cut-closed second into the audio-coordinate store, which is the defect
+     * this whole layer exists to avoid. The intent is not a time: it is what the player asked the
+     * page to PRINT, it survives the quantizer's grid, and it belongs to the note.
+     */
+    const authored = new Set(chordIds);
+    const notes = source.detected.notes.map((n) =>
+      n.id !== undefined && authored.has(n.id) ? { ...n, notationIntent: intent } : n
+    );
+
+    // ONLY THE CHORD. See the touched-contract note above — this is the line the critique flagged.
+    for (const id of authored) this.userTouchedIds.add(id);
+    this.lastRippleWriteback = rippleMovedIds(feed, [plan.op], map);
+
+    return this.commitRipple(plan.op, durationLabel(intent), { notes });
+  }
+
+  /** Names for ripple operations, monotone within a session. Ids are opaque — see identity.ts. */
+  private rippleSeq = 0;
+  /**
+   * Every id the last ripple MOVED — the `writebackIds` half of the split contract.
+   *
+   * Nothing is written back with it (the log is the storage). It exists so the probe can assert
+   * that a ripple moved the tail and that `userTouchedIds` did NOT swallow it.
+   */
+  private lastRippleWriteback = new Set<string>();
 
   /**
    * BARS ARE STRUCTURE, so a bar operation is a note edit AND a document-length change, in one
@@ -13126,13 +14105,38 @@ class App {
     return to > from ? { barStartSec: from, barLengthSec: to - from } : null;
   }
 
-  /** Stable ids for the pieces the splice law creates. Never collide with `n<i>` or `add<i>`. */
-  private splitNoteCount = 0;
-
+  /**
+   * A BAR OPERATION IS A RIPPLE, and it now goes through the same rational-op storage.
+   *
+   * WHAT IT USED TO DO, AND THE TWO DEFECTS THAT WERE IN IT. It ran `applyBarOp` over the FEED and
+   * then merged the result back into `source.detected.notes` with `mergeEditedOntoRaw`:
+   *
+   *   IT COULD DROP CUT-HIDDEN NOTES. The feed does not contain notes whose attack is inside a
+   *     cut, and `mergeEditedOntoRaw` rebuilds the take OUT OF THE FEED — so every hidden note was
+   *     deleted the first time a bar was inserted into a take that had been cut. The roll-edit road
+   *     already knew this and used `mergeRollEditOntoCutTake` instead; this road did not.
+   *   IT WROTE EDITED-CLOCK SECONDS INTO AUDIO-COORDINATE STORAGE. The feed is stated with the cuts
+   *     closed up and the snap applied; `source.detected.notes` is the recording, in audio seconds,
+   *     permanently, because that is what makes a cut undoable. Writing one into the other moves
+   *     every spliced note by the total length of everything cut before it.
+   *
+   * BOTH ARE CURED BY NOT WRITING NOTES AT ALL. A bar operation is a splice of the score timeline,
+   * which is exactly what a `RippleOp` is: seam, delta, and — for an insert — the split law that
+   * makes the new bar genuinely empty. The recording is not touched, so there is nothing for a cut
+   * to be inconsistent with and no clock to cross.
+   *
+   * AND IT MOVES THE RULER, NOT ONLY THE SECONDS. An imported symbolic part is engraved from
+   * `sourceTiming` against `sourceBars`; shifting the notes and leaving that map alone put every
+   * one of them straight back into the bar it came from. `commitRipple` splices both.
+   *
+   * `documentBars` stays exactly what it was: a FLOOR, adopted from the engraver on the first
+   * operation, and capped at the pipeline's own 256 rather than webcore's old 512.
+   */
   private applyBarOperation(op: BarOp): boolean {
     const source = this.runtime.get().source;
     const score = this.runtime.get().score;
-    if (!this.canEditBars() || !source?.detected || !score) return false;
+    const map = this.rippleMap();
+    if (!this.canEditBars() || !source?.detected || !score || !map) return false;
     const interval = this.barIntervalSec(score, op.barIndex);
     if (!interval) return false;
     // A RECORDED TAKE DECLARES NO LENGTH UNTIL IT IS ASKED TO. `documentBars` is absent on every
@@ -13141,46 +14145,38 @@ class App {
     // an inserted empty bar survive the rebuild instead of being re-derived away.
     const barCount = source.documentBars ?? score.ir.bars.length;
     if (!(barCount > 0)) return false;
+    if (op.kind === 'deleteBar' && barCount <= 1) return false;
 
-    const ctx: BarOpContext = {
-      ...interval,
-      barCount,
-      splitId: (id) => `split${++this.splitNoteCount}~${id}`
+    const insert = op.kind === 'insertBar';
+    const seamSec = insert && op.where === 'after' ? interval.barStartSec + interval.barLengthSec : interval.barStartSec;
+    // THE SEAM AND THE LENGTH IN TICKS, through the tempo map at BOTH ends — never one bar length
+    // in seconds multiplied by a scalar, which is a different number of ticks either side of a
+    // tempo change. Rounded to whole IR ticks because a bar IS a whole number of them.
+    const seamTick = map.toTick(seamSec);
+    const barTicks = Math.round(map.toTick(seamSec + interval.barLengthSec) - seamTick);
+    if (!(barTicks > 0)) return false;
+
+    const rippleOp: RippleOp = {
+      id: `b${++this.rippleSeq}`,
+      seamTick: ratFromTick(seamTick),
+      deltaTick: rational(insert ? barTicks : -barTicks),
+      ...(insert ? { split: true } : { dropSpan: true }),
+      label: insert ? (op.where === 'after' ? 'Insert bar after' : 'Insert bar before') : 'Delete bar'
     };
-    const feed = this.performanceFeed();
-    const result = applyBarOp(feed, op, ctx);
-    if (!result) return false;
-    for (const id of result.touchedIds) this.userTouchedIds.add(id);
+    const label = rippleOp.label ?? 'Bar operation';
+    const nextCount = insert
+      ? Math.min(MAX_DOCUMENT_BARS, barCount + 1)
+      : Math.max(1, barCount - 1);
 
-    const raw = source.detected.notes;
-    const merged =
-      feed === raw ? result.notes : mergeEditedOntoRaw(raw, result.notes, result.touchedIds);
+    // The player has decided about the bar, not about every note the splice moved — the same split
+    // the duration ripple makes. See `applyDurationRipple` §the touched contract.
+    this.lastRippleWriteback = rippleMovedIds(this.performanceFeed(), [rippleOp], map);
 
-    // ONE CLOCK, EVERY PART. An imported chart is pinned to the same bar list, so it splices with
-    // the same arithmetic — the operation that used to be refused because of it.
-    const importedParts = source.importedParts?.map((part) => ({
-      ...part,
-      notes: applyBarOpToPartNotes(part.notes, op, ctx)
-    }));
-
-    // THE AUDIO DURATION IS NOT WRITTEN HERE, AND THAT IS THE WHOLE OF WORKSTREAM C.
-    // `source.durationSec` is the recording's length and stays the recording's length; the
-    // waveform draws it unchanged. What changes is the SCORE's length, which the pipeline
-    // reports as `RiffScore.durationSec` on the next build and nothing needs to store. The
-    // `detached` flag is the declaration that the two may now differ, and the pipeline consumes
-    // it as `BuildInput.detachedTimeline` — without it the audio-length guard answers "insert a
-    // bar" by deleting everything the insert pushed past the old end (pipeline/src/guards.ts).
-    this.runtime.set({
-      source: {
-        ...source,
-        documentBars: result.barCount,
-        timelineDetached: true,
-        ...(importedParts ? { importedParts } : {})
-      }
-    });
-    this.commitPerformance(merged, result.label);
-    const label = this.root.querySelector<HTMLElement>('[data-role="bar-count"]');
-    if (label) label.textContent = `${result.barCount} bars`;
+    if (!this.commitRipple(rippleOp, label, { barCount: nextCount, barSplice: { kind: op.kind, seamSec } })) {
+      return false;
+    }
+    const barLabel = this.root.querySelector<HTMLElement>('[data-role="bar-count"]');
+    if (barLabel) barLabel.textContent = `${nextCount} bars`;
     return true;
   }
 
@@ -13195,6 +14191,19 @@ class App {
   private onSheetContextMenu(target: SheetTarget): void {
     const score = this.runtime.get().score;
     if (!score) return;
+    /*
+     * THE MENU'S TARGET BECOMES THE SELECTION (audit finding 4).
+     *
+     * A secondary press deliberately does not select (`view/triview.ts §onPointerDown` returns on
+     * `button !== 0`), and `contextmenu` then resolves its own target independently. So selecting
+     * A and right-clicking B left the ring on A while the menu edited B — and, before the
+     * destruction law was disarmed, B's neighbours as well. The player was shown one note and
+     * given another.
+     *
+     * Synchronising here rather than in the view keeps the authority rule intact: the menu is
+     * raised by the app, so the app is what states which note the next command is about.
+     */
+    if (target.noteId) this.selectNoteIds([target.noteId]);
     const items: SheetMenuItem[] = [];
     const imported = target.trackIndex !== null && !target.live;
     const importedReason = 'Imported parts are paper-only';
@@ -13413,7 +14422,7 @@ class App {
       return;
     }
 
-    const applied = applyAutoEdits(source.detected.notes, plan, () => `auto${++this.autoNoteCount}`);
+    const applied = applyAutoEdits(source.detected.notes, plan, () => this.noteIds.next('auto'));
     this.autoAttention = plan.attention;
     this.autoEdits = applied.applied.map((edit, i) => ({
       ...edit,
@@ -13917,15 +14926,13 @@ class App {
     this.perfStack = this.perfStack.slice(0, this.perfIndex + 1);
     this.perfLabels = this.perfLabels.slice(0, this.perfIndex + 1);
     this.perfCuts = this.perfCuts.slice(0, this.perfIndex + 1);
-    this.perfBars = this.perfBars.slice(0, this.perfIndex + 1);
-    this.perfParts = this.perfParts.slice(0, this.perfIndex + 1);
+    this.perfStructure = this.perfStructure.slice(0, this.perfIndex + 1);
     this.perfStack.push(notes);
     this.perfLabels.push(label);
     this.perfCuts.push(cuts);
     // Read AFTER the caller has written it: `applyBarOperation` sets the new length on the
     // runtime and then commits, so this snapshot is the length this step produced.
-    this.perfBars.push(this.runtime.get().source?.documentBars);
-    this.perfParts.push(this.runtime.get().source?.importedParts);
+    this.perfStructure.push(this.structureNow());
     this.perfIndex = this.perfStack.length - 1;
     this.history = this.history.slice(0, this.historyIndex + 1);
     this.history.push('perf');
@@ -13935,17 +14942,32 @@ class App {
     this.refreshUndoRedo();
   }
 
+  /** What the document's structure is right now — one snapshot for the performance stack. */
+  private structureNow(): PerfStructure {
+    const source = this.runtime.get().source;
+    return {
+      bars: source?.documentBars,
+      parts: source?.importedParts,
+      ripples: source?.rippleOps,
+      endTick: source?.documentEndTick
+    };
+  }
+
   /**
-   * Put the document's STRUCTURE back where a history step had it — its declared bar count and
-   * every imported part's timing. See `perfBars` and `perfParts`.
+   * Put the document's STRUCTURE back where a history step had it — its declared bar floor, every
+   * imported part's timing, the ripple log and the structural end. See `perfStructure`.
    *
    * NO AUDIO DURATION IS WRITTEN HERE. It used to recompute `source.durationSec` (and the audio
    * reference's) from the restored bar count, which was harmless while bar operations only ever
    * ran on documents that had no recording and is a corruption now that they run on takes: it
    * would resize the waveform on the way back through the history. The score's own length is
    * re-derived by the rebuild that follows, from the notes.
+   *
+   * `timelineDetached` IS NOT RESTORED, and that is the documented one-way policy rather than an
+   * omission (`state.ts §timelineDetached`): re-attaching would re-arm exactly the guards that
+   * would delete the material a redo is about to put back.
    */
-  private restoreDocumentBars(bars: number | undefined, parts: ImportedPart[] | undefined): void {
+  private restoreStructure(next: PerfStructure): void {
     const source = this.runtime.get().source;
     if (!source) return;
     /*
@@ -13957,21 +14979,26 @@ class App {
      * first insert put the notes back and left the document declaring a bar it no longer had.
      * The score kept an empty bar on the end that nothing in its own history accounted for.
      * Restoring `undefined` removes the floor and lets the engraver derive the length from the
-     * notes again, which is exactly the state the take was in before the insert.
+     * notes again, which is exactly the state the take was in before the insert. The same is true
+     * of the ripple log: undoing the first ripple must leave NO log, not an empty one.
      */
-    const barsChanged = source.documentBars !== bars;
-    const partsChanged = parts !== source.importedParts;
-    if (!barsChanged && !partsChanged) return;
+    const barsChanged = source.documentBars !== next.bars;
+    const partsChanged = next.parts !== source.importedParts;
+    const ripplesChanged = next.ripples !== source.rippleOps;
+    const endChanged = next.endTick !== source.documentEndTick;
+    if (!barsChanged && !partsChanged && !ripplesChanged && !endChanged) return;
     this.runtime.set({
       source: {
         ...source,
-        ...(barsChanged ? { documentBars: bars } : {}),
-        ...(partsChanged ? { importedParts: parts } : {})
+        ...(barsChanged ? { documentBars: next.bars } : {}),
+        ...(partsChanged ? { importedParts: next.parts } : {}),
+        ...(ripplesChanged ? { rippleOps: next.ripples } : {}),
+        ...(endChanged ? { documentEndTick: next.endTick } : {})
       }
     });
-    if (!barsChanged || bars === undefined) return;
+    if (!barsChanged || next.bars === undefined) return;
     const label = this.root.querySelector<HTMLElement>('[data-role="bar-count"]');
-    if (label) label.textContent = `${bars} bars`;
+    if (label) label.textContent = `${next.bars} bars`;
   }
 
   /** Put a performance on screen: new notes in, pipeline re-run, notation edits replayed. */
@@ -14071,7 +15098,7 @@ class App {
       this.perfIndex = Math.max(0, this.perfIndex - 1);
       // Both halves of the step, or undoing a cut would put the notes back and leave the tape
       // still cut — see `perfCuts`.
-      this.restoreDocumentBars(this.perfBars[this.perfIndex], this.perfParts[this.perfIndex]);
+      this.restoreStructure(this.perfStructure[this.perfIndex] ?? {});
       this.setPerformance(this.perfStack[this.perfIndex], this.perfCuts[this.perfIndex] ?? NO_CUTS);
       this.refreshUndoRedo();
       return;
@@ -14096,7 +15123,7 @@ class App {
     if (this.historyIndex < this.history.length - 1 && this.history[this.historyIndex + 1] === 'perf') {
       this.historyIndex++;
       this.perfIndex = Math.min(this.perfStack.length - 1, this.perfIndex + 1);
-      this.restoreDocumentBars(this.perfBars[this.perfIndex], this.perfParts[this.perfIndex]);
+      this.restoreStructure(this.perfStructure[this.perfIndex] ?? {});
       this.setPerformance(this.perfStack[this.perfIndex], this.perfCuts[this.perfIndex] ?? NO_CUTS);
       this.refreshUndoRedo();
       return;
@@ -14638,6 +15665,25 @@ class App {
  * comes out byte-identical, which is what keeps the playback assembly below untouched.
  */
 const tempoMaps = new WeakMap<RiffScore, TickSecondsMap | null>();
+
+/**
+ * THE BEAT PERIOD THIS SCORE WAS BUILT WITH, in seconds — the number the chord law is a function
+ * of (`pipeline/src/chords.ts §chordWindowSec`).
+ *
+ * MEASURED FROM THE TRACKED BEATS FIRST, and falling back to the display tempo only when there
+ * are not two of them. That order matters because the pipeline's own grouping ran against the
+ * beats it detected, not against the rounded BPM the tempo box shows: taking the second answer
+ * when the first exists would give the editor a slightly different window from the page's, which
+ * is the whole class of fault `edit/chordEvents.ts` exists to close. It mirrors the same
+ * derivation the façade already does for `RiffScore.durationSec`.
+ */
+function beatPeriodOf(score: RiffScore): number {
+  const beats = score.beatTimesSec;
+  if (beats && beats.length > 1) {
+    return (beats[beats.length - 1] - beats[0]) / (beats.length - 1);
+  }
+  return 60 / (score.tempoBpm || 100);
+}
 
 function tempoMapOf(score: RiffScore): TickSecondsMap | null {
   if (tempoMaps.has(score)) return tempoMaps.get(score) ?? null;

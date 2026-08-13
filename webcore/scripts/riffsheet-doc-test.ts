@@ -42,6 +42,7 @@ import {
   type PersistedSource,
   type RiffsheetDocument
 } from '../src/app/persist';
+import { ratValue, rational } from '../src/edit/ripple';
 import {
   DEFAULT_SETTINGS,
   SETTINGS_VERSION,
@@ -175,11 +176,26 @@ const document: RiffsheetDocument = {
 const written = writeRiffsheetDocument(document);
 const reopened = readRiffsheetDocument(written);
 
+/*
+ * THE EXPECTED VERSION MOVED, INTENTIONALLY: 4 -> 5. The old claim, quoted:
+ *
+ *   assert(
+ *     reopened.version === RIFFSHEET_DOCUMENT_VERSION && RIFFSHEET_DOCUMENT_VERSION === 4,
+ *     'a document written by this build reports version 4'
+ *   );
+ *
+ * v5 is v4 plus the STRUCTURAL SCORE-TIME LAYER — `timelineDetached`, `rippleOps` and
+ * `documentEndTick` (`persist.ts §RIFFSHEET_DOCUMENT_VERSION`). It passes the same test v4's bump
+ * did: a v4 reader handed one of these shows the take with every ripple undone and the timeline
+ * re-attached, and then writes the file back WITHOUT them. That is a reader being wrong about the
+ * music and destroying the evidence, which is what the gate is for. Everything about a document
+ * that has none of those fields is byte-identical, which §"the bytes do not move" below asserts.
+ */
 assert(
-  reopened.version === RIFFSHEET_DOCUMENT_VERSION && RIFFSHEET_DOCUMENT_VERSION === 4,
-  'a document written by this build reports version 4'
+  reopened.version === RIFFSHEET_DOCUMENT_VERSION && RIFFSHEET_DOCUMENT_VERSION === 5,
+  'a document written by this build reports version 5'
 );
-assert(!!reopened.audioData, 'a v4 document comes back with its recording');
+assert(!!reopened.audioData, 'a v5 document comes back with its recording');
 
 // THE CONTAINER: a real zip, recognisable to anything that reads them.
 assert(
@@ -479,6 +495,78 @@ const hugeName = readRiffsheetDocument(
   writeRiffsheetDocument({ ...document, source: { ...source, livePartName: `  ${'x'.repeat(400)}  ` } })
 );
 assert((hugeName.source.livePartName ?? '').length === 40, 'an over-long stored name is bounded on the way back');
+
+// ---------------------------------------------------------------------------
+// 4d. THE STRUCTURAL SCORE-TIME LAYER (v5) — the ship-blocker and the ripple log
+// ---------------------------------------------------------------------------
+//
+// THE SHIP-BLOCKER. `timelineDetached` is what tells the pipeline the score's clock and the
+// recording's have parted company and what stops the snap layer from clamping notes back inside
+// the tape. It was set by every bar operation and written by NEITHER encoder — so reopening a
+// bar-edited document re-armed every guard the edit had disarmed, and the material past the old
+// audio end was piled onto the last line inside the recording or dropped outright. The document
+// said one thing on screen and another after a restart.
+{
+  const detached = readRiffsheetDocument(
+    writeRiffsheetDocument({ ...document, source: { ...source, timelineDetached: true } })
+  );
+  assert(detached.source.timelineDetached === true, 'a detached timeline survives a save and reopen');
+  assert(
+    readRiffsheetDocument(writeRiffsheetDocument(document)).source.timelineDetached === undefined,
+    'and a document nobody has detached carries no such key — the bytes do not move'
+  );
+
+  // THE RIPPLE LOG. A ripple is a decision, exactly as a cut is, and cannot be recomputed: without
+  // it the document reopens with every note back at its played position while the notation edits —
+  // keyed on ids the ripple deliberately does not renumber — replay on top.
+  const ops = [
+    { id: 'r1', seamTick: rational(48), deltaTick: rational(24), chordIds: ['n0'], chordEndTick: rational(72) },
+    { id: 'b1', seamTick: rational(1234, 1000), deltaTick: rational(-96), dropSpan: true as const, label: 'Delete bar' }
+  ];
+  // THROUGH THE APP'S OWN ENCODER AND BACK, which is the pair that has to be inverses: the
+  // document is a container for exactly what `encodeSource` produced.
+  const live: SourceAudio = {
+    name: 'rippled.wav',
+    durationSec: 12,
+    peaks: null,
+    trim: null,
+    barOneSec: 0,
+    detected: { notes: [{ id: 'n0', startSec: 1, endSec: 1.5, midi: 40 }] },
+    rippleOps: ops,
+    documentEndTick: rational(577, 3),
+    timelineDetached: true
+  };
+  const wire = JSON.parse(JSON.stringify(encodeSource(live))) as PersistedSource;
+  const back = decodeSource(wire)!.rippleOps ?? [];
+  assert(back.length === 2, 'both operations come back');
+  assert(back[0].id === 'r1' && back[1].id === 'b1', '…and in the order they were made, which is the whole contract');
+  assert(ratValue(back[0].deltaTick) === 24 && back[0].chordIds?.join() === 'n0', 'the atom travels with its operation');
+  assert(back[1].dropSpan === true && ratValue(back[1].seamTick) === 1.234, 'a bar delete keeps its law and its sub-tick seam');
+  assert(decodeSource(wire)!.timelineDetached === true, 'and the detached flag rides with them');
+  // EXACTLY, not approximately. 577/3 is not representable as a decimal, and writing it as one
+  // would spend the exactness the layer exists for on the first save.
+  const end = decodeSource(wire)!.documentEndTick!;
+  assert(end.n === 577 && end.d === 3, 'the structural end is stored as a rational and comes back bit-identical');
+
+  // …AND THROUGH THE DOCUMENT CONTAINER, so the .riffsheet file carries them too.
+  const inDocument = readRiffsheetDocument(writeRiffsheetDocument({ ...document, source: wire }));
+  assert((inDocument.source.rippleOps ?? []).length === 2, 'the log travels inside the portable document');
+  assert(inDocument.source.timelineDetached === true, 'so does the detached flag');
+
+  // Through the same gate the live app uses: a hand-edited blob with a broken operation in it loses
+  // the operation, never the document.
+  const hostile = JSON.parse(JSON.stringify(wire)) as Record<string, unknown>;
+  (hostile.rippleOps as unknown[])[1] = { id: 'x', seam: [1, 0], delta: [1, 1] };
+  const repaired = decodeSource(hostile as PersistedSource);
+  assert(repaired!.rippleOps!.length === 1, 'an operation with a zero denominator is dropped, not divided by');
+  // …and the 512/256 contradiction is resolved on the way in: the pipeline clamps `minimumBars`
+  // to 256, so a document declaring 400 bars was engraved with 256 and every consumer that
+  // trusted the declaration was wrong about where the score ended.
+  assert(
+    decodeSource({ ...wire, documentBars: 400 } as PersistedSource)!.documentBars === undefined,
+    'a bar count past the pipeline’s own 256 is refused rather than silently truncated by the engraver'
+  );
+}
 
 // ---------------------------------------------------------------------------
 // 5. Magic-byte detection

@@ -6423,8 +6423,17 @@ async function main() {
         // `scripts/riffsheet-doc-test.ts`.
         // v4 since PARTS: `importedParts` / `partOrder` are additive, but a v3 reader handed one
         // would drop them on the next save, so the number moved. The READER still takes v1..v4.
+        //
+        // v5 SINCE THE STRUCTURAL SCORE-TIME LAYER, and the expected number here moved with it —
+        // intentionally, and by the same test v4's bump passed. The old claim, quoted:
+        //   'document: the current writer stamps the current version',
+        //   !!result.document && result.document.version === 4
+        // `timelineDetached`, `rippleOps` and `documentEndTick` (`app/persist.ts`) are what a
+        // ripple and a bar operation ARE, and a v4 reader handed one of these shows the take with
+        // every ripple undone and the timeline re-attached, then writes the file back without
+        // them: wrong about the music, and destroying the evidence. The READER still takes v1..v5.
         'document: the current writer stamps the current version',
-        !!result.document && result.document.version === 4
+        !!result.document && result.document.version === 5
       ],
       [
         // The container is the point of v3, so it is asserted rather than assumed, together

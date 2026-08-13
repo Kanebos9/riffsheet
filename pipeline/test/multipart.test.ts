@@ -317,6 +317,144 @@ describe('MULTI-PART — what parts share, and what they do not', () => {
   });
 });
 
+describe('MULTI-PART — every part carries its OWN instrument profile', () => {
+  /** Frets in printed order, so one part's fingering can be compared across two builds. */
+  const frets = (ir: { bars: { voices: { beats: { notes: { fret?: number }[] }[] }[] }[] }): number[] =>
+    ir.bars.flatMap((bar) =>
+      bar.voices.flatMap((v) => v.beats.flatMap((b) => b.notes.map((n) => n.fret ?? -1)))
+    );
+
+  /** A live bass under an imported guitar, each fretted, each asking for its own tablature. */
+  const twoTabbedParts = (over: Partial<BuildSettings> = {}, guitarOver: Partial<ScorePart> = {}) =>
+    buildMultiPartScore(
+      [
+        bassPart({ role: 'live' }),
+        guitarPart({ role: 'imported', tab: 'two-staves', ...guitarOver })
+      ],
+      TWO_BARS,
+      settings({ title: 'Two Fretboards', ...over })
+    );
+
+  it('prints BOTH parts a tablature staff — a live bass and an imported guitar with its own tab', () => {
+    const result = twoTabbedParts();
+    // The IR is where the decision lives: it is not an emit-time flag on top of a part built
+    // without one, which is how `ir.tab` and the page came to disagree.
+    expect(result.parts.map((p) => p.ir.instrument.kind)).toEqual(['bass4', 'guitar6']);
+    expect(result.parts.map((p) => p.ir.instrument.stringCount)).toEqual([4, 6]);
+    expect(result.parts.every((p) => p.ir.tab === undefined)).toBe(true);
+    expect(result.parts.flatMap((p) => p.notices)).toEqual([]);
+
+    const xml = result.toMusicXML();
+    expect(partBody(xml, 'P1')).toContain('<sign>TAB</sign>');
+    expect(partBody(xml, 'P2')).toContain('<sign>TAB</sign>');
+    expect(readMusicXml(xml, 0).staffTuning).toHaveLength(4);
+    expect(readMusicXml(xml, 1).staffTuning).toHaveLength(6);
+    // Two staves each — notation over tablature — and the two parts still share the bar list.
+    expect(readMusicXml(xml, 0).measureLengths).toEqual(readMusicXml(xml, 1).measureLengths);
+
+    const data = result.toAlphaTabModelData();
+    expect(data.tracks.map((t) => t.staves.some((s) => s.showTablature))).toEqual([true, true]);
+    expect(data.tracks.map((t) => t.staves[0].tuningsHighToLow.length)).toEqual([4, 6]);
+    // ...and the imported one is still engraved-only, tab or no tab.
+    expect(data.tracks[1].notationOnly).toBe(true);
+  });
+
+  it("the live take's Tab Off cannot erase an imported part's tablature", () => {
+    // `tab: 'omit'` in the SHARED settings is how webcore expresses the live Tab switch. It used
+    // to be spread into every part's build, so switching the live staff's tab off silently took
+    // the imported guitar's tab with it.
+    const result = twoTabbedParts({ tab: 'omit' });
+    expect(result.parts[0].ir.tab).toBe('omit');
+    expect(result.parts[1].ir.tab).toBeUndefined();
+    const xml = result.toMusicXML();
+    expect(partBody(xml, 'P1')).not.toContain('<sign>TAB</sign>');
+    expect(partBody(xml, 'P2')).toContain('<sign>TAB</sign>');
+    const data = result.toAlphaTabModelData();
+    expect(data.tracks.map((t) => t.staves.some((s) => s.showTablature))).toEqual([false, true]);
+  });
+
+  it("one part's tab:'omit' hides that part only, and the IR says so too", () => {
+    const result = twoTabbedParts({}, { tab: 'omit' });
+    expect(result.parts[0].ir.tab).toBeUndefined();
+    // THE BUILD KNOWS. Forwarding `tab` to the emitters alone left this undefined, so every IR
+    // reader believed the guitar still had a tablature staff the document does not contain.
+    expect(result.parts[1].ir.tab).toBe('omit');
+    const xml = result.toMusicXML();
+    expect(partBody(xml, 'P1')).toContain('<sign>TAB</sign>');
+    expect(partBody(xml, 'P2')).not.toContain('<sign>TAB</sign>');
+    expect(result.toAlphaTabModelData().tracks.map((t) => t.staves.some((s) => s.showTablature))).toEqual([
+      true,
+      false
+    ]);
+    // Hiding the tab is not a change of instrument: the guitar keeps its six strings (X1).
+    expect(result.parts[1].ir.instrument.stringCount).toBe(6);
+  });
+
+  it('keeps capo, fret limit and fingering inside the part that asked for them', () => {
+    const result = twoTabbedParts({ capo: 3, maxFret: 5 }, { capo: 7, maxFret: 19 });
+    expect(result.parts[0].ir.instrument.capo).toBe(3);
+    expect(result.parts[1].ir.instrument.capo).toBe(7);
+    const data = result.toAlphaTabModelData();
+    expect(data.tracks.map((t) => t.staves[t.staves.length - 1].capo)).toEqual([3, 7]);
+
+    // A part with its own instrument does not inherit the live take's fretboard at all: the same
+    // shared capo/fret limit, with nothing declared on the guitar, leaves the guitar unchanged.
+    const bare = twoTabbedParts({ capo: 3, maxFret: 5 }, {});
+    expect(bare.parts[0].ir.instrument.capo).toBe(3);
+    expect(bare.parts[1].ir.instrument.capo).toBe(0);
+    expect(frets(bare.parts[1].ir)).toEqual(frets(twoTabbedParts().parts[1].ir));
+  });
+
+  it("one part's fingering style cannot re-finger another part", () => {
+    const low = twoTabbedParts({ fingeringStyle: 'low' });
+    const anchored = twoTabbedParts({ fingeringStyle: 'aroundFret', anchorFret: 12 });
+    // The live bass follows the shared settings and really does move...
+    expect(frets(anchored.parts[0].ir)).not.toEqual(frets(low.parts[0].ir));
+    // ...while the imported guitar, which brought its own instrument, does not.
+    expect(frets(anchored.parts[1].ir)).toEqual(frets(low.parts[1].ir));
+    // ...and it moves when ITS OWN style is set.
+    const guitarAnchored = twoTabbedParts({}, { fingeringStyle: 'aroundFret', anchorFret: 12 });
+    expect(frets(guitarAnchored.parts[1].ir)).not.toEqual(frets(low.parts[1].ir));
+    expect(frets(guitarAnchored.parts[0].ir)).toEqual(frets(low.parts[0].ir));
+  });
+
+  it('folds octaveTransposition into the build, so the IR and both emitters agree', () => {
+    const result = twoTabbedParts({}, { octaveTransposition: 'conventional' });
+    // +12: the staff reads an octave above what sounds. The bass never asked, so it keeps none.
+    expect(result.parts[1].ir.displayPitchOffset).toBe(12);
+    expect(result.parts[0].ir.displayPitchOffset).toBeUndefined();
+    const xml = result.toMusicXML();
+    expect(readMusicXml(xml, 1).hasTranspose).toBe(true);
+    expect(readMusicXml(xml, 0).hasTranspose).toBe(false);
+    const data = result.toAlphaTabModelData();
+    expect(data.tracks[1].staves[0].displayTranspositionPitch).toBe(-12);
+
+    const atPitch = twoTabbedParts({}, { octaveTransposition: 'none' });
+    expect(atPitch.parts[1].ir.displayPitchOffset).toBe(0);
+    expect(atPitch.toAlphaTabModelData().tracks[1].staves[0].displayTranspositionPitch).toBe(0);
+  });
+
+  it('REPORTS a tab staff asked for on a part with no fretboard, and engraves the score anyway', () => {
+    const result = buildMultiPartScore(
+      [guitarPart(), bassPart({ tab: 'two-staves' })],
+      TWO_BARS,
+      settings({ title: 'No Fretboard', instrument: 'guitar6', tuningMidi: GUITAR })
+    );
+    expect(result.parts[0].notices).toEqual([]);
+    expect(result.parts[1].notices).toHaveLength(1);
+    expect(result.parts[1].notices[0]).toMatch(/tablature requested/);
+    expect(result.parts[1].notices[0]).toMatch(/no fretted profile/);
+    // The same sentence reaches the channel a surface already prints.
+    expect(result.parts[1].ir.diagnostics).toContain(result.parts[1].notices[0]);
+    // ...and the document is a document: notation for the part that cannot have tab, tab for the
+    // part that can. Nothing threw.
+    const xml = result.toMusicXML();
+    expect(partBody(xml, 'P1')).toContain('<sign>TAB</sign>');
+    expect(partBody(xml, 'P2')).not.toContain('<sign>TAB</sign>');
+    expect(readMusicXml(xml, 1).notes.filter((n) => !n.isRest)).toHaveLength(4);
+  });
+});
+
 describe('MULTI-PART — the nudge', () => {
   const soloNote = (over: Partial<InputNote> = {}): InputNote => ({
     id: 'a',

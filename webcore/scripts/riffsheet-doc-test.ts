@@ -190,12 +190,27 @@ const reopened = readRiffsheetDocument(written);
  * re-attached, and then writes the file back WITHOUT them. That is a reader being wrong about the
  * music and destroying the evidence, which is what the gate is for. Everything about a document
  * that has none of those fields is byte-identical, which §"the bytes do not move" below asserts.
+ *
+ * AND AGAIN, 5 -> 6, ON THE SAME TEST. The old claim, quoted:
+ *
+ *   assert(
+ *     reopened.version === RIFFSHEET_DOCUMENT_VERSION && RIFFSHEET_DOCUMENT_VERSION === 5,
+ *     'a document written by this build reports version 5'
+ *   );
+ *
+ * v6 is v5 plus the CANONICAL PLACEMENTS (`rollPlacements`) and the PER-PART FRETBOARD
+ * (`ImportedPart.tab`) — one bump for two fields that landed together. A v5 reader handed either
+ * would be wrong about the music and would then write the file back without it: it would re-apply
+ * the ripple log over an override that exists to stop it (the rectangle snaps back to the written
+ * value the player dragged it off), and it would print an imported guitar's tablature as a plain
+ * notation staff. Both fields are omitted when empty, so a document that uses neither still
+ * serialises to the bytes v5 wrote.
  */
 assert(
-  reopened.version === RIFFSHEET_DOCUMENT_VERSION && RIFFSHEET_DOCUMENT_VERSION === 5,
-  'a document written by this build reports version 5'
+  reopened.version === RIFFSHEET_DOCUMENT_VERSION && RIFFSHEET_DOCUMENT_VERSION === 6,
+  'a document written by this build reports version 6'
 );
-assert(!!reopened.audioData, 'a v5 document comes back with its recording');
+assert(!!reopened.audioData, 'a v6 document comes back with its recording');
 
 // THE CONTAINER: a real zip, recognisable to anything that reads them.
 assert(

@@ -34,7 +34,7 @@ import {
   type ScorePart
 } from '@pipeline-impl';
 
-import { toBuildSettings, type BuildRequest, type InputNote, type RiffScore } from '@pipeline';
+import { toBuildSettings, toPartFretboard, type BuildRequest, type InputNote, type RiffScore } from '@pipeline';
 import type { AppSettings } from '../app/state';
 
 /** The cap is the pipeline's, not a second opinion about it. */
@@ -63,6 +63,94 @@ export interface ImportedPart {
   /** The chip menu's ±ms box. Reaches the pipeline as `nudgeSec`, in seconds and otherwise as
    *  typed — the pipeline is what makes it a printable shift. */
   nudgeMs: number;
+  /**
+   * THIS PART'S OWN FRETBOARD. Absent means "a plain notation staff", which is what every part
+   * imported before this feature existed was. See `PartTabProfile`.
+   */
+  tab?: PartTabProfile;
+}
+
+/**
+ * ==============================================================================================
+ * ONE IMPORTED PART'S INSTRUMENT — the whole profile, not a visibility flag
+ * ==============================================================================================
+ *
+ * WHY A PROFILE AND NOT A BOOLEAN (roll-purity critique §D).
+ *
+ * The obvious model was `ScorePart.tab: 'two-staves' | 'omit'` and nothing else, and it renders no
+ * tablature at all: both alphaTab and MusicXML need a FRETTED INSTRUMENT WITH A TUNING before a
+ * TAB staff can exist. `tab` only decides whether an existing tablature staff is printed; it
+ * cannot turn an instrument with zero strings into a bass. So the part has to carry the whole
+ * thing — what instrument it is, how it is tuned, where the capo is, how far up the neck the
+ * planner may go, and how it chooses positions.
+ *
+ * AND THE PROFILE SURVIVES `tabMode: 'off'`, which is the other half of the requirement. Switching
+ * a part's tab off must leave its tuning where it was, so switching it back on restores the
+ * fretboard the player set rather than a default. That is why 'off' is a value of `tabMode` inside
+ * this record instead of the record being deleted.
+ *
+ * THE VOCABULARY IS THE LIVE TAKE'S, exactly. These are the same seven keys the notation toolbar
+ * writes into `AppSettings` for the live part, with the same names and the same meanings, so one
+ * set of controls drives either scope and `src/pipeline/index.ts §toPartFretboard` reads both
+ * through one function. A part is the active one or it is not; the controls do not change.
+ */
+export interface PartTabProfile {
+  /** 'off' | 'bass' | 'guitar' | 'custom'. 'off' keeps everything below it. */
+  tabMode: AppSettings['tabMode'];
+  tuningId: string;
+  customTuningMidi: number[];
+  capo: number;
+  maxFret: number;
+  fingering: AppSettings['fingering'];
+  anchorFret: number;
+}
+
+/**
+ * A profile for a part that has none — a plain notation staff, and the state every part imported
+ * before this feature existed is in.
+ *
+ * `tuningId` and `customTuningMidi` are seeded so that turning the tab ON has somewhere to start;
+ * they are inert while `tabMode` is 'off' (`toPartFretboard` returns `tab: 'omit'`).
+ */
+export function defaultPartTabProfile(settings: AppSettings): PartTabProfile {
+  return {
+    tabMode: 'off',
+    tuningId: settings.tuningId,
+    customTuningMidi: [...settings.customTuningMidi],
+    capo: 0,
+    maxFret: settings.maxFret,
+    fingering: settings.fingering,
+    anchorFret: settings.anchorFret
+  };
+}
+
+/**
+ * A PROFILE SEEDED FROM THE FILE, not from this take (§D, `import/scoreFile.ts:63`).
+ *
+ * The importer already reads the source staff's tuning, its capo and whether the file itself drew
+ * a tablature staff — and `addPartFromMusicXml` threw all three away, so a Guitar Pro chart in drop
+ * D arrived tuned like whatever the player's bass happens to be. The file's own word is the only
+ * one that can be right about somebody else's engraving, so it wins wherever it exists.
+ *
+ * A tuning arrives as MIDI numbers rather than as a preset id, so it is stored as the CUSTOM
+ * tuning and `tabMode: 'custom'` — which is exactly what "these specific open strings" means in
+ * this vocabulary, and avoids pretending a drop-D guitar is the standard preset.
+ */
+export function importedPartTabProfile(
+  settings: AppSettings,
+  source: { tuningLowToHigh?: number[]; capo?: number; showTablature?: boolean } | null | undefined
+): PartTabProfile {
+  const base = defaultPartTabProfile(settings);
+  const tuning = source?.tuningLowToHigh?.filter((m) => Number.isFinite(m)) ?? [];
+  if (tuning.length < 2) return base;
+  return {
+    ...base,
+    // The file said "print tablature" or it did not, and that is the honest default for a part
+    // nobody has opened the menu for yet.
+    tabMode: source?.showTablature ? 'custom' : 'off',
+    customTuningMidi: [...tuning],
+    capo: Math.max(0, Math.min(12, Math.round(source?.capo ?? 0)))
+  };
 }
 
 /**
@@ -339,11 +427,26 @@ export function buildPartedRiffScore(
           // positions notation can spell, and the MusicXML emitter refused the leftover crumb
           // with "`<type>32nd</type>` is 3 ticks but `<duration>` is 1".
           nudgeSec: (slot.part.nudgeMs || 0) / 1000,
-          // A plain notation staff. An imported chart is somebody else's engraving; inventing a
-          // fretboard for it out of THIS take's tuning is the one thing the pipeline's imported
-          // defaults exist to prevent, and asking for it explicitly says so on the page too.
-          instrument: 'staff',
-          tab: 'omit'
+          /*
+           * THIS PART'S OWN FRETBOARD, and never this take's (per-part TAB, critique §D).
+           *
+           * `instrument: 'staff', tab: 'omit'` stood here unconditionally, which was the right
+           * default and the wrong law: it made "an imported part is a plain staff" unreachable
+           * rather than merely the starting point, so a guitar chart could not be given its own
+           * tablature no matter what the player asked for.
+           *
+           * The default is UNCHANGED — a part with no stored profile still resolves to
+           * `instrument: 'staff'` through `defaultPartTabProfile`, because inventing a fretboard
+           * for somebody else's engraving out of THIS take's tuning is exactly what must not
+           * happen. What changes is that the part can now say otherwise, in its own words.
+           *
+           * Every field goes into the part's BUILD rather than being laid over it afterwards:
+           * `pipeline/IR.md §The per-part profile` is explicit that an emit-time flag is how
+           * `ir.tab` and the printed page came to disagree, and everything that reads the IR —
+           * note-name lanes, string legends, octave-fold warnings, this app's own guards —
+           * believes the IR.
+           */
+          ...toPartFretboard(slot.part.tab ?? defaultPartTabProfile(settings))
         }
   );
 

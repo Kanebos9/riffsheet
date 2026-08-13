@@ -237,7 +237,7 @@ export interface BuildRequest {
  * The tuning is therefore chosen the same way whatever `tabMode` says, and 'off' is expressed
  * where it belongs — `BuildSettings.tab: 'omit'`, which hides the staff and changes nothing else.
  */
-function selectedNotationTuning(settings: AppSettings): TuningPreset | null {
+function selectedNotationTuning(settings: FretboardChoice): TuningPreset | null {
   if (settings.tabMode === 'off') {
     // Whatever the part WAS. The remembered tuning is the last one the user chose, which is the
     // only honest answer to "what instrument is this" while its tab is hidden.
@@ -256,7 +256,7 @@ function selectedNotationTuning(settings: AppSettings): TuningPreset | null {
 }
 
 /** TAB choice + exact tuning -> the closest legacy metadata discriminator. */
-function instrumentKind(settings: AppSettings, tuningMidi: number[]): BuildSettings['instrument'] {
+function instrumentKind(settings: FretboardChoice, tuningMidi: number[]): BuildSettings['instrument'] {
   // 'staff' means "this part has no strings", which is a statement about the INSTRUMENT. Only a
   // part with no tuning at all earns it; hiding the tab does not (see selectedNotationTuning).
   if (!tuningMidi.length) return 'staff';
@@ -319,6 +319,69 @@ const FINGERING_MAP: Record<AppSettings['fingering'], BuildSettings['fingeringSt
   'open-strings': 'openStrings',
   'around-fret': 'aroundFret'
 };
+
+/**
+ * ==============================================================================================
+ * THE FRETBOARD HALF OF A PART, ON ITS OWN — so EVERY part can have one (per-part TAB).
+ * ==============================================================================================
+ *
+ * WHY IT IS A SEPARATE TYPE. `toBuildSettings` translates the whole of `AppSettings` because the
+ * LIVE take is the document's settings. An imported part is not: it carries its own instrument,
+ * tuning, capo, fret ceiling and fingering, stored on the part (`score/parts.ts §PartTabProfile`)
+ * and edited through the same toolbar controls with the same words. Everything else in
+ * `BuildSettings` — the quantize grid, the key, the meter, the tempo — is shared by construction
+ * and must stay shared, so it is not in here.
+ *
+ * The keys are deliberately the same names `AppSettings` uses, so `toBuildSettings` and this
+ * function are two readings of one vocabulary rather than two vocabularies, and an `AppSettings`
+ * is a valid `FretboardChoice` without conversion.
+ */
+export interface FretboardChoice {
+  tabMode: AppSettings['tabMode'];
+  tuningId: string;
+  customTuningMidi: number[];
+  capo: number;
+  maxFret: number;
+  fingering: AppSettings['fingering'];
+  anchorFret: number;
+}
+
+/** What one part's fretboard choice means to the pipeline. Exactly the `ScorePart` profile fields. */
+export interface PartFretboard {
+  instrument: BuildSettings['instrument'];
+  tuningMidi: number[];
+  fingeringStyle: BuildSettings['fingeringStyle'];
+  anchorFret?: number;
+  capo: number;
+  maxFret: number;
+  tab: 'two-staves' | 'omit';
+}
+
+/**
+ * One part's profile, resolved.
+ *
+ * `tab: 'omit'` is VISIBILITY and never identity — the same rule `toBuildSettings` follows and for
+ * the same reason (X1): the instrument and its string count survive the tab being switched off, so
+ * turning it back on restores the tuning that was there rather than inventing a default, and the
+ * written octave does not drop onto ledger lines in the meantime.
+ *
+ * `instrument: 'staff'` is the one honest way to say "this part has no strings", and it is what a
+ * part whose profile names no tuning at all resolves to — the pipeline then engraves plain
+ * notation and reports the refusal rather than throwing (`IR.md §The per-part profile`).
+ */
+export function toPartFretboard(choice: FretboardChoice): PartFretboard {
+  const tuning = selectedNotationTuning(choice);
+  const tuningMidi = tuning ? [...tuning.midiLowToHigh] : [];
+  return {
+    instrument: instrumentKind(choice, tuningMidi),
+    tuningMidi,
+    fingeringStyle: FINGERING_MAP[choice.fingering],
+    ...(choice.fingering === 'around-fret' ? { anchorFret: choice.anchorFret } : {}),
+    capo: choice.capo,
+    maxFret: choice.maxFret,
+    tab: choice.tabMode === 'off' || !tuningMidi.length ? 'omit' : 'two-staves'
+  };
+}
 
 export function toBuildSettings(settings: AppSettings, title?: string): BuildSettings {
   const tuning = selectedNotationTuning(settings);

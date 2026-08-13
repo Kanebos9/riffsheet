@@ -291,6 +291,14 @@ export const DEFAULT_TUNINGS: Record<Instrument, number[]> = {
 /** Default anchor for `aroundFret`: first position. */
 export const DEFAULT_ANCHOR_FRET = 5;
 
+/**
+ * The fingering the assigner uses when nobody chose one — the published baseline (see
+ * `FingeringStyle`). Exported because a MULTI-PART build has to name it: a part that does not
+ * follow the shared instrument cannot inherit the shared style, and `BuildSettings.fingeringStyle`
+ * is required, so the fallback has to be one value both sides of the bridge can point at.
+ */
+export const DEFAULT_FINGERING_STYLE: FingeringStyle = 'low';
+
 export function resolveSettings(s: BuildSettings): Required<
   Pick<
     BuildSettings,

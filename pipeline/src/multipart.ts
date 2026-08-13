@@ -39,6 +39,7 @@ import { toMultiPartMusicXML, abbreviatePartName, defaultPartName, type MusicXml
 import { toMultiPartMidi } from './midi.js';
 import { toMultiPartAlphaTabModelData, type AlphaTabScoreData } from './alphatab.js';
 import {
+  DEFAULT_FINGERING_STYLE,
   DEFAULT_TUNINGS,
   type BuildInput,
   type BuildSettings,
@@ -96,9 +97,21 @@ export interface ScorePart {
    */
   nudgeSec?: number;
   /**
-   * Engraving-only overrides. Anything absent falls back to the shared settings for the live part
-   * and to a plain notation staff for an imported one — an imported part gets no invented
-   * fretboard, though naming an instrument here gives it tab like any other part.
+   * THIS PART'S INSTRUMENT PROFILE — engraving-only overrides, and every one of them is folded
+   * into the `BuildSettings` this part is BUILT with, not applied at emit time. Any part can
+   * therefore carry its own TAB staff, its own capo and its own written octave.
+   *
+   * The fallbacks are one rule: the FRETBOARD half (`tuningMidi`, `fingeringStyle`, `anchorFret`,
+   * `capo`, `maxFret`, `tab`, `octaveTransposition`) follows the INSTRUMENT. A part that resolves
+   * to the shared instrument inherits the shared settings' fretboard half; a part with an
+   * instrument of its own starts from that instrument's defaults, so the live take's tuning, capo
+   * or Tab Off can never reach into an imported guitar. An explicit field here always wins.
+   * `clefMode` is a notation policy rather than a fretboard field and inherits from the shared
+   * settings for every part, unless named here.
+   *
+   * `instrument` itself defaults to the shared instrument for the live part and to `'staff'` for
+   * an imported one — an imported chart gets no invented fretboard — though naming an instrument
+   * here gives it tab like any other part.
    */
   instrument?: Instrument;
   tuningMidi?: number[];
@@ -107,7 +120,13 @@ export interface ScorePart {
   capo?: number;
   maxFret?: number;
   clefMode?: ClefMode;
-  /** 'omit' drops the tablature staff even on a fretted part. Default 'two-staves'. */
+  /**
+   * 'omit' drops the tablature staff even on a fretted part. Default 'two-staves'.
+   *
+   * TAB NEEDS A FRETBOARD: 'two-staves' on a part with no strings is a request that cannot be
+   * honoured, and it is REPORTED (`PartBuild.notices`, and the same sentence in `ir.diagnostics`)
+   * rather than thrown — the part is engraved as notation and the rest of the document is fine.
+   */
   tab?: 'two-staves' | 'omit';
   /** §8.3. Per part: one may print conventional octave-transposed pitch while another does not. */
   octaveTransposition?: 'none' | 'conventional';
@@ -140,6 +159,15 @@ export interface PartBuild {
   nudgeSec: number;
   ir: RiffsheetIR;
   diagnostics: BuildDiagnostics;
+  /**
+   * WHAT THIS PART ASKED FOR AND DID NOT GET, in plain sentences, empty when nothing was refused.
+   *
+   * Today it holds exactly one thing: a tablature staff requested on a part with no fretted
+   * profile. The same sentences are appended to `ir.diagnostics`, so a surface that already prints
+   * the build's diagnostics shows them without changing anything; this array is for a surface that
+   * wants to show only what THIS part's own settings did.
+   */
+  notices: string[];
   /**
    * THIS PART'S TOTAL PROJECTION, keyed by the NAMESPACED id (`p2-n0`), which is the id the IR
    * and both emitters carry. A part is an ordinary build, so this is exactly the projection that
@@ -367,23 +395,65 @@ export function buildMultiPartScore(
   const scoreNotes = nudged.flat();
 
   // ---- N ordinary builds ---------------------------------------------------------------------
+  // THE WHOLE INSTRUMENT PROFILE FOLLOWS THE INSTRUMENT, and `tab` is part of it.
+  //
+  // `tab` and `octaveTransposition` used to be forwarded to the two emitters and to nothing else,
+  // so the part they were built as and the part they were printed as were two different parts:
+  // `ir.tab` said one thing, the file and the screen said another, and everything reading the IR
+  // (note-name lanes, string legends, octave-fold warnings, webcore's own guards) believed the IR.
+  // They are settings of the BUILD, so they are resolved here with the rest of the profile.
+  //
+  // The tuning already followed the instrument for one specific reason — a bass tuning left behind
+  // on a `'staff'` part gives it string count 4 and a tablature staff nobody asked for — and every
+  // other fretboard field carries exactly the same hazard: the live take's capo shifting an
+  // imported guitar's frets, the live take's Tab Off erasing an imported part's tablature. So the
+  // rule is one rule: a part that resolves to the SHARED instrument inherits the shared fretboard
+  // half; a part with an instrument of its own starts from that instrument's defaults. An explicit
+  // field on the part always wins, whichever side it lands on.
   const builds: BuildResult[] = parts.map((part, index) => {
     const role = roles[index];
-    // An imported part gets a plain notation staff unless the caller asked for an instrument. The
-    // tuning has to follow the instrument, not the shared settings: a bass tuning left behind on a
-    // 'staff' part would give it string count 4 and a tablature staff nobody asked for.
+    // An imported part gets a plain notation staff unless the caller asked for an instrument.
     const instrument = part.instrument ?? (role === 'live' ? sharedSettings.instrument : 'staff');
-    const tuningMidi =
-      part.tuningMidi ??
-      (instrument === sharedSettings.instrument ? sharedSettings.tuningMidi : DEFAULT_TUNINGS[instrument]);
+    const ownProfile = instrument !== sharedSettings.instrument;
+    /** The part's own value, else the shared one — but only while the part shares the instrument. */
+    const profiled = <T>(own: T | undefined, shared: T | undefined): T | undefined =>
+      own ?? (ownProfile ? undefined : shared);
+    const tuningMidi = part.tuningMidi ?? (ownProfile ? DEFAULT_TUNINGS[instrument] : sharedSettings.tuningMidi);
+    const fingeringStyle = profiled(part.fingeringStyle, sharedSettings.fingeringStyle) ?? DEFAULT_FINGERING_STYLE;
+    const anchorFret = profiled(part.anchorFret, sharedSettings.anchorFret);
+    const capo = profiled(part.capo, sharedSettings.capo);
+    const maxFret = profiled(part.maxFret, sharedSettings.maxFret);
+    const tab = profiled(part.tab, sharedSettings.tab);
+    // §8.3 as a written-staff offset, which is the word the IR and both emitters already speak:
+    // 'conventional' is +12 (the staff reads an octave above what sounds), 'none' is at pitch.
+    const octaveOffset =
+      part.octaveTransposition === 'conventional'
+        ? 12
+        : part.octaveTransposition === 'none'
+          ? 0
+          : profiled<number>(undefined, sharedSettings.displayPitchOffset);
+    // The fretboard half is stripped from the base rather than overwritten: a conditional spread
+    // can only add a key, and a part with its own instrument has to be able to NOT have one.
+    const {
+      tuningMidi: _tuning,
+      fingeringStyle: _fingering,
+      anchorFret: _anchor,
+      capo: _capo,
+      maxFret: _maxFret,
+      tab: _tab,
+      displayPitchOffset: _octave,
+      ...scoreWide
+    } = sharedSettings;
     const settings: BuildSettings = {
-      ...sharedSettings,
+      ...scoreWide,
       instrument,
       tuningMidi,
-      ...(part.fingeringStyle !== undefined ? { fingeringStyle: part.fingeringStyle } : {}),
-      ...(part.anchorFret !== undefined ? { anchorFret: part.anchorFret } : {}),
-      ...(part.capo !== undefined ? { capo: part.capo } : {}),
-      ...(part.maxFret !== undefined ? { maxFret: part.maxFret } : {}),
+      fingeringStyle,
+      ...(anchorFret !== undefined ? { anchorFret } : {}),
+      ...(capo !== undefined ? { capo } : {}),
+      ...(maxFret !== undefined ? { maxFret } : {}),
+      ...(tab !== undefined ? { tab } : {}),
+      ...(octaveOffset !== undefined ? { displayPitchOffset: octaveOffset } : {}),
       ...(part.clefMode !== undefined ? { clefMode: part.clefMode } : {})
     };
     return buildScore({ ...sharedInput, notes: nudged[index] }, settings, { sharedNotes: scoreNotes });
@@ -393,6 +463,21 @@ export function buildMultiPartScore(
 
   const built: PartBuild[] = builds.map((build, index) => {
     const name = parts[index].name ?? defaultPartName(build.ir);
+    // TAB WITHOUT A FRETBOARD IS A REQUEST THAT CANNOT BE HONOURED, NOT AN ERROR. Neither emitter
+    // can print a tablature staff for a part with no strings — there is nothing to put on the
+    // lines — so the part is engraved as notation and the caller is TOLD, in the same channel it
+    // already reads for "3 notes dropped past the end of the audio". Throwing here would take a
+    // whole document down over one part's checkbox, which is not a proportionate answer to a UI
+    // that let someone tick Tab on a piano.
+    const notices: string[] = [];
+    if (parts[index].tab === 'two-staves' && build.ir.instrument.stringCount === 0) {
+      const notice =
+        `part ${index + 1} (${name}): tablature requested, but this part has no fretted profile ` +
+        `(instrument '${build.ir.instrument.kind}', 0 strings) — engraved as notation only. ` +
+        `Name a fretted instrument and its tuning to print tab.`;
+      notices.push(notice);
+      build.ir.diagnostics.push(notice);
+    }
     return {
       index,
       id: `P${index + 1}`,
@@ -405,6 +490,7 @@ export function buildMultiPartScore(
       nudgeSec: parts[index].nudgeSec ?? 0,
       ir: build.ir,
       diagnostics: build.diagnostics,
+      notices,
       projection: build.projection
     };
   });

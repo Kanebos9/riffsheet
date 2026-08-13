@@ -37,6 +37,7 @@ export type {
 export {
   DEFAULT_TUNINGS,
   DEFAULT_ANCHOR_FRET,
+  DEFAULT_FINGERING_STYLE,
   resolveSettings,
   resolveMinimumBars,
   notationIntentTicks,

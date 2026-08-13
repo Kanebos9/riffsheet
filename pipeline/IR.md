@@ -361,15 +361,16 @@ interface ScorePart {
   abbreviation?: string;      // <part-abbreviation>
   role?: 'live' | 'imported'; // default: 'live' for index 0, 'imported' for the rest
   nudgeSec?: number;          // move this part against the shared clock, before quantize. Default 0
-  // engraving-only overrides; anything absent falls back as described below
-  instrument?: Instrument;
-  tuningMidi?: number[];
-  fingeringStyle?: FingeringStyle;
-  anchorFret?: number;
+  // THIS PART'S INSTRUMENT PROFILE — every field folds into the BuildSettings this part is BUILT
+  // with, so any part can carry its own TAB staff. Fallbacks under "The per-part profile" below.
+  instrument?: Instrument;               // 'staff' | 'bass4' | 'bass5' | 'bass6' | 'guitar6'
+  tuningMidi?: number[];                 // open strings, low -> high. Never guessed
+  fingeringStyle?: FingeringStyle;       // 'low' | 'minMovement' | 'openStrings' | 'aroundFret'
+  anchorFret?: number;                   // for 'aroundFret' only
   capo?: number;
   maxFret?: number;
-  clefMode?: ClefMode;
-  tab?: 'two-staves' | 'omit';
+  clefMode?: ClefMode;                   // notation policy, not a fretboard field — see below
+  tab?: 'two-staves' | 'omit';           // needs a fretted profile; reported, never thrown
   octaveTransposition?: 'none' | 'conventional';
   midiProgram?: number;       // General MIDI program - 1
 }
@@ -392,7 +393,8 @@ interface PartBuild {
   nudgeSec: number;
   ir: RiffsheetIR;
   diagnostics: BuildDiagnostics;
-}
+  notices: string[];          // what THIS part asked for and did not get; [] when nothing was
+}                             // refused. Also appended to `ir.diagnostics`.
 ```
 
 **What parts share, and it is exactly two things.** THE CLOCK — same tempo, same meter, same bars,
@@ -404,12 +406,49 @@ assignment, rests, beams, stats, diagnostics — is decided from that part's not
 on a single-part build, and no code path exists by which one part's content could reach another's
 engraving.
 
+### The per-part profile — ANY part can carry its own TAB staff
+
+Every profile field above is folded into the `BuildSettings` that part is BUILT with. It is not an
+emit-time flag laid over a part built with somebody else's settings: that is how `ir.tab` and the
+printed page came to disagree, and everything reading the IR — note-name lanes, string legends,
+octave-fold warnings, webcore's own guards — believes the IR.
+
+**One fallback rule: the fretboard follows the instrument.**
+
+| field | when the part resolves to the SHARED instrument | when the part brings its OWN instrument |
+| --- | --- | --- |
+| `instrument` | shared (live) / `'staff'` (imported) | the part's |
+| `tuningMidi` | shared | `DEFAULT_TUNINGS[instrument]` |
+| `fingeringStyle` | shared | `DEFAULT_FINGERING_STYLE` (`'low'`) |
+| `anchorFret`, `capo`, `maxFret` | shared | the pipeline's own defaults (capo 0) |
+| `tab` | shared | `'two-staves'` |
+| `octaveTransposition` | shared `displayPitchOffset` | the instrument's convention |
+| `clefMode` | shared | shared — a notation policy, not a fretboard field |
+
+An explicit field on the `ScorePart` always wins, whichever column it lands in. The consequence
+webcore needs: **the live take's tuning, capo, fingering or Tab Off can never reach a part that
+brought its own instrument.** Switching the live staff's tab off (`sharedSettings.tab: 'omit'`)
+leaves an imported guitar's tablature exactly where it was; turning an imported part's tab off
+(`ScorePart.tab: 'omit'`) leaves the live take's alone. Both emitters already build per-part
+staves, so the whole grand + TAB machinery works per part.
+
+`octaveTransposition` becomes `BuildSettings.displayPitchOffset` — `'conventional'` is `+12` (the
+staff reads an octave above what sounds), `'none'` is `0` — so `ir.displayPitchOffset`, the
+MusicXML `<transpose>` and alphaTab's `displayTranspositionPitch` are three statements of one
+decision instead of three guesses.
+
+**TAB needs a fretboard, and asking without one is REPORTED, not thrown.** `tab: 'two-staves'` on a
+part with no strings cannot be honoured — there is nothing to put on the lines — so the part is
+engraved as notation, `PartBuild.notices` gains one sentence saying so, and the same sentence is
+appended to that part's `ir.diagnostics`. A checkbox on a piano part does not take the document
+down. Turning tab off never changes the part's identity: the instrument and its string count are
+untouched, which is what keeps the conventional written octave (X1).
+
 **Defaults per role.** The live part inherits `sharedSettings` verbatim, so it keeps the full
 grand-staff/TAB options it has today. An imported part defaults to `instrument: 'staff'` — a plain
-notation staff with no invented fretboard — and its tuning follows its instrument rather than the
-shared settings, so a bass tuning left in the shared settings cannot give a `'staff'` part a
-tablature staff nobody asked for. TAB is not hard-blocked: name an instrument on an imported part
-and it gets tab like any other.
+notation staff with no invented fretboard — so a bass tuning left in the shared settings cannot
+give a `'staff'` part a tablature staff nobody asked for. TAB is not hard-blocked: name an
+instrument and a tuning on an imported part and it gets tab like any other.
 
 **The nudge** is a translation, in seconds, applied before quantization; positive is later. A part
 carrying its own written ticks (`sourceTiming`) is shifted in ticks too, by `nudgeSec` at the

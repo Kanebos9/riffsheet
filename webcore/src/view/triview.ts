@@ -1119,9 +1119,22 @@ export class TriView {
     // Same measurement, second consumer: a braced system is also the one whose staves need more
     // air between them (F2b). Recorded before the render so the first frame already has it.
     this.multiStaff = staves > 1;
-    // Third consumer, and the one `reserveTopRoom` reads: with no tablature there is no staff/tab
-    // band for the names row to sit in, so it goes above the system and needs headroom.
-    this.hasTabStave = score.tracks.some((t) => t.staves.some((s) => s.showTablature));
+    /*
+     * Third consumer, and the one `reserveTopRoom` reads: with no tablature there is no staff/tab
+     * band for the names row to sit in, so it goes above the system and needs headroom.
+     *
+     * THE LIVE TRACK'S TABLATURE, NOT THE SCORE'S (per-part TAB, critique §D). The note names are
+     * the LIVE part's decoration — they are placed against the live staves, by `liveBars()`, for
+     * the same reordering reason as the string legend. `score.tracks.some(…)` was safe only while
+     * an imported part could not have tablature at all; now that it can, an imported guitar with
+     * its tab on would tell the live staff it has an inter-staff band to sit in when it does not,
+     * and the names would be laid into a lane that is not there.
+     *
+     * The two other consumers above stay score-wide on purpose: the reserved left column and the
+     * staff gap are properties of the SYSTEM, and a system is as braced as its most braced part.
+     */
+    const liveTrack = score.tracks[this.liveTrackIndex()] ?? score.tracks[0];
+    this.hasTabStave = !!liveTrack && liveTrack.staves.some((s) => s.showTablature);
     applyStaffTabGap(this.api.settings, this.needsGap(), this.multiStaff);
     const overhang = this.multiStaff
       ? Math.max(leftInkOverhangPerScale, BRACED_LEFT_OVERHANG_PER_SCALE)

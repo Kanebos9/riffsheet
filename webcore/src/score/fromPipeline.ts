@@ -219,11 +219,31 @@ export function buildAlphaTabScore(
    * and no note's string, fret or pitch is derived from this choice. Playback dumps either side
    * of this change are identical for every fixture, which is the condition it was made under.
    */
+  /*
+   * …AND IT IS THE LIVE TRACK'S FRETBOARD, NOT WHICHEVER TRACK HAPPENS TO BE FIRST (§D).
+   *
+   * The search below used to run over EVERY track's staves in printed order, which was correct
+   * only while imported parts were guaranteed to be notation-only. Now that any part can carry a
+   * tablature staff, moving an imported guitar above the live bass with Move Up would put the
+   * GUITAR's six strings into `index.tuningLowToHigh` — and that index is what `edit/actions.ts`
+   * validates a sheet drag against. Dragging a note on the bass's own tab would then be checked
+   * against a fretboard the bass does not have: a string that does not exist, or a fret refused
+   * because the wrong open string was assumed.
+   *
+   * So the live track is searched first and the whole score only as a fallback. `notationOnly` is
+   * the pipeline's own word for "this track is not the take" and travels on the data the sheet is
+   * built from, so this cannot drift from `score/parts.ts §isNotationOnlyTrack`.
+   *
+   * STILL NOTHING HERE TOUCHES THE MODEL: each staff is built from its own `staffData` below and
+   * no note's string, fret or pitch is derived from this choice, so the playback dump is
+   * unchanged for every fixture — the same condition the previous revision was made under.
+   */
+  const liveStaves = data.tracks.filter((trackData) => trackData.notationOnly !== true).flatMap((t) => t.staves);
   const allStaves = data.tracks.flatMap((trackData) => trackData.staves);
-  const tabStaff =
-    allStaves.find((staffData) => staffData.showTablature && staffData.tuningsHighToLow.length > 0) ??
-    allStaves.find((staffData) => staffData.tuningsHighToLow.length > 0) ??
-    allStaves[0];
+  const fretted = (staves: typeof allStaves) =>
+    staves.find((staffData) => staffData.showTablature && staffData.tuningsHighToLow.length > 0) ??
+    staves.find((staffData) => staffData.tuningsHighToLow.length > 0);
+  const tabStaff = fretted(liveStaves) ?? fretted(allStaves) ?? allStaves[0];
   if (tabStaff) {
     index.stringCount = tabStaff.tuningsHighToLow.length;
     index.tuningLowToHigh = [...tabStaff.tuningsHighToLow].sort((a, b) => a - b);

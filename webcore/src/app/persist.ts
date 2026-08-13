@@ -37,7 +37,8 @@ import { RIFFSHEET_LIMITS } from '../bridge/types';
 import type { SessionRestoreMode } from '../bridge/types';
 import type { TrimResult } from '../audio/trim';
 import type { AppSettings, HostGrid, SourceAudio } from './state';
-import { cleanPartName, MAX_SCORE_PARTS, type ImportedPart } from '../score/parts';
+import { cleanPartName, MAX_SCORE_PARTS, type ImportedPart, type PartTabProfile } from '../score/parts';
+import { DEFAULT_TUNING } from '../score/tuning';
 import { normalizeCuts, type CutSpan } from '../edit/cuts';
 import { rational, type Rational, type RippleOp } from '../edit/ripple';
 import { MAX_DOCUMENT_BARS } from '../edit/performanceEdit';
@@ -153,6 +154,18 @@ export interface PersistedSource {
    */
   importedParts?: ImportedPart[];
   partOrder?: string[];
+  /**
+   * THE CANONICAL PLACEMENT OVERRIDES (`edit/ripple.ts §RollPlacement`).
+   *
+   * NEW IN DOCUMENT v6, and it is a v-bump for the same reason `rippleOps` was: a v5 reader handed
+   * one of these would apply the log to a note the log has already been told not to move, put the
+   * rectangle back at the written value the player dragged it away from, and then write the file
+   * back WITHOUT the override. Wrong about the music, then destroying the evidence.
+   *
+   * Written only when there is something to say, so every document with no roll edit made against
+   * a ripple serialises to exactly the bytes it did before this field existed.
+   */
+  rollPlacements?: Record<string, { s: [number, number]; e: [number, number]; op: string | null }>;
   /**
    * The live part's name, when the player has typed one (`state.ts §SourceAudio.livePartName`).
    *
@@ -287,9 +300,13 @@ export function encodeSource(source: SourceAudio | null): PersistedSource | null
           id: part.id,
           name: part.name,
           nudgeMs: part.nudgeMs || 0,
-          notes: part.notes
+          notes: part.notes,
+          // THE PART'S OWN FRETBOARD (document v6). Omitted when the part has none, so every
+          // part written before this feature existed round-trips to the bytes it always had.
+          ...(part.tab ? { tab: { ...part.tab, customTuningMidi: [...part.tab.customTuningMidi] } } : {})
         }))
       : undefined,
+    rollPlacements: encodeRollPlacements(source.rollPlacements),
     partOrder: source.importedParts?.length ? source.partOrder?.slice() : undefined,
     // The live part's name is NOT conditional on there being imported parts: a solo take is the
     // commonest thing to rename, and `partOrder` above is only written beside a list it orders.
@@ -337,6 +354,7 @@ export function decodeSource(source: PersistedSource | null | undefined): Source
     // two must not produce a document with a chip for a part that is not there — `orderedPartSlots`
     // is the one that reconciles them, and it is fed the pair exactly as it is stored.
     importedParts: decodeImportedParts(source.importedParts),
+    rollPlacements: decodeRollPlacements(source.rollPlacements),
     partOrder: Array.isArray(source.partOrder)
       ? source.partOrder.filter((key): key is string => typeof key === 'string')
       : undefined,
@@ -404,6 +422,82 @@ function decodeRippleOps(value: unknown): RippleOp[] | undefined {
   return ops.length ? ops : undefined;
 }
 
+/**
+ * ONE PART'S FRETBOARD, VALIDATED (document v6, `score/parts.ts §PartTabProfile`).
+ *
+ * Every field is repaired rather than refused: a profile is cosmetic in the sense that matters
+ * here — the worst a nonsense value can do is print the wrong tablature, and none of it can cost
+ * the player a note. So a blob with a garbage capo gets capo 0 and the document still opens, which
+ * is the same policy the part's name and nudge have always had two functions below.
+ *
+ * The one hard gate is `tabMode`: an unrecognised word becomes 'off', which is the state every
+ * part was in before this field existed, so a hand-edited or future document degrades to the
+ * documented default rather than to an instrument nobody named.
+ */
+function decodePartTabProfile(value: unknown): PartTabProfile | undefined {
+  if (!value || typeof value !== 'object') return undefined;
+  const raw = value as Partial<PartTabProfile>;
+  const modes = ['off', 'bass', 'guitar', 'custom'] as const;
+  const fingerings = ['low-positions', 'minimize-movement', 'open-strings', 'around-fret'] as const;
+  const tuning = Array.isArray(raw.customTuningMidi)
+    ? (raw.customTuningMidi as unknown[])
+        .filter((m): m is number => Number.isFinite(m) && (m as number) >= 0 && (m as number) <= 127)
+        .slice(0, 12)
+    : [];
+  return {
+    tabMode: modes.includes(raw.tabMode as (typeof modes)[number]) ? (raw.tabMode as PartTabProfile['tabMode']) : 'off',
+    tuningId: typeof raw.tuningId === 'string' && raw.tuningId ? raw.tuningId : DEFAULT_TUNING.id,
+    customTuningMidi: tuning.length >= 2 ? tuning : [40, 45, 50, 55, 59, 64],
+    capo: finiteInRange(raw.capo, 0, 12, true) ?? 0,
+    maxFret: finiteInRange(raw.maxFret, 1, 36, true) ?? 24,
+    fingering: fingerings.includes(raw.fingering as (typeof fingerings)[number])
+      ? (raw.fingering as PartTabProfile['fingering'])
+      : 'low-positions',
+    anchorFret: finiteInRange(raw.anchorFret, 0, 24, true) ?? 0
+  };
+}
+
+/**
+ * THE PLACEMENT OVERRIDES, as two integer pairs and an operation name (document v6).
+ *
+ * Rationals are written `[n, d]` rather than `{ n, d }` for the same reason the peaks are packed:
+ * this is a per-NOTE record on a document that may have thousands, and `{"n":123,"d":1000}` is
+ * three times the bytes of `[123,1000]` for the same two numbers.
+ */
+function encodeRollPlacements(
+  placements: SourceAudio['rollPlacements']
+): PersistedSource['rollPlacements'] {
+  if (!placements) return undefined;
+  const out: NonNullable<PersistedSource['rollPlacements']> = {};
+  let any = false;
+  for (const [id, p] of Object.entries(placements)) {
+    if (!id || !p) continue;
+    out[id] = { s: [p.startTick.n, p.startTick.d], e: [p.endTick.n, p.endTick.d], op: p.afterOpId };
+    any = true;
+  }
+  return any ? out : undefined;
+}
+
+function decodeRollPlacements(value: unknown): SourceAudio['rollPlacements'] {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
+  // Through the SAME gate every other rational in this file goes through, so a `[n, d]` pair and
+  // the older `{ n, d }` object are both readable and a zero denominator is refused rather than
+  // silently collapsed to tick 0 — which would pin the note at the start of the score.
+  const pair = (v: unknown): Rational | null => decodeRational(v) ?? null;
+  const out: Record<string, { startTick: Rational; endTick: Rational; afterOpId: string | null }> = {};
+  let any = false;
+  for (const [id, raw] of Object.entries(value as Record<string, unknown>)) {
+    if (!id || !raw || typeof raw !== 'object') continue;
+    const r = raw as { s?: unknown; e?: unknown; op?: unknown };
+    const startTick = pair(r.s);
+    const endTick = pair(r.e);
+    if (!startTick || !endTick) continue;
+    out[id] = { startTick, endTick, afterOpId: typeof r.op === 'string' && r.op ? r.op : null };
+    any = true;
+  }
+  return any ? out : undefined;
+}
+
 function decodeImportedParts(value: unknown): ImportedPart[] | undefined {
   if (!Array.isArray(value)) return undefined;
   const parts: ImportedPart[] = [];
@@ -416,7 +510,8 @@ function decodeImportedParts(value: unknown): ImportedPart[] | undefined {
       id: part.id,
       name: typeof part.name === 'string' && part.name.trim() ? part.name.trim() : 'Part',
       nudgeMs: Number.isFinite(Number(part.nudgeMs)) ? Number(part.nudgeMs) : 0,
-      notes: part.notes as ImportedPart['notes']
+      notes: part.notes as ImportedPart['notes'],
+      ...(decodePartTabProfile(part.tab) ? { tab: decodePartTabProfile(part.tab)! } : {})
     });
   }
   return parts.length ? parts : undefined;
@@ -458,8 +553,22 @@ function validTimeSignature(value: unknown): { numerator: number; denominator: n
  * reader handed one of these would show the take with every ripple undone and the timeline
  * re-attached, and would then write the file back WITHOUT them. That is a reader being wrong about
  * the music and then destroying the evidence, which is exactly what the version gate is for.
+ *
+ * v6 is v5 plus TWO THINGS, bumped together on purpose because they landed together and a document
+ * carrying either one is equally unreadable by a v5 reader:
+ *
+ *   THE CANONICAL PLACEMENTS  `PersistedSource.rollPlacements` — where a hand-placed note actually
+ *     is, in the ripple log's own coordinates (`edit/ripple.ts §RollPlacement`). A v5 reader would
+ *     re-apply the log over the top of an override that exists precisely to stop it, snap the
+ *     rectangle back to the written value the player dragged it off, and save the file without it.
+ *   THE PER-PART FRETBOARD    `ImportedPart.tab` — an imported part's own instrument, tuning, capo,
+ *     fret ceiling and fingering (`score/parts.ts §PartTabProfile`). A v5 reader would print every
+ *     imported part as a plain notation staff, losing the tablature and then writing the loss back.
+ *
+ * Both are omitted entirely when there is nothing to say, so a document with neither serialises to
+ * the bytes v5 wrote — the bump costs old readers only the documents that actually need it.
  */
-export const RIFFSHEET_DOCUMENT_VERSION = 5;
+export const RIFFSHEET_DOCUMENT_VERSION = 6;
 
 /**
  * THE CONTAINER, and why it changed twice.

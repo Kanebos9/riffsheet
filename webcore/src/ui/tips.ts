@@ -353,8 +353,6 @@ export const TIPS = {
   exportPdf: 'Save the sheet and tab as a PDF you can print or send.',
   retranscribe:
     'Listen to the same recording again for a fresh reading. The engine does not always give the same answer twice, so a second attempt can simply come out better. It replaces the notes, so your changes are lost — it asks first.',
-  engineChip:
-    'A listening engine is running right now. Click to shut it down and give its memory back. It stops by itself after each transcription and starts again when you need it.',
   openAnother:
     'Back to the main menu, where you can open a file, capture the DAW track, start a blank score, or resume what you were doing.',
   /*

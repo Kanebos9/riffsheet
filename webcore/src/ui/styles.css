@@ -323,34 +323,11 @@ input[type="number"], input[type="text"], select {
  */
 .app-header .spacer { flex: 1 1 auto; min-width: 8px; }
 /*
- * THE LISTENER CHIP (G17). It is on screen only while a listening SERVER is actually up, which
- * is a minority of the time, and it says a whole sentence — "MuScriptor running — click to
- * stop" — because "Listener · 1.5 GB" read as a status badge and nobody clicks a badge.
- *
- * Two rules follow from being the one thing in this row that is a MESSAGE rather than a
- * control. It takes the row's small type, so a sentence costs what a chip costs; and it is the
- * only header child allowed to shrink, so when it appears in a bar that was already full it
- * gives its own ground rather than pushing the export menu and the gear off the edge. The whole
- * text stays in the tooltip. `min-width` keeps enough of it to be recognisable as the listener
- * rather than as an anonymous stub.
+ * THE LISTENER CHIP IS GONE (critique §F). `.app-header .engine-chip` stood here — an 11px,
+ * non-shrinking, `max-content` button reading "Stop MuScriptor" — together with the whole web-side
+ * poll that fed it. See `ui/app.ts §THE ENGINE CHIP SUBSYSTEM IS DELETED`. Nothing replaces it: the
+ * engine stops itself at the end of every job and the settings panel says what it is doing.
  */
-.app-header .engine-chip {
-  font-size: 11px;
-  /*
-   * NOT SHRINKABLE ANY MORE (Z6). It was `flex: 0 1 auto` with a 7em floor and an ellipsis, which
-   * is how "MuScriptor running — click to stop" — 213px of sentence — arrived on a squeezed header
-   * as "MuScriptor running — cli…". A control whose label is cut in half is a control nobody can
-   * be sure of pressing, and this one ends somebody's process.
-   *
-   * The fix is the label, not the box: it says "Stop MuScriptor" now (`ui/app.ts
-   * §refreshEngineChip`) — a verb and its object, about 100px, which the row can afford at every
-   * width. The memory figure and the rest of the explanation are in the tooltip, where they were
-   * already.
-   */
-  flex: 0 0 auto;
-  min-width: max-content;
-  white-space: nowrap;
-}
 
 .banner {
   padding: 7px 12px;
@@ -810,12 +787,33 @@ input[type="number"], input[type="text"], select {
  */
 .notation-toolbar > * { flex: 0 0 auto; max-width: 100%; }
 /*
- * …EXCEPT THE ONE GAP (G1). The staff group and the tab group sit at the two ends of the row and
- * this is what holds them there — see `ui/app.ts §notation-toolbar` for which control belongs to
- * which end. It has to out-specify the `flex: 0 0 auto` above, which is why it is written as a
- * descendant rather than as a child selector.
+ * THREE GROUPS, DISTRIBUTED — the row's own joints (toolbar critique §E).
+ *
+ * WHAT THIS REPLACES, quoted so the change reads as a decision:
+ *
+ *   ".notation-toolbar .spacer { flex: 1 1 auto; min-width: 8px; }
+ *    …EXCEPT THE ONE GAP (G1). The staff group and the tab group sit at the two ends of the row
+ *    and this is what holds them there."
+ *
+ * One elastic child puts ALL the surplus in ONE place, and that place turned out to be between
+ * Quantize and Tab — the two controls that belong next to each other. `space-between` over three
+ * named groups spends the same surplus across two joints instead of one, and the joints are at
+ * subject boundaries rather than wherever the markup happened to have a hole.
+ *
+ * The groups themselves never stretch (`flex: 0 0 auto` above still applies to them), so G1's
+ * real rule is untouched: surplus goes to gaps, never into a control.
  */
-.notation-toolbar .spacer { flex: 1 1 auto; min-width: 8px; }
+.notation-toolbar { justify-content: space-between; }
+.notation-toolbar .toolbar-group {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: nowrap;
+  /* The middle group is the one that changes width as the coarse-grid warning comes and goes, so
+     it is the one allowed to give ground first — and it gives it from its own gaps, not from the
+     text of its controls, which `.notation-toolbar > *` forbids for every child inside it. */
+  min-width: 0;
+}
 /*
  * THE DROP-DOWN ARROW IS OURS, and that is what turns the width above from a guess into a
  * measurement.
@@ -884,7 +882,13 @@ input[type="number"], input[type="text"], select {
      said. It takes its own line at the floor now, like everything else here. */
   flex: 0 0 auto;
 }
-.notation-toolbar .document-bars { display: flex; align-items: center; gap: 6px; margin-left: auto; }
+/*
+ * NO `margin-left: auto` (toolbar critique §E). It was the blank-document twin of the deleted
+ * spacer: on a score with no recording the bar counter shoved itself to the far right and opened
+ * exactly the same canyon the spacer opened everywhere else. The row is distributed by its three
+ * groups now, and the counter is simply the last control in the right-hand one.
+ */
+.notation-toolbar .document-bars { display: flex; align-items: center; gap: 6px; }
 
 /*
  * DEAD, kept only so an old stylesheet reference cannot silently restyle something else.
@@ -1247,6 +1251,31 @@ button[data-drag="midi"]:hover .drag-grip { opacity: 0.9; }
 /* ------------------------------------------------------------------ tri-view */
 
 .triview { flex: 1; min-height: 0; background: var(--paper); position: relative; }
+
+/*
+ * THE EDIT-SEMANTICS CAPTION (critique §C). See `ui/app.ts §buildEditSemanticsCaption`.
+ *
+ * A SIBLING of `.triview` and never a child: `.triview` is the scroll container, so a caption
+ * inside it would scroll away with the music. `flex: 0 0 auto` is what makes it a fixed-height row
+ * that the sheet's `flex: 1` then lays itself out around — the sheet loses exactly this much
+ * height and knows it, which an absolute overlay could not tell it.
+ *
+ * ONE LINE, AND NO ELLIPSIS ANYWHERE. `white-space: nowrap` with no `text-overflow` is deliberate:
+ * a truncated sentence about what an edit does to the score is worse than none, and at the app's
+ * 360px floor the face scale has already shrunk the whole design to fit rather than clipping it
+ * (`ui/faceScale.ts`), so there is nothing left for this row to give.
+ */
+.edit-semantics {
+  flex: 0 0 auto;
+  margin: 0;
+  padding: 4px 10px;
+  background: var(--bg-raised);
+  border-top: 1px solid var(--border);
+  color: var(--text-dim);
+  font-size: 11.5px;
+  line-height: 1.4;
+  white-space: nowrap;
+}
 
 .triview-scroll {
   width: 100%;

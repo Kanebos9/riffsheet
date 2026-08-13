@@ -1534,6 +1534,64 @@ async function main() {
     );
     await settle(600);
 
+    // --- ROLL PURITY: an edit touches the note you touched, and nothing else -------------
+    // Both layers, by id: the RECORDING (which a bad write-back corrupts) and the PAINTED
+    // rectangles (which the deleted same-row shortening pass corrupted). Snap Off, which is the
+    // adjudicated scope — Beat and Grid are global projections by design.
+    result.rollPurity = await evalJson(
+      `window.__RIFFSHEET_ROLLPURITY__
+        ? window.__RIFFSHEET_ROLLPURITY__().then(r => JSON.stringify(r), e => JSON.stringify({ error: String(e) }))
+        : Promise.resolve('null')`,
+      30_000
+    );
+    await settle(600);
+
+    // --- the caption, the toolbar's balance, and the per-part tab ------------------------
+    result.editCaption = await evalJson(`(() => {
+      const cap = document.querySelector('[data-role="edit-semantics"]');
+      const tri = document.querySelector('.triview');
+      if (!cap || !tri) return JSON.stringify({ present: !!cap });
+      const cb = cap.getBoundingClientRect();
+      const tb = tri.getBoundingClientRect();
+      return JSON.stringify({
+        present: true,
+        text: (cap.textContent || '').trim(),
+        role: cap.getAttribute('role'),
+        /** A SIBLING below the sheet, never inside its scroll content. */
+        insideTriview: tri.contains(cap),
+        below: cb.top >= tb.bottom - 1,
+        /** One line: the box is no taller than a line and a half of its own type. */
+        heightPx: Math.round(cb.height),
+        lineHeightPx: Math.round(parseFloat(getComputedStyle(cap).lineHeight) || 0),
+        ellipsized: cap.scrollWidth > cap.clientWidth + 1
+      });
+    })()`);
+    result.toolbarBalance = await evalJson(`(() => {
+      const bar = document.querySelector('[data-role="notation-toolbar"]');
+      if (!bar) return JSON.stringify({ present: false });
+      const groups = ['toolbar-left', 'toolbar-middle', 'toolbar-right']
+        .map((r) => bar.querySelector('[data-role="' + r + '"]'))
+        .filter(Boolean);
+      const bb = bar.getBoundingClientRect();
+      const boxes = groups.map((g) => g.getBoundingClientRect());
+      // Every gap in the row, including the two ends. The old spacer put ALL the surplus in one.
+      const gaps = [];
+      for (let i = 0; i < boxes.length - 1; i++) gaps.push(Math.round(boxes[i + 1].left - boxes[i].right));
+      return JSON.stringify({
+        present: true,
+        groups: groups.length,
+        spacers: bar.querySelectorAll(':scope > .spacer').length,
+        gaps,
+        widest: gaps.length ? Math.max(...gaps) : 0,
+        barWidth: Math.round(bb.width),
+        /** Quantize and Tab must be adjacent — in the same group, in that order. */
+        quantizeAndTabTogether: !!(
+          bar.querySelector('[data-role="toolbar-middle"] [data-role="notation-grid"]') &&
+          bar.querySelector('[data-role="toolbar-middle"] [data-role="tab-view"]')
+        )
+      });
+    })()`);
+
     // --- the two grids are actually two ------------------------------------------------
     // Driven through the real controls, because the whole failure being guarded against was
     // a UI wire: one <select> that reached both the roll and the quantizer.
@@ -3449,42 +3507,38 @@ async function main() {
     await evalJson(GEAR_CLICK);
     await settle(500);
 
-    // --- the two-step engine stop (#5-web) ----------------------------------------------
-    phase('checking the external-engine stop and the engine-click gesture', 120_000);
-
-    // G17 FIRST, BEFORE THE CHIP IS CLICKED — a stop would change every number in it.
-    result.engineChip = await evalJson(
-      `JSON.stringify(window.__RIFFSHEET_ENGINECHIP__ ? window.__RIFFSHEET_ENGINECHIP__() : null)`
-    );
-    result.engineChipStop = await evalJson(`(() => {
-      const chip = document.querySelector('[data-role="engine-chip"]');
-      if (!chip) return JSON.stringify({ present: false });
-      chip.click();
-      return JSON.stringify({ present: true, hidden: chip.style.display === 'none' });
-    })()`);
-    await settle(900);
-    result.leftRunning = await evalJson(`(() => {
-      const toasts = [...document.querySelectorAll('.toast')];
-      const withButton = toasts.find((t) => t.querySelector('[data-role="stop-external-engine"]'));
-      return JSON.stringify({
-        count: toasts.length,
-        texts: toasts.map((t) => t.textContent.trim()),
-        hasStopAnyway: !!withButton,
-        label: withButton
-          ? withButton.querySelector('[data-role="stop-external-engine"]').textContent.trim()
-          : null
-      });
-    })()`);
-    result.stopAnywayClick = await evalJson(clickRole('stop-external-engine'));
-    await settle(900);
-    result.afterStopAnyway = await evalJson(`(() => {
-      const toasts = [...document.querySelectorAll('.toast')].map((t) => t.textContent.trim());
-      return JSON.stringify({ toasts, count: toasts.length });
-    })()`);
-    await cdp.send('Runtime.evaluate', {
-      expression: `document.querySelectorAll('.toast button[aria-label="Dismiss"]').forEach(b => b.click())`,
-      returnByValue: true
-    });
+    /*
+     * --- THE ENGINE CHIP IS GONE (critique §F) -----------------------------------------
+     *
+     * WHAT THIS REPLACES. A block that clicked the header chip, read the "Left running" toast,
+     * pressed "Stop it anyway" and asserted the two-step external stop — plus `engineChip`,
+     * `engineChipStop`, `leftRunning`, `stopAnywayClick` and `afterStopAnyway`. All five described
+     * a subsystem that no longer exists (`ui/app.ts §THE ENGINE CHIP SUBSYSTEM IS DELETED`).
+     *
+     * WHAT IS ASSERTED INSTEAD, and it is the cheap and complete claim: the mock reports a RUNNING
+     * external server — the exact payload that used to draw the chip — and there is still no chip
+     * anywhere on the page and no `__RIFFSHEET_ENGINEPOLL__` hook behind it. A stale button that
+     * only appeared while a real server happened to be up would otherwise be invisible to a suite
+     * that never has one.
+     */
+    phase('checking the engine chip is gone', 30_000);
+    result.engineChipGone = await evalJson(`JSON.stringify({
+      /* Anywhere on the page, by role, by class and by the inner label the chip carried. */
+      chip: !!document.querySelector('[data-role="engine-chip"]'),
+      chipClass: !!document.querySelector('.engine-chip'),
+      chipText: !!document.querySelector('[data-role="engine-text"]'),
+      /* No CONTROL in the header offering to stop anything — the chip was a <button> reading
+         "Stop <engine>", so the shape is asked for rather than a substring of the whole row. */
+      stopText: [...document.querySelectorAll('.app-header button, .app-header .chip')]
+        .some((b) => /^\\s*Stop\\b/i.test(b.textContent ?? '')),
+      /* The subsystem behind it: the poll's test hooks, and the CSS rule it was styled by. */
+      pollHook: typeof window.__RIFFSHEET_ENGINEPOLL__,
+      chipHook: typeof window.__RIFFSHEET_ENGINECHIP__,
+      cssRules: [...document.styleSheets].reduce((n, sheet) => {
+        try { return n + [...sheet.cssRules].filter((r) => (r.selectorText ?? '').includes('engine-chip')).length; }
+        catch { return n; }
+      }, 0)
+    })`);
     await settle(400);
 
     // --- clicking an engine transcribes with it (#10) -----------------------------------
@@ -3875,24 +3929,6 @@ async function main() {
     await settle(900);
 
 
-    /*
-     * ------------------------------------------------------------------------------------
-     * H8 — THE ENGINE CHIP NOTICES A SERVER RIFFSHEET DID NOT START
-     * ------------------------------------------------------------------------------------
-     *
-     * Slow on purpose: the claim is about a TIMER, and the only honest way to check a timer is
-     * to wait for it. The hook stubs `engineStatus`, answers "nothing running" for one idle
-     * period — a poll that stopped re-arming after a negative answer is asked exactly once —
-     * then starts answering with somebody else's MuScriptor and waits again WITHOUT prompting
-     * the app. See `installTestHooks` in ui/app.ts.
-     */
-    phase('checking that the engine chip notices an external server', 60_000);
-    result.enginePoll = await evalJson(
-      `window.__RIFFSHEET_ENGINEPOLL__
-        ? window.__RIFFSHEET_ENGINEPOLL__().then(r => JSON.stringify(r), e => JSON.stringify({ error: String(e) }))
-        : Promise.resolve('null')`,
-      50_000
-    );
 
     /*
      * ------------------------------------------------------------------------------------
@@ -5270,68 +5306,52 @@ async function main() {
       ],
 
       // --- G17: the chip may only claim a listener that exists ---------------------------
+      /*
+       * --- THE ENGINE CHIP IS GONE, AND STAYS GONE (critique §F) -------------------------
+       *
+       * FOUR CHECKS STOOD HERE and every one of them described the deleted subsystem. Quoted, so
+       * this reads as a decision rather than as coverage quietly going missing:
+       *
+       *   'listener chip: it appears only where a server process actually exists'
+       *   'listener chip: shown means named, highlighted, and offering to stop'
+       *   'engine stop: “Left running” now carries a Stop it anyway button'
+       *   'engine stop: pressing it stops the borrowed listener'
+       *
+       * The product decision is that a header button which ends somebody's process does not
+       * belong in the row a player reads on every take — the engine stops itself at the end of
+       * each job, which is what made the chip a rare sight in the first place. So the claim to
+       * assert is the negative one, and it is asserted against the payload that used to DRAW the
+       * chip: the mock reports a running external server and there is still nothing on the page.
+       *
+       * The bridge's `stopEngine` / `stopExternalEngine` and the native lifecycle are untouched
+       * and are not what these checks were ever about.
+       */
       [
-        /*
-         * THE BUG: "Listener · running" on a machine where nobody had ever started an engine
-         * server. `EngineStatus.state` means the SERVER'S LIFECYCLE for MuScriptor and "this
-         * engine is installed" for every other engine, and ui/app.ts read it as the first for
-         * both — so on any machine whose resolved engine was not MuScriptor the chip was up
-         * from boot. `memoryMb` was absent, which is why the text read the literal word
-         * "running" instead of a figure; that string was the tell.
-         *
-         * A check cannot start a Python process, so it cannot assert the chip is RIGHT. What it
-         * asserts is the implication that was broken, in both directions: visible only where
-         * the payload carries evidence of a process, and no evidence means not visible. The
-         * evidence list is the same one `engineProcessAlive()` uses, restated here rather than
-         * imported, so a quiet widening of it on the app's side fails this check.
-         */
-        'listener chip: it appears only where a server process actually exists',
-        !!result.engineChip &&
-          result.engineChip.present === true &&
-          result.engineChip.visible ===
-            (['ready', 'starting'].includes(result.engineChip.state) &&
-              ((result.engineChip.port ?? 0) > 0 ||
-                (result.engineChip.memoryMb ?? 0) > 0 ||
-                result.engineChip.externalServer === true ||
-                result.engineChip.adopted === true))
+        'engine chip: no chip is drawn — not by role, not by class, not by its label',
+        !!result.engineChipGone &&
+          result.engineChipGone.chip === false &&
+          result.engineChipGone.chipClass === false &&
+          result.engineChipGone.chipText === false,
+        JSON.stringify(result.engineChipGone)
       ],
       [
-        /*
-         * And when it IS shown it says what it is and what pressing it does, in the accent —
-         * "Listener · 1.5 GB" read as a status badge, and nobody clicks a status badge. The
-         * memory figure is not lost; it moved into the tooltip.
-         *
-         * THE WORDING IS SHORTER THAN IT WAS (Z6), and this check moved with it. It used to read
-         * "MuScriptor running — click to stop": 213px of sentence in the row that has to survive
-         * REAPER's 390px docked FX window, which is why it shipped ellipsized to "MuScriptor
-         * running — cli…". "Stop MuScriptor" is a verb and its object — the same two facts, about
-         * 100px, and unmistakably a button. That it is RUNNING is what the chip's presence means:
-         * it is drawn only where a process exists, which is the check above.
-         */
-        'listener chip: shown means named, highlighted, and offering to stop',
-        !result.engineChip?.visible ||
-          (/^Stop \S| starting$/.test(result.engineChip?.text ?? '') &&
-            !/…/.test(result.engineChip?.text ?? '') &&
-            result.engineChip?.highlighted === true)
-      ],
-
-      // --- #5-web: a refusal you can act on ----------------------------------------------
-      [
-        // "It is not Riffsheet's to stop" is a correct principle and, on its own, a dead end:
-        // the person reading it usually started that server themselves, can see it holding
-        // well over a gigabyte, and has just been told the app will not help.
-        'engine stop: “Left running” now carries a Stop it anyway button',
-        result.engineChipStop?.present === true &&
-          result.leftRunning?.hasStopAnyway === true &&
-          /left running/i.test((result.leftRunning?.texts ?? []).join(' ')) &&
-          /stop it anyway/i.test(result.leftRunning?.label ?? '')
+        // Nothing in the header offers to end a listener, whatever it is called. The browser mock
+        // reports an external MuScriptor for part of this run, which is exactly the payload that
+        // used to draw the chip — so this is asserted against the state that could produce one.
+        'engine chip: nothing in the header offers to stop a listener',
+        !!result.engineChipGone && result.engineChipGone.stopText === false,
+        JSON.stringify(result.engineChipGone)
       ],
       [
-        // And it works — through `stopExternalEngine`, which is a separate native call rather
-        // than a flag on the ordinary Stop, so nothing can reach it without the second press.
-        'engine stop: pressing it stops the borrowed listener',
-        result.stopAnywayClick?.clicked === true &&
-          /listener stopped/i.test((result.afterStopAnyway?.toasts ?? []).join(' '))
+        // The subsystem behind it, not only its DOM: the eight-second poll, its two test hooks and
+        // the stylesheet rule. A surviving hook is a surviving poll, and a surviving poll is the
+        // `refreshEngineChip` -> `renderMain` rebuild loop the §F note is about.
+        'engine chip: the poll, its hooks and its stylesheet rule went with it',
+        !!result.engineChipGone &&
+          result.engineChipGone.pollHook === 'undefined' &&
+          result.engineChipGone.chipHook === 'undefined' &&
+          result.engineChipGone.cssRules === 0,
+        JSON.stringify(result.engineChipGone)
       ],
 
       // --- #10: choosing an engine transcribes with it -----------------------------------
@@ -6127,6 +6147,124 @@ async function main() {
         'snap feed: the roll draws the same notes at every Quantize value',
         !!result.snapFeed && !result.snapFeed.error && result.snapFeed.feedStableAcrossGrids === true
       ],
+
+      /*
+       * ==========================================================================================
+       * ROLL PURITY (roll-purity critique §A) — both layers, by id, with Snap Off
+       * ==========================================================================================
+       *
+       * The owner's report was "editing one note on the roll changes its neighbours". The reducer
+       * was already local, so nothing here would have caught it: the two real mechanisms were the
+       * RENDERER shortening overlapping same-row rectangles, and the ripple log re-asserting an
+       * absolute `chordEndTick` over a later resize. Both live between the note list and the
+       * picture, which is why every check below reads the PAINTED rectangles as well as the raw
+       * recording, and names the ids that strayed rather than counting them.
+       *
+       * SNAP OFF is the scope, adjudicated. Beat and Grid re-derive every event's placement from
+       * the whole take by design — a global allocator is what a snap IS — so the exact statement of
+       * the law is the Snap Off one, and the snap modes' own behaviour is covered by `snapFeed`
+       * above.
+       */
+      ['purity: the probe ran', !!result.rollPurity && !result.rollPurity.error],
+      [
+        'purity: MOVING a note leaves every other note where it was — in the recording',
+        !!result.rollPurity && (result.rollPurity.move?.rawStrayed ?? ['?']).length === 0,
+        JSON.stringify(result.rollPurity?.move ?? null)
+      ],
+      [
+        'purity: …and in the picture',
+        !!result.rollPurity && (result.rollPurity.move?.paintedStrayed ?? ['?']).length === 0,
+        JSON.stringify(result.rollPurity?.move ?? null)
+      ],
+      [
+        'purity: RESIZING a note leaves every other note where it was — in the recording',
+        !!result.rollPurity && (result.rollPurity.resize?.rawStrayed ?? ['?']).length === 0,
+        JSON.stringify(result.rollPurity?.resize ?? null)
+      ],
+      [
+        // THE ONE THE OLD RENDERER FAILED. The resize is long enough to run over the next note on
+        // the same MIDI row; `layoutRects` used to shorten the earlier rectangle to make room, so
+        // a note nobody touched visibly got shorter.
+        'purity: …and in the picture, even where the resize now overlaps its own row',
+        !!result.rollPurity && (result.rollPurity.resize?.paintedStrayed ?? ['?']).length === 0,
+        JSON.stringify(result.rollPurity?.resize ?? null)
+      ],
+      [
+        // The literal-duration law itself: the rectangle is exactly as long as the note it draws.
+        // Half a tenth of a second of tolerance, which is well under the shortening this replaces.
+        'purity: the roll paints the TRUE duration, not a shortened one',
+        !!result.rollPurity && !!result.rollPurity.painted && !!result.rollPurity.feedSpan &&
+          Math.abs(result.rollPurity.painted.end - result.rollPurity.feedSpan.end) < 0.01 &&
+          Math.abs(result.rollPurity.painted.start - result.rollPurity.feedSpan.start) < 0.01,
+        JSON.stringify({ painted: result.rollPurity?.painted, fed: result.rollPurity?.feedSpan })
+      ],
+      [
+        'purity: ADDING a note leaves every other note where it was — in the recording',
+        !!result.rollPurity && (result.rollPurity.add?.rawStrayed ?? ['?']).length === 0,
+        JSON.stringify(result.rollPurity?.add ?? null)
+      ],
+      [
+        'purity: …and in the picture',
+        !!result.rollPurity && (result.rollPurity.add?.paintedStrayed ?? ['?']).length === 0,
+        JSON.stringify(result.rollPurity?.add ?? null)
+      ],
+      [
+        // THE AUTHORED-ID CONTRACT. `rollEditNoteIds({kind:'add'})` returned `[]` — an add command
+        // carries no id, because the id is minted inside the reducer — so a hand-drawn note was
+        // never entered into `userTouchedIds` and the auto-edit pass went on treating it as fair
+        // game. The reducer states its own authored ids now.
+        'purity: a note the player DREW is recorded as one they decided about',
+        !!result.rollPurity && (result.rollPurity.add?.newIds ?? []).length === 1 &&
+          result.rollPurity.add?.userTouched === true,
+        JSON.stringify(result.rollPurity?.add ?? null)
+      ],
+
+      // --- the caption that says which surface does which (critique §C) ------------------
+      ['caption: the sheet/roll semantics line is on the page', !!result.editCaption?.present],
+      [
+        // A SIBLING below `.triview`, never inside it: alphaTab's scroll content would carry it
+        // away with the music and put it in the middle of the page.
+        'caption: it sits below the sheet, outside the sheet’s scroll content',
+        !!result.editCaption && result.editCaption.insideTriview === false && result.editCaption.below === true,
+        JSON.stringify(result.editCaption)
+      ],
+      [
+        'caption: it names both surfaces and what each one does',
+        /sheet edits/i.test(result.editCaption?.text ?? '') &&
+          /piano-roll edits/i.test(result.editCaption?.text ?? '') &&
+          /only the note you touch/i.test(result.editCaption?.text ?? '')
+      ],
+      [
+        // One line, and never cut short — the same rule the notation bar follows. No "…" anywhere.
+        'caption: one line, whole, with no ellipsis',
+        !!result.editCaption && result.editCaption.ellipsized === false &&
+          !/…/.test(result.editCaption.text ?? '') &&
+          result.editCaption.heightPx <= result.editCaption.lineHeightPx + 12,
+        JSON.stringify(result.editCaption)
+      ],
+
+      // --- the notation bar is three groups, not one canyon (critique §E) ----------------
+      [
+        'toolbar: three semantic groups, and the flex spacer is gone',
+        !!result.toolbarBalance?.present && result.toolbarBalance.groups === 3 &&
+          result.toolbarBalance.spacers === 0,
+        JSON.stringify(result.toolbarBalance)
+      ],
+      [
+        // Quantize and Tab were the two controls the old spacer drove apart, and they are the two
+        // that belong together: how much the page rounds, and which instrument it is for.
+        'toolbar: Quantize and Tab are adjacent',
+        result.toolbarBalance?.quantizeAndTabTogether === true
+      ],
+      [
+        // THE BALANCE CLAIM, measured rather than eyeballed. One elastic spacer put the entire
+        // surplus in ONE joint; three distributed groups spend it across two. No single gap may
+        // be more than a third of the bar.
+        'toolbar: no single gap swallows the row',
+        !!result.toolbarBalance?.present &&
+          result.toolbarBalance.widest <= result.toolbarBalance.barWidth / 3,
+        JSON.stringify(result.toolbarBalance)
+      ],
       [
         // ...and the SHEET is not identical, or the line above would be true for the wrong
         // reason (a menu that reaches nothing at all passes a stability check trivially).
@@ -6432,8 +6570,19 @@ async function main() {
         // ripple and a bar operation ARE, and a v4 reader handed one of these shows the take with
         // every ripple undone and the timeline re-attached, then writes the file back without
         // them: wrong about the music, and destroying the evidence. The READER still takes v1..v5.
+        //
+        // v6 SINCE THE CANONICAL PLACEMENTS AND THE PER-PART FRETBOARD, one bump for two fields
+        // that landed together. The old claim, quoted:
+        //   'document: the current writer stamps the current version',
+        //   !!result.document && result.document.version === 5
+        // `rollPlacements` (`edit/ripple.ts §RollPlacement`) says where a hand-placed note actually
+        // is in the ripple log's own coordinates, and `ImportedPart.tab` gives an imported part its
+        // own instrument and tuning. A v5 reader would re-apply the log over an override that
+        // exists to stop it — the rectangle snaps back to the value the player dragged it off —
+        // and would print an imported guitar as a plain staff, then save both losses. Same test,
+        // same answer. The READER still takes v1..v6.
         'document: the current writer stamps the current version',
-        !!result.document && result.document.version === 5
+        !!result.document && result.document.version === 6
       ],
       [
         // The container is the point of v3, so it is asserted rather than assumed, together
@@ -7291,29 +7440,21 @@ async function main() {
         JSON.stringify(result.themeSystemLine)
       ],
 
-      // --- H8: the engine chip notices somebody else's server ---------------------------
-      [
-        // A poll that stopped re-arming after a negative answer is asked exactly once. Two or
-        // more asks over one idle period is the whole claim.
-        'engine chip: the poll keeps asking after “nothing is running”',
-        !!result.enginePoll && !result.enginePoll.error && result.enginePoll.askedWhileDown >= 2
-      ],
-      [
-        'engine chip: it is hidden while nothing is running',
-        !!result.enginePoll && result.enginePoll.hiddenWhileDown === true
-      ],
-      [
-        // Nobody told the app. The timer noticed, inside about ten seconds.
-        'engine chip: an externally-started server appears without being announced',
-        !!result.enginePoll && result.enginePoll.chipShown === true &&
-          result.enginePoll.noticedMs <= result.enginePoll.idlePollMs + 4000
-      ],
-      [
-        // …and it names the engine that is RUNNING, not the one the player has selected.
-        'engine chip: it names the running engine, not the selected one',
-        !!result.enginePoll && /MuScriptor/i.test(result.enginePoll.chipText ?? '') &&
-          !/^muscriptor$/i.test(result.enginePoll.selectedEngine ?? '')
-      ],
+      /*
+       * --- H8 IS RETIRED WITH THE CHIP IT WAS ABOUT (critique §F) ------------------------
+       *
+       * The four checks that stood here — quoted so the loss is deliberate — all measured the
+       * eight-second header poll:
+       *
+       *   'engine chip: the poll keeps asking after “nothing is running”'
+       *   'engine chip: it is hidden while nothing is running'
+       *   'engine chip: an externally-started server appears without being announced'
+       *   'engine chip: it names the running engine, not the selected one'
+       *
+       * They were driven by `__RIFFSHEET_ENGINEPOLL__`, which waited out two full idle periods and
+       * was the single slowest step in the whole suite (19s of a 59s budget). Both the hook and
+       * the poll are deleted; "the poll and its hooks went with it" above is what replaces them.
+       */
 
       // --- H4: a new take starts from the fixed defaults ---------------------------------
       [
@@ -7671,15 +7812,9 @@ async function main() {
           !!sweep?.takeName && sweep.takeName.shown === true && sweep.takeName.whole === true
         ]
       ]),
-      [
-        // The engine chip is a CONTROL that ends somebody's process, and it used to say
-        // "MuScriptor running — click to stop" — 213px of sentence in the row that has to survive
-        // a 390px docked FX window, ellipsized to "MuScriptor running — cli…". A verb and its
-        // object says the same two things in half the width.
-        'chip: the listener chip is a verb, and it fits at every width',
-        !!result.engineChip && /^Stop /.test(result.engineChip.text ?? '') &&
-          !/…/.test(result.engineChip.text ?? '')
-      ],
+      // The width-ladder check for the engine chip stood here ('chip: the listener chip is a
+      // verb, and it fits at every width'). There is no chip to fit — see §F above. The row it
+      // was measured in is still swept at all three widths by the `sweep` checks above.
 
       // --- octave-folded tab positions ------------------------------------------------
       ['8va: the drop-tuned fixture folds something', !!drop && drop.octaveShiftNotes > 0],
@@ -7728,7 +7863,7 @@ async function main() {
       // --- one origin (codex-critique §7) ---------------------------------------------
       ['origin: the probe ran on a take with real leading silence', !!OP && !OP.error && OP.appOrigin > 0.5],
       ['origin: the roll draws on the app’s origin and not its own', !!OP && Math.abs((OP.rollOrigin ?? 99) - OP.appOrigin) < 0.01],
-      ['origin: a double-click adds a note', !!OP && !!OP.addedNoteId],
+      ['origin: a double-click adds a note', !!OP && !!OP.addedNoteId, JSON.stringify(OP?.why ?? OP)],
       [
         // WHAT THE RESIDUAL IS. An added note is a performance edit, so the sheet is rebuilt and
         // the pipeline QUANTIZES it onto a line it can print: the note lands on the nearest
@@ -7747,6 +7882,34 @@ async function main() {
         // budget that would have to be re-tuned with the fixture.
         'origin: …and at the second that was clicked, not a silence later',
         !!OP && OP.errorSec !== null && OP.errorSec < Math.min(0.3, OP.silenceSec / 4)
+      ],
+
+      /*
+       * --- THE FIRST CLICK OF THE DOUBLE-CLICK (roll-purity critique §B) ----------------
+       *
+       * `__RIFFSHEET_ORIGINPROBE__` now drives the REAL sequence — pointerdown/up/click twice,
+       * with awaited gaps, then dblclick — instead of one synthetic `dblclick`. The three checks
+       * below read the state between the first press and the second, which is the only window in
+       * which the reported fault is visible: the seek fires there, and everything it must NOT do
+       * it did there.
+       *
+       * The old suite had no claim here at all. Its `origin:` checks above still pass with the
+       * bug present, because a lone `dblclick` never delivers the first press that seeks.
+       */
+      ['first-click: the press really did seek', !!OP && OP.firstClick?.transportMovedSec > 0.05],
+      [
+        // The shared window's left edge, in seconds. `followSeek()` used to centre it on the
+        // seeked moment, which moved the roll's ruler out from under the pointer between the
+        // two presses. Zero is the claim, and the tolerance is one frame of float.
+        'first-click: …and it did NOT move the page',
+        !!OP && (OP.firstClick?.viewMovedSec === null || OP.firstClick?.viewMovedSec < 0.001)
+      ],
+      [
+        // The pitch window's top edge, in semitones. `setPosition()` ran the playback
+        // auto-follow on a STOPPED take, so a seek could scroll the row the second click was
+        // aimed at off the pointer.
+        'first-click: …and it did NOT move the pitch window',
+        !!OP && OP.firstClick?.pitchMovedSemitones < 0.001
       ],
 
       // --- a view control does not destroy history (codex-critique §6.2) ---------------

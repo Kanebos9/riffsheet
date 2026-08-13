@@ -23,6 +23,10 @@
  * second place to look for the same twelve lines.
  */
 
+// The one-proportion law's coordinate correction (G1): this menu is `position: fixed` under a
+// zoomed body, so it is placed and clamped in LOGICAL pixels. See `ui/faceScale.ts`.
+import { faceViewport, logicalRect } from '../ui/faceScale';
+
 export interface SheetMenuItem {
   label: string;
   /** Ticked, for a value the target already has. */
@@ -82,10 +86,16 @@ export function sheetMenuProbe(): {
 }
 
 /**
- * Put the menu on screen at a client point, flipped so it never hangs off an edge.
+ * Put the menu on screen at a point, flipped so it never hangs off an edge.
  *
  * Appended to `document.body` rather than to the sheet, because the sheet is a scroller with
  * `overflow: hidden` on one axis and a menu inside it would be clipped by the pane it belongs to.
+ *
+ * THE POINT IS IN LOGICAL PIXELS (G1), not raw client ones — the caller converts, and
+ * `SheetTarget.clientX/clientY` carry the converted pair. The menu is `position: fixed` inside a
+ * body that carries the face scale, so its `left`/`top` are read in the design's own pixels; a raw
+ * `clientX` would place it at `clientX / scale`, which at a small plugin window is most of the way
+ * across the sheet from wherever the player pressed.
  */
 export function showSheetMenu(clientX: number, clientY: number, items: readonly SheetMenuItem[]): void {
   closeSheetMenu();
@@ -205,9 +215,10 @@ export function showSheetMenu(clientX: number, clientY: number, items: readonly 
   document.body.appendChild(menu);
   // Measured after it is in the document, because the width depends on the longest label and
   // there is no honest way to know that in advance.
-  const rect = menu.getBoundingClientRect();
-  const x = Math.max(4, Math.min(clientX, window.innerWidth - rect.width - 4));
-  const y = Math.max(4, Math.min(clientY, window.innerHeight - rect.height - 4));
+  const rect = logicalRect(menu);
+  const view = faceViewport();
+  const x = Math.max(4, Math.min(clientX, view.width - rect.width - 4));
+  const y = Math.max(4, Math.min(clientY, view.height - rect.height - 4));
   menu.style.left = `${x}px`;
   menu.style.top = `${y}px`;
 

@@ -209,13 +209,15 @@ export function buildScore(input: BuildInput, settings: BuildSettings, options: 
   // every drag of the "bar 1" marker. Numbering after the guard would renumber every later note
   // the moment one artefact is dropped.
   const identified: InputNote[] = (input.notes ?? []).map((n, i) => ({ ...n, id: n.id ?? `n${i}` }));
-  const guard = applyGuards(identified, input.audioDurationSec);
+  const guard = applyGuards(identified, input.audioDurationSec, input.detachedTimeline);
   const notes: InputNote[] = guard.notes;
 
   // ---- station 1: time skeleton -------------------------------------------------------------
   // The SCORE's notes, not this part's: identical to `notes` on an ordinary single-part build,
   // the union of every part on a multi-part one. See BuildOptions.
-  const scoreNotes = options.sharedNotes ? applyGuards(options.sharedNotes, input.audioDurationSec).notes : notes;
+  const scoreNotes = options.sharedNotes
+    ? applyGuards(options.sharedNotes, input.audioDurationSec, input.detachedTimeline).notes
+    : notes;
   const sourceCarrier = (options.sharedNotes ?? identified).find((note) => note.sourceBars?.length);
   const tempoCarrier = (options.sharedNotes ?? identified).find((note) => note.sourceTempoChanges?.length);
   // THE SOURCE'S BARS GO IN, THEY ARE NOT PAINTED ON AFTERWARDS (finding 2). `applySymbolicBars`

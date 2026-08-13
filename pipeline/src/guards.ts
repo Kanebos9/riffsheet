@@ -4,7 +4,9 @@
  * Two jobs, both of which the pipeline can do without hearing anything:
  *
  *  1. PAST-END FILTER. A detector that keeps hallucinating after the audio stops produces
- *     notes with `startSec >= audioDurationSec`. Those are never real. Dropped outright.
+ *     notes with `startSec >= audioDurationSec`. Those are never real. Dropped outright — unless
+ *     the caller has declared a detached timeline, in which case the audio's length says nothing
+ *     about the score's and the filter is off. See `applyGuards`.
  *
  *  2. REPEAT-LOOP DETECTOR (interface only, by design). A stuck decoder emits a run of
  *     identical pitches at a machine-regular spacing. That is ALSO what a real sixteenth-note
@@ -118,9 +120,29 @@ function isDeclared(note: InputNote): boolean {
   return notationIntentTicks(note.notationIntent) !== null;
 }
 
-export function applyGuards(notes: InputNote[], audioDurationSec?: number): GuardResult {
+/**
+ * A DETACHED TIMELINE IS THE THIRD EXEMPTION, and it is the caller's declaration rather than a
+ * property of the note.
+ *
+ * The past-end filter and the ring-out clamp are both statements about ONE audio file being the
+ * whole truth about when the music stops. Bar insert/delete makes that false on purpose: the
+ * edit moves real material later in note time while the waveform stays exactly as long as it was
+ * recorded, so a score legitimately outlives its audio and `audioDurationSec` stops being an
+ * authority over the notes. Applying the guard there would answer "insert a bar" by deleting
+ * everything the insert pushed past the old end — see `BuildInput.detachedTimeline`.
+ *
+ * Only the two audio-length rules are lifted. `MIN_NOTE_SEC` is about a detector's resolution and
+ * survives; so does everything else in this module.
+ */
+export function applyGuards(
+  notes: InputNote[],
+  audioDurationSec?: number,
+  detachedTimeline = false
+): GuardResult {
   let pastEndDropped = 0;
   let tooShortDropped = 0;
+  /** The audio's length is only a boundary on the notes while they still share its timeline. */
+  const boundarySec = detachedTimeline ? undefined : audioDurationSec;
 
   const kept: { note: InputNote; originalIndex: number }[] = [];
   notes.forEach((n, originalIndex) => {
@@ -128,12 +150,12 @@ export function applyGuards(notes: InputNote[], audioDurationSec?: number): Guar
       kept.push({ note: { ...n }, originalIndex });
       return;
     }
-    if (audioDurationSec !== undefined && n.startSec >= audioDurationSec) {
+    if (boundarySec !== undefined && n.startSec >= boundarySec) {
       pastEndDropped++;
       return;
     }
     // Clamp a note that rings past the end of the audio rather than dropping it.
-    const endSec = audioDurationSec !== undefined ? Math.min(n.endSec, audioDurationSec) : n.endSec;
+    const endSec = boundarySec !== undefined ? Math.min(n.endSec, boundarySec) : n.endSec;
     if (endSec - n.startSec < MIN_NOTE_SEC && !isDeclared(n)) {
       tooShortDropped++;
       return;

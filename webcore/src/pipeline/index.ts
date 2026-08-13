@@ -30,7 +30,8 @@ import {
   type TempoSource,
   type TickSecondsMap,
   notationIntentTicks,
-  NOTATION_INTENT_DENOMINATORS
+  NOTATION_INTENT_DENOMINATORS,
+  CHORD_WINDOW_MIN_SEC
 } from '@pipeline-impl';
 
 import type { AppSettings } from '../app/state';
@@ -47,6 +48,28 @@ export type { AlphaTabScoreData, RiffsheetIR, InputNote, NotationIntent, TempoSe
  * construction instead of by a comment.
  */
 export { notationIntentTicks, NOTATION_INTENT_DENOMINATORS };
+
+/**
+ * ONE ANSWER TO "ARE THESE TWO NOTES THE SAME CHORD", SHARED WITH THE ENGRAVER (P1).
+ *
+ * The editor used to ask this question with a microsecond epsilon while the pipeline groups
+ * attacks inside a window measured in TENS OF MILLISECONDS (`pipeline/src/chords.ts` §4.3b:
+ * `max(35 ms, 1/64 whole note)`, the human-motor-slop floor a strum needs). Two numbers, two
+ * answers, and the disagreement was not academic: a double stop played 3 ms apart is ONE
+ * engraved chord on the page and was TWO colliding notes in the reducer, so the duration
+ * command clipped the note the player had just chosen a value for against its own chord mate
+ * and the roll rectangle collapsed to the minimum. That is the reported "each click makes it
+ * shorter" loop, and it is a units bug rather than a policy one.
+ *
+ * The FLOOR is re-exported rather than `chordWindowSec(beatPeriod)` — the tempo-aware widening
+ * — on purpose. The window only ever grows above this number, so grouping on the floor can
+ * merge fewer pairs than the pipeline does but never more: the editor can be slightly stricter
+ * than the page and still never split something the page draws as one chord, which is the only
+ * direction of disagreement that does not produce a visible fault. Taking the full
+ * `chordWindowSec` would need the beat period at the edited note's own position, which is a
+ * tempo-map walk per collision test for a difference that is zero below 250 BPM.
+ */
+export { CHORD_WINDOW_MIN_SEC };
 
 /**
  * THE AUTHORITATIVE TICK <-> SECONDS CONVERSION, handed to webcore.
@@ -149,6 +172,20 @@ export interface BuildRequest {
   hostGrid?: HostGridInput;
   /** Full-rest bars requested by the empty-document setup. */
   blankBars?: number;
+  /**
+   * THE SCORE'S TIMELINE IS ITS OWN (workstream C). Forwarded verbatim as
+   * `BuildInput.detachedTimeline`.
+   *
+   * With it, `audioDurationSec` above stops being an authority over the notes: the pipeline's
+   * guards stop dropping notes past the end of the tape and stop clamping ring-out against it,
+   * and the bar skeleton is derived from the notes and `minimumBars` instead. That is exactly
+   * what a bar insert needs — it moves real material later in NOTE time while the recording stays
+   * precisely as long as it was recorded — and without it the guard answers "insert a bar" by
+   * deleting everything the insert pushed past the old end.
+   *
+   * `audioDurationSec` is still passed when it is known, because it remains true about the audio.
+   */
+  detachedTimeline?: boolean;
   title?: string;
 }
 
@@ -304,7 +341,8 @@ export function buildRiffScore(request: BuildRequest, settings: AppSettings): Ri
     ...(request.downbeats && !externalGrid ? { downbeats: request.downbeats } : {}),
     ...(request.audioDurationSec !== undefined ? { audioDurationSec: request.audioDurationSec } : {}),
     ...(request.startOffsetSec !== undefined ? { startOffsetSec: request.startOffsetSec } : {}),
-    ...(request.blankBars !== undefined ? { blankBars: request.blankBars } : {})
+    ...(request.blankBars !== undefined ? { blankBars: request.blankBars } : {}),
+    ...(request.detachedTimeline ? { detachedTimeline: true } : {})
   };
 
   const result = teamCBuildScore(input, buildSettings);

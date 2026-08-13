@@ -18,8 +18,10 @@ interface BuildInput {
   beatTimesSec?: number[];
   tempoBpm?: number;
   audioDurationSec?: number;
+  detachedTimeline?: boolean;
   timeSignature?: [number, number];
-  blankBars?: number;
+  minimumBars?: number;               // floor on printed bars, 1..256
+  blankBars?: number;                 // DEPRECATED name for minimumBars
 }
 
 interface InputNote {
@@ -42,6 +44,30 @@ interface InputNote {
   sourceTempoChanges?: { tick: number; ppq: number; bpm: number }[];
 }
 ```
+
+### `detachedTimeline` — the score's clock is no longer the audio's
+
+`audioDurationSec` drives one rule: station 7's past-end filter drops a detected note starting at
+or after the last sample and clamps a note that merely rings past it. That rule is only true while
+the note list is a *transcript* of the audio.
+
+Bar insert/delete makes it false on purpose. Inserting a bar is a pure note-time edit — real,
+user-owned material moves later while the waveform stays exactly as long as it was recorded — so
+the score's timeline legitimately exceeds and diverges from the audio's. `detachedTimeline: true`
+says so, and turns that one rule off:
+
+* notes beyond `audioDurationSec` are engraved normally, with their full sounding length;
+* the time skeleton extends to hold them (its length has always been derived from the material and
+  `minimumBars`, never from the audio) — the tempo map, the tick↔seconds map and `validateIR` need
+  no change and no other guard trims;
+* `audioDurationSec` may still be passed and remains meaningful to the app as the waveform's
+  extent; it simply stops being an authority over the notes.
+
+Everything else is unchanged. The sub-30 ms filter is a statement about detection quality, not
+about where the audio stops, so it still applies; so do chord grouping, the overlap clamp and the
+repeat-loop flag. Symbolic notes were already exempt from both audio-length rules.
+
+For a multi-part build the flag lives on `SharedBuildInput` and applies to every part.
 
 `sourceTiming`, bar structure, meter, tempo, clefs, and staff identity are used only when an
 importer marks them as authoritative. They bypass audio quantization. A source display

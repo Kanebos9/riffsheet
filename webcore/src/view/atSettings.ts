@@ -28,17 +28,57 @@ export const ALPHATAB_VERSION = '1.8.4';
 export const PAGE_PADDING_PX = 35;
 
 /**
- * Set only the left padding, keeping the other three at alphaTab's default.
+ * THE FOUR PADDINGS, READ BACK RATHER THAN ASSUMED. The prerequisite for everything below.
+ *
+ * `setLeftPadding` used to WRITE all four every time it ran — the requested left, and 35 into the
+ * other three — which made it impossible for anything else to own one of the other edges: the
+ * next inset recalculation (there are three, on zoom, on load and on the ink-measuring pass)
+ * silently threw away whatever had been reserved at the top. Any headroom for a chord stack
+ * would have lasted until the player next pinched the sheet.
+ *
+ * So each edge is now set on its own, over the array that is already there. Both callers still
+ * end up writing a four-element `[left, top, right, bottom]`, which is the form the tri-view
+ * needs — alphaTab's own default is the two-element `[leftRight, topBottom]` shorthand and
+ * cannot express a left edge alone.
+ */
+function padding4(settings: alphaTab.Settings): [number, number, number, number] {
+  const p = settings.display.padding ?? [];
+  if (p.length >= 4) return [p[0], p[1], p[2], p[3]];
+  // alphaTab's shorthand: [left-and-right, top-and-bottom].
+  if (p.length === 2) return [p[0], p[1], p[0], p[1]];
+  return [PAGE_PADDING_PX, PAGE_PADDING_PX, PAGE_PADDING_PX, PAGE_PADDING_PX];
+}
+
+/**
+ * Set only the left padding, leaving the other three exactly as they were.
  *
  * Safe to call on a live `Settings`; follow it with `api.updateSettings()` and a render.
  */
 export function setLeftPadding(settings: alphaTab.Settings, px: number): void {
-  settings.display.padding = [
-    Math.max(0, px),
-    PAGE_PADDING_PX,
-    PAGE_PADDING_PX,
-    PAGE_PADDING_PX
-  ];
+  const padding = padding4(settings);
+  padding[0] = Math.max(0, px);
+  settings.display.padding = padding;
+}
+
+/**
+ * Set only the TOP padding — the headroom above the first staff line (P5).
+ *
+ * What it is for: the note-names row is drawn ABOVE the system on every shape except a single
+ * notation stave sitting directly over its own tablature, and a chord's names stack UPWARD from
+ * that anchor. A five-note stack therefore reaches about 64px above the top of the system, and
+ * with alphaTab's default 35 the top two names of the owner's C2/C3 stack were laid out at a
+ * NEGATIVE y — outside the scrollable content, so no amount of scrolling could reveal them.
+ *
+ * REAL PAGE PADDING rather than a pane-local scroll, because the labels and the engraving have
+ * to move TOGETHER: the row is HTML positioned against alphaTab's SVG coordinates, so anything
+ * that shifts one without the other puts every name on the wrong note.
+ *
+ * See `view/triview.ts §reserveTopRoomFor` for how much, and why it is measured off the score.
+ */
+export function setTopPadding(settings: alphaTab.Settings, px: number): void {
+  const padding = padding4(settings);
+  padding[1] = Math.max(0, px);
+  settings.display.padding = padding;
 }
 
 export interface ViewSettings {

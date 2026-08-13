@@ -182,9 +182,33 @@ const main = async () => {
     // -------------------------------------------------------------------
     /** Everything the sheet says about itself, in one frame. See `__RIFFSHEET_SHEETEDIT__`. */
     const sheet = () => json('JSON.stringify(window.__RIFFSHEET_SHEETEDIT__ ? window.__RIFFSHEET_SHEETEDIT__() : null)');
+    /**
+     * The nth notehead ON THE NOTATION STAVE.
+     *
+     * `editProbe().noteHeads` holds tab positions too — a fret digit has `noteHeadBounds` like
+     * any other note — and a pitch drag aimed at one of those is a STRING drag, where the pitch
+     * deliberately does not move. Taking "the seventh notehead" without filtering made this
+     * probe's pitch checks depend on the engraving's stave order, which is not what they claim
+     * to be about.
+     */
     const noteHeadAt = async (nth) => {
       const s = await sheet();
-      return s && s.noteHeads.length ? s.noteHeads[Math.min(nth, s.noteHeads.length - 1)] : null;
+      const heads = (s?.noteHeads ?? []).filter((h) => h.staff === 'notation');
+      return heads.length ? heads[Math.min(nth, heads.length - 1)] : null;
+    };
+    /** Every notehead of the chord at `beat`, lowest on the page (highest pitch) first. */
+    const stackAt = async (beat) => {
+      const s = await sheet();
+      return (s?.noteHeads ?? [])
+        .filter((h) => h.staff === 'notation' && h.beat === beat)
+        .sort((a, b) => a.y - b.y);
+    };
+    /** The feed note with this id, as the app itself reports it. */
+    const noteById = async (id) => (await sheet()).notes.find((n) => n.id === id) ?? null;
+    /** Second at which bar `i` (0-based) beat `b` (0-based) starts, off the app's own bar list. */
+    const beatSec = async (i, b) => {
+      const bar = (await sheet()).bars[i];
+      return bar ? bar.startSec + (b * bar.durSec) / bar.beats : null;
     };
 
     const rightClick = (x, y) => ev(`(() => {
@@ -263,11 +287,15 @@ const main = async () => {
       JSON.stringify(noteMenu.items.filter((i) => i.checked).map((i) => i.label))
     );
     check('note menu: Delete note is there', noteMenu.items.some((i) => i.label === 'Delete note'));
+    // BAR OPERATIONS ARE ENABLED ON A RECORDED TAKE (workstream C). This check used to assert
+    // the opposite — that they were shown, greyed, and explained with "Bars are fixed by the
+    // recording". That refusal is gone: the waveform is a photograph, the score is the music,
+    // and §8 below proves the photograph does not move when a bar is inserted into the music.
     check(
-      'note menu: bar operations are shown and REFUSED with a reason on a recorded take',
+      'note menu: bar operations are ENABLED on a recorded take (they used to be refused)',
       ['Insert bar before', 'Insert bar after', 'Delete bar'].every((label) => {
         const item = noteMenu.items.find((i) => i.label === label);
-        return item && item.disabled && item.reason === 'Bars are fixed by the recording';
+        return item && !item.disabled;
       }),
       JSON.stringify(noteMenu.items.filter((i) => i.label.includes('bar')))
     );
@@ -333,8 +361,50 @@ const main = async () => {
       say('empty target', staffPoint);
       check('add note: the empty-space menu offers it', addMenu.items.some((i) => i.label === 'Add note' && !i.disabled),
         JSON.stringify(addMenu.items[0]));
+      const idsBefore = new Set((await sheet()).notes.map((n) => n.id));
       const addPicked = await pick('Add note');
       await settle(1500);
+
+      // =================================================================
+      // 5a — ...AND IT LANDS WHERE THE HAND PUT IT (P2)
+      // =================================================================
+      //
+      // THE CHECK THIS ADDS, and the reason the old one could not see the bug. "The note count
+      // went up" is true of a note added in the right place and of a note added in the wrong
+      // one, and the fault was the second: `nearestBeatTick` compared an alphaTab tick (960 to a
+      // quarter) against IR bar ticks (24 to a quarter) and handed the answer back to a converter
+      // that read it as alphaTab's again — a deterministic 40x error, so the note landed near the
+      // top of the take or on top of something else and the command looked inert.
+      //
+      // TWO INDEPENDENT WITNESSES, because one of them alone would be the app marking its own
+      // homework:
+      //
+      //   1. THE ENGRAVING. The new note's notehead is read back out of alphaTab's bounds lookup
+      //      and compared with the pixel that was right-clicked. Nothing in that path shares a
+      //      line of code with the seconds arithmetic under test.
+      //   2. THE METER. Its attack must sit exactly on a beat line of the bar it is in, off the
+      //      app's own bar list in seconds — which is what "the nearest beat" means.
+      {
+        const after = await sheet();
+        const added = after.notes.find((n) => !idsBefore.has(n.id));
+        const head = (after.noteHeads ?? []).find((h) => h.id === added?.id && h.staff === 'notation');
+        const bar = after.bars.find(
+          (b) => added && added.startSec >= b.startSec - 1e-3 && added.startSec < b.startSec + b.durSec - 1e-3
+        );
+        const beatDur = bar ? bar.durSec / bar.beats : 0;
+        const offBeat = bar ? Math.abs(((added.startSec - bar.startSec) / beatDur) % 1) : 1;
+        say('added note', { added, head, bar, offBeat: Number(offBeat.toFixed(6)) });
+        check(
+          'add note: it lands on a BEAT of the bar it was dropped in, exactly',
+          !!bar && (offBeat < 1e-3 || offBeat > 1 - 1e-3),
+          `start=${added?.startSec}s, bar ${bar?.index} starts ${bar?.startSec}s, beat=${beatDur}s`
+        );
+        check(
+          'add note: and it is ENGRAVED under the pixel that was clicked (the 40x tick bug)',
+          !!head && Math.abs(head.x - staffPoint.x) <= 40,
+          `clicked x=${staffPoint.x}, engraved x=${head?.x ?? 'nowhere'}`
+        );
+      }
       // FIT THE PITCH AXIS FIRST. The roll draws the take's own pitch range, and a note added
       // at the middle of a BASS staff is well above a bass take's lowest string — outside the
       // window, so no rectangle is painted for it and the count would be unchanged for a reason
@@ -381,7 +451,7 @@ const main = async () => {
 
     {
       const before = await rects();
-      const target = (await sheet()).noteHeads[4];
+      const target = await noteHeadAt(4);
       const beforeRect = before.find((r) => r.noteId === target.id);
       // Mostly sideways, with a few pixels of vertical slop a real hand would add.
       await drag(target, 70, 5);
@@ -405,9 +475,40 @@ const main = async () => {
         (await sheet()).undoTitle
       );
 
+      // ===============================================================
+      // 5c — ...AND IT LANDS WHERE IT WAS DROPPED (P3)
+      // ===============================================================
+      //
+      // The owner's report: "it takes the note back to wherever the second note is, every time".
+      // Deterministic, which is what a units bug looks like from the outside — the same 40x
+      // domain mismatch as P2, arriving through the drop-to-beat mapping instead of the
+      // right-click one. So the claim is not "it moved" but "it moved TO THE PIXEL THE HAND LET
+      // GO OF", proved against alphaTab's bounds lookup, and onto a real beat line.
+      {
+        const s = await sheet();
+        const head = (s.noteHeads ?? []).find((h) => h.id === target.id && h.staff === 'notation');
+        const note = s.notes.find((n) => n.id === target.id);
+        const bar = s.bars.find(
+          (b) => note && note.startSec >= b.startSec - 1e-3 && note.startSec < b.startSec + b.durSec - 1e-3
+        );
+        const beatDur = bar ? bar.durSec / bar.beats : 0;
+        const offBeat = bar ? Math.abs(((note.startSec - bar.startSec) / beatDur) % 1) : 1;
+        say('drop placement', { droppedAtX: target.x + 70, engravedX: head?.x, note, bar });
+        check(
+          'drag: the note is ENGRAVED where the hand let go, not at a neighbour (the 40x tick bug)',
+          !!head && Math.abs(head.x - (target.x + 70)) <= 40,
+          `dropped at x=${target.x + 70}, engraved at x=${head?.x ?? 'nowhere'}`
+        );
+        check(
+          'drag: and on a real beat of the bar it was dropped in',
+          !!bar && (offBeat < 1e-3 || offBeat > 1 - 1e-3),
+          `start=${note?.startSec}s, bar ${bar?.index} starts ${bar?.startSec}s, beat=${beatDur}s`
+        );
+      }
+
       // The mirror: mostly vertical, with sideways slop. Pitch moves, time does not.
       const before2 = await rects();
-      const target2 = (await sheet()).noteHeads[6];
+      const target2 = await noteHeadAt(6);
       const beforeRect2 = before2.find((r) => r.noteId === target2.id);
       await drag(target2, 5, -22);
       const after2 = await rects();
@@ -482,10 +583,17 @@ const main = async () => {
         const m = await menu();
         say('imported menu', m.items.map((i) => `${i.label}${i.disabled ? ' (off)' : ''}`));
         await shot('06-imported-part');
+        // EVERY NOTE EDIT is refused — that is the paper-only rule, and it is unchanged. The BAR
+        // items are the exception now, and deliberately: a bar belongs to the document's one
+        // shared clock rather than to any part, so inserting one shifts every part together
+        // (§8 asserts exactly that). Refusing them on the imported staff would mean the same
+        // menu item worked or not depending on which staff the pointer happened to be over.
         check(
-          'imported part: every edit item is refused',
-          m.open === true && m.items.length > 0 && m.items.every((i) => i.disabled),
-          JSON.stringify(m.items.filter((i) => !i.disabled))
+          'imported part: every NOTE edit is refused',
+          m.open === true &&
+            m.items.filter((i) => !i.label.includes('bar')).length > 0 &&
+            m.items.filter((i) => !i.label.includes('bar')).every((i) => i.disabled),
+          JSON.stringify(m.items.filter((i) => !i.disabled && !i.label.includes('bar')))
         );
         check(
           'imported part: and the reason is on screen, not implied',
@@ -496,6 +604,481 @@ const main = async () => {
       } else {
         check('imported part: a point on its staff was found', false, 'no imported staff on screen');
       }
+    }
+
+    // ===================================================================
+    // 8 — CHORDS: one duration, and every notehead is its own note (P1, P6)
+    // ===================================================================
+    //
+    // On the `chord` fixture, which is the owner's own screenshot written down: a C2 held for
+    // three beats and a C3 struck THREE MILLISECONDS later and released after a 1/32, plus a
+    // three-note and a five-note stack. Everything in this section is about that first bar.
+    const reload = async (url) => {
+      await cdp.send('Page.navigate', { url });
+      for (let i = 0; ; i++) {
+        const ready = await ev(
+          '!!window.__RIFFSHEET_DEMO_READY__ && (document.querySelector(".at-host .at-surface")?.childElementCount ?? 0) > 0'
+        );
+        if (ready === true) break;
+        if (i > 60) throw new Error('demo never became ready');
+        await settle(200);
+      }
+      await settle(1200);
+    };
+    await reload(`http://127.0.0.1:${PORT}/index.html?demo=chord&bars=4&tab=bass&verify=1`);
+
+    {
+      const first = await sheet();
+      const beat = Math.min(...first.noteHeads.filter((h) => h.staff === 'notation').map((h) => h.beat));
+      const stack = await stackAt(beat);
+      say('chord stack', stack.map((h) => ({ id: h.id, x: h.x, y: h.y })));
+      await shot('07-chord-before');
+      check(
+        'chord: the fixture engraves a stack of at least two noteheads to point at',
+        stack.length >= 2,
+        `${stack.length} noteheads at beat ${beat}`
+      );
+
+      // -----------------------------------------------------------------
+      // P5 — THE NAMES ROW HAS ROOM ABOVE THE STAFF
+      // -----------------------------------------------------------------
+      //
+      // The report: a chord's names ran off the top of the sheet pane with no way to scroll to
+      // them. Not a scrolling problem — the stack grows upward from an anchor a fixed distance
+      // above the system, so with alphaTab's default page padding the third name of a stack was
+      // laid out at a NEGATIVE y, which is outside the scrollable content entirely. The fixture's
+      // third bar is a five-note stack, which is the tallest the owner says this material makes.
+      {
+        const rows = await json(`JSON.stringify((() => {
+          const out = [];
+          for (const el of document.querySelectorAll('.note-name')) {
+            const m = /translate\\(([-0-9.]+)px, *([-0-9.]+)px\\)/.exec(el.style.transform || '');
+            out.push({ text: el.textContent, x: m ? Number(m[1]) : null, y: m ? Number(m[2]) : null });
+          }
+          return out;
+        })())`);
+        const tallest = rows.reduce((most, r) => {
+          const n = rows.filter((o) => Math.abs(o.x - r.x) < 1).length;
+          return Math.max(most, n);
+        }, 0);
+        const above = rows.filter((r) => r.y !== null && r.y < 0);
+        say('names row', { labels: rows.length, tallestStack: tallest, negative: above.length });
+        check(
+          'headroom: not one name is laid out above the top of the page (they used to be)',
+          rows.length > 0 && above.length === 0,
+          JSON.stringify(above.slice(0, 4))
+        );
+        // The FULL five-name stack is checked in §10, on the grand staff: this shape puts the row
+        // in the staff/tab band, and a four-string bass cannot hold five simultaneous notes, so
+        // the tallest stack HERE is a property of the instrument rather than of the layout.
+      }
+
+      // -----------------------------------------------------------------
+      // P6 — EVERY MEMBER SELECTS ITSELF
+      // -----------------------------------------------------------------
+      //
+      // The report: clicking the long member highlighted its roll note and clicking the short one
+      // did nothing. Every notehead in the stack is pressed here, in turn, and each must answer
+      // with its OWN id — the short member included, which is the half that was broken.
+      const selectedIds = [];
+      for (const head of stack) {
+        await ev(`(() => {
+          const el = document.querySelector('.triview-scroll');
+          el.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true, cancelable: true, pointerId: 11, isPrimary: true, button: 0, buttons: 1, clientX: ${head.x}, clientY: ${head.y} }));
+          window.dispatchEvent(new PointerEvent('pointerup', { bubbles: true, pointerId: 11 }));
+          return true;
+        })()`);
+        await settle(300);
+        selectedIds.push({ wanted: head.id, got: (await sheet()).selection });
+      }
+      say('chord member selection', selectedIds);
+      check(
+        'chord: every stacked notehead selects ITS OWN roll note, short members included',
+        selectedIds.length >= 2 && selectedIds.every((s) => s.got.includes(s.wanted)),
+        JSON.stringify(selectedIds.filter((s) => !s.got.includes(s.wanted)))
+      );
+
+      // The names row is the other door into the same fault: it used to resolve a press by X
+      // alone and hand back `beat.notes[0]`, so every name in a stack selected the bottom member.
+      const nameHits = await json(`JSON.stringify((() => {
+        const out = [];
+        for (const el of document.querySelectorAll('.note-name')) {
+          if (!el.dataset.noteId) continue;
+          out.push(el.dataset.noteId);
+        }
+        return out.slice(0, 12);
+      })())`);
+      say('name labels carry ids', nameHits);
+      check(
+        'chord: the note-name labels carry the note each one is ABOUT',
+        nameHits.length >= 2 && new Set(nameHits).size >= 2,
+        JSON.stringify(nameHits)
+      );
+
+      // -----------------------------------------------------------------
+      // P1 — THE DURATION IS CHORD-WIDE, AND REPEATING IT CHANGES NOTHING
+      // -----------------------------------------------------------------
+      //
+      // The report: "picking a length does nothing visible on the sheet but SHORTENS the roll
+      // note each successive click." Root cause: the reducer's chord test was a microsecond
+      // epsilon while the engraver groups attacks inside 35 ms, so the edited note was clipped
+      // against its OWN chord mate and collapsed to the minimum. Both halves are checked — the
+      // stack becomes one value, and the second identical pick is a no-op.
+      const memberIds = stack.map((h) => h.id);
+      await rightClick(Math.round(stack[stack.length - 1].x), Math.round(stack[stack.length - 1].y));
+      await settle(300);
+      const pickedHalf = await pick('Half');
+      await settle(1500);
+      const afterHalf = await sheet();
+      const rollAfter = await rects();
+      const spans = memberIds.map((id) => {
+        const n = afterHalf.notes.find((x) => x.id === id);
+        return { id, startSec: n?.startSec ?? null, endSec: n?.endSec ?? null };
+      });
+      say('after Half', { picked: pickedHalf, spans });
+      await shot('08-chord-half');
+      check(
+        'chord duration: EVERY member of the stack becomes the chosen value, not just the one clicked',
+        spans.length >= 2 &&
+          spans.every((s) => s.endSec !== null) &&
+          Math.max(...spans.map((s) => s.endSec)) - Math.min(...spans.map((s) => s.endSec)) < 0.01,
+        JSON.stringify(spans)
+      );
+      check(
+        'chord duration: and the roll shows it — the short member got LONGER, it did not collapse',
+        memberIds.every((id) => {
+          const r = rollAfter.find((x) => x.noteId === id);
+          return r && r.w > 4;
+        }),
+        JSON.stringify(memberIds.map((id) => rollAfter.find((x) => x.noteId === id)?.w ?? null))
+      );
+
+      // REPEAT-APPLY. This is the reported loop, stated as a fixed point.
+      await rightClick(Math.round(stack[stack.length - 1].x), Math.round(stack[stack.length - 1].y));
+      await settle(300);
+      await pick('Half');
+      await settle(1500);
+      const afterTwice = await sheet();
+      const spans2 = memberIds.map((id) => afterTwice.notes.find((x) => x.id === id)?.endSec ?? null);
+      say('after Half twice', spans2);
+      check(
+        'chord duration: picking the SAME value again changes nothing (the shrink loop)',
+        spans2.every((end, i) => end !== null && Math.abs(end - spans[i].endSec) < 1e-3),
+        `${JSON.stringify(spans.map((s) => s.endSec))} -> ${JSON.stringify(spans2)}`
+      );
+    }
+
+    // ===================================================================
+    // 9 — BAR OPERATIONS ON A RECORDED TAKE, AND THE WAVEFORM DOES NOT MOVE
+    // ===================================================================
+    //
+    // The whole of workstream C in one sequence: insert a bar into the middle of a take that has
+    // audio behind it, and check that the NOTES moved, the inserted bar is EMPTY, the recording's
+    // own length did not change by so much as a float, and the waveform strip is the same
+    // picture — pixel for pixel, off a real screenshot of the element rather than off a number
+    // the app reports about itself.
+    {
+      const waveShot = async () => {
+        const box = await json(`JSON.stringify((() => {
+          const el = document.querySelector('.waveform') || document.querySelector('canvas.waveform-canvas') ||
+                     document.querySelector('.waveform-pane');
+          if (!el) return null;
+          const r = el.getBoundingClientRect();
+          return { x: Math.round(r.left), y: Math.round(r.top), width: Math.round(r.width), height: Math.round(r.height) };
+        })())`);
+        if (!box || box.width < 4 || box.height < 4) return null;
+        const r = await cdp.send('Page.captureScreenshot', {
+          format: 'png',
+          clip: { ...box, scale: 1 }
+        });
+        return r.data;
+      };
+
+      const before = await sheet();
+      const waveBefore = await waveShot();
+      // The bar the operation acts on: the middle one, so there is material on both sides of it.
+      const targetBar = Math.max(1, Math.floor(before.bars.length / 2));
+      const seamSec = before.bars[targetBar].startSec;
+      const barSec = before.bars[targetBar].durSec;
+      const laterBefore = before.notes.filter((n) => n.startSec >= seamSec - 1e-3).map((n) => n.startSec);
+      say('bar op setup', {
+        bars: before.bars.length,
+        targetBar,
+        seamSec,
+        barSec,
+        audio: before.audioDurationSec,
+        score: before.scoreDurationSec,
+        detached: before.timelineDetached
+      });
+      await shot('09-bars-before');
+
+      // Right-click ON that bar: the x of any notehead inside it, at a y with nothing on it.
+      const inBar = before.noteHeads.find(
+        (h) => h.staff === 'notation' && before.notes.some((n) =>
+          n.id === h.id && n.startSec >= seamSec - 1e-3 && n.startSec < seamSec + barSec - 1e-3)
+      );
+      check('bars on a take: a notehead inside the target bar was found', !!inBar, JSON.stringify(inBar ?? null));
+      if (inBar) {
+        await rightClick(Math.round(inBar.x), Math.round(inBar.y));
+        await settle(300);
+        const m = await menu();
+        check(
+          'bars on a take: Insert bar before is offered and NOT refused',
+          !!m.items.find((i) => i.label === 'Insert bar before' && !i.disabled),
+          JSON.stringify(m.items.filter((i) => i.label.includes('bar')))
+        );
+        const barPick = await pick('Insert bar before');
+        await settle(1800);
+        const after = await sheet();
+        const waveAfter = await waveShot();
+        say('after insert', {
+          picked: barPick,
+          bars: after.bars.length,
+          audio: after.audioDurationSec,
+          score: after.scoreDurationSec,
+          detached: after.timelineDetached
+        });
+        await shot('10-bars-after');
+
+        check(
+          'bars on a take: THE WAVEFORM IS PIXEL-IDENTICAL (it is a photograph, not a timeline)',
+          !!waveBefore && waveBefore === waveAfter,
+          waveBefore === waveAfter ? 'identical' : 'the strip repainted differently'
+        );
+        check(
+          "bars on a take: and the RECORDING's length is untouched to the float",
+          after.audioDurationSec === before.audioDurationSec,
+          `${before.audioDurationSec}s -> ${after.audioDurationSec}s`
+        );
+        check(
+          'bars on a take: the SCORE got one bar longer, and says so',
+          after.scoreDurationSec > before.scoreDurationSec + barSec * 0.5 && after.timelineDetached === true,
+          `score ${before.scoreDurationSec}s -> ${after.scoreDurationSec}s, detached=${after.timelineDetached}`
+        );
+        check(
+          'bars on a take: every note at or after the seam moved exactly one bar later',
+          laterBefore.length > 0 &&
+            laterBefore.every((sec) =>
+              after.notes.some((n) => Math.abs(n.startSec - (sec + barSec)) < 0.02)
+            ),
+          `${laterBefore.length} notes; first ${laterBefore[0]}s -> wanted ${laterBefore[0] + barSec}s`
+        );
+        check(
+          'bars on a take: THE INSERTED BAR IS EMPTY — nothing attacks or sounds inside it',
+          !after.notes.some((n) => n.startSec < seamSec + barSec - 1e-3 && n.endSec > seamSec + 1e-3),
+          JSON.stringify(
+            after.notes.filter((n) => n.startSec < seamSec + barSec - 1e-3 && n.endSec > seamSec + 1e-3).slice(0, 3)
+          )
+        );
+
+        // ONE UNDO, both halves: the notes AND the structural length.
+        await ev(`(() => { document.querySelector('[data-role="undo"]')?.click(); return true; })()`);
+        await settle(1800);
+        const undone = await sheet();
+        say('after undo', { bars: undone.bars.length, audio: undone.audioDurationSec, score: undone.scoreDurationSec });
+        check(
+          'bars on a take: ONE undo puts every note back where it was',
+          laterBefore.every((sec) => undone.notes.some((n) => Math.abs(n.startSec - sec) < 0.02)),
+          `${laterBefore.length} notes checked`
+        );
+        check(
+          'bars on a take: ...and the recording is still exactly as long as it always was',
+          undone.audioDurationSec === before.audioDurationSec,
+          `${before.audioDurationSec}s -> ${undone.audioDurationSec}s`
+        );
+        // THE STRUCTURAL HALF OF THE SAME STEP. A recorded take declares no bar count until the
+        // first insert adopts one, so undoing that insert has to put the declaration back to
+        // "none" — otherwise the page keeps an empty bar its own history does not account for.
+        check(
+          'bars on a take: and the page is back to the length it was engraved at',
+          undone.bars.length === before.bars.length && undone.scoreDurationSec === before.scoreDurationSec,
+          `${before.bars.length} bars/${before.scoreDurationSec}s -> ${undone.bars.length} bars/${undone.scoreDurationSec}s`
+        );
+
+        // THE OTHER DIRECTION, on the same take: delete removes the bar's notes and pulls
+        // everything after it one bar earlier. Same rule about the recording — it does not move.
+        await rightClick(Math.round(inBar.x), Math.round(inBar.y));
+        await settle(300);
+        const delPicked = await pick('Delete bar');
+        await settle(1800);
+        const deleted = await sheet();
+        const waveDeleted = await waveShot();
+        const insideBefore = before.notes.filter(
+          (n) => n.startSec >= seamSec - 1e-3 && n.startSec < seamSec + barSec - 1e-3
+        );
+        const afterBarBefore = before.notes
+          .filter((n) => n.startSec >= seamSec + barSec - 1e-3)
+          .map((n) => n.startSec);
+        say('after delete', {
+          picked: delPicked,
+          bars: deleted.bars.length,
+          audio: deleted.audioDurationSec,
+          score: deleted.scoreDurationSec,
+          removed: insideBefore.length
+        });
+        await shot('12-bars-deleted');
+        check(
+          'bars on a take: deleting one takes the notes that were IN it with it',
+          insideBefore.length > 0 && insideBefore.every((n) => !deleted.notes.some((d) => d.id === n.id)),
+          `${insideBefore.length} notes were in the bar; ${insideBefore.filter((n) => deleted.notes.some((d) => d.id === n.id)).length} survived`
+        );
+        check(
+          'bars on a take: and pulls everything after it exactly one bar earlier',
+          afterBarBefore.length > 0 &&
+            afterBarBefore.every((sec) =>
+              deleted.notes.some((n) => Math.abs(n.startSec - (sec - barSec)) < 0.02)
+            ),
+          `${afterBarBefore.length} notes; first ${afterBarBefore[0]}s -> wanted ${afterBarBefore[0] - barSec}s`
+        );
+        check(
+          'bars on a take: the waveform is STILL the same photograph after a delete',
+          !!waveBefore && waveBefore === waveDeleted && deleted.audioDurationSec === before.audioDurationSec,
+          `audio ${before.audioDurationSec}s -> ${deleted.audioDurationSec}s, strip ${waveBefore === waveDeleted ? 'identical' : 'repainted'}`
+        );
+      }
+    }
+
+    // ===================================================================
+    // 10 — GRAND + TAB: the key on BOTH staves, and the names off the stem lane
+    // ===================================================================
+    //
+    // The two defects the owner's first screenshot carries, checked on the same picture it was a
+    // picture of: Clef: Grand with Tab: Bass, in a key with accidentals in it.
+    await reload(`http://127.0.0.1:${PORT}/index.html?demo=chord&bars=4&tab=bass&verify=1`);
+    {
+      // A key with three sharps, and the grand clef — both through the real controls.
+      await ev(`(() => {
+        const set = (role, value) => {
+          const el = document.querySelector('[data-role="' + role + '"]');
+          if (!el) return false;
+          el.value = value;
+          el.dispatchEvent(new Event('change', { bubbles: true }));
+          return true;
+        };
+        return [set('doc-key', '3'), set('clef-view', 'grand')];
+      })()`);
+      await settle(2500);
+      await shot('11-grand-tab-key');
+
+      // THE KEY, counted off the ENGRAVING, per stave. alphaTab draws a key signature as
+      // accidental glyphs immediately after the clef, so "how many accidental glyphs are in the
+      // first 120px of each stave" is the question the screenshot answers by eye.
+      const perStave = await json(`JSON.stringify((() => {
+        const tv = window.__RIFFSHEET_LAYOUT__ && window.__RIFFSHEET_LAYOUT__();
+        return tv ? tv.keySignaturePerStave : null;
+      })())`);
+      say('key signature per stave', perStave);
+      check(
+        'grand: the key signature is on EVERY stave, not only the treble one',
+        Array.isArray(perStave) && perStave.length >= 2 && perStave.every((k) => k === perStave[0] && k !== 0),
+        JSON.stringify(perStave)
+      );
+
+      // B7 — the names must not be in the bass-stem / TAB lane. With a grand staff the row goes
+      // ABOVE the whole system, so every label is above the topmost stave's top line.
+      const lane = await json(`JSON.stringify((() => {
+        const tv = window.__RIFFSHEET_LAYOUT__ && window.__RIFFSHEET_LAYOUT__();
+        const top = tv ? tv.systemTop : null;
+        const rows = [];
+        for (const el of document.querySelectorAll('.note-name')) {
+          const m = /translate\\(([-0-9.]+)px, *([-0-9.]+)px\\)/.exec(el.style.transform || '');
+          if (m) rows.push(Number(m[2]));
+        }
+        return { top, lowest: rows.length ? Math.max(...rows) : null, highest: rows.length ? Math.min(...rows) : null, count: rows.length };
+      })())`);
+      say('grand names lane', lane);
+      check(
+        'grand + tab: every note name is ABOVE the system, out of the bass-stem and TAB lane',
+        lane.count > 0 && lane.top !== null && lane.lowest !== null && lane.lowest <= lane.top,
+        JSON.stringify(lane)
+      );
+      check(
+        'grand + tab: and none of them is off the top of the page',
+        lane.highest !== null && lane.highest >= 0,
+        JSON.stringify(lane)
+      );
+      // P5, on the shape that actually produces a five-note stack: a grand staff can hold all
+      // five of the fixture's simultaneous pitches, where a four-string bass tab cannot. The row
+      // stacks upward by 12px a name, so a five-name stack spans 48px above its anchor — which
+      // is exactly the room `reserveTopRoom` buys, and the reason the top two names used to be
+      // laid out at a negative y with no way to scroll to them.
+      const stackSpan = lane.lowest !== null && lane.highest !== null ? lane.lowest - lane.highest : 0;
+      check(
+        'headroom: the five-note stack is drawn IN FULL and still fits above the staff',
+        stackSpan >= 47 && lane.highest >= 0,
+        `stack spans ${stackSpan}px, topmost name at y=${lane.highest}`
+      );
+      const padding = await json(
+        `JSON.stringify((window.__RIFFSHEET_LAYOUT__ && window.__RIFFSHEET_LAYOUT__().pagePadding) ?? null)`
+      );
+      say('page padding', padding);
+      check(
+        'headroom: it is REAL page padding, so the engraving and the labels moved together',
+        Array.isArray(padding) && padding.length === 4 && padding[1] > 35,
+        JSON.stringify(padding)
+      );
+    }
+
+    // ===================================================================
+    // 11 — THE GESTURE RECORDER (D2): off by default, and real when it is on
+    // ===================================================================
+    //
+    // WHY THIS IS CHECKED AT ALL. Everything this repository claims about WKWebView's trackpad is
+    // a claim about a SHAPE — `scripts/gesture-test.ts` says so on its face, because no Chromium
+    // has ever implemented `GestureEvent`. The only machine that can settle it is the owner's,
+    // running the real plugin, where there is no console to paste a snippet into. So the recorder
+    // ships, behind a flag, and this proves the flag works and that what it writes is the fixture
+    // format — the two things that would leave the owner with nothing to send back.
+    {
+      const off = await ev('typeof window.__RSGT__');
+      check(
+        'gesture recorder: OFF unless it is asked for — nothing installed on an ordinary boot',
+        off === 'undefined',
+        `window.__RSGT__ is ${off}`
+      );
+
+      await reload(`http://127.0.0.1:${PORT}/index.html?demo=straight&bars=2&tab=bass&verify=1&gesturerec=1`);
+      const roll = await json(`JSON.stringify((() => {
+        const el = document.querySelector('.pianoroll') || document.querySelector('.triview-scroll');
+        const r = el.getBoundingClientRect();
+        return { x: Math.round(r.left + r.width / 2), y: Math.round(r.top + r.height / 2) };
+      })())`);
+      // THROUGH THE BROWSER, not `dispatchEvent`: `Input.dispatchMouseEvent` makes the engine
+      // synthesise the event, so what the recorder sees is `isTrusted: true` with the engine's own
+      // deltaMode and modifier plumbing — which is the difference between a capture and a
+      // hand-written stream, and is exactly what the fixture's provenance field is about.
+      for (let i = 0; i < 4; i++) {
+        await cdp.send('Input.dispatchMouseEvent', {
+          type: 'mouseWheel', x: roll.x, y: roll.y, deltaX: 0, deltaY: -8, modifiers: 2, pointerType: 'mouse'
+        });
+        await settle(40);
+      }
+      await settle(400);
+      const trace = await json(`JSON.stringify(JSON.parse(window.__RSGT__.json('probe-trace')))`);
+      say('recorder', {
+        provenance: trace.provenance,
+        events: trace.events.length,
+        first: trace.events[0] ?? null
+      });
+      check(
+        'gesture recorder: the flag turns it on and it records real, delivered events',
+        trace.events.length >= 4 && trace.events.every((e) => e.isTrusted === true),
+        `${trace.events.length} events, trusted=${trace.events.every((e) => e.isTrusted)}`
+      );
+      check(
+        'gesture recorder: what it writes IS the fixture format the replay test reads',
+        trace.provenance === 'captured' &&
+          typeof trace.engine === 'string' &&
+          trace.events.every((e) => e.kind === 'wheel' && typeof e.atMs === 'number' && typeof e.delta === 'number'),
+        JSON.stringify(trace.events[0] ?? null)
+      );
+      check(
+        'gesture recorder: and it says WHICH SIDE of the tree it saw each one on, and what the app did',
+        trace.events.some((e) => e.phase === 'capture') &&
+          trace.events.some((e) => e.defaultPrevented === true) &&
+          trace.events.some((e) => (e.path ?? []).length > 0),
+        JSON.stringify(trace.events.map((e) => ({ p: e.phase, dp: e.defaultPrevented })).slice(0, 4))
+      );
     }
 
     check('no console errors', errors.length === 0, errors.slice(0, 3).join(' | '));

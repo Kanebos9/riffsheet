@@ -368,15 +368,46 @@ export function buildAlphaTabScore(
     }
   }
 
-  // Phase 3: key signatures, now that every track, staff and bar exists.
+  /*
+   * Phase 3: KEY SIGNATURES, ON EVERY BAR OF EVERY STAFF (P8).
+   *
+   * THE BUG, which is a one-line API trap and produced exactly the owner's screenshot: a key
+   * signature printed on the treble staff of a grand system and nowhere else. This loop used to
+   * assign `MasterBar.keySignature`, which reads like a property of the master bar — one key per
+   * bar for the whole score, which is also what the pipeline's contract says. In the pinned
+   * alphaTab (1.8.4) that setter is DEPRECATED and its body is literally
+   *
+   *     set keySignature(value) { this.score.tracks[0].staves[0].bars[this.index].keySignature = value; }
+   *
+   * (`alphaTab.core.mjs` §MasterBar). Track 0, staff 0, and nothing else — so on a grand staff
+   * the bass staff kept alphaTab's default of C major, on a grand-plus-tab the tab staff did too,
+   * and on a multi-part score every imported part did. The value was right; it was written to one
+   * bar out of two, three or six.
+   *
+   * Written on the BARS themselves, which is where 1.8.4 keeps them and what the deprecation
+   * notice points at ("Use key signatures on bar level"). One key per master bar is still the
+   * contract — the same value goes to every staff — so nothing here invents per-staff keys.
+   *
+   * AFTER the staves are built, not during, because a bar is only reachable once its staff has
+   * been added: this is a second pass over the finished model rather than an assignment inside
+   * the build loop, for the same reason the old one was.
+   */
   data.masterBars.forEach((mb, i) => {
     const masterBar = masterBars[i];
     if (!masterBar) return;
-    masterBar.keySignature = mb.keySignature as alphaTab.model.KeySignature;
-    masterBar.keySignatureType =
+    const keySignature = mb.keySignature as alphaTab.model.KeySignature;
+    const keySignatureType =
       mb.keySignatureType === 'Minor'
         ? alphaTab.model.KeySignatureType.Minor
         : alphaTab.model.KeySignatureType.Major;
+    for (const track of score.tracks) {
+      for (const staff of track.staves) {
+        const bar = staff.bars[i];
+        if (!bar) continue;
+        bar.keySignature = keySignature;
+        bar.keySignatureType = keySignatureType;
+      }
+    }
   });
 
   // Beaming is deliberately left to alphaTab. Team C emits MusicXML-style beam states per

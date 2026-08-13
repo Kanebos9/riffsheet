@@ -139,6 +139,14 @@ export function snapPerformanceToGrid(
  *
  * `takeDurationSec` is optional because both functions are also used to answer "where would this
  * land", with no take behind the question; when it is absent nothing below does anything.
+ *
+ * IT IS THE DOCUMENT'S END, NOT THE AUDIO FILE'S, and the caller is the one who knows the
+ * difference. On every ordinary take they are the same number. After a bar insert they are not
+ * (`SourceAudio.timelineDetached`): the score legitimately outlives the recording, the pipeline's
+ * past-end guard has been lifted for exactly that reason, and clamping here to the tape would go
+ * on doing what the guard has stopped doing — piling every note the insert pushed past the old
+ * end back onto the last line inside the recording. `App.documentDurationSec()` is what the
+ * caller passes, and it is `max(audio, score)` once the two have parted company.
  */
 const END_EPS = 1e-6;
 

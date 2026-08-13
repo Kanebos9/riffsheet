@@ -114,6 +114,27 @@ export interface BuildInput {
    */
   audioDurationSec?: number;
   /**
+   * THE NOTES NO LONGER SHARE THE AUDIO'S TIMELINE.
+   *
+   * The past-end guard encodes one assumption — that the note list is a TRANSCRIPT of the audio,
+   * so anything past the last sample is a detector that never stopped. Bar insert/delete breaks
+   * that assumption on purpose: inserting a bar is a pure note-time edit that shifts real,
+   * user-owned material later, and the waveform is immutable underneath it. Four inserted bars
+   * push the tail of a 30 s take to 38 s, and the guard would answer that edit by deleting
+   * everything it moved — the score would silently shorten back to the audio every time.
+   *
+   * So the caller declares it: with `detachedTimeline`, the score's timeline is its own and
+   * `audioDurationSec` stops being an authority over it. Notes beyond the audio are engraved
+   * normally and the skeleton grows to hold them (its length has always come from the material
+   * and `minimumBars`, never from the audio). `audioDurationSec` may still be passed — it stays
+   * meaningful to the app as the waveform's extent — it simply no longer clips anything.
+   *
+   * NOTHING ELSE CHANGES. The sub-30 ms filter is a statement about detection quality, not about
+   * where the audio stops, so it still applies; so do chord grouping, quantization and the
+   * repeat-loop flag. This flag turns off exactly one rule.
+   */
+  detachedTimeline?: boolean;
+  /**
    * Move the time origin: bar 1 / beat 1 anchors here. Material before it is KEPT — within a
    * beat it becomes an anacrusis, further back it gets as many implicit pre-measures as it
    * needs and leading rests are fine. Declaring the origin also disables the automatic

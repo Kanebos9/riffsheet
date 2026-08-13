@@ -37,7 +37,7 @@
  * PURE, so the whole law is testable without a DOM — see scripts/sheet-edit-test.ts.
  */
 
-import type { InputNote, NotationIntent } from '@pipeline';
+import { CHORD_WINDOW_MIN_SEC, type InputNote, type NotationIntent } from '@pipeline';
 import type { CutSpan } from './cuts';
 import { editedToAudioSec } from './cuts';
 import {
@@ -49,8 +49,29 @@ import {
   resizedTiming
 } from './rollPerformance';
 
-/** Seconds below which two times are the same instant. A chord is not a collision. */
+/**
+ * Seconds below which two times are literally the same number — a no-op guard, nothing more.
+ *
+ * NOT the chord test any more, and the distinction is the whole of P1. This one answers "did
+ * anything actually change" (a drag that landed where it started, an end that is already where
+ * the menu wants it); it is arithmetic noise, so it stays at the float's own scale.
+ */
 const EPS = 1e-6;
+
+/**
+ * SECONDS WITHIN WHICH TWO ATTACKS ARE ONE CHORD. The engraver's own number (see @pipeline).
+ *
+ * Every simultaneity question in this file asks it: chord membership for the duration command,
+ * and "same onset, so not a collision" in the settling pass. Both used to ask `EPS`, which meant
+ * the reducer disagreed with the page it was editing about what a chord is — see the note on the
+ * re-export in `src/pipeline/index.ts` for the fault that produced.
+ */
+const CHORD_SEC = CHORD_WINDOW_MIN_SEC;
+
+/** The notes struck with this one, itself included, in the engraver's own grouping. */
+function chordMates(feed: ReadonlyArray<InputNote>, at: InputNote): InputNote[] {
+  return feed.filter((n) => Math.abs(n.startSec - at.startSec) <= CHORD_SEC);
+}
 
 /**
  * One edit, in the DERIVED domain the player was looking at.
@@ -120,58 +141,114 @@ export interface SheetEditResult {
 /**
  * THE COLLISION LAW, applied once and named. One voice cannot hold two notes at once.
  *
- * Four cases, spelled out because "the existing collision rule" is an engraving-time clamp
+ * SAME ONSET IS A CHORD, and it is now the ENGRAVER's definition of "same" (`CHORD_SEC`) rather
+ * than a float epsilon. That one change is the whole of the P1 shrink loop: a double stop played
+ * three milliseconds apart is one chord on the page and was two colliding notes here, so the
+ * duration command clipped the note the player had just chosen a value for against its own chord
+ * mate and the roll rectangle collapsed to `MIN_DUR_SEC`. Every simultaneity question in this
+ * file now asks the page's own number.
+ *
+ * The other cases, spelled out because "the existing collision rule" is an engraving-time clamp
  * (pipeline/src/simplify.ts) that never touches the performance list, so nothing here can be
  * inherited:
  *
- *   SAME ONSET      a chord, not a collision. Two notes attacked at the same instant are how a
- *                   double stop is written; trimming one of them would delete the chord.
- *   ACTIVE OVERRUNS the moved/lengthened note's own end stops at the next LATER attack. This is
- *                   the same rule the engraver would apply anyway, applied here as well so the
- *                   roll's rectangle and the printed glyph agree before the rebuild rather than
- *                   after it.
- *   LANDED INSIDE   a note already sounding when the active one attacks is trimmed AT that
- *                   attack, and NAMED — that is the whole reason `touchedIds` is explicit.
- *   COLLAPSE        a victim is never deleted by a trim. It keeps `MIN_DUR_SEC`, which is the
- *                   floor pipeline/src/guards.ts drops notes below; shortening it further would
- *                   make the next rebuild remove a note the player never asked to remove.
+ *   RANG INTO IT   a note already sounding when the active one attacks is trimmed AT that
+ *                  attack, and NAMED — that is the whole reason `touchedIds` is explicit.
+ *   COLLAPSE       a victim is never deleted by a TRIM. It keeps `MIN_DUR_SEC`, the floor
+ *                  pipeline/src/guards.ts drops notes below; shortening it further would remove
+ *                  a note the player never asked to remove.
  *
- * NO CHAIN REACTIONS, enforced rather than assumed: victims are computed against the note list
- * as it stood BEFORE this edit, and a victim is never itself treated as active, so trimming B
- * cannot go on to trim C.
+ * ...and then the two commands part company, because they mean opposite things:
+ *
+ *   `editedWins: false` — ADD and MOVE. The active note's own end stops at the next later
+ *   attack. A note DRAWN in front of an existing one becomes as long as the room it was given,
+ *   which is what a player means by putting a note there; a note DRAGGED somewhere keeps its
+ *   length only as far as the next thing along. Neither gesture named a length, so neither one
+ *   gets to overrule one.
+ *
+ *   `editedWins: true` — THE DURATION MENU (P1), which named a length explicitly. The chosen
+ *   value is the value the note gets and the page rearranges itself around it:
+ *
+ *       SWALLOWED   a neighbour that begins AND ends inside the new span is gone — there is
+ *                   nothing left of it to hear. Deleted, and NAMED, so one undo brings it back
+ *                   with everything else the command did.
+ *       OVERLAPPED  a neighbour that begins inside the span but outlives it keeps its END and
+ *                   loses its head: it attacks where the active note stops. Trimmed rather than
+ *                   deleted, because there is still something of it left to play.
+ *
+ *   That branch is IDEMPOTENT by construction, which the unit tests and the live probe both
+ *   assert: afterwards every survivor either ends at or before the active note's start or
+ *   begins at or after its end, so running the same command again moves nothing.
+ *
+ * NO CHAIN REACTIONS, enforced rather than assumed: a victim is never itself treated as active,
+ * so trimming B cannot go on to trim C.
  */
 function settleCollisions(
   after: InputNote[],
   activeIds: ReadonlySet<string>,
   touched: Set<string>,
-  tempoBpm: number
+  tempoBpm: number,
+  editedWins = false
 ): InputNote[] {
   const out = after.slice();
+  const deleted = new Set<string>();
   for (let i = 0; i < out.length; i++) {
     const a = out[i];
     if (!a.id || !activeIds.has(a.id)) continue;
 
-    // ACTIVE OVERRUNS: the next attack that is genuinely later, chords excepted.
-    let end = a.endSec;
-    for (const b of out) {
-      if (b === a || (b.id && activeIds.has(b.id))) continue;
-      if (b.startSec > a.startSec + EPS && b.startSec < end - EPS) end = b.startSec;
-    }
-    if (Math.abs(end - a.endSec) > EPS) {
-      out[i] = resize(a, Math.max(MIN_DUR_SEC, end - a.startSec), tempoBpm);
-    }
-
-    // LANDED INSIDE: whatever was already sounding when this attacked.
-    for (let j = 0; j < out.length; j++) {
-      const b = out[j];
-      if (j === i || !b.id || activeIds.has(b.id)) continue;
-      if (b.startSec < a.startSec - EPS && b.endSec > a.startSec + EPS) {
-        out[j] = resize(b, Math.max(MIN_DUR_SEC, a.startSec - b.startSec), tempoBpm);
-        touched.add(b.id);
+    if (!editedWins) {
+      // ACTIVE OVERRUNS: the next attack that is genuinely later, chords excepted.
+      let end = a.endSec;
+      for (const b of out) {
+        if (b === a || (b.id && activeIds.has(b.id))) continue;
+        if (b.startSec > a.startSec + CHORD_SEC && b.startSec < end - EPS) end = b.startSec;
+      }
+      if (Math.abs(end - a.endSec) > EPS) {
+        out[i] = resize(a, Math.max(MIN_DUR_SEC, end - a.startSec), tempoBpm);
       }
     }
+    const active = out[i];
+
+    for (let j = 0; j < out.length; j++) {
+      const b = out[j];
+      if (j === i || !b.id || activeIds.has(b.id) || deleted.has(b.id)) continue;
+
+      // SAME ONSET: a chord mate of the active note, and nobody's collision.
+      if (Math.abs(b.startSec - active.startSec) <= CHORD_SEC) continue;
+
+      if (b.startSec < active.startSec) {
+        // RANG INTO IT.
+        if (b.endSec > active.startSec + EPS) {
+          out[j] = resize(b, Math.max(MIN_DUR_SEC, active.startSec - b.startSec), tempoBpm);
+          touched.add(b.id);
+        }
+        continue;
+      }
+
+      // Attacks at or after the active note's own end: untouched, and the reason the
+      // edited-wins pass converges.
+      if (!editedWins || b.startSec >= active.endSec - EPS) continue;
+
+      if (b.endSec <= active.endSec + EPS) {
+        // SWALLOWED.
+        deleted.add(b.id);
+        touched.add(b.id);
+        continue;
+      }
+      // OVERLAPPED: keeps its end, attacks where the active note stops.
+      out[j] = movedTo(b, active.endSec, tempoBpm);
+      touched.add(b.id);
+    }
   }
-  return out;
+  return deleted.size ? out.filter((n) => !(n.id && deleted.has(n.id))) : out;
+}
+
+/** A note re-attacked at `startSec`, keeping its END rather than its length. See OVERLAPPED. */
+function movedTo(n: InputNote, startSec: number, tempoBpm: number): InputNote {
+  const moved = { ...n, startSec, endSec: Math.max(startSec + MIN_DUR_SEC, n.endSec) };
+  const timing = movedTiming(n.sourceTiming, startSec - n.startSec, tempoBpm);
+  const resized = resizedTiming(timing ?? n.sourceTiming, moved.endSec - moved.startSec, tempoBpm);
+  return resized ? { ...moved, sourceTiming: resized } : moved;
 }
 
 function resize(n: InputNote, durationSec: number, tempoBpm: number): InputNote {
@@ -193,6 +270,23 @@ export function applySheetEditToNotes(
   const touched = new Set<string>();
 
   switch (edit.kind) {
+    /**
+     * A DURATION IS A PROPERTY OF THE CHORD, NOT OF THE NOTEHEAD (P1).
+     *
+     * Riffsheet engraves ONE VOICE, deliberately and for this version — so a stack of noteheads
+     * is one rhythmic slot with one stem and one flag, and the pipeline reproduces every member
+     * across the tied pieces of that slot (`pipeline/src/buildScore.ts` §chord intent). "Make
+     * this note a half and leave the one above it a 1/32" is therefore not a thing the page can
+     * draw: there is no second voice to draw it in. The menu used to promise it anyway, write the
+     * intent onto the one selected id, and let the engraver produce a chord whose members
+     * disagreed about their own length — which is where the tie arcs in the owner's screenshot
+     * come from.
+     *
+     * So the command is chord-wide: every member of the struck chord becomes the chosen value,
+     * they all end together, and the ONE stack the player is looking at changes as one thing.
+     * Membership comes from `CHORD_SEC` — the engraver's window — so the editor's idea of the
+     * chord is the page's idea of the chord.
+     */
     case 'setDuration': {
       const at = feed.find((n) => n.id === edit.noteId);
       if (!at) return null;
@@ -200,14 +294,24 @@ export function applySheetEditToNotes(
       // Null is `notationIntentTicks` refusing the value — a dotted 1/32 has no glyph. The menu
       // greys that item out; refusing here as well means a keyboard or a probe cannot get past it.
       if (length === null || !(length > 0)) return null;
-      touched.add(edit.noteId);
+      // THE CHORD'S END, measured from the note that was clicked. Members struck a few
+      // milliseconds apart keep their own attacks — that is the performance, and moving it would
+      // be a second edit nobody asked for — but they stop together, which is what one written
+      // value means.
+      const chordEnd = at.startSec + Math.max(MIN_DUR_SEC, length);
+      const mates = chordMates(feed, at);
+      for (const m of mates) if (m.id) touched.add(m.id);
+      const mateIds = new Set(mates.map((m) => m.id).filter((id): id is string => !!id));
       const next = feed.map((n) =>
-        n.id === edit.noteId
-          ? { ...resize(n, Math.max(MIN_DUR_SEC, length), ctx.tempoBpm), notationIntent: edit.intent }
+        n.id !== undefined && mateIds.has(n.id)
+          ? {
+              ...resize(n, Math.max(MIN_DUR_SEC, chordEnd - n.startSec), ctx.tempoBpm),
+              notationIntent: edit.intent
+            }
           : n
       );
       return {
-        notes: settleCollisions(next, new Set(touched), touched, ctx.tempoBpm),
+        notes: settleCollisions(next, new Set(touched), touched, ctx.tempoBpm, true),
         touchedIds: touched,
         label: durationLabel(edit.intent)
       };
@@ -365,25 +469,47 @@ export function mergePerformanceEditOntoCutTake(
 }
 
 // ---------------------------------------------------------------------------
-// Bar operations — blank, audio-free documents only
+// Bar operations — on EVERY document, recording or not
 // ---------------------------------------------------------------------------
 
 /**
- * WHY BARS CAN ONLY BE INSERTED AND REMOVED ON A DOCUMENT WITH NO RECORDING BEHIND IT.
+ * A BAR OPERATION IS A NOTE-TIME EDIT, AND THE WAVEFORM NEVER CHANGES (workstream C).
  *
- * Inserting a bar inserts SILENCE. On a blank score that is the whole operation: the notes after
- * the seam move later by one bar and the document gets longer. On a recorded take it is not an
- * operation at all, because the waveform does not move: the notes, the sheet and the exports
- * would all slide a bar to the right of the audio they were transcribed from, and the player
- * would hear the note a bar before they saw it.
+ * THE RULE THAT USED TO BE HERE, and why it is gone. Bar insert and delete were refused on
+ * anything with a recording behind it, on the argument that inserting silence into a take would
+ * slide the notes away from the audio they were transcribed from. That argument is sound and its
+ * conclusion was wrong, because it assumes the sheet and the waveform must go on describing the
+ * same instant forever. The owner's design says otherwise, and says it precisely:
  *
- * The cut machinery cannot help. A `CutSpan` describes tape DELETED from an immutable recording
- * and maps audio seconds onto a shorter edited clock (edit/cuts.ts); there is no way to spell
- * "and here is a second of silence that was never recorded" in it. Supporting that honestly
- * needs a real arrangement map — source segments and inserted gaps, respected by the transport,
- * the waveform, the notes, the beats, the downbeats, the host grid, persistence and every
- * export. That is a feature, not a flag, so the menu items are SHOWN and DISABLED with the
- * reason on them rather than hidden: "these exist, they do not apply to a recording".
+ *     THE WAVEFORM IS AN IMMUTABLE PHOTOGRAPH OF WHAT WAS PLAYED.
+ *     THE SCORE IS THE MUSIC, AND THE MUSIC IS EDITABLE.
+ *
+ * After a bar operation those two are allowed to disagree, on purpose and visibly. Nothing in
+ * this file writes an audio duration, nothing resamples, nothing moves a peak: a bar operation
+ * produces new NOTE TIMES and a new declared bar count, and that is the whole of it. The
+ * consequences the player has bought are real and are stated rather than hidden — Original
+ * playback still plays the recording, the MIDI side plays the edited score, and past the first
+ * insertion the two sides of the blend fader are auditioning different musical moments at the
+ * same transport second.
+ *
+ * TWO CLOCKS, SPLIT WHERE THEY MEET THE REST OF THE APP. `audioDurationSec` (the recording) is
+ * never touched by any of this; `scoreDurationSec` (where the notes stop) is the pipeline's own
+ * note-derived `ir.stats.durationSec`, and the app reads it rather than storing a third number.
+ * The moment the two can differ the document is DETACHED, which is a flag the app sets once and
+ * the pipeline consumes as `BuildInput.detachedTimeline` — without it the audio-length guards
+ * would answer "insert a bar" by deleting everything the insert pushed past the old end
+ * (`pipeline/src/guards.ts`).
+ *
+ * THE SPLICE LAW, which is what makes an inserted bar genuinely EMPTY. A note still sounding at
+ * the seam is SPLIT there: the head keeps its attack and stops at the seam, and a tail is
+ * re-attacked on the far side of the inserted bar with the rest of the length. Shifting only the
+ * notes that had not started yet — the old behaviour — leaves the "empty" bar with a note ringing
+ * straight through it, which is not an empty bar and not what the menu item says.
+ *
+ * The two pieces engrave as two honest attacks rather than a tie, and that is correct rather
+ * than a compromise: they are separated by a whole bar of rest, so there is nothing to tie
+ * across. (Confirmed against the engraver: same-pitch pieces merge only on identical snapped
+ * start ticks, which two pieces a bar apart can never have.)
  */
 export interface BarOp {
   kind: 'insertBar' | 'deleteBar';
@@ -394,10 +520,24 @@ export interface BarOp {
 }
 
 export interface BarOpContext {
-  /** How long one bar is, in seconds, at this document's tempo and meter. */
+  /**
+   * Where the target bar STARTS, in feed seconds.
+   *
+   * Supplied by the caller from the score's own bar tick through the tempo map, NOT computed
+   * here as `barIndex * barLengthSec`. That product is only right on a document with one tempo
+   * and one meter for its whole length; on anything else it names a second in the wrong bar, and
+   * it names it further wrong the further into the take the player right-clicked.
+   */
+  barStartSec: number;
+  /** How long THAT bar is, in feed seconds — same provenance, same reason. */
   barLengthSec: number;
   /** How many bars the document currently declares (`SourceAudio.documentBars`). */
   barCount: number;
+  /**
+   * A stable id for the tail piece a splice creates. The caller owns id minting because ids must
+   * not collide with the engine's `n<index>` series or with anything an earlier edit added.
+   */
+  splitId: (noteId: string) => string;
 }
 
 export interface BarOpResult {
@@ -406,21 +546,94 @@ export interface BarOpResult {
   label: string;
   /** The new declared document length, for `BuildInput.minimumBars`. */
   barCount: number;
+  /** Seconds the note timeline grew (insert) or shrank (delete). Never an AUDIO duration. */
+  durationDeltaSec: number;
 }
 
 /**
- * Insert or delete one bar, in the tick domain, on a blank document.
+ * The splice itself, over one list of notes. Shared by the live take and by every imported part.
  *
- * INSERT at boundary B: every note attacked at or after B moves one bar later; earlier notes
- * keep their length, including one that is still sounding across B — an inserted bar of silence
- * does not cut a note in half, it postpones what has not started yet.
+ * ONE CLOCK FOR THE WHOLE DOCUMENT is why this is a separate function: a multi-part score has one
+ * bar list, one meter map and one set of downbeats, so a bar inserted into the take is a bar
+ * inserted into everybody. Shifting only the live part would re-bar the imported chart against
+ * its own notes, which is exactly the silent corruption the old "imported parts share these bars"
+ * refusal was protecting against — the fix is to shift them, not to refuse.
  *
- * DELETE bar [B, E): notes attacked inside it are removed; notes attacked at or after E move
- * earlier by one bar; a note that crosses the seam is clipped to B. The document never goes
- * below one bar.
+ * `touched` collects every id whose time changed, INCLUDING the tails: on a document with the
+ * snap on, the merge back into the recording restores the un-named notes from raw, so an
+ * unnamed shift would appear on screen and vanish on the next rebuild.
+ */
+function spliceNotes(
+  notes: ReadonlyArray<InputNote>,
+  kind: BarOp['kind'],
+  seamSec: number,
+  barSec: number,
+  splitId: (noteId: string) => string,
+  touched: Set<string>
+): InputNote[] {
+  const out: InputNote[] = [];
+
+  if (kind === 'insertBar') {
+    for (const n of notes) {
+      if (n.startSec >= seamSec - EPS) {
+        if (n.id) touched.add(n.id);
+        out.push({ ...n, startSec: n.startSec + barSec, endSec: n.endSec + barSec });
+        continue;
+      }
+      if (n.endSec > seamSec + EPS) {
+        // THE SPLICE. Head stops at the seam; tail is re-attacked past the inserted bar.
+        if (n.id) touched.add(n.id);
+        const head = { ...n, endSec: Math.max(n.startSec + MIN_DUR_SEC, seamSec) };
+        const tailLength = Math.max(MIN_DUR_SEC, n.endSec - seamSec);
+        const tail: InputNote = {
+          ...n,
+          ...(n.id ? { id: splitId(n.id) } : {}),
+          startSec: seamSec + barSec,
+          endSec: seamSec + barSec + tailLength
+        };
+        // The tail is a NEW note, so it carries no written-value intent from the old one: the
+        // player chose that value for a note of a different length.
+        delete (tail as { notationIntent?: NotationIntent }).notationIntent;
+        if (tail.id) touched.add(tail.id);
+        out.push(head, tail);
+        continue;
+      }
+      out.push(n);
+    }
+    return out.sort(byTimeThenPitch);
+  }
+
+  const to = seamSec + barSec;
+  for (const n of notes) {
+    if (n.startSec >= seamSec - EPS && n.startSec < to - EPS) {
+      // Attacked inside the bar that is going: it goes with it.
+      if (n.id) touched.add(n.id);
+      continue;
+    }
+    if (n.startSec >= to - EPS) {
+      if (n.id) touched.add(n.id);
+      out.push({ ...n, startSec: n.startSec - barSec, endSec: n.endSec - barSec });
+      continue;
+    }
+    if (n.endSec > seamSec + EPS) {
+      // Crosses the deleted interval: STITCHED, not clipped — it loses exactly the seconds the
+      // bar took with it and keeps whatever it had on the far side, which is what "remove this
+      // bar from the music" means for a note that was already sounding.
+      if (n.id) touched.add(n.id);
+      const removed = Math.min(n.endSec, to) - seamSec;
+      out.push({ ...n, endSec: Math.max(n.startSec + MIN_DUR_SEC, n.endSec - removed) });
+      continue;
+    }
+    out.push(n);
+  }
+  return out.sort(byTimeThenPitch);
+}
+
+/**
+ * Insert or delete one bar. Works on every document; see the header above for the two clocks.
  *
- * Every note whose time changed is named, because on a document with the snap on the merge would
- * otherwise restore the un-shifted raw note and the bar would appear to re-collapse.
+ * Returns null only when the operation is not expressible — a bar of no length, or the last bar
+ * of a one-bar document, which would leave a score with nothing to engrave.
  */
 export function applyBarOp(
   feed: ReadonlyArray<InputNote>,
@@ -432,48 +645,44 @@ export function applyBarOp(
   const touched = new Set<string>();
 
   if (op.kind === 'insertBar') {
-    const at = (op.where === 'after' ? op.barIndex + 1 : op.barIndex) * bar;
-    const notes = feed.map((n) => {
-      if (n.startSec < at - EPS) return n;
-      if (n.id) touched.add(n.id);
-      return { ...n, startSec: n.startSec + bar, endSec: n.endSec + bar };
-    });
+    const seam = op.where === 'after' ? ctx.barStartSec + bar : ctx.barStartSec;
     return {
-      notes: notes.slice().sort(byTimeThenPitch),
+      notes: spliceNotes(feed, 'insertBar', seam, bar, ctx.splitId, touched),
       touchedIds: touched,
       label: op.where === 'after' ? 'Insert bar after' : 'Insert bar before',
-      barCount: Math.min(512, ctx.barCount + 1)
+      barCount: Math.min(512, ctx.barCount + 1),
+      durationDeltaSec: bar
     };
   }
 
   if (ctx.barCount <= 1) return null;
-  const from = op.barIndex * bar;
-  const to = from + bar;
-  const notes: InputNote[] = [];
-  for (const n of feed) {
-    if (n.startSec >= from - EPS && n.startSec < to - EPS) {
-      // Attacked inside the bar that is going: it goes with it.
-      if (n.id) touched.add(n.id);
-      continue;
-    }
-    if (n.startSec >= to - EPS) {
-      if (n.id) touched.add(n.id);
-      notes.push({ ...n, startSec: n.startSec - bar, endSec: n.endSec - bar });
-      continue;
-    }
-    if (n.endSec > from + EPS) {
-      // Crosses the seam: clipped at it rather than dragged shorter by a whole bar, which would
-      // move its END past notes it never overlapped.
-      if (n.id) touched.add(n.id);
-      notes.push({ ...n, endSec: Math.max(n.startSec + MIN_DUR_SEC, from) });
-      continue;
-    }
-    notes.push(n);
-  }
+  const notes = spliceNotes(feed, 'deleteBar', ctx.barStartSec, bar, ctx.splitId, touched);
   return {
+    // A deleted bar can take the note that was carrying a symbolic import's bar and tempo map
+    // with it — the importers hang those on the first note of each track only.
     notes: keepStructureCarriers([...feed], notes).sort(byTimeThenPitch),
     touchedIds: touched,
     label: 'Delete bar',
-    barCount: Math.max(1, ctx.barCount - 1)
+    barCount: Math.max(1, ctx.barCount - 1),
+    durationDeltaSec: -bar
   };
+}
+
+/**
+ * The same splice, applied to ONE IMPORTED PART's symbolic notes.
+ *
+ * Separate entry point rather than a flag on `applyBarOp`, because a part has no `touchedIds`
+ * contract to honour: it is not merged back against a recording, it IS its own stored list, so
+ * the caller replaces it wholesale. What it does share is the arithmetic, which is the point.
+ */
+export function applyBarOpToPartNotes(
+  notes: ReadonlyArray<InputNote>,
+  op: BarOp,
+  ctx: BarOpContext
+): InputNote[] {
+  const bar = ctx.barLengthSec;
+  if (!(bar > 0)) return [...notes];
+  const seam =
+    op.kind === 'insertBar' && op.where === 'after' ? ctx.barStartSec + bar : ctx.barStartSec;
+  return spliceNotes(notes, op.kind, seam, bar, ctx.splitId, new Set<string>());
 }

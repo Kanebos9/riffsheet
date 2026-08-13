@@ -133,6 +133,68 @@ export function straightRiff(bars: number, bpm = 110): Performance {
 }
 
 /**
+ * STACKS: the fixture the chord faults are checked against (P1, P5, P6).
+ *
+ * Written from the owner's own screenshots rather than invented, because all three defects are
+ * about the SAME picture and a fixture that only had tidy chords would reproduce none of them:
+ *
+ *   BAR 1  C2 and C3 an octave apart, struck THREE MILLISECONDS APART, the lower one held for
+ *          most of the bar and the upper one a 1/32 long. That is the exact shape in the P1/P5
+ *          screenshot, and the three-millisecond gap is the whole of the duration bug: the
+ *          engraver groups attacks inside 35 ms into one chord, the editor used to insist on
+ *          microsecond equality, so the two disagreed about whether this was one chord or two
+ *          colliding notes. It is also the P6 shape — a long member and a short one, where
+ *          clicking the short one's notehead selected the long one.
+ *   BAR 2   a three-note stack, and BAR 3 a FIVE-note stack — the tallest the owner says this
+ *          material produces. Their names are what ran off the top of the sheet pane, so this
+ *          is what the reserved headroom is measured against (`triview.ts §reserveTopRoom`).
+ *   BAR 4   plain single notes, so the same take also proves that nothing about the chord rules
+ *          reaches a note that is not in a chord.
+ *
+ * Deliberately PERFECTLY REGULAR in time apart from that one 3 ms slip: every attack is on a
+ * beat, so a probe can assert an exact bar and beat for a drop rather than a tolerance.
+ */
+export function chordRiff(bars: number, bpm = 120): Performance {
+  const beatSec = 60 / bpm;
+  const barSec = 4 * beatSec;
+  const notes: InputNote[] = [];
+  const beats: number[] = [];
+  let id = 0;
+  const push = (start: number, dur: number, midi: number): void => {
+    notes.push({ id: `f${id++}`, startSec: start, endSec: start + dur, midi, velocity: 96 });
+  };
+
+  for (let bar = 0; bar < bars; bar++) {
+    const barStart = bar * barSec;
+    for (let b = 0; b < 4; b++) beats.push(barStart + b * beatSec);
+    switch (bar % 4) {
+      case 0:
+        // The reported stack: C2 held, C3 struck 3 ms later and released almost at once.
+        push(barStart, beatSec * 3, 36);
+        push(barStart + 0.003, beatSec / 8, 48);
+        push(barStart + 3 * beatSec, beatSec * 0.9, 40);
+        break;
+      case 1:
+        // Three names.
+        for (const midi of [36, 43, 47]) push(barStart, beatSec * 1.8, midi);
+        push(barStart + 2 * beatSec, beatSec * 0.9, 38);
+        push(barStart + 3 * beatSec, beatSec * 0.9, 40);
+        break;
+      case 2:
+        // Five names — the tallest stack the headroom is sized for.
+        for (const midi of [36, 40, 43, 47, 50]) push(barStart, beatSec * 1.8, midi);
+        push(barStart + 2 * beatSec, beatSec * 1.8, 43);
+        break;
+      default:
+        [36, 38, 40, 43].forEach((midi, i) => push(barStart + i * beatSec, beatSec * 0.9, midi));
+        break;
+    }
+  }
+
+  return { notes, beats, bpm, durationSec: bars * barSec };
+}
+
+/**
  * A drop-tuned riff played against a standard 4-string setting: it dips to D1 and C1, both
  * BELOW the low E of the default tuning.
  *

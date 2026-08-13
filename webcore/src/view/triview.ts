@@ -22,9 +22,12 @@ import {
   applyStaffTabGap,
   createSettings,
   setLeftPadding,
+  setTopPadding,
+  PAGE_PADDING_PX,
   type ViewSettings
 } from './atSettings';
 import { TIMELINE_GUTTER_PX } from './pianoroll';
+import { installGestureRecorder } from './gestureRecorder';
 import { buildAlphaTabScore, soundingMidi, type ScoreIndex } from '../score/fromPipeline';
 import { midiToName, accidentalsForKey, type Accidentals } from '../score/notes';
 import { assignFret } from '../score/tuning';
@@ -49,6 +52,11 @@ import type { EngravedExtent } from './timeAxis';
 import { PinchGesture } from './gesture';
 import { countRendererCredits, stripRendererCredit } from './watermark';
 import { t, TIPS } from '../ui/tips';
+// THE ONE-PROPORTION LAW'S COORDINATE CORRECTION (G1). Pointer coordinates and
+// `getBoundingClientRect()` are VISUAL pixels; alphaTab's bounds lookup, `LEFT_INSET_PX`, the
+// scroller's `scrollLeft` and every engraved measurement are LOGICAL ones. One conversion, in
+// `ui/faceScale.ts`, and every hit test on this surface goes through it.
+import { logicalPoint, logicalRect, logicalX, toLogical, toVisual } from '../ui/faceScale';
 import type { RiffScore } from '../pipeline';
 
 export type NamesPlacement = 'between' | 'above' | 'below';
@@ -117,6 +125,14 @@ export interface TriViewOptions {
   view?: Partial<ViewSettings>;
   namesPlacement?: NamesPlacement;
   showNames?: boolean;
+  /**
+   * The app's native export door, for the DEBUG gesture recorder only (D2).
+   *
+   * Optional, and absent everywhere except the one wiring in ui/app.ts: the recorder is off
+   * unless its flag is set, and with no door it falls back to a browser download. Nothing about
+   * the engraving depends on it. See view/gestureRecorder.ts.
+   */
+  exportFile?: (name: string, bytes: Uint8Array, mimeType?: string) => Promise<unknown>;
   onNoteClick?: (hit: NoteHit) => void;
   onSeekRequest?: (tick: number) => void;
   /**
@@ -244,7 +260,14 @@ export interface NoteHit {
  * ever converting a pixel itself.
  */
 export interface SheetTarget {
-  /** Client coordinates of the press, for placing the menu. */
+  /**
+   * Where the press landed, for placing the menu — in LOGICAL client pixels (G1).
+   *
+   * Logical rather than raw `clientX/clientY` because the menu is `position: fixed` inside a body
+   * that carries the face scale, and a fixed element's offsets are read in the design's own
+   * pixels. Converted here, once, so `ui/app.ts` still "builds a menu out of the answer without
+   * ever converting a pixel itself".
+   */
   clientX: number;
   clientY: number;
   /** The note under the pointer, if the press was on one. */
@@ -288,6 +311,26 @@ interface NameLabel {
 }
 
 /**
+ * One label in the note-names row, WITH THE NOTE IT IS ABOUT (P6).
+ *
+ * `noteId` is the whole of the addition. A press on a label used to be resolved by X alone
+ * (`hitTestByX`), which walks the beats, finds the nearest anchor and takes `beat.notes[0]` — so
+ * on a CHORD every one of the stacked names selected the same, bottom, member. Clicking "C3"
+ * highlighted C2, which reads on screen as "the short member cannot be selected at all". The
+ * label knows perfectly well which note it was drawn for; it now carries it.
+ *
+ * `null` for a label whose note has no stable id, which nothing in the live take produces but
+ * an imported part can — the press then falls back to the by-X answer, as before.
+ */
+interface WantedName {
+  x: number;
+  y: number;
+  text: string;
+  uncertain: boolean;
+  noteId: string | null;
+}
+
+/**
  * Name-row metrics, in px. These are the numbers the CSS produces (`.note-name` is
  * 10.5px/1 with 1px padding), kept here because the placement maths needs them and a
  * silent disagreement between the two is exactly how the row ended up on top of the tab.
@@ -306,6 +349,47 @@ function nameHalfWidth(text: string): number {
 }
 /** Chord names stack upward from the anchor by this much per extra note. */
 const NAME_STACK_STEP = 12;
+/** How far above the top of the system the LOWEST name of an 'above' row sits. */
+const NAMES_ABOVE_GAP = 16;
+
+/**
+ * The tallest stack of NAMES any beat in this score will ask for. See `reserveTopRoom`.
+ *
+ * Counted the same way the row itself counts (`rebuildOverlays`): tie DESTINATIONS get no name,
+ * because a note held across a bar line is one attack engraved as several noteheads and labelling
+ * every glyph is what produced the reported "A1 A1 A1 A1" stutter. So a chord's height here is
+ * the number of names that will actually be drawn over it, not the number of noteheads.
+ *
+ * Over the MODEL rather than the bounds, because this runs before the first render of this score
+ * — which is the whole point: the padding has to be right for the frame the clipping was a
+ * photograph of, not one corrective render later.
+ */
+function maxChordSize(score: alphaTab.model.Score): number {
+  let most = 1;
+  for (const track of score.tracks) {
+    for (const staff of track.staves) {
+      for (const bar of staff.bars) {
+        for (const voice of bar.voices) {
+          for (const beat of voice.beats) {
+            let n = 0;
+            for (const note of beat.notes) if (!note.isTieDestination) n++;
+            if (n > most) most = n;
+          }
+        }
+      }
+    }
+  }
+  return most;
+}
+/**
+ * The tallest chord the headroom is sized for (P5).
+ *
+ * The owner's own number: "stacks are 3–5 max" on the material this app is for. It is a CAP and
+ * not an assumption — `reserveTopRoomFor` takes the smaller of this and the tallest stack the
+ * score actually contains, so an ordinary single-note riff reserves nothing at all and a
+ * pathological twelve-note cluster reserves five names' worth rather than half the pane.
+ */
+const MAX_STACK_FOR_HEADROOM = 5;
 /**
  * How far tab fret digits rise above the y that `BarBounds.visualBounds` calls the top of
  * the tab staff. They are centred ON the top line, so that y is the MIDDLE of the topmost
@@ -671,6 +755,8 @@ export class TriView {
   private insetTuneBudget = 0;
   /** True when the score renders more than one stave — a grand staff, or grand staff + tab. */
   private multiStaff = false;
+  /** Does the engraved score show tablature at all? See `reserveTopRoom`. */
+  private hasTabStave = false;
   /** Highest playable fret. Only used to decide whether a drag is possible. */
   private maxFret: number;
   /** The key signature, for turning staff positions into semitones. */
@@ -693,6 +779,13 @@ export class TriView {
     this.opts = opts;
     this.namesPlacement = opts.namesPlacement ?? 'between';
     this.showNames = opts.showNames ?? true;
+
+    // THE GESTURE RECORDER (D2), behind its flag and inert without it. Installed from here
+    // because this is the first thing built for the screen the gestures happen on; it listens on
+    // `window` in the capture phase, so it sees the roll's and the strip's events too, and it is
+    // passive, so it cannot change what any of them do. See view/gestureRecorder.ts for the
+    // one-step recipe.
+    installGestureRecorder(opts.exportFile);
 
     opts.container.classList.add('triview');
     opts.container.innerHTML = `
@@ -879,6 +972,9 @@ export class TriView {
     // Same measurement, second consumer: a braced system is also the one whose staves need more
     // air between them (F2b). Recorded before the render so the first frame already has it.
     this.multiStaff = staves > 1;
+    // Third consumer, and the one `reserveTopRoom` reads: with no tablature there is no staff/tab
+    // band for the names row to sit in, so it goes above the system and needs headroom.
+    this.hasTabStave = score.tracks.some((t) => t.staves.some((s) => s.showTablature));
     applyStaffTabGap(this.api.settings, this.needsGap(), this.multiStaff);
     const overhang = this.multiStaff
       ? Math.max(leftInkOverhangPerScale, BRACED_LEFT_OVERHANG_PER_SCALE)
@@ -887,9 +983,53 @@ export class TriView {
     if (Math.abs(wanted - (this.api.settings.display.padding[0] ?? 0)) >= 0.5) {
       setLeftPadding(this.api.settings, wanted);
     }
+    this.maxChordSize = maxChordSize(score);
+    this.reserveTopRoom();
     // Unconditional: the gap above may have changed even when the padding did not, and there is
     // no render in flight yet — `load()` starts one immediately after this returns.
     this.api.updateSettings();
+  }
+
+  /** The tallest chord in the score about to be engraved. See `reserveTopRoom`. */
+  private maxChordSize = 1;
+
+  /**
+   * HEADROOM ABOVE THE FIRST STAFF LINE, sized for the names row that will sit in it (P5).
+   *
+   * THE REPORTED FAULT: a stacked chord's names ran off the top of the sheet pane with no way to
+   * scroll to them. Not a scrolling problem — `namesYFor` anchors the row `NAMES_ABOVE_GAP` above
+   * the system and the stack grows UPWARD from there, so with alphaTab's default 35px of page
+   * padding the third name of a stack is laid out at a negative y. A negative y is OUTSIDE the
+   * scrollable content, which is why "scroll up to it" was never going to be the fix.
+   *
+   * So the room is reserved in the ENGRAVING's own padding, which moves the SVG and the HTML
+   * labels together. The prerequisite was splitting `setLeftPadding` into per-edge writers: it
+   * used to rewrite all four every time it ran, and it runs on every zoom, so any headroom
+   * reserved here would have been silently destroyed by the next pinch (`atSettings.ts`).
+   *
+   * WHAT IT COSTS WHEN IT IS NOT NEEDED: nothing. The reserved height is derived from the score's
+   * own tallest chord, capped at `MAX_STACK_FOR_HEADROOM`, and floored at alphaTab's own
+   * `PAGE_PADDING_PX` — so a single-note riff, a names-off view, and the notation-plus-tab shape
+   * whose row lives in the staff/tab band all keep exactly the padding they had before.
+   *
+   * NOT SCALED by `display.scale`: alphaTab divides page padding by the scale during layout and
+   * multiplies the finished coordinates back (measured in 1.8.4, see `PAGE_PADDING_PX`), and the
+   * label metrics this is computed from are CSS pixels that do not shrink with the engraving
+   * either. Both sides of the sum are screen pixels, at every zoom.
+   */
+  private reserveTopRoom(): void {
+    const stack = Math.max(1, Math.min(MAX_STACK_FOR_HEADROOM, this.maxChordSize));
+    // Only the row that sits ABOVE the system needs it. The 'between' row lives in a gap that is
+    // already reserved (`applyStaffTabGap`), and 'below' hangs off the bottom.
+    const above =
+      this.showNames &&
+      (this.namesPlacement === 'above' ||
+        (this.namesPlacement === 'between' && (this.multiStaff || !this.hasTabStave)));
+    const wanted = above
+      ? Math.max(PAGE_PADDING_PX, NAMES_ABOVE_GAP + (stack - 1) * NAME_STACK_STEP + NAME_HEIGHT / 2)
+      : PAGE_PADDING_PX;
+    if (Math.abs(wanted - (this.api.settings.display.padding[1] ?? PAGE_PADDING_PX)) < 0.5) return;
+    setTopPadding(this.api.settings, wanted);
   }
 
   /**
@@ -1008,9 +1148,16 @@ export class TriView {
     this.rebuildOverlays();
   }
 
-  /** Only the 'between' row lives inside the staff<->tab gap; the others sit outside it. */
+  /**
+   * Only the 'between' row lives inside the staff<->tab gap; the others sit outside it.
+   *
+   * ...and on a GRAND staff there is no 'between' row at all — `namesYFor` puts it above the
+   * system, because the gap the band would name is full of the bass staff's own stems (B7). So
+   * the gap must not be reserved for it either: the two answers are one decision and asking it
+   * twice is how a hole opens under a row that is somewhere else.
+   */
   private needsGap(): boolean {
-    return this.showNames && this.namesPlacement === 'between';
+    return this.showNames && this.namesPlacement === 'between' && !this.multiStaff;
   }
 
   /**
@@ -1022,8 +1169,17 @@ export class TriView {
   private applyGap(): boolean {
     const wanted = this.needsGap();
     const before = this.api.settings.display.notationStaffPaddingTop;
+    const beforeTop = this.api.settings.display.padding[1];
     applyStaffTabGap(this.api.settings, wanted, this.multiStaff);
-    if (this.api.settings.display.notationStaffPaddingTop === before) return false;
+    // Turning the names off, or moving the row out of the band, changes how much headroom the
+    // page owes it — the same decision, so the same re-render. See `reserveTopRoom`.
+    this.reserveTopRoom();
+    if (
+      this.api.settings.display.notationStaffPaddingTop === before &&
+      this.api.settings.display.padding[1] === beforeTop
+    ) {
+      return false;
+    }
     this.api.updateSettings();
     // Geometry change: every stave below the first moves, so nothing already painted is still
     // in the right place and `reuseViewport` would only license a ghost. See `setZoom`.
@@ -1189,7 +1345,7 @@ export class TriView {
 
     let beatCount = 0;
     let hasStaffTabSplit = false;
-    const wanted: Array<{ x: number; y: number; text: string; uncertain: boolean }> = [];
+    const wanted: Array<WantedName> = [];
     const wantedMarks: Array<{ x: number; y: number; text: string }> = [];
 
     for (const system of lookup.staffSystems) {
@@ -1271,19 +1427,29 @@ export class TriView {
             // end at arbitrary times and need more tied pieces to write down. More pieces, more
             // phantom labels.
             .filter((n) => !n.isTieDestination)
-            .map((n) => ({ midi: soundingMidi(this.index!, n), uncertain: false }))
+            .map((n) => ({
+              midi: soundingMidi(this.index!, n),
+              uncertain: false,
+              // THE NOTE THIS NAME IS ABOUT, carried through to the DOM. See `WantedName`.
+              noteId: this.index!.noteToInfo.get(n)?.id ?? null
+            }))
             // Lowest first, and stacked UPWARD from the anchor. Two reasons: it matches
             // how the pitches sit on the staff, and it keeps a tall chord growing into the
             // empty gap rather than down through the top line of the tab.
             .sort((a, b) => a.midi - b.midi)
-            .map((n) => ({ text: midiToName(n.midi, this.accidentals), uncertain: n.uncertain }));
+            .map((n) => ({
+              text: midiToName(n.midi, this.accidentals),
+              uncertain: n.uncertain,
+              noteId: n.noteId
+            }));
 
           names.forEach((n, i) => {
             wanted.push({
               x: beatBounds.onNotesX,
               y: namesY - i * NAME_STACK_STEP,
               text: n.text,
-              uncertain: n.uncertain
+              uncertain: n.uncertain,
+              noteId: n.noteId
             });
           });
         }
@@ -1327,14 +1493,34 @@ export class TriView {
     system: alphaTab.rendering.StaffSystemBounds
   ): number {
     if (this.namesPlacement === 'above') {
-      return Math.max(0, system.visualBounds.y - 16);
+      return Math.max(0, system.visualBounds.y - NAMES_ABOVE_GAP);
     }
     if (this.namesPlacement === 'below') {
       return system.realBounds.y + system.realBounds.h - 14;
     }
+    /*
+     * A GRAND STAFF HAS NO LABEL LANE, so 'between' means 'above' on one (B7).
+     *
+     * Photographed by the owner on Clef: Grand + Tab: Bass — the names crammed into the gap
+     * between the BASS staff and the tablature, sharing pixels with the bass stems that hang down
+     * into it and with the fret digits below. `bandStaves` picks "the tab and whatever is directly
+     * above it", which on a grand-plus-tab system is the bass staff, and that gap is not a lane:
+     * it is where the bass staff's own downward stems, beams and ledger lines go, and `pruneNames`
+     * deliberately ignores music glyphs (Bravura's em box is about four times its ink, so
+     * intersecting against it would delete the whole row) — so nothing downstream could catch it.
+     *
+     * The lane only genuinely exists on the one shape it was designed for: a SINGLE notation
+     * stave engraved directly above its own tablature, where `applyStaffTabGap` reserves the
+     * room for it. Anywhere else the row goes above the whole system, which is the placement
+     * already proven on single-stave scores — and `reserveTopRoomFor` reserves the headroom it
+     * needs there.
+     */
+    if (this.multiStaff) {
+      return Math.max(0, system.visualBounds.y - NAMES_ABOVE_GAP);
+    }
     if (barBoundsList.length >= 2) {
       const band = this.nameBand(barBoundsList);
-      if (!band) return Math.max(0, system.visualBounds.y - 16);
+      if (!band) return Math.max(0, system.visualBounds.y - NAMES_ABOVE_GAP);
       // Sit LOW in the band, not centred. Tuplet brackets, staccato dots and stem
       // descenders all hang below the staff into the top of it; a centred row collides
       // with the "3" of every triplet, and a chord stacks UPWARD from this anchor anyway.
@@ -1346,7 +1532,7 @@ export class TriView {
       // path that should never run.
       return Math.max(0, (band.top + band.bottom) / 2 - NAME_HEIGHT / 2);
     }
-    return Math.max(0, system.visualBounds.y - 16);
+    return Math.max(0, system.visualBounds.y - NAMES_ABOVE_GAP);
   }
 
   /**
@@ -1477,6 +1663,22 @@ export class TriView {
      */
     noteXs: Array<{ noteId: string; contentX: number; screenX: number }>;
     /**
+     * THE KEY SIGNATURE ON EACH STAVE, as a number of accidentals with its sign (P8).
+     *
+     * Read off the MODEL's bars, which is precisely where the fault was: `MasterBar.keySignature`
+     * is a deprecated setter that writes track 0, staff 0 and nothing else, so the value could be
+     * right on the treble stave of a grand system and absent on every other one. A harness that
+     * only looked at the score's declared key would have seen the correct number and missed it.
+     */
+    keySignaturePerStave: number[];
+    /**
+     * The top of the first engraved system, in content y — the line the names row must be ABOVE
+     * on a grand staff (B7) and the number the reserved headroom is spent on (P5).
+     */
+    systemTop: number | null;
+    /** alphaTab's page padding as it currently stands: `[left, top, right, bottom]`. */
+    pagePadding: number[];
+    /**
      * THE NUMBERS ALIGN'S WINDOW IS DERIVED FROM, read from the pane that owns them.
      *
      * `ui/app.ts §syncViewports` turns the sheet's two viewport edges into the seconds every
@@ -1541,14 +1743,25 @@ export class TriView {
       leftEdgeTick: vp ? this.contentXToTick(vp.scrollLeft + LEFT_INSET_PX) : null,
       rightEdgeTick: vp ? this.contentXToTick(vp.scrollLeft + vp.viewportWidth) : null
     };
+    /*
+     * THE PROBE MEASURES IN THE ENGRAVING'S PIXELS (G1).
+     *
+     * Every number this returns is compared against `band`, `staffBottom` and `tabTop`, which come
+     * from alphaTab's bounds lookup and are LOGICAL. The DOM rects below are visual, so each
+     * difference from the host's own edge is converted once, here — otherwise `clearBelowTab` and
+     * `clearAboveStaff` would be reported in a different unit from the thing they clear, and the
+     * harness's "the names row never sits on a fret digit" check would pass or fail by the face
+     * scale rather than by the geometry.
+     */
     const hostRect = this.host.getBoundingClientRect();
+    const fromHostTop = (clientTop: number): number => toLogical(clientTop - hostRect.top);
     const markTexts = this.tabMarks.map((m) => m.el.textContent ?? '');
     let marksOnTab = 0;
     for (const m of this.tabMarks) {
       const r = m.el.getBoundingClientRect();
       // "On the tab" = below the notation staff. tabTop is the top LINE of the tab and the
       // marker deliberately rises above it, so compare against the band instead.
-      if (band && r.height > 0 && r.top - hostRect.top >= band.top) marksOnTab++;
+      if (band && r.height > 0 && fromHostTop(r.top) >= band.top) marksOnTab++;
     }
 
     if (!band) {
@@ -1579,6 +1792,9 @@ export class TriView {
         ghostsTrimmed: this.ghostsTrimmed,
         surfaceGrownPx: this.surfaceGrownPx,
         noteXs,
+        keySignaturePerStave: this.keySignaturePerStave(),
+        systemTop: this.systemTop(),
+        pagePadding: [...(this.api.settings.display.padding ?? [])],
         axis
       };
     }
@@ -1590,8 +1806,8 @@ export class TriView {
       const r = label.el.getBoundingClientRect();
       if (r.width === 0 && r.height === 0) continue;
       labelRects.push(r);
-      labelTop = Math.min(labelTop, r.top - hostRect.top);
-      labelBottom = Math.max(labelBottom, r.bottom - hostRect.top);
+      labelTop = Math.min(labelTop, fromHostTop(r.top));
+      labelBottom = Math.max(labelBottom, fromHostTop(r.bottom));
     }
     if (labelRects.length === 0) {
       labelTop = band.top;
@@ -1658,8 +1874,35 @@ export class TriView {
       ghostsTrimmed: this.ghostsTrimmed,
       surfaceGrownPx: this.surfaceGrownPx,
       noteXs,
+      keySignaturePerStave: this.keySignaturePerStave(),
+      systemTop: this.systemTop(),
+      pagePadding: [...(this.api.settings.display.padding ?? [])],
       axis
     };
+  }
+
+  /**
+   * The key signature each engraved stave is carrying. See `layoutProbe().keySignaturePerStave`.
+   *
+   * The first bar of each stave of each track, in engraved order. alphaTab's `KeySignature` is
+   * the count of accidentals with its sign (C = 0, three sharps = 3, two flats = -2), so a
+   * harness can say "they all agree and none of them is C" without a lookup table.
+   */
+  private keySignaturePerStave(): number[] {
+    const out: number[] = [];
+    for (const track of this.builtModel?.tracks ?? []) {
+      for (const staff of track.staves) {
+        const bar = staff.bars[0];
+        if (bar) out.push(bar.keySignature as unknown as number);
+      }
+    }
+    return out;
+  }
+
+  /** Content y of the top of the first engraved system, or null with nothing engraved. */
+  private systemTop(): number | null {
+    const system = this.api.renderer.boundsLookup?.staffSystems?.[0];
+    return system ? system.visualBounds.y : null;
   }
 
   /**
@@ -1686,7 +1929,9 @@ export class TriView {
             all.push({
               noteId: id,
               contentX: Number(beatBounds.onNotesX.toFixed(2)),
-              screenX: Number((stackLeft + beatBounds.onNotesX).toFixed(2))
+              // A true CLIENT x: `stackLeft` is visual and `onNotesX` is engraved, so the
+              // engraved half is scaled on the way out (G1).
+              screenX: Number((stackLeft + toVisual(beatBounds.onNotesX)).toFixed(2))
             });
           }
         }
@@ -1769,7 +2014,9 @@ export class TriView {
     for (const glyph of this.host.querySelectorAll('svg.at-surface-svg path,svg.at-surface-svg text')) {
       const r = glyph.getBoundingClientRect();
       if (r.width === 0 && r.height === 0) continue;
-      inkXs.push(r.left - stackLeft + r.width / 2);
+      // CONTENT x, so LOGICAL: `inkInSpan` below is called with `realBounds` from alphaTab, and
+      // a census measured in visual pixels would have counted the wrong bars' ink (G1).
+      inkXs.push(toLogical(r.left - stackLeft + r.width / 2));
       if (
         r.right >= paneRect.left &&
         r.left <= paneRect.right &&
@@ -2151,8 +2398,11 @@ export class TriView {
     // gestures. The pointer's tick and its offset now go in before `api.render` is ever called.
     const left = this.scroller.scrollLeft;
     const anchored = anchorClientX !== null && Number.isFinite(anchorClientX);
+    // LOGICAL, because `scrollLeft` is and `contentXToTick` reads engraved coordinates (G1).
     const rect = anchored ? this.scroller.getBoundingClientRect() : null;
-    const px = rect ? Math.max(0, Math.min(rect.width, (anchorClientX as number) - rect.left)) : 0;
+    const px = rect
+      ? Math.max(0, Math.min(toLogical(rect.width), logicalX(this.scroller, anchorClientX as number)))
+      : 0;
     const anchorTick = anchored ? this.contentXToTick(left + px) : null;
     if (anchored && anchorTick !== null) {
       this.scrollAnchorAtStart = false;
@@ -2187,9 +2437,11 @@ export class TriView {
 
   /** Where the pointer is, as a fraction of the music column. The anchor a `zoom` command wants. */
   pinchFrac(clientX: number): number {
-    const rect = this.scroller.getBoundingClientRect();
-    const width = Math.max(1, rect.width - LEFT_INSET_PX);
-    return Math.max(0, Math.min(1, (clientX - rect.left - LEFT_INSET_PX) / width));
+    // BOTH SIDES IN LOGICAL PIXELS (G1): `rect.width` is visual and `LEFT_INSET_PX` is logical, so
+    // the inset used to be subtracted from a width it was not measured in — an anchor that drifted
+    // further from the fingers the smaller the window was.
+    const width = Math.max(1, toLogical(this.scroller.getBoundingClientRect().width) - LEFT_INSET_PX);
+    return Math.max(0, Math.min(1, (logicalX(this.scroller, clientX) - LEFT_INSET_PX) / width));
   }
 
   /**
@@ -2446,7 +2698,9 @@ export class TriView {
         box = null;
       }
       if (!box || (box.width === 0 && box.height === 0)) continue;
-      const left = svg.getBoundingClientRect().left - stackLeft + box.x;
+      // `getBBox()` is in SVG user units — the engraving's own pixels — so only the DOM half of
+      // this sum is visual and only that half is converted (G1).
+      const left = toLogical(svg.getBoundingClientRect().left - stackLeft) + box.x;
       if (left < min) min = left;
     }
     return Number.isFinite(min) ? min : null;
@@ -2478,8 +2732,8 @@ export class TriView {
    * chord's names is a wrong chord, not a thinner one.
    */
   private pruneNames(
-    wanted: Array<{ x: number; y: number; text: string; uncertain: boolean }>
-  ): Array<{ x: number; y: number; text: string; uncertain: boolean }> {
+    wanted: Array<WantedName>
+  ): Array<WantedName> {
     if (wanted.length === 0) return wanted;
     const stackLeft = this.stack.getBoundingClientRect().left;
     const stackTop = this.stack.getBoundingClientRect().top;
@@ -2498,13 +2752,19 @@ export class TriView {
       if (text.length === 0 || ![...text].some((c) => c.charCodeAt(0) < 0xe000)) continue;
       const r = glyph.getBoundingClientRect();
       if (r.width === 0 || r.height === 0) continue;
-      const top = r.top - stackTop;
-      const bottom = r.bottom - stackTop;
+      // Against `wanted`, which is in the engraving's pixels — so the blockers must be too (G1).
+      const top = toLogical(r.top - stackTop);
+      const bottom = toLogical(r.bottom - stackTop);
       if (bottom < bandTop || top > bandBottom) continue;
-      blockers.push({ left: r.left - stackLeft, right: r.right - stackLeft, top, bottom });
+      blockers.push({
+        left: toLogical(r.left - stackLeft),
+        right: toLogical(r.right - stackLeft),
+        top,
+        bottom
+      });
     }
 
-    const kept: Array<{ x: number; y: number; text: string; uncertain: boolean }> = [];
+    const kept: Array<WantedName> = [];
     const keptBoxes: Array<{ left: number; right: number; top: number; bottom: number }> = [];
     let droppedAnchorX: number | null = null;
     let keptAnchorX: number | null = null;
@@ -2541,7 +2801,7 @@ export class TriView {
   }
 
   /** Reuse label elements across renders; creating 400 divs per keystroke is not free. */
-  private syncLabels(wanted: Array<{ x: number; y: number; text: string; uncertain: boolean }>): void {
+  private syncLabels(wanted: Array<WantedName>): void {
     while (this.labels.length < wanted.length) {
       const el = document.createElement('span');
       el.className = 'note-name';
@@ -2558,6 +2818,10 @@ export class TriView {
       if (l.el.textContent !== w.text) l.el.textContent = w.text;
       l.el.style.transform = `translate(${w.x}px, ${w.y}px) translateX(-50%)`;
       l.el.classList.toggle('uncertain', w.uncertain);
+      // The label's own note, for the press handler (P6). Deleted rather than set to "" when
+      // there is none, so `dataset.noteId` is absent exactly when the answer is unknown.
+      if (w.noteId) l.el.dataset.noteId = w.noteId;
+      else delete l.el.dataset.noteId;
       l.x = w.x;
     }
   }
@@ -2618,7 +2882,9 @@ export class TriView {
       button.addEventListener('click', () => {
         const index = Number(button.dataset.track);
         if (!Number.isFinite(index)) return;
-        const r = button.getBoundingClientRect();
+        // LOGICAL CLIENT COORDINATES (G1): the rename field this opens is `position: fixed`, and
+        // under the face scale a fixed element's `left`/`top` are read in the design's own pixels.
+        const r = logicalRect(button);
         this.opts.onPartLabelClick?.(index, { x: r.left, y: r.top, w: r.width, h: r.height });
       });
       this.partLabelHits.appendChild(button);
@@ -2655,7 +2921,14 @@ export class TriView {
       const r = glyph.getBoundingClientRect();
       // Sideways, and only sideways. See (3) above.
       if (r.width === 0 || r.height <= r.width) continue;
-      lettered.push({ x: r.left - stack.left, y: r.top - stack.top, w: r.width, h: r.height, text });
+      // Matched against `realBounds`/`visualBounds` below, which are engraved pixels (G1).
+      lettered.push({
+        x: toLogical(r.left - stack.left),
+        y: toLogical(r.top - stack.top),
+        w: toLogical(r.width),
+        h: toLogical(r.height),
+        text
+      });
     }
     if (lettered.length === 0) return found;
 
@@ -3080,7 +3353,7 @@ export class TriView {
     // actually on, so pick the nearest by y rather than the first in the list.
     const heads = this.noteGlyphRects(hit.note);
     if (heads.length === 0) return;
-    const pointerY = e.clientY - this.host.getBoundingClientRect().top;
+    const pointerY = logicalPoint(this.host, e.clientX, e.clientY).y;
     let head = heads[0];
     let best = Number.POSITIVE_INFINITY;
     for (const r of heads) {
@@ -3125,9 +3398,22 @@ export class TriView {
   private updateDrag(clientX: number, clientY: number, altKey: boolean): void {
     const d = this.drag;
     if (!d || !this.index) return;
-    const dy = clientY - d.startClientY;
-    const dx = clientX - d.startClientX;
-    if (!d.moved && Math.max(Math.abs(dy), Math.abs(dx)) < DRAG_THRESHOLD_PX) return;
+    /*
+     * THE DELTAS GO LOGICAL AND THE THRESHOLD COMES WITH THEM (G1).
+     *
+     * `dy` is divided by `stepPx`, which is an alphaTab engraving metric times `display.scale` —
+     * a LOGICAL length — so the pointer delta has to be logical too or a drag moves a note by the
+     * wrong number of staff positions at every face scale below 1.
+     *
+     * `DRAG_THRESHOLD_PX` is the opposite kind of number: it describes how far a hand moves before
+     * it meant to, which is a fact about the hand and not about the drawing, so it stays constant
+     * in VISUAL pixels — and staying constant in visual pixels while the deltas are logical means
+     * dividing it by the same scale.
+     */
+    const dy = toLogical(clientY - d.startClientY);
+    const dx = toLogical(clientX - d.startClientX);
+    const threshold = toLogical(DRAG_THRESHOLD_PX);
+    if (!d.moved && Math.max(Math.abs(dy), Math.abs(dx)) < threshold) return;
     // THE LOCK, taken at the moment the drag is recognised and never revisited. See `DragState`.
     if (d.axis === null) d.axis = Math.abs(dx) > Math.abs(dy) ? 'time' : 'pitch';
     d.moved = true;
@@ -3137,11 +3423,11 @@ export class TriView {
       d.dx = dx;
       // A CONTENT x, not a client one: the ghost is drawn inside the scrolled stack, and the
       // tick has to come from the same axis the engraving publishes.
-      const contentX = clientX - this.host.getBoundingClientRect().left;
+      const contentX = logicalX(this.host, clientX);
       d.tick = this.contentXToTick(contentX);
       // An imported part is paper. The gesture is shown as refused rather than ignored, so the
       // player learns the rule from the picture instead of from nothing happening.
-      d.valid = d.editable && d.tick !== null && Math.abs(dx) >= DRAG_THRESHOLD_PX;
+      d.valid = d.editable && d.tick !== null && Math.abs(dx) >= threshold;
       d.label = d.editable ? 'move in time' : 'imported part';
       d.steps = 0;
       this.drawGhost();
@@ -3487,15 +3773,34 @@ export class TriView {
     const lookup = this.api.renderer.boundsLookup;
     if (!lookup) return null;
 
-    const hostRect = this.host.getBoundingClientRect();
-    const x = clientX - hostRect.left;
-    const y = clientY - hostRect.top;
+    // THE LAW'S CONVERSION (G1): alphaTab's bounds lookup is in the engraving's own pixels.
+    const { x, y } = logicalPoint(this.host, clientX, clientY);
+    // …and the rect below comes back in LOGICAL CLIENT coordinates — the space a `position: fixed`
+    // popover is placed in under the face scale — so a caller can hand it straight to `style.left`.
+    const hostRect = logicalRect(this.host);
 
     let beat = lookup.getBeatAtPos(x, y);
     let note = beat ? lookup.getNoteAtPos(beat, x, y) : null;
-    if (!note) {
-      const near = this.nearestNoteHead(x, y);
-      if (near) {
+    /*
+     * NEAREST CENTRE WINS EVEN WHEN ALPHATAB REPORTS AN "EXACT" HIT (P6).
+     *
+     * `BeatBounds.findNoteAtPos` returns the FIRST note in the beat's list whose notehead box
+     * contains the point — list order, not distance. That is only unambiguous while the boxes are
+     * disjoint, and in a chord they are not: a second is engraved with one notehead shifted
+     * sideways so the two boxes overlap, and every stacked member's box is inflated by the
+     * glyph's own bearings. So a press aimed at the upper member of a stack could be answered
+     * with the lower one, deterministically — which on screen is "clicking this notehead selects
+     * the other one", the reported failure.
+     *
+     * The nearest CENTRE is the rule the piano roll has always used and the one this class
+     * already fell back to; it is simply asked first-among-equals now. alphaTab's answer is still
+     * used when it is the closer of the two, and it is still the only answer available outside
+     * the hit radius.
+     */
+    const near = this.nearestNoteHead(x, y);
+    if (near && near.note !== note) {
+      const exact = note ? this.noteHeadDistance(note, x, y) : Number.POSITIVE_INFINITY;
+      if (near.dist < exact) {
         note = near.note;
         beat = near.note.beat;
       }
@@ -3535,7 +3840,7 @@ export class TriView {
   }
 
   /**
-   * Pixels within which a press counts as being ON a notehead. See `hitTest`.
+   * SCREEN pixels within which a press counts as being ON a notehead. See `hitTest`.
    *
    * Twelve, matched to the roll's own tolerance rather than picked: a notehead is about nine
    * screen pixels tall at scale 1, so this is "within about one notehead of the centre", which
@@ -3543,11 +3848,31 @@ export class TriView {
    */
   private static readonly NOTE_HIT_RADIUS_PX = 12;
 
-  /** The closest notehead centre to a content point, inside the radius. Null past it. */
+  /**
+   * The closest notehead centre to a content point, inside the radius. Null past it.
+   *
+   * THE RADIUS IS DIVIDED BY THE FACE SCALE, AND THAT IS WHAT KEEPS IT CONSTANT (G1).
+   *
+   * It describes how accurately a hand can point, which does not change when the face is drawn
+   * smaller — so the number that must stay fixed is the SCREEN one, and the search happens in
+   * LOGICAL pixels. Twelve screen pixels is twelve logical ones at scale 1 and forty-four at
+   * REAPER's 360x280 floor, where the whole face is painted at 0.27. Left unscaled it would have
+   * shrunk with the picture: at that window a press three screen pixels from a notehead's centre
+   * would have missed it, on a face where three screen pixels is the best anybody can do.
+   */
+  /** How far a point is from ONE note's notehead centre. Infinite when it has no geometry. */
+  private noteHeadDistance(note: alphaTab.model.Note, x: number, y: number): number {
+    const bounds = this.api.renderer.boundsLookup?.findBeat(note.beat);
+    const nb = bounds?.notes?.find((n) => n.note === note);
+    if (!nb) return Number.POSITIVE_INFINITY;
+    const r = nb.noteHeadBounds;
+    return Math.hypot(x - (r.x + r.w / 2), y - (r.y + r.h / 2));
+  }
+
   private nearestNoteHead(x: number, y: number): { note: alphaTab.model.Note; dist: number } | null {
     const lookup = this.api.renderer.boundsLookup;
     if (!lookup) return null;
-    const limit = TriView.NOTE_HIT_RADIUS_PX;
+    const limit = toLogical(TriView.NOTE_HIT_RADIUS_PX);
     let best: { note: alphaTab.model.Note; dist: number } | null = null;
     for (const system of lookup.staffSystems) {
       for (const masterBar of system.bars) {
@@ -3624,9 +3949,7 @@ export class TriView {
   targetAt(clientX: number, clientY: number): SheetTarget | null {
     const lookup = this.api.renderer.boundsLookup;
     if (!lookup) return null;
-    const hostRect = this.host.getBoundingClientRect();
-    const x = clientX - hostRect.left;
-    const y = clientY - hostRect.top;
+    const { x, y } = logicalPoint(this.host, clientX, clientY);
 
     const hit = this.hitTest(clientX, clientY);
     const staff = hit?.staff ?? this.staffAtY(y);
@@ -3642,9 +3965,10 @@ export class TriView {
     // The BAR is answerable from geometry even where no beat is, which is what makes the bar
     // menu reachable on the empty half of a grand staff.
     const barIndex = identity.barIndex ?? this.barIndexAtX(x);
+    const at = { x: toLogical(clientX), y: toLogical(clientY) };
     return {
-      clientX,
-      clientY,
+      clientX: at.x,
+      clientY: at.y,
       noteId: hit?.noteId ?? null,
       trackIndex: identity.trackIndex,
       live: identity.live,
@@ -3664,7 +3988,27 @@ export class TriView {
    * the same geometry `hitTest` uses.
    */
   editProbe(): {
-    noteHeads: Array<{ id: string; x: number; y: number; w: number; h: number }>;
+    /**
+     * Every live notehead, WITH THE STAVE IT IS ON and the beat it belongs to.
+     *
+     * `staff` because the list holds tab positions as well as noteheads — a fret digit has
+     * `noteHeadBounds` too — and a probe that took "the seventh notehead" without looking could
+     * be dispatching a PITCH drag at a tablature digit, where the same gesture means a string
+     * change and the pitch deliberately does not move. That is a test measuring the wrong thing,
+     * passing or failing for reasons that have nothing to do with what it claims.
+     *
+     * `beat` is what makes a CHORD addressable: the members of one stack share it, so a probe can
+     * click every notehead of a stack and assert that each answers with its own id (P6).
+     */
+    noteHeads: Array<{
+      id: string;
+      x: number;
+      y: number;
+      w: number;
+      h: number;
+      staff: StaveKind;
+      beat: number;
+    }>;
     /** A point on a NOTATION staff of the live part with no notehead anywhere near it. */
     emptyNotation: { x: number; y: number } | null;
     /**
@@ -3677,7 +4021,26 @@ export class TriView {
   } {
     const lookup = this.api.renderer.boundsLookup;
     const hostRect = this.host.getBoundingClientRect();
-    const noteHeads: Array<{ id: string; x: number; y: number; w: number; h: number }> = [];
+    /*
+     * ENGRAVED (logical) -> CLIENT (visual), and this is the one place in the file that goes that
+     * way (G1). Everything alphaTab reports — `visualBounds`, `noteHeadBounds`, `LEFT_INSET_PX` —
+     * is in the design's own pixels; `hostRect` and the client coordinates the caller is going to
+     * dispatch a pointer event at are visual. Adding the two without scaling was correct only at
+     * face scale 1, and silently aimed the harness at the wrong pixel everywhere else — which is
+     * exactly the class of bug the law had to land before, so that the gesture and hit-test work
+     * after it is measured against true coordinates.
+     */
+    const cx = (x: number): number => hostRect.left + toVisual(x);
+    const cy = (y: number): number => hostRect.top + toVisual(y);
+    const noteHeads: Array<{
+      id: string;
+      x: number;
+      y: number;
+      w: number;
+      h: number;
+      staff: StaveKind;
+      beat: number;
+    }> = [];
     const staves: Array<{ x: number; y: number; w: number; h: number }> = [];
     let importedStaff: { x: number; y: number } | null = null;
     const live = this.liveTrackIndex();
@@ -3689,9 +4052,9 @@ export class TriView {
           const bounds = bars[i];
           if (bounds.bar?.staff?.track?.index !== live) {
             const v = bounds.visualBounds;
-            const x = Math.round(v.x + v.w / 2 + hostRect.left);
-            if (!importedStaff && x > hostRect.left + LEFT_INSET_PX && x < window.innerWidth - 8) {
-              importedStaff = { x, y: Math.round(v.y + v.h / 2 + hostRect.top) };
+            const x = Math.round(cx(v.x + v.w / 2));
+            if (!importedStaff && x > cx(LEFT_INSET_PX) && x < window.innerWidth - 8) {
+              importedStaff = { x, y: Math.round(cy(v.y + v.h / 2)) };
             }
             continue;
           }
@@ -3703,10 +4066,14 @@ export class TriView {
               const r = nb.noteHeadBounds;
               noteHeads.push({
                 id,
-                x: Math.round(r.x + r.w / 2 + hostRect.left),
-                y: Math.round(r.y + r.h / 2 + hostRect.top),
-                w: Math.round(r.w),
-                h: Math.round(r.h)
+                x: Math.round(cx(r.x + r.w / 2)),
+                y: Math.round(cy(r.y + r.h / 2)),
+                w: Math.round(toVisual(r.w)),
+                h: Math.round(toVisual(r.h)),
+                staff: kinds[i] ?? 'other',
+                // The beat's own playback tick, which is stable across renders and shared by
+                // every member of a chord.
+                beat: bb.beat.absolutePlaybackStart
               });
             }
           }
@@ -3728,23 +4095,23 @@ export class TriView {
     // A BLANK SCORE HAS NO NOTEHEADS AT ALL, so there are no gaps to be widest — the whole staff
     // is one. Its own middle, clamped onto the screen, is the honest answer there.
     if (staff && xs.length < 2) {
-      const left = Math.max(staff.x + hostRect.left, hostRect.left + LEFT_INSET_PX + 40);
-      const right = Math.min(staff.x + staff.w + hostRect.left, window.innerWidth - 20);
+      const left = Math.max(cx(staff.x), cx(LEFT_INSET_PX + 40));
+      const right = Math.min(cx(staff.x + staff.w), window.innerWidth - 20);
       if (right > left) {
         emptyNotation = {
           x: Math.round((left + right) / 2),
-          y: Math.round(staff.y + staff.h / 2 + hostRect.top)
+          y: Math.round(cy(staff.y + staff.h / 2))
         };
       }
     }
     if (staff && xs.length >= 2) {
-      const y = Math.round(staff.y + staff.h / 2 + hostRect.top);
+      const y = Math.round(cy(staff.y + staff.h / 2));
       let widest = 0;
       for (let i = 1; i < xs.length; i++) {
         const mid = Math.round((xs[i - 1] + xs[i]) / 2);
         const gap = xs[i] - xs[i - 1];
         if (gap <= widest) continue;
-        if (mid < hostRect.left + LEFT_INSET_PX || mid > window.innerWidth - 8) continue;
+        if (mid < cx(LEFT_INSET_PX) || mid > window.innerWidth - 8) continue;
         widest = gap;
         emptyNotation = { x: mid, y };
       }
@@ -3806,12 +4173,47 @@ export class TriView {
     return diatonicToMidi(topLine - stepsBelowTopLine, this.keyFifths);
   }
 
+  /**
+   * A press on a NOTE NAME, answered by the note the label was drawn for (P6).
+   *
+   * The label carries its own note id (`WantedName`), so this is a lookup rather than a guess.
+   * `hitTestByX` — which finds the nearest beat anchor and takes `beat.notes[0]` — is still there
+   * for a press on empty paper and for a label with no id behind it, but on a chord it answered
+   * every one of the stacked names with the bottom member, and that is what made a stacked note
+   * look unselectable.
+   *
+   * Null when the label names a note this render no longer has, which is a stale DOM node about
+   * to be replaced; the caller falls back to the by-X answer.
+   */
+  hitTestByName(label: HTMLElement): NoteHit | null {
+    const id = label.dataset.noteId;
+    const note = id ? this.index?.idToNote.get(id) : undefined;
+    const lookup = this.api.renderer.boundsLookup;
+    if (!note || !lookup) return null;
+    const beatBounds = lookup.findBeat(note.beat);
+    if (!beatBounds) return null;
+    const hostRect = logicalRect(this.host);
+    const nb = beatBounds.notes?.find((n) => n.note === note);
+    const box = nb ? nb.noteHeadBounds : beatBounds.visualBounds;
+    return {
+      noteId: id ?? null,
+      note,
+      beat: note.beat,
+      rect: { x: box.x + hostRect.left, y: box.y + hostRect.top, w: box.w, h: box.h },
+      // A press on the names row is not a press on either staff: the row sits between them or
+      // above them, so there is no staff kind to report and no drag to start from it.
+      staff: null,
+      ...this.identityOf(note.beat, beatBounds.visualBounds.y + beatBounds.visualBounds.h / 2)
+    };
+  }
+
   /** Names-row click: we only have an x, so resolve by nearest beat anchor. */
   hitTestByX(clientX: number): NoteHit | null {
     const lookup = this.api.renderer.boundsLookup;
     if (!lookup) return null;
-    const hostRect = this.host.getBoundingClientRect();
-    const x = clientX - hostRect.left;
+    const x = logicalX(this.host, clientX);
+    // LOGICAL CLIENT coordinates for the rect below, as in `hitTest` — see `NoteHit.rect`.
+    const hostRect = logicalRect(this.host);
 
     let best: alphaTab.rendering.BeatBounds | null = null;
     let bestDist = Number.POSITIVE_INFINITY;
@@ -3866,7 +4268,8 @@ export class TriView {
     // underneath the rename field that is opening. See `syncPartLabelHits`.
     if (target.classList.contains('part-label-hit')) return;
     const hit = target.classList.contains('note-name')
-      ? this.hitTestByX(e.clientX)
+      ? // The label's OWN note first (P6); the nearest beat anchor only when it has none.
+        (this.hitTestByName(target) ?? this.hitTestByX(e.clientX))
       : this.hitTest(e.clientX, e.clientY);
 
     if (hit) {

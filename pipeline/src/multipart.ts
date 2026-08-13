@@ -280,7 +280,7 @@ export function alignPartBars(irs: RiffsheetIR[]): void {
  * BUILD ONE SCORE FROM N PARTS. See the module header for what is shared and what is not.
  *
  * `sharedInput` is `BuildInput` minus the notes (beats, downbeats, `externalGrid`,
- * `startOffsetSec`, `audioDurationSec`, `blankBars`); `sharedSettings` is the ordinary
+ * `startOffsetSec`, `audioDurationSec`, `detachedTimeline`, `blankBars`); `sharedSettings` is the ordinary
  * `BuildSettings`, and the timing/key/title half of it (`grid`, `timeSigOverride`, `bpmOverride`,
  * `keyFifths`, `title`, `composer`) is authoritative for the whole score. Only the engraving half
  * can be overridden per part, and `ScorePart` lists exactly which fields those are.
@@ -337,7 +337,14 @@ export function buildMultiPartScore(
   );
   const displayBpm = needsTickNudge
     ? buildTimeSkeleton(
-        { ...sharedInput, notes: applyGuards(secondsNudged.flat(), sharedInput.audioDurationSec).notes },
+        {
+          ...sharedInput,
+          notes: applyGuards(
+            secondsNudged.flat(),
+            sharedInput.audioDurationSec,
+            sharedInput.detachedTimeline
+          ).notes
+        },
         sharedSettings
       ).displayBpm || 120
     : 120;

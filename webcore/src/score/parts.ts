@@ -308,7 +308,12 @@ export function buildPartedRiffScore(
     ...(request.downbeats && !externalGrid ? { downbeats: request.downbeats } : {}),
     ...(request.audioDurationSec !== undefined ? { audioDurationSec: request.audioDurationSec } : {}),
     ...(request.startOffsetSec !== undefined ? { startOffsetSec: request.startOffsetSec } : {}),
-    ...(request.blankBars !== undefined ? { blankBars: request.blankBars } : {})
+    ...(request.blankBars !== undefined ? { blankBars: request.blankBars } : {}),
+    // Forwarded on THIS path too, and it has to be: a bar operation splices every part against
+    // one shared clock, so a multi-part score is exactly as detached from its recording as a
+    // single-part one is. Dropping it here would re-arm the audio-length guard for the one
+    // document shape where the material past the end of the tape belongs to somebody else.
+    ...(request.detachedTimeline ? { detachedTimeline: true } : {})
   };
 
   // The override on the live slot when there is one; the derived word otherwise. Resolved once

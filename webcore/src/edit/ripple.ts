@@ -219,6 +219,53 @@ export interface RippleOp {
   label?: string;
 }
 
+/**
+ * ===========================================================================================
+ * A NOTE'S CANONICAL PLACEMENT — the roll's answer to "raw-only is not enough"
+ * ===========================================================================================
+ *
+ * WHY THIS EXISTS (roll-purity critique §A "Raw-only write-back is not sufficient").
+ *
+ * A roll edit is written back into `source.detected.notes`, in RECORDING seconds, and every later
+ * derivation of the feed re-applies the whole log to it. Two things that road cannot represent:
+ *
+ *   THE OLD ASSERTION. A duration ripple states `chordEndTick` for its atom absolutely, and
+ *     `place()` re-states it on every derivation. A roll resize of one of those notes writes a
+ *     different raw end, the next feed derivation ignores it and re-asserts the old one, and the
+ *     rectangle SNAPS BACK to the written value. `unrippleNotes` says so in its own header, and
+ *     called it the interim.
+ *   INSERTED TIME. A point inside a bar an insert created has no pre-image in the recording at
+ *     all — `undoShift` collapses it onto the seam — so a note added in the middle of an inserted
+ *     bar cannot be stated in raw audio seconds even in principle. It would land on the seam.
+ *
+ * WHAT THIS IS. For one note, its EXACT canonical span in the tick coordinates that the operations
+ * up to and including `afterOpId` produce. Those operations are already materialised into these
+ * numbers and are not applied again; every LATER operation still applies normally, so a subsequent
+ * sheet ripple still pushes this note exactly as it pushes every other one. That is the whole law:
+ *
+ *   > A roll edit changes only the selected note's canonical placement; it never rewrites
+ *   > neighbouring notes.
+ *
+ * WHY NOT `ignoredRippleIds`. A patch that merely told `place()` to skip an op for one id would
+ * fix the old assertion and could still not put a note inside inserted time, because there would
+ * be no coordinate in which to say where it is. The critique is explicit: do not stop there.
+ *
+ * STALE BY CONSTRUCTION IS SAFE. If `afterOpId` names an operation the log no longer contains —
+ * the player undid the ripple — the placement describes coordinates that no longer exist, and
+ * `place()` falls back to the recording. Undo restores the log and the placement map together
+ * (one `PerfStructure`), so the two can only disagree on a document edited by hand.
+ */
+export interface RollPlacement {
+  /** IR ticks, exact, in the coordinates `afterOpId` produced. */
+  startTick: Rational;
+  endTick: Rational;
+  /** The last operation ALREADY materialised into the ticks above. `null` = the raw feed. */
+  afterOpId: string | null;
+}
+
+/** Every note that has one, by id. Persisted with the document; see `app/persist.ts`. */
+export type RollPlacements = Readonly<Record<string, RollPlacement>>;
+
 /** The tick↔seconds map, in IR ticks. `ui/app.ts` wraps the score's tempo map into this. */
 export interface RippleTickMap {
   /** Feed seconds -> IR ticks. */
@@ -236,6 +283,8 @@ export interface RippleApplyContext {
    * feed produces the same identity every time and selection, undo and playback stay pinned to it.
    */
   splitId?(opId: string, noteId: string): string;
+  /** Canonical overrides, by note id. See `RollPlacement`. Absent on every un-edited document. */
+  placements?: RollPlacements;
 }
 
 /** The default split name. Contains a colon, which no minted or engine id can produce. */
@@ -392,15 +441,50 @@ interface Placed {
   tail?: { startTick: Rational; endTick: Rational; shift: Rational; opId: string };
 }
 
-function place(note: InputNote, ops: ReadonlyArray<RippleOp>, map: RippleTickMap): Placed | null {
-  let startTick = ratFromTick(map.toTick(note.startSec));
-  let endTick = ratFromTick(map.toTick(note.endSec));
+function place(
+  note: InputNote,
+  ops: ReadonlyArray<RippleOp>,
+  map: RippleTickMap,
+  placements?: RollPlacements
+): Placed | null {
+  const rawStart = ratFromTick(map.toTick(note.startSec));
+  const rawEnd = ratFromTick(map.toTick(note.endSec));
+  let startTick = rawStart;
+  let endTick = rawEnd;
   let startShift = RAT_ZERO;
   let endShift = RAT_ZERO;
   let tail: Placed['tail'];
   const id = note.id;
 
-  for (const op of ops) {
+  /*
+   * THE OVERRIDE, AND WHERE IN THE LOG IT PICKS UP. See `RollPlacement`.
+   *
+   * `from` is the index of the first operation that has NOT yet been materialised into the
+   * override's ticks. Everything before it is skipped — including any `chordEndTick` assertion,
+   * which is exactly the snap-back this fixes — and everything from it on is applied normally, so
+   * a later sheet ripple still moves this note with the rest of the score.
+   *
+   * The displacement the source-tick restatement needs is the difference between where the note
+   * is being PUT and where the recording says it is, and it is seeded here so `shiftedTiming`
+   * carries the roll edit into an imported part's own ticks as well.
+   */
+  const override = id !== undefined && placements ? placements[id] : undefined;
+  let from = 0;
+  if (override) {
+    const at = override.afterOpId === null ? -1 : ops.findIndex((op) => op.id === override.afterOpId);
+    // A named operation that is not in this log is a placement from a future the document no
+    // longer has (the ripple was undone). The recording is the only coordinate system left.
+    if (override.afterOpId === null || at >= 0) {
+      startTick = override.startTick;
+      endTick = override.endTick;
+      startShift = ratSub(startTick, rawStart);
+      endShift = ratSub(endTick, rawEnd);
+      from = at + 1;
+    }
+  }
+
+  for (let i = from; i < ops.length; i++) {
+    const op = ops[i];
     const isMate = id !== undefined && !!op.chordIds && op.chordIds.includes(id);
     if (isMate) {
       // THE ATOM. Its attack does not move for its own operation and its release is stated, not
@@ -498,7 +582,7 @@ export function applyRippleOps(
   const splitId = ctx.splitId ?? defaultSplitId;
   const out: InputNote[] = [];
   for (const note of notes) {
-    const placed = place(note, ops, ctx.map);
+    const placed = place(note, ops, ctx.map, ctx.placements);
     if (!placed) continue;
     const startSec = ctx.map.toSec(ratValue(placed.startTick));
     const endSec = ctx.map.toSec(ratValue(placed.endTick));
@@ -579,6 +663,52 @@ export function unrippleNotes(
   });
 }
 
+/**
+ * MINT THE OVERRIDES FOR ONE ROLL EDIT — the notes the player authored, pinned where they landed.
+ *
+ * Called from `App.applyRollEdit` with the notes AS THE PLAYER LEFT THEM (feed seconds, after the
+ * whole log), so the ticks recorded here are exactly the ticks that were on screen. `afterOpId` is
+ * the last operation in the log at the moment of the edit: everything up to it is already in these
+ * numbers, everything after it has not happened yet.
+ *
+ * ONLY WHEN THERE IS A LOG. On an un-rippled document the recording IS the canonical coordinate
+ * system, raw write-back is exact, and an override would be a second authority saying the same
+ * thing — so `ops` empty returns the map unchanged and every existing document keeps the road it
+ * has always taken.
+ *
+ * Existing entries for ids that are no longer in the feed are dropped: a placement for a note the
+ * player deleted is a fact about nothing, and would come back to life if the id were ever reused.
+ */
+export function withRollPlacements(
+  previous: RollPlacements | undefined,
+  feed: ReadonlyArray<InputNote>,
+  authoredIds: ReadonlyArray<string>,
+  ops: ReadonlyArray<RippleOp>,
+  map: RippleTickMap
+): RollPlacements | undefined {
+  if (!ops.length) return previous;
+  const alive = new Set<string>();
+  for (const n of feed) if (n.id !== undefined) alive.add(n.id);
+
+  const next: Record<string, RollPlacement> = {};
+  for (const [id, placement] of Object.entries(previous ?? {})) {
+    if (alive.has(id)) next[id] = placement;
+  }
+
+  const afterOpId = ops[ops.length - 1].id;
+  const byId = new Map(feed.filter((n) => n.id !== undefined).map((n) => [n.id as string, n]));
+  for (const id of authoredIds) {
+    const note = byId.get(id);
+    if (!note) continue;
+    next[id] = {
+      startTick: ratFromTick(map.toTick(note.startSec)),
+      endTick: ratFromTick(map.toTick(note.endSec)),
+      afterOpId
+    };
+  }
+  return Object.keys(next).length ? next : undefined;
+}
+
 function undoShift(t: Rational, op: RippleOp): Rational {
   const after = ratAdd(op.seamTick, op.deltaTick);
   if (ratCmp(t, after) >= 0) return ratSub(t, op.deltaTick);
@@ -596,13 +726,14 @@ function undoShift(t: Rational, op: RippleOp): Rational {
 export function rippleMovedIds(
   notes: ReadonlyArray<InputNote>,
   ops: ReadonlyArray<RippleOp>,
-  map: RippleTickMap
+  map: RippleTickMap,
+  placements?: RollPlacements
 ): Set<string> {
   const out = new Set<string>();
   if (!ops.length) return out;
   for (const note of notes) {
     if (!note.id) continue;
-    const placed = place(note, ops, map);
+    const placed = place(note, ops, map, placements);
     if (!placed) {
       out.add(note.id);
       continue;

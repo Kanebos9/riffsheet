@@ -919,6 +919,16 @@ interface RollRect {
   y: number;
   w: number;
   h: number;
+  /**
+   * This rectangle shares its row with another one it OVERLAPS IN TIME. See `layoutRects`.
+   *
+   * Not a fault and not a thing to correct: two notes of the same pitch really can sound at
+   * once (a held bass note under a re-attack, an overdub, a note being lengthened past its
+   * successor). The flag exists so `paintRects` can make the overlap legible — the covering
+   * rectangle is drawn translucent so the one underneath is not erased — rather than making it
+   * disappear by shortening one of them.
+   */
+  overlapped: boolean;
 }
 
 /** The edges of a selection, so a group edit can stop at them AS A GROUP. See `groupStats`. */
@@ -1643,10 +1653,25 @@ export class PianoRoll {
     this.draw();
   }
 
-  setPosition(sec: number): void {
+  /**
+   * Where the playhead is, and — the second argument — whether it is MOVING ON ITS OWN.
+   *
+   * THE VERTICAL HALF OF THE FIRST-CLICK BUG (roll-purity critique §B). `App.bindTransportUi`
+   * calls this on every transport update, including the ones a SEEK produces while the take is
+   * stopped, and `followSoundingNote()` used to run unconditionally underneath it. So clicking
+   * empty background to move the playhead could scroll the PITCH window as a side effect — the
+   * rectangle the player was aiming at moved out from under the pointer between the first click
+   * and the second, and a double-click added its note on a different row from the one it began on.
+   *
+   * Auto-follow is a PLAYBACK courtesy: it exists so the sounding note stays on screen while the
+   * take plays itself. A stopped take is not playing, so there is nothing to follow, and a click
+   * is the player saying where to look rather than asking to be taken somewhere. Default `false`,
+   * so a caller that does not say is treated as the discrete case — the safe direction.
+   */
+  setPosition(sec: number, playing = false): void {
     if (Math.abs(sec - this.positionSec) < 0.005) return;
     this.positionSec = sec;
-    this.followSoundingNote();
+    if (playing) this.followSoundingNote();
     this.draw();
   }
 
@@ -3312,6 +3337,25 @@ export class PianoRoll {
   }
 
   /**
+   * The pitch row a CANVAS y falls on — the same answer a double-click there would author.
+   *
+   * Public for one reason, and it is the reason `noteIdAt` is public too: a harness aiming a real
+   * gesture must be able to ask where it is aiming rather than reconstruct the geometry. Every
+   * attempt to reconstruct it outside this file has to guess at the ruler's height (which appears
+   * and disappears with the pane's), at the row origin, and at the rounding — and a probe that
+   * guesses wrong authors a note on a row that is scrolled off the top, where `layoutRects` culls
+   * it. The gesture then looks like it did nothing, which is the most expensive kind of false
+   * failure: it accuses the app of the bug the harness has.
+   *
+   * CANVAS coordinates in, to match `paintedRects()` and `probe().emptyRowY`, both of which the
+   * caller turns straight into a `clientY`. The ruler offset is taken off here, exactly once, by
+   * the same `rulerH` the pointer funnel uses.
+   */
+  midiAtCanvasY(y: number): number {
+    return this.yToMidi(y - this.rulerH);
+  }
+
+  /**
    * THE WHEEL, AND NO KEY TO HOLD DOWN.
    *
    *   over the GUTTER      zoom the pitch axis, about the pointer
@@ -3957,12 +4001,18 @@ export class PianoRoll {
     y: number;
     w: number;
     h: number;
+    /** The written end, so a purity probe can compare a PAINTED length against a fed one. */
+    endSec: number;
+    /** This rectangle shares its row with one it overlaps in time. See `RollRect.overlapped`. */
+    overlapped: boolean;
   }> {
     const rulerH = this.rulerH;
     return this.rects.map((r) => ({
       noteId: r.note.noteId,
       midi: r.midi,
       startSec: Number(r.startSec.toFixed(4)),
+      endSec: Number(r.endSec.toFixed(4)),
+      overlapped: r.overlapped,
       x: Number(r.x.toFixed(2)),
       y: Number((r.y + rulerH).toFixed(2)),
       w: Number(r.w.toFixed(2)),
@@ -4284,10 +4334,37 @@ export class PianoRoll {
   /**
    * Where every rectangle goes, including the one a drag is currently holding.
    *
-   * Two passes, and the second is the one people forget: after the widths are computed, any
-   * rect that would touch the next one on the same row is SHORTENED. Never moved — the left
-   * edge is the onset and a picture that lies about when a note started is worse than one
-   * that lies about how long it was. Invariant 5.
+   * ===========================================================================================
+   * THE ROLL PAINTS TRUE DURATIONS. IT NO LONGER SHORTENS ANYTHING. (roll-purity critique §A.1)
+   * ===========================================================================================
+   *
+   * WHAT USED TO STAND HERE, and it is worth quoting because it sounded like an invariant:
+   *
+   *   "Two passes, and the second is the one people forget: after the widths are computed, any
+   *    rect that would touch the next one on the same row is SHORTENED. Never moved — the left
+   *    edge is the onset and a picture that lies about when a note started is worse than one
+   *    that lies about how long it was."
+   *
+   * The reasoning is sound and the conclusion is wrong, because it accepted the wrong premise:
+   * that one of the two lies has to be told. It does not. A rectangle that is drawn shorter than
+   * its note is a rectangle that reports a duration the take does not contain, and the roll is
+   * the surface whose entire job is to be a literal picture of the performance.
+   *
+   * WHAT IT COST, which is the reported fault. Draw a second note of the SAME PITCH before an
+   * existing held note ends and the earlier block visibly shrinks. No note data changed — the
+   * player's own reading is that adding one note silently shortened another, and there is no
+   * gesture that undoes it because nothing happened. That is precisely the "roll edits are not
+   * local" complaint, produced entirely inside the renderer.
+   *
+   * WHAT REPLACES IT. Overlapping same-row rectangles OVERLAP, and are told apart by drawing
+   * rather than by falsification: the covering rectangle is painted translucent so the one
+   * underneath keeps its outline and its full length (`paintRects`, keyed off `overlapped`).
+   * Every rect still carries its own inset outline, so "two notes read as two" — the invariant
+   * the old pass was really serving — is still true, and is now true without either of them
+   * lying about how long it was.
+   *
+   * NOTE_GAP_PX still comes off the right-hand edge of every rect, as it always did. That is a
+   * one-pixel drawing inset applied uniformly, not a duration claim about a neighbour.
    */
   private layoutRects(rowH: number, yFor: (midi: number) => number, w: number, g: number): RollRect[] {
     const noteH = Math.max(2, rowH - 2);
@@ -4337,12 +4414,19 @@ export class PianoRoll {
         x: x0,
         y,
         w: Math.max(MIN_NOTE_W_PX, x1 - x0 - NOTE_GAP_PX),
-        h: noteH
+        h: noteH,
+        overlapped: false
       });
     }
 
-    // Keep the outlines apart. Sorted per row so "the next one" is well defined even after a
-    // provisional move has put a note on a row it does not normally live on.
+    /*
+     * WHO OVERLAPS WHOM — a MARK, not a correction.
+     *
+     * Sorted per row so "the one before it" is well defined even after a provisional move has
+     * put a note on a row it does not normally live on. Both members of an overlapping pair are
+     * marked: the one underneath so a caller can see it is partly covered, and the one on top so
+     * `paintRects` knows to let the other through.
+     */
     const byRow = new Map<number, RollRect[]>();
     for (const r of out) {
       const row = byRow.get(r.midi);
@@ -4350,12 +4434,14 @@ export class PianoRoll {
       else byRow.set(r.midi, [r]);
     }
     for (const row of byRow.values()) {
+      if (row.length < 2) continue;
       row.sort((a, b) => a.x - b.x);
       for (let i = 0; i < row.length - 1; i++) {
         const a = row[i];
         const b = row[i + 1];
-        const room = b.x - NOTE_GAP_PX - a.x;
-        if (a.x + a.w > b.x - NOTE_GAP_PX) a.w = Math.max(1, room);
+        if (a.x + a.w <= b.x - NOTE_GAP_PX) continue;
+        a.overlapped = true;
+        b.overlapped = true;
       }
     }
     return out;
@@ -4471,7 +4557,21 @@ export class PianoRoll {
       const sounding = r.startSec <= nowWritten && nowWritten < r.endSec;
       const ghost = !!id && deleting && this.pendingIds.has(id);
 
-      ctx.globalAlpha = ghost ? 0.25 : 1;
+      /*
+       * A COVERING RECTANGLE DOES NOT ERASE THE ONE UNDER IT (roll-purity critique §A.1).
+       *
+       * `layoutRects` no longer shortens an overlapped rect, so two same-pitch notes that really
+       * do sound at once really do overlap on screen. Painted opaque and in list order, the later
+       * one would simply blot out the earlier one's tail and its outline — which is the same lie
+       * the shortening told, arrived at through the paint instead of through the geometry.
+       *
+       * So an overlapping fill is translucent. The rectangle underneath keeps its full length and
+       * its outline, both are legible as separate notes, and neither is drawn at a duration its
+       * note does not have. Selection is exempt: a selected note is the answer to "which one am I
+       * about to edit?" and has to be unambiguous.
+       */
+      const veiled = r.overlapped && !selected;
+      ctx.globalAlpha = ghost ? 0.25 : veiled ? 0.62 : 1;
       if (selected) {
         ctx.fillStyle = this.colors.accent;
       } else if (sounding) {

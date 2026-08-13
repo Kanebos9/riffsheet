@@ -40,7 +40,6 @@ import {
   type CaptureResult,
   type DroppedInputResult,
   type EngineListResult,
-  type EngineStatus,
   type ExportPayload,
   type HostInfo,
   type NativeBridge,
@@ -82,7 +81,6 @@ import {
 } from '../view/timeAxis';
 import {
   PianoRoll,
-  rollEditNoteIds,
   setTransientReserve,
   type RollVerticalView,
   TIMELINE_GUTTER_PX,
@@ -122,9 +120,11 @@ import {
   rippleMovedIds,
   spliceSourceBars,
   unrippleNotes,
+  withRollPlacements,
   type Rational,
   type RippleOp,
   type RippleTickMap,
+  type RollPlacements,
   type WrittenSpan
 } from '../edit/ripple';
 import { closeSheetMenu, showSheetMenu, sheetMenuProbe, type SheetMenuItem } from '../edit/sheetMenu';
@@ -141,6 +141,12 @@ interface PerfStructure {
   bars?: number;
   parts?: ImportedPart[];
   ripples?: RippleOp[];
+  /**
+   * The canonical placement overrides (`edit/ripple.ts §RollPlacement`). They belong here and not
+   * on the note stack because they are stated in the LOG's coordinates: restoring a step's notes
+   * without its placements would leave a pin pointing at an operation that step does not have.
+   */
+  placements?: RollPlacements;
   endTick?: Rational;
 }
 import {
@@ -189,7 +195,9 @@ import {
 import {
   buildPartedRiffScore,
   cleanPartName,
+  defaultPartTabProfile,
   importedPartName,
+  importedPartTabProfile,
   isNotationOnlyTrack,
   livePartName,
   LIVE_PART_ID,
@@ -201,7 +209,8 @@ import {
   scoreParts,
   snapNudgeMs,
   type ImportedPart,
-  type PartSlot
+  type PartSlot,
+  type PartTabProfile
 } from '../score/parts';
 import { accidentalsForKey, midiToName } from '../score/notes';
 import { TUNING_PRESETS, customTuning, parseTuning, tuningById, tuningLabel } from '../score/tuning';
@@ -365,18 +374,6 @@ const REDO_SVG =
  * see what changed and what they skipped, and `/latest` shows one release with no history.
  */
 const RELEASES_URL = 'https://github.com/Kanebos9/riffsheet/releases';
-
-/**
- * How often the engine chip asks whether a listener is up (H8). See `pollEngine()`.
- *
- * TWO CADENCES, because the two states are asking different questions. While a server is UP the
- * chip is showing a figure that moves, so ten seconds is about the rate at which it is worth
- * redrawing. While it is DOWN the question is "has one appeared?" — which now has to be asked at
- * all, because a server the player started themselves is invisible to everything else in the
- * app — and eight seconds is what makes "within about ten" true rather than nearly true.
- */
-const ENGINE_LIVE_POLL_MS = 10_000;
-const ENGINE_IDLE_POLL_MS = 8_000;
 
 /**
  * The version to show when the shell cannot be asked.
@@ -753,9 +750,6 @@ class App {
    * Without it the roll forgets where you scrolled every time anything else on screen updates.
    */
   private rollView: RollVerticalView | null = null;
-  /** What the listener is doing and what it costs. Null until asked, or in a browser. */
-  private engine: EngineStatus | null = null;
-  private engineTimer = 0;
   /**
    * Every engine this build can drive, for the picker on the main menu.
    *
@@ -1118,13 +1112,22 @@ class App {
     }
 
     if (!options?.secondary) this.watchHostTimeline();
-    // The engine watch runs for as long as this window is open (H8), so it needs to know when
-    // the window stops being one. Installed here rather than in `pollEngine()`, which is called
-    // from four places and would otherwise stack four listeners.
-    if (!options?.secondary) this.watchEngineVisibility();
-    // …and start asking. `pollEngine()` re-arms itself from here on, whether or not the first
-    // answer is "nothing running" — which is the whole of the externally-started-server fix.
-    this.pollEngine();
+    /*
+     * THE ENGINE WATCH IS GONE, and it went with the header chip it existed for (critique §F).
+     *
+     * What stood here: `watchEngineVisibility()` plus a first `pollEngine()`, which then re-armed
+     * itself every eight to ten seconds for as long as the window was open. Every one of those
+     * calls had exactly one consumer — a chip in the header saying "Stop MuScriptor" — and that
+     * chip is removed. A status poll with nothing reading it is a status poll that costs a shell
+     * round trip every eight seconds to update nothing.
+     *
+     * WHAT IS NOT REMOVED. `bridge.stopEngine` / `stopExternalEngine` are untouched, and so are
+     * the internal lifecycle calls that use them (closing a document, starting a new take). The
+     * settings panel keeps its own status poll for as long as it is open, which is the one place
+     * a player goes to ask what the engine is doing. And the engine still stops by itself at the
+     * end of every job — that has always been the native side's business
+     * (`shell/Source/engines/EngineRegistry.h`, `MuScriptorAdapter.cpp`), never this button's.
+     */
 
     // Which engines exist, and which one is in charge. Asked once at boot rather than polled:
     // the settings panel keeps it fresh while it is open, and the main menu only needs to be
@@ -1198,11 +1201,6 @@ class App {
     if (list.configuredEngine && list.configuredEngine !== this.settings.get().engineId) {
       this.settings.set({ engineId: list.configuredEngine });
     }
-    // The chip names an engine out of THIS list (H8, `listenerName()`), and the list arrives on
-    // its own schedule — a promise resolved some time after boot. Without this the chip keeps
-    // whatever it could say before the names were known, which on a machine with a server
-    // already running is "The listener" for the whole session.
-    this.refreshEngineChip();
     this.renderOpening();
   }
 
@@ -3341,271 +3339,30 @@ class App {
     return best ? best.midi : null;
   }
 
-  /**
-   * Watch the listener — and keep watching after it has gone (H8).
+  /*
+   * ============================================================================================
+   * THE ENGINE CHIP SUBSYSTEM IS DELETED — ALL OF IT, NOT ONLY ITS BUTTON (critique §F)
+   * ============================================================================================
    *
-   * The engine is a Python process holding about a gigabyte, and the player's objection was
-   * exactly that: it should not be sitting there when nothing is being transcribed. It dies the
-   * moment a transcription ends, and this is what makes that visible — a chip that appears while
-   * it is up, says what it is costing, and disappears again on its own.
+   * WHAT WAS HERE: `pollEngine`, `armEnginePoll`, `watchEngineVisibility`, `engineProcessAlive`,
+   * `listenerName`, `refreshEngineChip`, `stopEngine` and `stopExternalEngine` — an eight-second
+   * status poll, a visibility watcher, a liveness predicate and two toast handlers, all of it
+   * feeding one header chip that read "Stop MuScriptor".
    *
-   * THE REPORTED FAULT. "I started a MuScriptor server myself, in the browser, and the chip never
-   * appeared." The poll used to re-arm ITSELF ONLY WHILE THE ENGINE WAS UP — "an idle plugin
-   * polls nothing" — which is airtight for a server Riffsheet started, because Riffsheet knows
-   * when it starts one. It is exactly wrong for a server somebody ELSE started: down at boot
-   * means down forever, because the one thing that would have noticed had switched itself off.
-   * `EngineStatus.externalServer` is the shell's word for that case and `engineProcessAlive()`
-   * already reads it; nothing was ever asking again.
+   * WHY THE WHOLE SUBSYSTEM AND NOT JUST THE DOM. Removing only the button would have left
+   * `refreshEngineChip()` unable to find its chip — and its not-found branch calls `renderMain()`,
+   * which ends by re-arming `pollEngine()`, whose promise resolves on a microtask and calls
+   * straight back in. That is an unbounded full-screen rebuild loop, armed by a live server, and
+   * the code said so itself in the comment on that branch. Deleting the button alone would have
+   * turned a working product decision into a hang.
    *
-   * SO IT ALWAYS RE-ARMS, at two cadences. Up: every 10s, which is the state where the figure on
-   * the chip is changing. Down: every `ENGINE_IDLE_POLL_MS`, which is what makes an
-   * externally-started server appear within about eight seconds and vanish about eight seconds
-   * after it is stopped. That is one cheap status call every eight seconds while a window is
-   * open — the payload is a compiled-in table plus a cached status on the shell side.
-   *
-   * AND ONLY WHILE THE WINDOW IS VISIBLE. A hidden plugin editor is not a window anybody is
-   * reading a chip in, and browsers throttle its timers to once a minute anyway, which would make
-   * the cadence a fiction. `watchEngineVisibility()` polls immediately on the way back, so
-   * returning to the window is never a wait.
+   * WHAT SURVIVES, DELIBERATELY. `bridge.stopEngine` and `bridge.stopExternalEngine` are still on
+   * the bridge and are still called by the internal lifecycle (closing a document, starting a new
+   * take). The native side still ends its own job — `shell/Source/engines/EngineRegistry.h` runs
+   * the end-of-job lifecycle and `MuScriptorAdapter.cpp` stops servers it owns — so automatic
+   * cleanup never depended on this button and does not now. The settings panel keeps its own
+   * status poll, which is where somebody who wants to know goes.
    */
-  private pollEngine(): void {
-    if (!this.bridge.engineStatus) return;
-    window.clearTimeout(this.engineTimer);
-    if (document.visibilityState === 'hidden') return;
-    void this.bridge
-      .engineStatus()
-      .then((status) => {
-        const wasUp = this.engineProcessAlive();
-        this.engine = status;
-        // Both reads go through `engineProcessAlive()` (G17), so the poll and the chip cannot
-        // disagree about what "up" means — which is how a chip for a process that does not
-        // exist stayed on screen and kept re-arming its own timer.
-        const isUp = this.engineProcessAlive();
-        if (wasUp !== isUp || (isUp && this.runtime.get().screen === 'main')) this.refreshEngineChip();
-        this.armEnginePoll(isUp);
-      })
-      .catch(() => {
-        this.engine = null;
-        // A failed status call is not proof there is no engine — a shell can be busy or briefly
-        // unreachable — and it must not be the thing that stops the watch for good. That is the
-        // same shape of bug as the one above, arrived at from the error path.
-        this.armEnginePoll(false);
-      });
-  }
-
-  /** One writer for the poll timer, so the two cadences cannot drift apart. */
-  private armEnginePoll(isUp: boolean): void {
-    window.clearTimeout(this.engineTimer);
-    if (document.visibilityState === 'hidden') return;
-    this.engineTimer = window.setTimeout(
-      () => this.pollEngine(),
-      isUp ? ENGINE_LIVE_POLL_MS : ENGINE_IDLE_POLL_MS
-    );
-  }
-
-  /**
-   * Stop asking while nobody is looking, and ask again the moment they are.
-   *
-   * Installed once, from `start()`. Without the second half, coming back to a window that had
-   * been hidden for an hour would show whatever the chip said when it was hidden until the next
-   * tick — and the tick is what was hidden.
-   */
-  private watchEngineVisibility(): void {
-    document.addEventListener('visibilitychange', () => {
-      if (document.visibilityState === 'hidden') window.clearTimeout(this.engineTimer);
-      else this.pollEngine();
-    });
-  }
-
-  /**
-   * IS THERE ACTUALLY A LISTENER PROCESS? (G17)
-   *
-   * THE BUG: the chip read "Listener · running" on machines where nobody had ever started an
-   * engine server. It was not a stale value and not a leaked process — it was this file reading
-   * `EngineStatus.state` as if it meant one thing when the shell uses it to mean two.
-   *
-   * For MuScriptor, `state` IS the server's lifecycle: 'stopped' at rest, 'starting' while the
-   * Python process boots, 'ready' while it holds a port and about a gigabyte of weights. For
-   * every OTHER engine — the built-in Riffsheet engine, Basic Pitch, and the per-job CLI
-   * engines — there is no server at all, and the shell reports `state: 'ready'` to mean "this
-   * engine is installed and usable". `src/bridge/mock.ts` §statusForEngine models both
-   * faithfully, which is where the difference is easiest to see: the MuScriptor branch answers
-   * `port: 8223` when it is up, the other branch answers `port: 0` always.
-   *
-   * So on any machine whose resolved engine is not MuScriptor, `state === 'ready'` was true
-   * from boot and the chip appeared immediately. `memoryMb` was absent, which is why the text
-   * came out as the literal word "running" rather than as a figure — that string was the tell,
-   * and a genuinely running listener has always read "Listener · 1.5 GB".
-   *
-   * THE FIX: `state` is necessary and no longer sufficient. There has to be evidence of a
-   * PROCESS as well — a listening port, a memory figure, or the shell saying outright that a
-   * server it did not start is up. All three are absent for an engine that is merely installed,
-   * and at least one is present for every server that really exists, including one still
-   * booting once it has claimed its port.
-   *
-   * WHAT IS NOT IN THIS FILE'S POWER. A shell that reports a port for a non-server engine, or
-   * that leaves `state: 'ready'` behind after its process dies, would still be believed here —
-   * the app cannot see processes, only this payload. If the chip is ever seen again after this,
-   * the next thing to read is what the shell's own `engineStatus` returns for the resolved
-   * engine, in that order: `state`, then `port`, then `memoryMb`, then `externalServer`.
-   */
-  private engineProcessAlive(): boolean {
-    const e = this.engine;
-    if (!e || (e.state !== 'ready' && e.state !== 'starting')) return false;
-    return (
-      (typeof e.port === 'number' && e.port > 0) ||
-      (typeof e.memoryMb === 'number' && e.memoryMb > 0) ||
-      e.externalServer === true ||
-      e.adopted === true
-    );
-  }
-
-  /**
-   * The engine ACTUALLY RUNNING, by the name it is offered under.
-   *
-   * THE PAYLOAD FIRST, and that is the fix (H8). This used to read the player's `engineId` and
-   * fall back to what `auto` resolved to — i.e. it named the engine that WOULD listen, and then
-   * that name was printed on a chip whose whole meaning is "a listener process is up right now".
-   * Those are two different questions, and the reported case is exactly where they part company:
-   * a MuScriptor server somebody started by hand, while the player has Riffsheet's own bass
-   * engine selected. `engineStatus().id` is the shell's word for which engine the status
-   * describes, so a chip drawn from it says whose process is holding the memory. The Stop button
-   * has always acted on that server rather than on the selection, so the two now agree.
-   *
-   * The old route stays as the fallback for a single-engine shell, which sends no `id` at all.
-   */
-  private listenerName(): string {
-    const list = this.engineList;
-    const chosen = this.settings.get().engineId;
-    const running = this.engine?.id;
-    const id = running || (chosen && chosen !== 'auto' ? chosen : (list?.resolvedEngine ?? ''));
-    // "The listener" when the name is not known, and NEVER the raw id dressed up as one: an id
-    // is lower-case and a brand is not, so `muscriptor` comes out as "Muscriptor" — a name for
-    // a product nobody ships. A generic noun is honest; a mangled brand is not. The list is
-    // asked for at boot and the chip is redrawn when it lands (see `loadEngines`), so the
-    // unnamed case is a shell that does not publish a catalogue at all.
-    return list?.engines.find((e) => e.id === id)?.name ?? 'The listener';
-  }
-
-  /** Cheap in-place update — the header must not be rebuilt every ten seconds. */
-  private refreshEngineChip(): void {
-    const chip = this.root.querySelector<HTMLElement>('[data-role="engine-chip"]');
-    if (!chip) {
-      // A missing chip is only worth a rebuild when a rebuild could actually produce one.
-      //
-      // The header builds the chip on every main-screen render, but ONLY when the host can
-      // also stop the engine. A host that offers `engineStatus` without `stopEngine` — the
-      // browser mock, and any shell exposing one and not the other — therefore has no chip
-      // to find, ever. Rebuilding anyway was an unbounded loop rather than a wasted render:
-      // renderMain() ends by re-arming pollEngine(), whose promise resolves on a microtask
-      // and calls straight back in here, so the renderer never yielded again. No paint, no
-      // readiness flag, and no answer to the debugger — the whole tab simply stopped.
-      //
-      // The screen check is the other half: renderMain() paints the main screen without
-      // setting `screen`, so reaching it from the opening screen replaced what the player
-      // was looking at with a view the app did not believe it was showing.
-      if (!this.bridge.stopEngine || this.runtime.get().screen !== 'main') return;
-      this.renderMain();
-      return;
-    }
-    const e = this.engine;
-    const up = this.engineProcessAlive();
-    chip.style.display = up ? '' : 'none';
-    if (!up || !e) return;
-    const name = this.listenerName();
-    /*
-     * IT SAYS WHAT IT IS AND WHAT PRESSING IT DOES, AND IT FITS (Z6).
-     *
-     * "Listener · 1.5 GB" named neither: it read as a status badge, and a status badge is not
-     * something anybody clicks. What replaced it — "MuScriptor running — click to stop" — named
-     * both and did not fit: 213px of sentence in the one row that has to survive a 390px docked
-     * FX window, inside `overflow: hidden` with an ellipsis, so on a squeezed header it arrived
-     * as "MuScriptor running — cli…". Half a label on the control that ends somebody's process.
-     *
-     * A VERB AND ITS OBJECT says the same two things in half the width and cannot be mistaken for
-     * a badge: "Stop MuScriptor" is unambiguously a button, names whose process is about to end,
-     * and is about 100px — which the header can afford at every width in the ladder, so nothing
-     * has to be cut and nothing has to be dropped. That it is RUNNING is what the chip's presence
-     * means: it is drawn only while `engineProcessAlive()` (G17) and lit while it is there.
-     *
-     * NO "…" ON THE STARTING STATE EITHER. The character is the truncation this whole sweep is
-     * about, and a label that ends in one is indistinguishable from a label that was cut.
-     */
-    chip.querySelector('[data-role="engine-text"]')!.textContent =
-      e.state === 'starting' ? `${name} starting` : `Stop ${name}`;
-    // The chip is about 100px of header that was not there a moment ago. That used to change the
-    // row's budget and force a re-decision about the take's name; under the one-proportion law
-    // the header is laid out in at least 1320 logical px whatever the window is doing, so 100px
-    // of chip comes out of the spacer between the two groups and nothing has to be dropped.
-    const mb =
-      typeof e.memoryMb === 'number' && e.memoryMb > 0
-        ? ` It is holding ${(e.memoryMb / 1024).toFixed(1)} GB right now.`
-        : '';
-    // `data-riff-tip` is where ui/tips.ts hoists a `title` the first time a control is hovered,
-    // and the hoisted copy wins from then on — so a bare `chip.title = …` here would be
-    // overwritten by whatever text this chip was carrying when the mouse first touched it.
-    const tip = t(`${TIPS.engineChip}${mb}`);
-    chip.removeAttribute('data-riff-tip');
-    if (tip === undefined) chip.removeAttribute('title');
-    else chip.title = tip;
-    // HIGHLIGHTED WHENEVER IT IS ON SCREEN, not only while a job is running. It is here to be
-    // noticed — the whole reason it exists is that a gigabyte was being held and nothing on
-    // screen said so — and a chip in the same grey as the buttons beside it is not noticed.
-    chip.classList.add('on');
-  }
-
-  private async stopEngine(): Promise<void> {
-    if (!this.bridge.stopEngine) return;
-    const r = await this.bridge.stopEngine().catch(() => ({ stopped: false, reason: 'the engine did not answer' }));
-    this.toast(
-      // "Left running" is not a fault — it means somebody else is using it, or it is not ours
-      // to stop — so it is never dressed as an error.
-      'info',
-      r.stopped ? 'Listener stopped' : 'Left running',
-      r.stopped
-        ? 'The transcription engine has been shut down and its memory given back. It starts again by itself the next time you transcribe something.'
-        : r.reason,
-      // AND A WAY OUT OF IT. "It is not Riffsheet's to stop" is a correct principle and, on its
-      // own, a dead end: the person reading it is usually the same person who started that
-      // server, they can see it holding well over a gigabyte, and the app has just explained
-      // why it will not help. The refusal stays the default — nothing here happens without a
-      // second, deliberate press — but the second press now exists.
-      //
-      // OFFERED FROM `canStopExternal`, AND FROM NOTHING ELSE. Not from `adopted`, not from
-      // `externalServer` — BRIDGE.md is explicit about why: on Windows the listening process's
-      // command line cannot be read, so the shell cannot prove what it is about to end and
-      // refuses by design. There `externalServer` is true while `canStopExternal` is false, and
-      // a button drawn from the first could only ever refuse. The capability test on the call
-      // itself is the other half, for a shell that predates it.
-      !r.stopped && this.bridge.stopExternalEngine && this.engine?.canStopExternal === true
-        ? { label: 'Stop it anyway', role: 'stop-external-engine', run: () => void this.stopExternalEngine() }
-        : undefined
-    );
-    this.pollEngine();
-  }
-
-  /**
-   * Kill a listener Riffsheet did not start, having said so first.
-   *
-   * The only caller is the button on the "Left running" notice, and that is the whole safety
-   * model: you cannot get here without having pressed Stop, read why it refused, and pressed
-   * again. The shell still refuses mid-job — that rule has no override anywhere — so this can
-   * come back with `stopped: false` and the reason is shown exactly as the first refusal was.
-   */
-  private async stopExternalEngine(): Promise<void> {
-    if (!this.bridge.stopExternalEngine) return;
-    const r = await this.bridge
-      .stopExternalEngine()
-      .catch(() => ({ stopped: false, reason: 'the engine did not answer' }));
-    this.toast(
-      'info',
-      r.stopped ? 'Listener stopped' : 'Still running',
-      r.stopped
-        ? `${r.reason} Riffsheet starts its own the next time you transcribe something.`
-        : r.reason
-    );
-    this.pollEngine();
-  }
 
   /**
    * Everything the player's settings have to say about how the next take is listened to.
@@ -4544,36 +4301,161 @@ class App {
      *
      * Everything is put back before returning, so the probe leaves the take as it found it.
      */
+
     /**
-     * THE LISTENER CHIP, next to the evidence it is supposed to be drawn from (G17).
+     * ==========================================================================================
+     * ROLL PURITY — "an edit changes the note you touched, and nothing else"
+     * ==========================================================================================
      *
-     * The reported fault was a chip reading "Listener · running" on a machine where no engine
-     * server had ever been started. The cause is written up in full on `engineProcessAlive()`:
-     * `EngineStatus.state` is a server lifecycle for MuScriptor and an "is it installed?" for
-     * every other engine, and this file was reading it as the first for both.
+     * THE OWNER'S REPORT, and the thing that has to be provable rather than argued: adding or
+     * resizing one rectangle appeared to change its neighbours. The critique found the reducer was
+     * already local and named the two real mechanisms — the renderer shortening overlapping
+     * same-row rectangles, and the log re-asserting `chordEndTick` over a resize — so this probe
+     * checks BOTH LAYERS, by id, because "the data is local" and "the picture is local" are two
+     * different claims and the reported fault lived entirely in the second one.
      *
-     * A check cannot start a Python process, so it cannot assert "the chip is right". What it
-     * CAN assert is the implication that was broken: the chip is on screen ONLY where the
-     * payload carries evidence of a process. Both sides are reported raw so a failure names
-     * which of them disagreed rather than merely saying the chip was wrong.
+     *   RAW      `source.detected.notes` — the recording, which is what a write-back can corrupt.
+     *   PAINTED  `PianoRoll.paintedRects()` — what the player is actually looking at.
+     *
+     * SNAP OFF, and that is the adjudicated scope. Beat and Grid are GLOBAL PROJECTIONS by design:
+     * a snap allocator re-derives every event's placement from the whole take, so adding an event
+     * legitimately changes where an untouched one is drawn. That is a property of asking for a
+     * snap, not a purity violation, and it is the mode in which the law is stated exactly.
+     *
+     * Everything is put back before returning: the take leaves this function as it arrived.
      */
-    (window as unknown as Record<string, unknown>).__RIFFSHEET_ENGINECHIP__ = () => {
-      const chip = this.root.querySelector<HTMLElement>('[data-role="engine-chip"]');
-      const e = this.engine;
-      return {
-        present: !!chip,
-        visible: !!chip && chip.style.display !== 'none',
-        highlighted: !!chip?.classList.contains('on'),
-        text: chip?.querySelector('[data-role="engine-text"]')?.textContent ?? null,
-        state: e?.state ?? null,
-        // The three pieces of process evidence, itemised. A payload with none of them and a
-        // visible chip is exactly the bug.
-        port: e?.port ?? null,
-        memoryMb: e?.memoryMb ?? null,
-        externalServer: e?.externalServer ?? null,
-        adopted: e?.adopted ?? null,
-        alive: this.engineProcessAlive()
+    (window as unknown as Record<string, unknown>).__RIFFSHEET_ROLLPURITY__ = async () => {
+      const roll = this.pianoRoll;
+      const before = this.runtime.get().source;
+      if (!roll || !before?.detected) return { error: 'no take' };
+      const settingsBefore = { rollSnap: this.settings.get().rollSnap };
+      const r4 = (n: number) => Number(n.toFixed(4));
+
+      /** Every note the RECORDING holds, by id — the layer a bad write-back damages. */
+      const rawById = () => {
+        const out: Record<string, [number, number, number]> = {};
+        for (const n of this.runtime.get().source?.detected?.notes ?? []) {
+          if (n.id) out[n.id] = [r4(n.startSec), r4(n.endSec), n.midi];
+        }
+        return out;
       };
+      /** Every rectangle the ROLL draws, by id — the layer the shortening pass damaged. */
+      const paintedById = () => {
+        const out: Record<string, [number, number, number, number]> = {};
+        for (const r of roll.paintedRects()) {
+          if (r.noteId) out[r.noteId] = [r4(r.startSec), r4(r.endSec), r.midi, Math.round(r.w)];
+        }
+        return out;
+      };
+      /** The ids whose record differs, ignoring the ones the gesture was allowed to touch. */
+      const strayed = (
+        a: Record<string, unknown[]>,
+        b: Record<string, unknown[]>,
+        allowed: ReadonlyArray<string>
+      ): string[] => {
+        const skip = new Set(allowed);
+        const out: string[] = [];
+        for (const id of Object.keys(a)) {
+          if (skip.has(id) || !b[id]) continue;
+          if (JSON.stringify(a[id]) !== JSON.stringify(b[id])) out.push(id);
+        }
+        return out;
+      };
+
+      try {
+        this.settings.set({ rollSnap: 'off' });
+        this.rebuildNotation({ keepEdits: true });
+        await new Promise((r) => setTimeout(r, 60));
+
+        const feed = this.performanceFeed();
+        if (feed.length < 4) return { error: 'not enough notes' };
+        const target = feed[Math.floor(feed.length / 2)];
+        const targetId = target.id ?? '';
+        if (!targetId) return { error: 'the middle note has no identity' };
+
+        const step = async (
+          run: () => void,
+          allowed: ReadonlyArray<string>
+        ): Promise<{ raw: string[]; painted: string[]; count: number }> => {
+          const raw0 = rawById();
+          const painted0 = paintedById();
+          run();
+          await new Promise((r) => setTimeout(r, 120));
+          return {
+            raw: strayed(raw0, rawById(), allowed),
+            painted: strayed(painted0, paintedById(), allowed),
+            count: Object.keys(rawById()).length
+          };
+        };
+
+        // (1) MOVE the middle note a little later. Nothing else may follow it.
+        const moved = await step(
+          () => this.applyRollEdit({ kind: 'move', noteId: targetId, deltaSec: 0.11, deltaSemitones: 0 }),
+          [targetId]
+        );
+
+        // (2) RESIZE it to something long enough to run over its own successor on the same row.
+        //     This is the case the renderer used to falsify: the note BEFORE an overlap was drawn
+        //     short, so a resize appeared to shorten a note nobody touched.
+        const sameRow = this.performanceFeed().filter((n) => n.midi === target.midi && n.id !== targetId);
+        // LONG ENOUGH TO REACH THE NEXT NOTE ON ITS OWN ROW, computed rather than assumed: the
+        // whole point of this step is the overlap the renderer used to hide, and a fixed 1.4s
+        // silently stopped short of it on any fixture whose next same-pitch attack is later.
+        const nextSameRow = sameRow
+          .filter((n) => n.startSec > target.startSec)
+          .sort((a, b) => a.startSec - b.startSec)[0];
+        const overlapDuration = nextSameRow
+          ? nextSameRow.endSec - target.startSec + 0.05
+          : Math.max(1.4, target.endSec - target.startSec + 1);
+        const resized = await step(
+          () => this.applyRollEdit({ kind: 'resize', noteId: targetId, newDurationSec: overlapDuration }),
+          [targetId]
+        );
+        // …and the rectangle really is as long as the note says, overlap or no overlap.
+        const rect = roll.paintedRects().find((r) => r.noteId === targetId) ?? null;
+        const fed = this.performanceFeed().find((n) => n.id === targetId) ?? null;
+
+        // (3) ADD a note. The one edit whose id did not exist when it was issued.
+        const idsBefore = new Set(Object.keys(rawById()));
+        const added = await step(
+          () =>
+            this.applyRollEdit({
+              kind: 'add',
+              midi: target.midi + 5,
+              startSec: Math.max(0, target.startSec - this.originSec(this.runtime.get().score!) + 0.3),
+              durationSec: 0.3
+            }),
+          [...idsBefore].length ? [] : []
+        );
+        const newIds = Object.keys(rawById()).filter((id) => !idsBefore.has(id));
+
+        return {
+          targetId,
+          move: { rawStrayed: moved.raw, paintedStrayed: moved.painted },
+          resize: {
+            rawStrayed: resized.raw,
+            paintedStrayed: resized.painted,
+            /** The overlap the old renderer would have hidden by shortening the earlier rect. */
+            sameRowNeighbours: sameRow.length,
+            overlapping: roll.paintedRects().filter((r) => r.overlapped).length
+          },
+          /** The whole of the literal-duration claim: painted length == fed length. */
+          painted: rect && fed ? { start: rect.startSec, end: rect.endSec } : null,
+          feedSpan: fed ? { start: r4(fed.startSec - this.originSec(this.runtime.get().score!)), end: r4(fed.endSec - this.originSec(this.runtime.get().score!)) } : null,
+          add: {
+            rawStrayed: added.raw.filter((id) => !newIds.includes(id)),
+            paintedStrayed: added.painted.filter((id) => !newIds.includes(id)),
+            newIds,
+            /** The authored-id contract: an added note is entered as user-touched. */
+            userTouched: newIds.every((id) => this.userTouchedIds.has(id))
+          }
+        };
+      } finally {
+        this.settings.set(settingsBefore);
+        this.runtime.set({ source: before });
+        this.resetHistories();
+        this.rebuildNotation({ keepEdits: false });
+      }
     };
 
     (window as unknown as Record<string, unknown>).__RIFFSHEET_SNAPFEED__ = () => {
@@ -5985,86 +5867,6 @@ class App {
       }
     };
 
-    /**
-     * H8 — the engine chip, for a server RIFFSHEET DID NOT START.
-     *
-     * THE REPORT: "I started a MuScriptor server myself and the chip never appeared." The poll
-     * used to re-arm only while the engine was up, so one negative answer at boot ended the
-     * watch for good; and the chip's label came from the player's engine SELECTION rather than
-     * from the status payload, so even when it did appear it could name the wrong engine.
-     *
-     * Both are driven here against a STUBBED `engineStatus`, because the browser mock's external
-     * server cannot be started again once stopped and neither half of this is about the mock.
-     * Phase one answers "nothing is running" and counts how many times the app asks anyway —
-     * a poll that died after a negative answer is asked exactly once. Phase two answers with a
-     * MuScriptor server the player has NOT selected, and reads the chip's own text back.
-     */
-    (window as unknown as Record<string, unknown>).__RIFFSHEET_ENGINEPOLL__ = async () => {
-      const realStatus = this.bridge.engineStatus;
-      const engineBefore = this.engine;
-      const chip = () => this.root.querySelector<HTMLElement>('[data-role="engine-chip"]');
-      const base = {
-        port: 0,
-        adopted: false,
-        model: 'stub',
-        installedModels: [],
-        busy: false,
-        queueLength: 0,
-        queuePosition: 0,
-        memoryMb: null
-      };
-      let asked = 0;
-      try {
-        // --- 1. NOTHING IS RUNNING, over and over -------------------------------------
-        this.bridge.engineStatus = (async () => {
-          asked += 1;
-          return { ...base, state: 'stopped', externalServer: false } as EngineStatus;
-        }) as typeof this.bridge.engineStatus;
-        this.pollEngine();
-        await new Promise((done) => setTimeout(done, ENGINE_IDLE_POLL_MS + 1500));
-        const askedWhileDown = asked;
-        const hiddenWhileDown = chip()?.style.display === 'none';
-
-        // --- 2. …AND THEN SOMEBODY ELSE'S SERVER APPEARS ------------------------------
-        // A MuScriptor the player has not chosen: `engineId` is whatever this run is set to,
-        // and the chip must name what is RUNNING rather than what is selected.
-        this.bridge.engineStatus = (async () => {
-          asked += 1;
-          return {
-            ...base,
-            state: 'ready',
-            port: 8223,
-            id: 'muscriptor',
-            externalServer: true,
-            canStopExternal: true,
-            memoryMb: 1300
-          } as EngineStatus;
-        }) as typeof this.bridge.engineStatus;
-        const appearedBy = Date.now();
-        // Not called directly — the WAIT is the claim. The timer armed by the negative answer
-        // above is the only thing that can notice this, which is the whole regression.
-        await new Promise((done) => setTimeout(done, ENGINE_IDLE_POLL_MS + 1500));
-        const box = chip();
-        return {
-          /** Asked more than once while the answer was "nothing running". The poll survived. */
-          askedWhileDown,
-          idlePollMs: ENGINE_IDLE_POLL_MS,
-          livePollMs: ENGINE_LIVE_POLL_MS,
-          hiddenWhileDown,
-          /** How long the chip took to notice a server nobody told the app about. */
-          noticedMs: Date.now() - appearedBy,
-          chipShown: !!box && box.style.display !== 'none',
-          chipText: box?.querySelector('[data-role="engine-text"]')?.textContent ?? null,
-          /** What the player has selected — deliberately NOT what the chip should be naming. */
-          selectedEngine: this.settings.get().engineId,
-          alive: this.engineProcessAlive()
-        };
-      } finally {
-        this.bridge.engineStatus = realStatus;
-        this.engine = engineBefore;
-        this.pollEngine();
-      }
-    };
 
     /**
      * H4 — "I set the fret count to 22 once and every project since starts at 22", driven end
@@ -6536,7 +6338,17 @@ class App {
           }
         });
         this.rebuildNotation({ keepEdits: true });
-        await new Promise((r) => setTimeout(r, 60));
+        /*
+         * LONG ENOUGH FOR THE PANE TO SETTLE, and that is a correctness requirement rather than
+         * politeness. Everything below is measured off the roll's PAINTED geometry — the x of a
+         * second, the y of an empty pitch row — and the ruler's height is part of that geometry:
+         * it is re-derived when the rebuilt score changes how many bar labels the strip carries.
+         * Measuring at 60 ms took the numbers from a frame whose ruler was 26 px and clicked them
+         * into one whose ruler was 45, which aimed the double-click a pitch row and a half above
+         * where it was computed — off the top of the window, where `layoutRects` culls it. The
+         * note was added exactly where the probe asked for it and no rectangle existed to find.
+         */
+        await new Promise((r) => setTimeout(r, 400));
 
         const score = this.runtime.get().score;
         if (!score) return { error: 'no score after the shift' };
@@ -6554,28 +6366,153 @@ class App {
         if (!Number.isFinite(pxPerSec) || pxPerSec === 0) return { error: 'degenerate ruler', appOrigin };
         const targetWrittenSec = Number(((a.startSec + b.startSec) / 2).toFixed(4));
         const targetX = a.x + (targetWrittenSec - a.startSec) * pxPerSec;
-        const emptyY = rollProbe.emptyRowY;
-        if (emptyY === null || emptyY === undefined) return { error: 'no empty pitch row', appOrigin };
+        /*
+         * THE TARGET ROW IS ONE THE FRAME IS ALREADY DRAWING ON — exactly as `targetX` is.
+         *
+         * `probe().emptyRowY` was used here and is the wrong instrument for this job. It is
+         * computed in PLOT coordinates and handed back in canvas ones, and the two differ by the
+         * ruler's height — a strip whose presence depends on the pane's height, which the caption
+         * row, the take-edit row and the tuner all move. Aim a double-click with a y measured
+         * against one ruler and delivered against another and it lands a row or two off; land it
+         * above the top of the pitch window and `layoutRects` culls the new rectangle, so the note
+         * is added exactly where the probe asked and there is nothing to find. That reads as "the
+         * add did nothing" and is a probe bug wearing an app bug's clothes.
+         *
+         * So the row is taken from a rectangle THAT IS ON SCREEN: its own painted y, in the same
+         * coordinates this probe hands to the browser, offset to its centre. Two things follow for
+         * free — the row is certainly drawn (it has a rectangle on it), and `roll.noteIdAt` can be
+         * asked whether the exact point is empty rather than assumed to be.
+         */
+        const rulerH = rollProbe.rulerHeight ?? 0;
+        const rowH = rollProbe.pxPerSemitone || 1;
+        // STRICTLY INSIDE the drawn range. `visibleHigh` is the highest row with ANY pixel on
+        // screen, so its own row can be mostly above the top edge — a note authored there is
+        // culled and the add appears to have done nothing.
+        const insideLow = rollProbe.visibleLowMidi + 1;
+        const insideHigh = rollProbe.visibleHighMidi - 1;
+        let emptyY: number | null = null;
+        let emptyMidi: number | null = null;
+        // Every candidate row the frame is drawing, from a rectangle's own y outward. The roll is
+        // asked what pitch each y IS (`midiAtCanvasY`) and whether anything is there
+        // (`noteIdAt`), so neither the ruler's height nor the rounding is guessed at.
+        const candidates: number[] = [];
+        for (const r of rects) candidates.push(r.y + r.h / 2);
+        for (let k = 1; k <= 24; k++) candidates.push(rects[0].y + k * rowH, rects[0].y - k * rowH);
+        for (const y of candidates) {
+          const midi = roll.midiAtCanvasY(y);
+          if (midi < insideLow || midi > insideHigh) continue;
+          if (roll.noteIdAt(targetX, y - rulerH) !== null) continue;
+          emptyY = y;
+          emptyMidi = midi;
+          break;
+        }
+        if (emptyY === null) return { error: 'no empty point on any drawn row', appOrigin };
 
         const canvas = this.root.querySelector<HTMLCanvasElement>('canvas.pianoroll');
         if (!canvas) return { error: 'no roll canvas', appOrigin };
-        const box = canvas.getBoundingClientRect();
         const idsBefore = new Set(rects.map((r) => r.noteId));
         // LOGICAL -> VISUAL on the way out (G1). `targetX` and `emptyY` come from the roll's own
         // painted geometry, which is in the design's pixels; a `MouseEvent`'s client coordinates
         // are visual ones and are converted back by `canvasPoint()` on the way in. Adding the two
         // without scaling aimed this probe at the wrong beat at every face scale below 1.
-        canvas.dispatchEvent(
-          new MouseEvent('dblclick', {
-            bubbles: true,
-            clientX: box.left + toVisual(targetX),
-            clientY: box.top + toVisual(emptyY)
-          })
-        );
-        await new Promise((r) => setTimeout(r, 120));
+        /*
+         * THE CANVAS'S BOX IS READ AT DISPATCH TIME, NOT ONCE UP FRONT.
+         *
+         * It was hoisted, and that is a stale measurement: `clientX/clientY` are VIEWPORT
+         * coordinates, so they are only equivalent to the canvas-relative point they were computed
+         * from for as long as the canvas has not moved. Anything that changes the height of a row
+         * above the roll — and the seek this probe now performs is followed by a transport update
+         * that touches several of them — slides the pane, and the click then lands that many
+         * pixels off. Vertically that walked the double-click off the top of the pitch window,
+         * where `layoutRects` culls the note it authored; horizontally nothing moves, which is why
+         * the x looked perfect while the pitch was three rows out.
+         *
+         * The canvas-RELATIVE point is stable, so re-reading the box each time is the whole fix.
+         */
+        const clientPoint = () => {
+          const box = canvas.getBoundingClientRect();
+          return { clientX: box.left + toVisual(targetX), clientY: box.top + toVisual(emptyY) };
+        };
 
-        const added = roll.paintedRects().find((r) => r.noteId !== null && !idsBefore.has(r.noteId));
+        /*
+         * THE WHOLE EVENT SEQUENCE, NOT THE LAST EVENT OF IT (roll-purity critique §B).
+         *
+         * The old probe dispatched a lone synthetic `dblclick`, which is not what a hand
+         * produces and is exactly the shape that CANNOT see the reported bug: the browser
+         * delivers `pointerdown`/`pointerup`/`click` for the first press, and again for the
+         * second, before `dblclick` — and it was the FIRST `pointerdown` that seeked, which
+         * recentred the coupled viewport, which moved the ruler `dblclick` then measured
+         * against. A probe that skips the first two clicks never seeks, so it never moved the
+         * ruler, so it passed against a broken app.
+         *
+         * REAL TIMING TOO. The two presses are separated by an awaited gap, so the seek's
+         * viewport work, its `sheetScroll` and any transport subscriber all get their turn on
+         * the event loop before the second press is measured — which is the interleaving the
+         * hand produces and the synthetic event skipped.
+         */
+        const at = (type: string, detail: number) => {
+          const { clientX, clientY } = clientPoint();
+          return canvas.dispatchEvent(
+            type.startsWith('pointer')
+              ? new PointerEvent(type, { bubbles: true, cancelable: true, clientX, clientY, pointerId: 1, button: 0, buttons: type === 'pointerdown' ? 1 : 0 })
+              : new MouseEvent(type, { bubbles: true, cancelable: true, clientX, clientY, detail })
+          );
+        };
+        const press = async (detail: number) => {
+          at('pointerdown', detail);
+          await new Promise((r) => setTimeout(r, 12));
+          at('pointerup', detail);
+          at('click', detail);
+          await new Promise((r) => setTimeout(r, 12));
+        };
+
+        // WHERE THE PAGE AND THE PITCH WINDOW WERE, read either side of the FIRST press. These
+        // two numbers ARE the regression: a seek may move the playhead and nothing else.
+        const viewBefore = this.viewport ? Number(this.viewport.fromSec.toFixed(4)) : null;
+        const posBefore = Number(this.transport.state.positionSec.toFixed(4));
+        await press(1);
+        const afterFirst = roll.probe();
+        const viewAfterFirst = this.viewport ? Number(this.viewport.fromSec.toFixed(4)) : null;
+        const posAfterFirst = Number(this.transport.state.positionSec.toFixed(4));
+        await press(2);
+        at('dblclick', 2);
+
+        /*
+         * WAIT FOR THE REBUILD, DO NOT GUESS AT IT.
+         *
+         * A flat `setTimeout(120)` stood here and was a latent flake: the add is drawn
+         * PROVISIONALLY the instant the gesture fires (`layoutRects §add`, with `noteId: null`, so
+         * it is deliberately not selectable and deliberately not reported here), and the real
+         * rectangle only arrives when the pipeline has re-engraved. 120 ms was enough while the
+         * probe dispatched one synthetic event and is not enough now that it drives the whole press
+         * sequence — the seek's own work lands in the same event loop. Polling for the ANSWER
+         * rather than for a duration makes the check about the app instead of about the machine
+         * it is running on.
+         */
+        let added: ReturnType<typeof roll.paintedRects>[number] | undefined;
+        for (let i = 0; i < 60; i++) {
+          await new Promise((r) => setTimeout(r, 50));
+          added = roll.paintedRects().find((r) => r.noteId !== null && !idsBefore.has(r.noteId));
+          if (added) break;
+        }
+        /** Why, when there is no rectangle — so a failure names the layer rather than the symptom. */
+        const rawAdded = (this.runtime.get().source?.detected?.notes ?? []).filter(
+          (n) => n.id !== undefined && !idsBefore.has(n.id) && (n.id ?? '').startsWith('add')
+        );
+        const lastFrame = roll.probe();
         return {
+          why: added
+            ? null
+            : {
+                inTheRecording: rawAdded.map((n) => ({ id: n.id, midi: n.midi, startSec: Number(n.startSec.toFixed(3)) })),
+                pendingStill: lastFrame.pendingEdit,
+                drawnRects: lastFrame.drawnRects,
+                visibleMidi: [lastFrame.visibleLowMidi, lastFrame.visibleHighMidi],
+                aimedAtY: emptyY,
+                aimedAtMidi: emptyMidi,
+                rulerH,
+                feedCount: this.performanceFeed().length
+              },
           appOrigin: Number(appOrigin.toFixed(4)),
           rollOrigin: Number((rollProbe.originSec ?? 0).toFixed(4)),
           silenceSec,
@@ -6588,7 +6525,28 @@ class App {
           /** The whole claim, in pixels: a note has to appear where the pointer was. */
           errorPx: added ? Number(Math.abs(added.x - targetX).toFixed(2)) : null,
           /** …and the same error in seconds, which is what the origin bug was measured in. */
-          errorSec: added ? Number(Math.abs(added.startSec - targetWrittenSec).toFixed(4)) : null
+          errorSec: added ? Number(Math.abs(added.startSec - targetWrittenSec).toFixed(4)) : null,
+          /*
+           * THE FIRST-CLICK CLAIM, in three numbers read after the first press and before the
+           * second: the transport moved, the shared window did not, and the pitch window did not.
+           */
+          firstClick: {
+            /** It DID seek — otherwise the two "did not move" claims below are vacuous. */
+            transportMovedSec: Number(Math.abs(posAfterFirst - posBefore).toFixed(4)),
+            positionSecBefore: posBefore,
+            positionSecAfter: posAfterFirst,
+            viewFromSecBefore: viewBefore,
+            viewFromSecAfter: viewAfterFirst,
+            viewMovedSec:
+              viewBefore !== null && viewAfterFirst !== null
+                ? Number(Math.abs(viewAfterFirst - viewBefore).toFixed(4))
+                : null,
+            scrollTopMidiBefore: rollProbe.scrollTopMidi,
+            scrollTopMidiAfter: afterFirst.scrollTopMidi,
+            pitchMovedSemitones: Number(
+              Math.abs((afterFirst.scrollTopMidi ?? 0) - (rollProbe.scrollTopMidi ?? 0)).toFixed(3)
+            )
+          }
         };
       } finally {
         restore();
@@ -8964,7 +8922,7 @@ class App {
    * `runtime.source` rather than `editedSource()`: parts are a property of the DOCUMENT, not of
    * the cut-down view of the recording, and `editedSource` derives itself from this object.
    */
-  private setParts(imported: ImportedPart[], order: string[]): void {
+  private setParts(imported: ImportedPart[], order: string[], options?: { quiet?: boolean }): void {
     const source = this.runtime.get().source;
     if (!source) return;
     this.runtime.set({
@@ -8977,7 +8935,10 @@ class App {
     // Nothing about the PERFORMANCE changed, so the player's notation edits are still about the
     // notes they were made on: `keepEdits` defaults true and the ids are the same ids.
     this.rebuildNotation();
-    this.renderMain();
+    // `quiet` skips the screen rebuild — see `updatePart`. The engraving still changes, because
+    // `rebuildNotation` above is what draws it; what is skipped is replacing the control the
+    // player's hand is on.
+    if (!options?.quiet) this.renderMain();
     this.saveNow();
   }
 
@@ -9272,8 +9233,17 @@ class App {
     return applyRippleOps(notes, ops, {
       map,
       divisions: score.ir.divisions || 12,
-      splitId: (opId, noteId) => `rip:${opId}:${noteId}`
+      splitId: (opId, noteId) => `rip:${opId}:${noteId}`,
+      // THE HAND-PLACED NOTES, pinned where the player left them. See `edit/ripple.ts
+      // §RollPlacement`: without this a roll resize of a rippled note is overruled by the log's
+      // own `chordEndTick` on the very next derivation and the rectangle snaps back.
+      ...(this.rollPlacements() ? { placements: this.rollPlacements()! } : {})
     });
+  }
+
+  /** The canonical overrides this document is carrying. Absent until a roll edit lands on a log. */
+  private rollPlacements(): RollPlacements | undefined {
+    return this.runtime.get().source?.rollPlacements;
   }
 
   /**
@@ -10372,7 +10342,26 @@ class App {
    */
   private projectStaffVisibility(score: RiffScore): void {
     if (this.settings.get().showStaff) return;
-    for (const track of score.data.tracks) {
+    /*
+     * THE LIVE TRACK ONLY (per-part TAB, critique §D).
+     *
+     * `showStaff` is an `AppSettings` key and `AppSettings` is the LIVE take's settings. This used
+     * to run over every track in the score, which was harmless only for as long as an imported
+     * part could not have a tablature staff: the `withTab.length === 0` guard skipped them all.
+     * Now that a part can bring its own fretboard, hiding the take's notation would strip the
+     * notation off somebody else's chart as well — a setting on one part silently editing another.
+     *
+     * A single-part score has no `parts` sidecar, and `LIVE_PART_ID` then matches nothing, so the
+     * fallback is the whole list exactly as before: on the one-part path this function is
+     * unchanged, line for line.
+     */
+    const parts = scoreParts(score);
+    const liveIndex = parts.find((part) => part.key === LIVE_PART_ID)?.trackIndex;
+    const tracks =
+      liveIndex === undefined
+        ? score.data.tracks
+        : score.data.tracks.filter((_, index) => index === liveIndex);
+    for (const track of tracks) {
       const withTab = track.staves.filter((staff) => staff.showTablature);
       if (withTab.length === 0) continue;
       for (const staff of withTab) {
@@ -10959,9 +10948,38 @@ class App {
     const select = this.root.querySelector<HTMLSelectElement>('[data-role="part-view"]');
     if (!select) return;
     replace(select, ...this.partMenuGroups());
+    this.refreshTabScope();
     // The name in the box just changed, and the box is only as wide as the name it shows.
     // See `fitTopBars`.
     this.fitTopBars();
+  }
+
+  /**
+   * THE TAB SUBGROUP FOLLOWS THE SELECTION (per-part TAB, critique §D).
+   *
+   * THE BUG THIS FIXES, caught in a rendered screenshot rather than in a check. `buildNotationToolbar`
+   * resolves the active part ONCE and closes over it: `profile` is what the controls show and
+   * `setTab` is where they write. `syncPartSelect` used to replace the OPTIONS of the part box and
+   * nothing else — deliberately, because `renderMain()` is a wholesale screen replace and would
+   * detach the control the hand is still on — so after choosing an imported part every control to
+   * the right of the box was still holding the LIVE take's closure. Selecting the imported guitar
+   * and choosing Tab: Guitar retuned the BASS BEING RECORDED, and the Tab box then redrew itself
+   * reading "Off" because the imported part's own profile had never been written.
+   *
+   * So the two groups that are ABOUT the active part are rebuilt in place, from the same builder,
+   * with fresh closures. The left-hand group — which contains the part box itself — is deliberately
+   * untouched: it is the control the player just used, and replacing it is the exact fault G10 is
+   * about. Nothing is re-engraved: this is a swap of two DOM subtrees, not a rebuild of the score.
+   */
+  private refreshTabScope(): void {
+    const bar = this.root.querySelector<HTMLElement>('[data-role="notation-toolbar"]');
+    if (!bar) return;
+    const fresh = this.buildNotationToolbar();
+    for (const role of ['toolbar-middle', 'toolbar-right']) {
+      const now = bar.querySelector<HTMLElement>(`[data-role="${role}"]`);
+      const next = fresh.querySelector<HTMLElement>(`[data-role="${role}"]`);
+      if (now && next) now.replaceWith(next);
+    }
   }
 
   private onPartControlChange(select: HTMLSelectElement): void {
@@ -11267,12 +11285,21 @@ class App {
     this.partLabelEdit = null;
   }
 
-  private updatePart(id: string, change: (part: ImportedPart) => ImportedPart): void {
+  /**
+   * @param options.quiet re-engrave and save WITHOUT rebuilding the screen. For the number boxes
+   *   on the notation bar, which are destroyed under the hand by a `renderMain()` — the same
+   *   argument as `stepNumber` (G10), now that those boxes can be about an imported part.
+   */
+  private updatePart(
+    id: string,
+    change: (part: ImportedPart) => ImportedPart,
+    options?: { quiet?: boolean }
+  ): void {
     const slots = this.partSlots();
     const imported = slots.flatMap((slot) =>
       slot.kind === 'imported' ? [slot.part.id === id ? change(slot.part) : slot.part] : []
     );
-    this.setParts(imported, partOrderOf(slots));
+    this.setParts(imported, partOrderOf(slots), options);
   }
 
   /**
@@ -11392,11 +11419,16 @@ class App {
     // this part's engraved note ids are namespaced with (`score/parts.ts §canonical`).
     let n = 1;
     while (existing.some((part) => part.id === `imp${n}`)) n++;
+    // THE FILE'S OWN FRETBOARD, PRESERVED (critique §D). `parseScoreFile` has always reported the
+    // source staff's tuning, its capo and whether the file drew a tablature staff, and this
+    // constructor threw all three away — so a drop-D chart arrived tuned like the take beside it.
+    const staff = track?.staves?.find((s) => s.tuningLowToHigh?.length >= 2) ?? track?.staves?.[0];
     const part: ImportedPart = {
       id: `imp${n}`,
       name: importedPartName(track?.name, fileName),
       nudgeMs: 0,
-      notes
+      notes,
+      tab: importedPartTabProfile(this.settings.get(), staff ?? null)
     };
     this.activePartKey = part.id;
     // No notice. The chip appearing beside the take's, and the staff appearing on the page, is
@@ -11404,21 +11436,108 @@ class App {
     this.setParts([...existing, part], [...partOrderOf(slots), part.id]);
   }
 
+  /**
+   * ===========================================================================================
+   * THE TWO SURFACES DO TWO DIFFERENT THINGS, AND THE PAGE SAYS SO (critique §C)
+   * ===========================================================================================
+   *
+   * WHAT IT IS FOR. A duration edit on the sheet is a STRUCTURAL splice: the note's written value
+   * changes and the whole rest of the score moves to make room (`edit/ripple.ts`). A duration edit
+   * on the roll is LOCAL: the rectangle the player grabbed gets longer and nothing else moves. Both
+   * are correct, both are wanted, and until this line existed the only way to find out which one
+   * you had asked for was to make the edit and look at what happened to bar 12.
+   *
+   * WHERE IT SITS, AND WHY NOT ANYWHERE ELSE. A fixed-height SIBLING below `.triview`, never inside
+   * it. `.triview` is alphaTab's scroll container — anything parented into it scrolls away with the
+   * music, and appears in the middle of the page rather than under it. An absolutely-positioned
+   * overlay was the other candidate and is worse: it would cover the bottom system of the notation
+   * and would make the sheet's own height a lie, so the engraver would lay out music into a band
+   * the player cannot read.
+   *
+   * ONE LINE, FIXED HEIGHT, NO ELLIPSIS. It is prose on a surface whose whole law is that nothing
+   * is ever cut short (`ui/styles.css §notation-toolbar`), and half a sentence about what an edit
+   * does is worse than no sentence. It takes the face scale like every other piece of chrome, so
+   * it is the same size relative to the page at every window width.
+   *
+   * `role="note"` rather than a heading or a status: it is a standing remark about the two
+   * surfaces, not an announcement, so a screen reader must not interrupt for it.
+   */
+  private buildEditSemanticsCaption(): HTMLElement {
+    return el('p', {
+      class: 'edit-semantics',
+      'data-role': 'edit-semantics',
+      role: 'note',
+      text: 'Sheet edits push and pull the music. Piano-roll edits change only the note you touch.'
+    });
+  }
+
   /** Controls that change the written page live with the written page, not in the app header. */
   private buildNotationToolbar(): HTMLElement {
     const s = this.settings.get();
     const source = this.runtime.get().source;
-    const tabOn = s.tabMode !== 'off';
+    /**
+     * THE TAB GROUP IS ABOUT THE ACTIVE PART, AND ONLY THE ACTIVE PART (per-part TAB, §D).
+     *
+     * The Part box already names whose page the bar is about; until now everything to the right of
+     * it lied about that, because every control wrote `AppSettings` — which is the LIVE take's
+     * settings and nobody else's. Selecting an imported guitar and changing the tuning retuned the
+     * bass being recorded.
+     *
+     * So the fretboard half of the bar reads and writes ONE profile, chosen by the selection:
+     * `AppSettings` when the live take is active, the part's own `PartTabProfile` when an import
+     * is. The words, the widgets and the values are identical either way — a part is the active
+     * one or it is not, and the controls do not change shape.
+     */
+    const activeSlot = this.partSlots().find(
+      (slot): slot is Extract<PartSlot, { kind: 'imported' }> =>
+        slot.kind === 'imported' && slot.part.id === this.activePartKey
+    );
+    const profile: PartTabProfile = activeSlot
+      ? (activeSlot.part.tab ?? defaultPartTabProfile(s))
+      : {
+          tabMode: s.tabMode,
+          tuningId: s.tuningId,
+          customTuningMidi: s.customTuningMidi,
+          capo: s.capo,
+          maxFret: s.maxFret,
+          fingering: s.fingering,
+          anchorFret: s.anchorFret
+        };
+    /** The ACTIVE part's tab, which is what the fretboard controls are about. */
+    const tabOn = profile.tabMode !== 'off';
+    /**
+     * …and the LIVE take's, which is what the Clef: Off guard is about. The two were one variable
+     * and are two questions: "would hiding the notation staff leave a blank page?" is asked of the
+     * take, whose staff that Off would hide, whatever part the Part box happens to be naming.
+     */
+    const liveTabOn = s.tabMode !== 'off';
     // `freeGridUsable` stood here — "every note carries source ticks, so this is a symbolic
     // import and 'free' is safe" — and it gated the Quantize menu's Free option. It is gone with
     // the gate: Free is offered for every take now and is the default. See the <select> below
     // for the re-measurement that retired it.
-    const presets = TUNING_PRESETS.filter((preset) => preset.instrument === s.tabMode);
+    const presets = TUNING_PRESETS.filter((preset) => preset.instrument === profile.tabMode);
 
     const rebuild = (patch: Partial<AppSettings>) => {
       this.settings.set({ ...patch, instrument: 'auto' });
       this.rebuildNotation({ keepEdits: true });
       this.renderMain();
+    };
+
+    /**
+     * ONE WRITER FOR THE FRETBOARD, WHICHEVER PART IT BELONGS TO.
+     *
+     * The live road is `rebuild()` unchanged — `AppSettings` keys, same names, same effect. The
+     * imported road goes through `updatePart()`, which re-engraves and saves like every other part
+     * change. Neither road can be taken by accident: the scope is decided once, above, from the
+     * same selection the Part box is showing.
+     */
+    const setTab = (patch: Partial<PartTabProfile>) => {
+      if (!activeSlot) {
+        rebuild(patch as Partial<AppSettings>);
+        return;
+      }
+      const id = activeSlot.part.id;
+      this.updatePart(id, (part) => ({ ...part, tab: { ...(part.tab ?? defaultPartTabProfile(s)), ...patch } }));
     };
 
     /**
@@ -11449,16 +11568,73 @@ class App {
      * The clamped value is written back to the box because there is no re-render to do it: a
      * player who types 40 into a 0–12 field must see the 12 that was actually applied.
      */
-    const stepNumber = (input: HTMLInputElement, value: number, patch: Partial<AppSettings>) => {
+    /**
+     * …AND IT IS ONE FUNCTION FOR EITHER SCOPE (per-part TAB). `stepNumber`, which wrote
+     * `AppSettings` directly, is gone: every number box on this bar is now about the ACTIVE part,
+     * so there is one writer and no way for the two roads to drift.
+     *
+     * `setTab` cannot be used for these: its imported road goes through `updatePart`, which ends in
+     * `renderMain()` — the wholesale screen replace this whole note is about. `{ quiet: true }`
+     * re-engraves and saves without rebuilding the bar, so Capo and Around-fret behave identically
+     * on an imported part and on the take.
+     */
+    const stepPartNumber = (input: HTMLInputElement, value: number, patch: Partial<PartTabProfile>) => {
       input.value = String(value);
-      this.settings.set({ ...patch, instrument: 'auto' });
-      this.rebuildNotation({ keepEdits: true });
+      if (!activeSlot) {
+        this.settings.set({ ...(patch as Partial<AppSettings>), instrument: 'auto' });
+        this.rebuildNotation({ keepEdits: true });
+        return;
+      }
+      this.updatePart(
+        activeSlot.part.id,
+        (part) => ({ ...part, tab: { ...(part.tab ?? defaultPartTabProfile(s)), ...patch } }),
+        { quiet: true }
+      );
     };
 
     return el(
       'div',
       { class: 'notation-toolbar', 'data-role': 'notation-toolbar' },
-      el('span', { class: 'toolbar-label', text: 'Notation' }),
+      /*
+       * ===========================================================================================
+       * THREE SEMANTIC GROUPS, NOT ONE HOLE (toolbar critique §E)
+       * ===========================================================================================
+       *
+       * WHAT STOOD HERE, and it was deliberate code rather than an oversight — the old note is
+       * quoted so the change is a decision and not a regression:
+       *
+       *   "THE ROW SPLITS HERE, AND THE SPLIT IS WHAT JUSTIFIES IT (G1). … everything about the
+       *    STAFF … stays left, and everything about the TAB … goes right, with the window's spare
+       *    width between them, which reads as a designed row rather than as a row that ran out of
+       *    things to say."
+       *
+       * The law it serves (a row is justified edge to edge) is unchanged. Its EXECUTION was one
+       * `flex: 1 1 auto` spacer, which puts the entire surplus in a single place — and at the
+       * widths people actually work at that place is a canyon between Quantize and Tab. Worse, the
+       * two controls it drove apart are the two that belong together: Quantize is the coarseness
+       * of the page and Tab is which instrument that page is for, and the warning that says
+       * "1/4 would merge 12 notes" was left stranded on the far side of the gap from the menu it is
+       * about.
+       *
+       * THREE GROUPS INSTEAD, distributed rather than one hole:
+       *
+       *   LEFT    Notation · Part · Clef · Key      — whose page this is, and how it is spelled
+       *   MIDDLE  Quantize · its warning · Tab      — how much the page rounds, and for what
+       *   RIGHT   frets · fingering · tuning · capo — the fretboard details, and the bar counter
+       *
+       * NOT `space-between` OVER THE RAW CONTROLS, which the critique rules out by name: half of
+       * them are conditional (the anchor box only exists for "Around fret", the tuning box swaps
+       * for a text field on Custom, the warning comes and goes with the grid) and the row would
+       * grow a new arbitrary hole every time one appeared. Distributing three STABLE groups gives
+       * the row the same number of joints at every state it can be in.
+       *
+       * Surplus still goes to the gaps and never to a control, which is the half of G1 that is
+       * about the uniform scale: no box is ever stretched to fill a row.
+       */
+      el(
+        'div',
+        { class: 'toolbar-group', 'data-role': 'toolbar-left' },
+        el('span', { class: 'toolbar-label', text: 'Notation' }),
       // THE PARTS, and they are the first control on the bar because they say WHOSE page the
       // rest of it is about. Only where there is a document to have parts — see
       // `buildPartControl` for the row this replaced.
@@ -11524,8 +11700,10 @@ class App {
             value: 'staff:off',
             text: 'Clef: Off',
             selected: !s.showStaff,
-            disabled: !tabOn,
-            title: tabOn ? undefined : STAFF_OFF_REASON
+            // THE LIVE TAKE'S TAB, not the active part's — this Off hides the take's notation
+            // staff, so the question "would that leave a blank page?" is about the take.
+            disabled: !liveTabOn,
+            title: liveTabOn ? undefined : STAFF_OFF_REASON
           })
         ),
         el(
@@ -11563,7 +11741,12 @@ class App {
           ...KEY_OPTIONS.map(([fifths, label]) =>
             el('option', { value: String(fifths), text: `Key: ${label}`, selected: source.keyFifths === fifths })
           )
-        ),
+        )
+      ),
+      // ---- MIDDLE: how much the page rounds, and which instrument it is for -------------------
+      el(
+        'div',
+        { class: 'toolbar-group', 'data-role': 'toolbar-middle' },
       // QUANTIZE. It is the quantizer's brief: how much the sheet rounds what was played. The
       // menu used to be called "Notation", which named the bar it sits on rather than the thing
       // it does, and "Notation: 1/8" reads as a fact about the page instead of an instruction
@@ -11611,26 +11794,10 @@ class App {
             el('option', { value, text: `Quantize: ${GRID_LABELS[value]}`, selected: s.grid === value })
           )
       ),
+      // …AND ITS WARNING, which now sits beside the menu it is about instead of on the far side
+      // of the row's one hole. The spacer that used to stand here is gone — see the group note
+      // at the top of this function for why, and what replaced it.
       this.coarseGridWarning(),
-      /*
-       * THE ROW SPLITS HERE, AND THE SPLIT IS WHAT JUSTIFIES IT (G1).
-       *
-       * The law says every row of chrome is justified edge to edge at every scale, and this bar
-       * had nothing holding its right-hand end: the controls packed left and the surplus width
-       * sat in a dead strip beside the Capo box, at every window size above the one where the
-       * old ladder started squeezing. The redistribution the law licenses ("controls may be
-       * redistributed between rows for balance") is the one the subject matter already suggests:
-       * everything about the STAFF — part, clef, key, quantize and the coarse-grid warning that
-       * belongs to it — stays left, and everything about the TAB — instrument, fret count,
-       * fingering anchor, tuning, capo — goes right, with the blank score's bar counter after it.
-       * Two named groups with the window's spare width between them, which reads as a designed
-       * row rather than as a row that ran out of things to say.
-       *
-       * It is a GAP and not a stretched control: one uniform scale cannot fill two dimensions at
-       * an arbitrary aspect ratio, so surplus goes to gaps and panes and every control keeps the
-       * size it was designed at. See `ui/styles.css §body` for the law itself.
-       */
-      el('div', { class: 'spacer' }),
       // THE TAB MENU — one dropdown, three sections.
       //
       // Everything about the tablature that is a CHOICE now lives here: which instrument it is
@@ -11658,39 +11825,46 @@ class App {
           onChange: (e: Event) => {
             const raw = (e.target as HTMLSelectElement).value;
             if (raw.startsWith('fingering:')) {
-              rebuild({ fingering: raw.slice(10) as AppSettings['fingering'] });
+              setTab({ fingering: raw.slice(10) as AppSettings['fingering'] });
               return;
             }
             if (raw.startsWith('maxFret:')) {
-              rebuild({ maxFret: Number(raw.slice(8)) });
+              setTab({ maxFret: Number(raw.slice(8)) });
               return;
             }
             const tabMode = raw as AppSettings['tabMode'];
-            const current = TUNING_PRESETS.find((preset) => preset.id === s.tuningId);
+            const current = TUNING_PRESETS.find((preset) => preset.id === profile.tuningId);
             const tuningId =
               tabMode === 'bass' || tabMode === 'guitar'
                 ? current?.instrument === tabMode
                   ? current.id
-                  : (TUNING_PRESETS.find((preset) => preset.instrument === tabMode)?.id ?? s.tuningId)
-                : s.tuningId;
-            rebuild({ tabMode, tuningId });
+                  : (TUNING_PRESETS.find((preset) => preset.instrument === tabMode)?.id ?? profile.tuningId)
+                : profile.tuningId;
+            setTab({ tabMode, tuningId });
           }
         },
         el(
           'optgroup',
           { label: 'Instrument' },
-          // The mirror of the Clef menu's guard (G2): with the notation staff already hidden,
-          // switching the tab off would leave a blank page. Disabled, with the reason on it.
+          /*
+           * The mirror of the Clef menu's guard (G2): with the notation staff already hidden,
+           * switching the tab off would leave a blank page.
+           *
+           * FOR THE LIVE TAKE ONLY, and that is the per-part rule the critique settles (§D): the
+           * "one staff must remain" question is asked per part, and an imported part's notation
+           * cannot be hidden at all — there is no control for it — so its Tab Off is always safe
+           * and must never be greyed out by a setting that belongs to the take.
+           */
           el('option', {
             value: 'off',
             text: 'Tab: Off',
-            selected: s.tabMode === 'off',
-            disabled: !s.showStaff,
-            title: s.showStaff ? undefined : STAFF_OFF_REASON
+            selected: profile.tabMode === 'off',
+            disabled: !activeSlot && !s.showStaff,
+            title: activeSlot || s.showStaff ? undefined : STAFF_OFF_REASON
           }),
-          el('option', { value: 'bass', text: 'Tab: Bass', selected: s.tabMode === 'bass' }),
-          el('option', { value: 'guitar', text: 'Tab: Guitar', selected: s.tabMode === 'guitar' }),
-          el('option', { value: 'custom', text: 'Tab: Custom', selected: s.tabMode === 'custom' })
+          el('option', { value: 'bass', text: 'Tab: Bass', selected: profile.tabMode === 'bass' }),
+          el('option', { value: 'guitar', text: 'Tab: Guitar', selected: profile.tabMode === 'guitar' }),
+          el('option', { value: 'custom', text: 'Tab: Custom', selected: profile.tabMode === 'custom' })
         ),
         tabOn &&
           el(
@@ -11699,11 +11873,16 @@ class App {
             ...FINGERING_STYLES.map((style) =>
               el('option', {
                 value: `fingering:${style}`,
-                text: `${s.fingering === style ? '✓ ' : '   '}${FINGERING_LABELS[style]}`
+                text: `${profile.fingering === style ? '✓ ' : '   '}${FINGERING_LABELS[style]}`
               })
             )
           ),
       ),
+      ),
+      // ---- RIGHT: the fretboard's details, for whichever part the box above is naming ---------
+      el(
+        'div',
+        { class: 'toolbar-group', 'data-role': 'toolbar-right' },
       // FRET COUNT — the third section of the same subject, kept as its own control because it
       // is a NUMBER and a tick beside "24 frets" in a menu is a worse way to read a number than
       // a box showing 24. It moved here from the settings panel, where it was two panels away
@@ -11716,15 +11895,15 @@ class App {
             'data-role': 'max-fret',
             'data-setting': 'maxFret',
             title: t(TIPS.maxFret),
-            onChange: (e: Event) => rebuild({ maxFret: Number((e.target as HTMLSelectElement).value) })
+            onChange: (e: Event) => setTab({ maxFret: Number((e.target as HTMLSelectElement).value) })
           },
-          ...fretCountOptions(s.maxFret).map((fret) =>
-            el('option', { value: String(fret), text: `${fret} frets`, selected: fret === s.maxFret })
+          ...fretCountOptions(profile.maxFret).map((fret) =>
+            el('option', { value: String(fret), text: `${fret} frets`, selected: fret === profile.maxFret })
           )
         ),
       // The anchor for "Around fret N", and only then — every other style ignores it, and a
       // number box that changes nothing is the kind of control this whole pass is removing.
-      tabOn && s.fingering === 'around-fret' &&
+      tabOn && profile.fingering === 'around-fret' &&
         el('label', { class: 'string-count', title: t(TIPS.fingering) },
           el('span', { class: 'dim', text: 'Around fret' }),
           el('input', {
@@ -11734,15 +11913,15 @@ class App {
             'data-role': 'anchor-fret',
             'data-setting': 'anchorFret',
             'aria-label': 'Anchor fret',
-            value: String(s.anchorFret),
+            value: String(profile.anchorFret),
             onChange: (e: Event) => {
               const box = e.target as HTMLInputElement;
               const anchorFret = Math.max(0, Math.min(24, Math.round(Number(box.value)) || 0));
-              stepNumber(box, anchorFret, { anchorFret });
+              stepPartNumber(box, anchorFret, { anchorFret });
             }
           })
         ),
-      tabOn && s.tabMode !== 'custom' &&
+      tabOn && profile.tabMode !== 'custom' &&
         el(
           'select',
           {
@@ -11750,16 +11929,16 @@ class App {
             'data-role': 'tab-tuning',
             'data-setting': 'tuningId',
             title: t(TIPS.tuning),
-            onChange: (e: Event) => rebuild({ tuningId: (e.target as HTMLSelectElement).value })
+            onChange: (e: Event) => setTab({ tuningId: (e.target as HTMLSelectElement).value })
           },
           ...presets.map((preset) =>
-            el('option', { value: preset.id, text: preset.name, selected: preset.id === s.tuningId })
+            el('option', { value: preset.id, text: preset.name, selected: preset.id === profile.tuningId })
           )
         ),
-      tabOn && s.tabMode === 'custom' &&
+      tabOn && profile.tabMode === 'custom' &&
         el('input', {
           class: 'custom-tuning',
-          value: tuningLabel(s.customTuningMidi),
+          value: tuningLabel(profile.customTuningMidi),
           spellcheck: 'false',
           'data-role': 'custom-tuning',
           'data-setting': 'customTuningMidi',
@@ -11769,13 +11948,13 @@ class App {
             const notes = parseTuning((e.target as HTMLInputElement).value);
             if (!notes) {
               this.toast('danger', 'Tuning not changed', 'Use pitch names with octaves, from low to high: B0 E1 A1 D2 G2.');
-              (e.target as HTMLInputElement).value = tuningLabel(s.customTuningMidi);
+              (e.target as HTMLInputElement).value = tuningLabel(profile.customTuningMidi);
               return;
             }
-            rebuild({ customTuningMidi: notes });
+            setTab({ customTuningMidi: notes });
           }
         }),
-      tabOn && s.tabMode === 'custom' &&
+      tabOn && profile.tabMode === 'custom' &&
         el('label', { class: 'string-count' },
           el('span', { class: 'dim', text: 'Strings' }),
           el('input', {
@@ -11783,11 +11962,11 @@ class App {
             min: '2',
             max: '12',
             'data-role': 'string-count',
-            value: String(s.customTuningMidi.length),
+            value: String(profile.customTuningMidi.length),
             onChange: (e: Event) => {
               const box = e.target as HTMLInputElement;
-              const customTuningMidi = resizeTuning(this.settings.get().customTuningMidi, Number(box.value));
-              stepNumber(box, customTuningMidi.length, { customTuningMidi });
+              const customTuningMidi = resizeTuning(profile.customTuningMidi, Number(box.value));
+              stepPartNumber(box, customTuningMidi.length, { customTuningMidi });
               // The one control on this bar whose text follows this number. Written in place
               // rather than by re-rendering, for the reason in `stepNumber` above.
               const tuningBox = this.root.querySelector<HTMLInputElement>('[data-role="custom-tuning"]');
@@ -11811,11 +11990,11 @@ class App {
             'data-role': 'capo',
             'data-setting': 'capo',
             'aria-label': 'Capo fret',
-            value: String(s.capo),
+            value: String(profile.capo),
             onChange: (e: Event) => {
               const box = e.target as HTMLInputElement;
               const capo = Math.max(0, Math.min(12, Math.round(Number(box.value)) || 0));
-              stepNumber(box, capo, { capo });
+              stepPartNumber(box, capo, { capo });
             }
           })
         ),
@@ -11838,6 +12017,7 @@ class App {
           el('span', { 'data-role': 'bar-count', text: `${source.documentBars} bars` }),
           el('button', { text: '+ Bar', 'data-role': 'bar-plus', title: 'Add one bar', onClick: () => this.changeDocumentBars(1) })
         )
+      )
     );
   }
 
@@ -12056,27 +12236,6 @@ class App {
       el('div', { class: 'spacer' }),
       // Listen again. Only offered when there is a recording to re-read — a MIDI import has
       // nothing to listen to, and re-running the engine on it would be theatre.
-      // What the listener is costing, and a way to stop it early — in the header rather than
-      // buried in the settings panel, because the player's complaint was that it sits there
-      // eating memory and there was nothing in front of him about it. Hidden entirely when the
-      // engine is down, which is now nearly always: it dies at the end of every job, so the chip
-      // is really only on screen while a transcription is in flight.
-      this.bridge.stopEngine &&
-        el(
-          'button',
-          {
-            class: 'chip engine-chip',
-            'data-role': 'engine-chip',
-            // Same test as `refreshEngineChip`, which is the point: the chip is built hidden on
-            // every render and only `engineProcessAlive()` may ever un-hide it (G17).
-            style: { display: this.engineProcessAlive() ? '' : 'none' },
-            title: t(TIPS.engineChip),
-            onClick: () => void this.stopEngine()
-          },
-          // The "✕" that stood beside this went with the text change: the chip says "click to
-          // stop" in words now, and a glyph repeating it is width this row cannot spare.
-          el('span', { 'data-role': 'engine-text', text: 'Listener' })
-        ),
       // "LISTEN AGAIN" IS NOT IN THIS HEADER ANY MORE.
       //
       // It was a permanent button for a rare gesture, sitting in the row somebody reads on
@@ -12215,6 +12374,7 @@ class App {
       // are a control ON this bar now — see `buildPartControl`.
       this.buildNotationToolbar(),
       sheet,
+      this.buildEditSemanticsCaption(),
       this.toastLayer()
     );
 
@@ -12351,9 +12511,27 @@ class App {
         onHeightChange: (px, commit) => {
           if (commit) this.settings.set({ pianoRollHeight: px });
         },
+        /*
+         * A SEEK MOVES THE PLAYHEAD. IT DOES NOT MOVE THE PAGE (roll-purity critique §B).
+         *
+         * THE BUG, reported as "the first double-click on empty roll adds its note somewhere
+         * else". A double-click is not one event: the browser delivers `pointerdown`, `pointerup`
+         * and `click` for the FIRST press before `dblclick` ever fires. That first `pointerdown`
+         * lands on empty background, which seeks — and `followSeek(sec)` used to CENTRE the
+         * coupled viewport on the seeked second, which re-derives the roll's own time ruler. By
+         * the time `onDoubleClick` converts the second click's x through `xToWritten`, the ruler
+         * under that x is a different ruler, so the note is authored at a second the player never
+         * pointed at. The vertical twin of it is gated in `PianoRoll.setPosition`.
+         *
+         * `transport.seek()` STAYS, and it is the whole of what the gesture asked for: the DAW
+         * reflex is "click the timeline, the playhead goes there", and nothing in that sentence
+         * says the timeline scrolls. Other discrete navigation sources keep their follow — the
+         * waveform strip's `onSeek` above, and the bar/menu roads through `followSeek` — because
+         * those are requests to be TAKEN somewhere rather than requests made AT a pixel that is
+         * already on screen and about to be clicked again.
+         */
         onSeek: (sec) => {
           void this.transport.seek(this.toAudioSec(sec));
-          this.followSeek(sec);
         },
 
         // --- selection ------------------------------------------------------------------
@@ -12538,8 +12716,7 @@ class App {
     this.ensureSettingsPanel().setOpen(rt.settingsOpen);
 
     this.bindTransportUi();
-    // Ask once when the screen appears; the poll re-arms itself only while the engine is up.
-    this.pollEngine();
+
   }
 
   /**
@@ -13081,7 +13258,10 @@ class App {
       const shown = this.toEditedSec(state.positionSec);
       if (state.mode === 'playing') this.skipCutsDuringPlayback(state.positionSec);
       this.waveform?.setPosition(shown);
-      this.pianoRoll?.setPosition(shown);
+      // PLAYING, OR MERELY MOVED. The roll's pitch auto-follow is a playback courtesy and runs
+      // only while the take is playing itself — see `PianoRoll.setPosition`. Handing it `true`
+      // unconditionally is what let a seek scroll the pitch window under the player's pointer.
+      this.pianoRoll?.setPosition(shown, state.mode === 'playing');
       if (state.mode === 'playing') this.updatePlayhead(shown);
       else this.triview?.hidePlayhead();
     });
@@ -13746,16 +13926,27 @@ class App {
     // delta to the raw note would land it a fraction of a beat from where it was dropped. With
     // the snap off the feed IS the raw take and this is the call it always was.
     const feed = this.performanceFeed();
+    const map = this.rippleMap();
     const result = applyRollEditToNotes(feed, edit, {
       originSec: this.originSec(score),
       tempoBpm: score.tempoBpm,
-      newNoteId: () => this.noteIds.next('add')
+      newNoteId: () => this.noteIds.next('add'),
+      // THE SCORE'S OWN TICK MAP, so a resize past a tempo change restates `sourceTiming` at the
+      // rate that actually applies there rather than at one scalar BPM. See the field's note in
+      // `edit/rollPerformance.ts`.
+      ...(map ? { scoreTicks: { toTick: map.toTick, divisions: score.ir.divisions || 12 } } : {})
     });
     if (!result) return;
 
-    // The player has now decided about these notes, so the auto-edit pass leaves them alone
-    // from here on. See `userTouchedIds`.
-    const touched = new Set(rollEditNoteIds(edit));
+    /*
+     * WHAT THE PLAYER AUTHORED — FROM THE REDUCER, NOT FROM THE COMMAND (§A authored-ID contract).
+     *
+     * `rollEditNoteIds(edit)` returns `[]` for an `add`, because an add command has no id: the id
+     * is minted inside the reducer. So a hand-drawn note was never entered in `userTouchedIds`,
+     * and the auto-edit pass went on treating it as a note nobody had decided about. The reducer
+     * is the only thing that knows, and it now says.
+     */
+    const touched = new Set(result.authoredIds);
     for (const id of touched) this.userTouchedIds.add(id);
 
     // A CUT TAKE MERGES DIFFERENTLY (F16), for two reasons that both cost data if ignored.
@@ -13775,6 +13966,32 @@ class App {
     // not; see `unrippled`. On a document with no log this is the identity and the road below is
     // the road it always was.
     const edited = this.unrippled(result.notes);
+
+    /*
+     * …AND PINNED, WHEN THERE IS A LOG TO BE OVERRULED BY (§A "raw-only is not sufficient").
+     *
+     * Written to the runtime BEFORE `commitPerformance`, which is what puts it inside the same
+     * undo transaction: `structureNow()` reads the source afterwards, so this step's snapshot
+     * carries the override and ⌘Z takes it back off with the notes it belongs to. Exactly the
+     * shape `applyBarOperation` already uses for the log itself.
+     *
+     * `withRollPlacements` is the identity on a document with no ripple log, so every un-rippled
+     * take keeps the raw-only road it has always taken.
+     */
+    if (map && this.rippleOps().length) {
+      const placements = withRollPlacements(
+        this.rollPlacements(),
+        result.notes,
+        result.authoredIds,
+        this.rippleOps(),
+        map
+      );
+      if (placements !== this.rollPlacements()) {
+        const src = this.runtime.get().source;
+        if (src) this.runtime.set({ source: { ...src, rollPlacements: placements } });
+      }
+    }
+
     this.commitPerformance(
       cuts.length
         ? mergeRollEditOntoCutTake(raw, edited, touched, cuts)
@@ -14949,6 +15166,7 @@ class App {
       bars: source?.documentBars,
       parts: source?.importedParts,
       ripples: source?.rippleOps,
+      placements: source?.rollPlacements,
       endTick: source?.documentEndTick
     };
   }
@@ -14985,14 +15203,19 @@ class App {
     const barsChanged = source.documentBars !== next.bars;
     const partsChanged = next.parts !== source.importedParts;
     const ripplesChanged = next.ripples !== source.rippleOps;
+    // The same `undefined`-is-a-value rule as the log above: undoing the first roll edit made
+    // against a rippled document must leave NO override map, not an empty one, or the note stays
+    // pinned where the undone gesture put it.
+    const placementsChanged = next.placements !== source.rollPlacements;
     const endChanged = next.endTick !== source.documentEndTick;
-    if (!barsChanged && !partsChanged && !ripplesChanged && !endChanged) return;
+    if (!barsChanged && !partsChanged && !ripplesChanged && !placementsChanged && !endChanged) return;
     this.runtime.set({
       source: {
         ...source,
         ...(barsChanged ? { documentBars: next.bars } : {}),
         ...(partsChanged ? { importedParts: next.parts } : {}),
         ...(ripplesChanged ? { rippleOps: next.ripples } : {}),
+        ...(placementsChanged ? { rollPlacements: next.placements } : {}),
         ...(endChanged ? { documentEndTick: next.endTick } : {})
       }
     });

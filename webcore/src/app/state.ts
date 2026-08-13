@@ -12,7 +12,7 @@ import { DEFAULT_ROLL_HEIGHT_PX } from '../view/pianoroll';
 import type { SynthVoice } from '../audio/synth';
 import type { TrimResult } from '../audio/trim';
 import type { CutSpan } from '../edit/cuts';
-import type { Rational, RippleOp } from '../edit/ripple';
+import type { Rational, RippleOp, RollPlacements } from '../edit/ripple';
 import type { ImportedPart } from '../score/parts';
 import type { HostInfo } from '../bridge';
 
@@ -618,6 +618,23 @@ export interface SourceAudio {
    * straight back by reference — so the whole layer is inert until it is used.
    */
   rippleOps?: RippleOp[];
+  /**
+   * WHERE A HAND-PLACED NOTE ACTUALLY IS — the canonical placement overrides (`edit/ripple.ts`).
+   *
+   * The other half of the layer above, and the reason it needs one: the log states an ABSOLUTE
+   * release for the chord it edited and re-states it on every derivation, and inserted time has no
+   * pre-image in the recording at all. So a roll resize of a rippled note snapped back to the
+   * written value, and a note drawn inside an inserted bar collapsed onto the seam.
+   *
+   * One entry per note the player placed by hand SINCE the log started: its exact span in the
+   * coordinates the operations up to `afterOpId` produced. `place()` picks the log up from there,
+   * so later ripples still push the note and earlier ones no longer overrule it. See
+   * `edit/ripple.ts §RollPlacement` for the whole argument.
+   *
+   * Absent on every document with no ripple log — raw write-back is exact there, and a second
+   * authority saying the same thing is a second authority to keep in step.
+   */
+  rollPlacements?: RollPlacements;
   /**
    * WHERE THE DOCUMENT ENDS, in exact IR ticks — the other half of `documentBars`.
    *

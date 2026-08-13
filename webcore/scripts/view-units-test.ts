@@ -36,6 +36,7 @@ import {
   barGrid,
   clampWindow,
   engravedPxPerSec,
+  preservedScaleWindow,
   subdivisionsPerBeat,
   writtenSecAt,
   fracToSec,
@@ -512,6 +513,41 @@ windowIs(windowShowing(5, 0, 4, limits), 5, 9, 'windowShowing at the left edge')
   near(absoluteSheetScale(1, 0, 900, 3, 0.25, 4), 1, 'nothing measured, no change');
   near(absoluteSheetScale(1, 100, 0, 3, 0.25, 4), 1, 'no viewport, no change');
   near(absoluteSheetScale(1, 100, 900, 0.01, 0.25, 4), 4, 'the measured form is clamped too');
+
+  /*
+   * BPM CHANGES TIME, NOT TYPOGRAPHY — the pure half of it.
+   *
+   * `preservedScaleWindow` is `absoluteSheetScale`'s inverse, and being exactly that is the whole
+   * mechanism: the window it produces, handed straight back, must ask for the scale the sheet is
+   * already at. If it did not, a tempo rebuild would still start a re-engrave — a smaller one than
+   * the four-fold enlargement it replaced, but the same bug.
+   */
+  {
+    const limits = { durationSec: 600, minSpanSec: 0.05 };
+    // 900 px of plot at 100 px/s is 9 s, pinned at the left edge, and 9 s is what comes back.
+    const w = preservedScaleWindow(20, 0, 100, 900, limits)!;
+    windowIs(w, 20, 29, 'the fixed engraving shows the span its own calibration implies');
+    near(
+      absoluteSheetScale(1.7, 100, 900, w.toSec - w.fromSec, 0.6, 3),
+      1.7,
+      'and that window asks for the scale the sheet is already at — the fixed point'
+    );
+    // A quarter of the tempo is a quarter of the px/s, so the SAME page is four times the seconds.
+    // Nothing here mentions BPM: the tempo reaches this only as a measurement of the engraving.
+    windowIs(preservedScaleWindow(20, 0, 25, 900, limits)!, 20, 56, 'a slower clock widens the window, not the staff');
+    windowIs(preservedScaleWindow(20, 0.5, 100, 900, limits)!, 15.5, 24.5, 'the anchor can sit anywhere in the plot');
+    // THE HARD EDGE: a document too short to hold the span the size implies. The window is reduced
+    // rather than granted, which is what tells `App.rebaseViewportAtSheetScale` that size lost.
+    windowIs(
+      preservedScaleWindow(4, 0, 25, 900, { durationSec: 10, minSpanSec: 0.05 })!,
+      0,
+      10,
+      'a 36 s span out of a 10 s document comes back clamped, not invented'
+    );
+    assert(preservedScaleWindow(20, 0, 0, 900, limits) === null, 'nothing measured, no window');
+    assert(preservedScaleWindow(20, 0, 100, 0, limits) === null, 'no plot, no window');
+    assert(preservedScaleWindow(Number.NaN, 0, 100, 900, limits) === null, 'no anchor, no window');
+  }
 }
 
 // ---------------------------------------------------------------------------

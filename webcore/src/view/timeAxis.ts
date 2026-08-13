@@ -905,3 +905,55 @@ export function absoluteSheetScale(
   const wantedPxPerSec = viewportWidth / spanSec;
   return Math.max(minScale, Math.min(maxScale, currentScale * (wantedPxPerSec / pxPerSecAtCurrentScale)));
 }
+
+// ---------------------------------------------------------------------------
+// BPM CHANGES TIME, NOT TYPOGRAPHY
+// ---------------------------------------------------------------------------
+
+/**
+ * WHAT A REBUILD IS ALLOWED TO DO TO THE WINDOW. Typed, because the two answers are opposite.
+ *
+ * `follow-window` — the span on screen is a decision the player made and the new engraving must
+ *   be scaled to honour it. Every ordinary rebuild: an edit, a snap change, a re-quantize. The
+ *   written music moved; the clock under it did not, so the same seconds mean the same music.
+ *
+ * `preserve-sheet-scale` — the CLOCK moved. A tempo (or meter) change re-maps written ticks onto
+ *   seconds and nothing else: the same notes, the same page, a different number of seconds per
+ *   bar. Scaling the engraving to keep the old seconds on screen turns that into a zoom command —
+ *   at 30 BPM a quarter of the measured px/sec asks for about four times `display.scale`, and the
+ *   sheet visibly grows under a control that was never about size. So the SIZE is what is held
+ *   and the seconds window is rebased around an anchor instead.
+ *
+ * The three things a tempo change cannot all preserve are the engraving's size, the old seconds
+ * window, and endpoint alignment between the panes. This picks SIZE plus ALIGNMENT: the same
+ * bars stay on screen at the same size, and the roll and the strip widen (or narrow) to say the
+ * same music now occupies more (or fewer) seconds. That is what a tempo change MEANS.
+ */
+export type RebuildViewportPolicy = 'follow-window' | 'preserve-sheet-scale';
+
+/**
+ * The window a FIXED engraving shows, around an anchor. The exact inverse of `absoluteSheetScale`.
+ *
+ * `absoluteSheetScale` answers "what scale shows this span"; this answers "what span does this
+ * scale show", off the same one measurement of the live engraving. Being each other's inverse is
+ * the property that makes the rebuild a fixed point rather than a nudge: hand the window this
+ * returns straight back to `absoluteSheetScale` at the same `pxPerSec` and it asks for the scale
+ * the sheet is already at, so the re-engrave that would have been the visible bug never starts.
+ *
+ * `anchorFrac` is where in the plot the anchor is pinned — 0 for the left edge, which is the one
+ * point the sheet and the roll are exactly pinned at anyway (§sheetLeftEdgeSec).
+ *
+ * CLAMPED, and the clamp is not cosmetic. `limits` is the shared range, so a span the take cannot
+ * hold (a slow tempo on a short document) comes back reduced — and the caller has then been told,
+ * honestly, that size could not be held. See `App.rebaseViewportAtSheetScale`.
+ */
+export function preservedScaleWindow(
+  anchorSec: number,
+  anchorFrac: number,
+  pxPerSecAtCurrentScale: number,
+  plotWidthPx: number,
+  limits: TimeLimits
+): TimeWindow | null {
+  if (!(pxPerSecAtCurrentScale > 0) || !(plotWidthPx > 0) || !Number.isFinite(anchorSec)) return null;
+  return windowShowing(anchorSec, anchorFrac, plotWidthPx / pxPerSecAtCurrentScale, limits);
+}

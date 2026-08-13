@@ -6,7 +6,7 @@
   "events": [
     {
       "kind": "wheel",
-      "atMs": 22832.5,
+      "atMs": 22823.2,
       "delta": -8,
       "deltaMode": 0,
       "ctrlKey": true,
@@ -19,7 +19,7 @@
     },
     {
       "kind": "wheel",
-      "atMs": 22902.6,
+      "atMs": 22907.7,
       "delta": -8,
       "deltaMode": 0,
       "ctrlKey": true,
@@ -32,7 +32,7 @@
     },
     {
       "kind": "wheel",
-      "atMs": 22970.1,
+      "atMs": 22970.6,
       "delta": -8,
       "deltaMode": 0,
       "ctrlKey": true,
@@ -45,7 +45,7 @@
     },
     {
       "kind": "wheel",
-      "atMs": 23051.4,
+      "atMs": 23051.7,
       "delta": -8,
       "deltaMode": 0,
       "ctrlKey": true,
@@ -71,7 +71,7 @@
     },
     {
       "kind": "wheel",
-      "atMs": 23217.1,
+      "atMs": 23217.7,
       "delta": -8,
       "deltaMode": 0,
       "ctrlKey": true,
@@ -84,7 +84,7 @@
     },
     {
       "kind": "wheel",
-      "atMs": 23301.2,
+      "atMs": 23300.7,
       "delta": -8,
       "deltaMode": 0,
       "ctrlKey": true,
@@ -97,7 +97,7 @@
     },
     {
       "kind": "wheel",
-      "atMs": 23383.4,
+      "atMs": 23383.3,
       "delta": -8,
       "deltaMode": 0,
       "ctrlKey": true,

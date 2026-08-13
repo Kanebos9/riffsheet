@@ -1160,6 +1160,557 @@ async function main() {
       );
     }
 
+    // =====================================================================
+    // P4 — THE SHEET PANE IS ONE GESTURE SURFACE, GLYPH OR NOT
+    //
+    // THE REPORT: a pinch over the sheet zooms perfectly with the pointer over the empty space
+    // BELOW the music, and is dead — or dies after one event — directly over the engraving.
+    //
+    // THE MECHANISM, which is a LATCH and not a `preventDefault`. Every one of the sheet's
+    // handlers is on `.triview-scroll` and events bubble, so where the pointer is cannot change
+    // which handler runs. What it changes is which NODE the platform delivers the gesture to:
+    // macOS latches both roads (view/gesture.ts) to the node hit at the start of a pinch and
+    // routes every later event of that pinch to it, so a latched node that leaves the document
+    // mid-gesture takes the rest of the pinch with it. Over the engraving the latched node was
+    // an alphaTab `<path>`/`<text>`, the first event asked for a zoom, the zoom re-engraved, and
+    // alphaTab replaced every partial — the node the remaining events were owed to was destroyed
+    // by the event that had just been delivered to it. Below the music the node was
+    // `.triview-scroll`, built once and never replaced, so the same pinch worked perfectly.
+    //
+    // BOTH ROADS AT REAL COORDINATES, and they see the fault differently — which is the point.
+    //
+    //   ctrl-wheel, through `Input.dispatchMouseEvent`: the browser does its own hit test and its
+    //     own routing rather than being told the answer. Chromium re-hit-tests EVERY wheel event,
+    //     so it never loses the zoom and the parity numbers stay level even with the bug in
+    //     place. What it still shows is the property underneath — the node the gesture latched to
+    //     is `isConnected === false` a moment later — and that is asserted directly.
+    //
+    //   GestureEvent, dispatched at `document.elementFromPoint(x, y)`: not constructible outside
+    //     WebKit, so it is synthesised — and synthesising it is what makes the LATCH reproducible
+    //     here, because one hit test followed by every later event of the pinch at that same node
+    //     is exactly what macOS does. Events dispatched at a node that has left the document do
+    //     not reach `.triview-scroll`, so the fault appears as the owner described it and as a
+    //     NUMBER: with the fix reverted this road is worth x1.06 over the engraving — one event
+    //     of four — against x1.2625 over the empty pane below it. Measured, both faces.
+    //
+    // WHY NO EXISTING CHECK CAUGHT IT: `finding 6` above dispatches at `.triview-scroll` itself,
+    // which is the one node in the pane that was never the problem, so it never touched the
+    // engraving's layer stack at all.
+    // =====================================================================
+    {
+      /** Sheet back to a known middle scale, so no measurement starts against the zoom clamp. */
+      const restScale = () =>
+        ev('(async () => { await window.__RIFFSHEET_SHEETSCALE__(1); return true; })()', true);
+
+      /**
+       * The six places a pinch has to behave identically: five kinds of engraved ink and the
+       * empty pane below the last stave, which is the one the owner reported as WORKING.
+       *
+       * The noteheads come from the app's own `editProbe` (client pixels, face-scale corrected);
+       * the beam and the staff line are classified off the SVG by shape, because "wide and one
+       * pixel tall" and "short, wide and solid" is what those two things are and neither carries
+       * a class name to ask for.
+       */
+      const sheetPoints = () => json(`(() => {
+        const s = document.querySelector('.triview-scroll').getBoundingClientRect();
+        const inside = (r) => r.width > 0 && r.height > 0 &&
+          r.left > s.left + 8 && r.right < s.right - 8 && r.top > s.top + 4 && r.bottom < s.bottom - 4;
+        const centre = (r) => ({ x: Math.round(r.left + r.width / 2), y: Math.round(r.top + r.height / 2) });
+        const heads = (window.__RIFFSHEET_SHEETEDIT__().noteHeads ?? []).filter(
+          (h) => inside({ left: h.x - h.w / 2, right: h.x + h.w / 2, top: h.y - h.h / 2, bottom: h.y + h.h / 2, width: h.w, height: h.h })
+        );
+        // CLIPPED TO THE PANE, not required to fit inside it: a staff line runs the width of the
+        // whole system and is therefore almost never wholly on screen, so "fully inside" found
+        // one only by luck and dropped it at the scales where the engraving is wider. What is
+        // needed is a POINT on the ink that is in the pane, which is what the clip gives.
+        const pad = 8;
+        const clip = (r) => {
+          const left = Math.max(r.left, s.left + pad), right = Math.min(r.right, s.right - pad);
+          const top = Math.max(r.top, s.top + 4), bottom = Math.min(r.bottom, s.bottom - 4);
+          return right > left && bottom > top
+            ? { left, right, top, bottom, width: right - left, height: bottom - top, ink: r }
+            : null;
+        };
+        const ink = [...document.querySelectorAll('.at-host .at-surface svg path, .at-host .at-surface svg rect')]
+          .map((el) => clip(el.getBoundingClientRect()))
+          .filter(Boolean);
+        /*
+         * STAFF LINE vs BEAM, BY SHAPE RATIO — and it has to be a ratio, not a pixel count.
+         *
+         * The first version asked for "wider than 200px", which is a statement about the SCALE
+         * rather than about the thing: alphaTab engraves in partials, so a staff line is cut into
+         * one segment per partial, and at a small sheet scale the widest segment on screen is
+         * 183px. The check then went looking for a staff line in a pane full of them and found
+         * none. What actually tells the two apart at every scale is how much longer than thick
+         * each is — a staff line is a hairline running the width of a bar (hundreds to one), a
+         * beam is a solid slab a few notes long (tens to one at most).
+         *
+         * Measured on the INK's own box, never the clipped one: a clip can shorten something, so
+         * a half-scrolled staff line would otherwise start reading as a beam.
+         */
+        const aspect = (r) => r.ink.width / Math.max(0.01, r.ink.height);
+        const widest = (list) => list.slice().sort((a, b) => b.width - a.width)[0];
+        const staffLine = widest(ink.filter((r) => r.ink.height <= 3 && r.ink.width >= 40 && aspect(r) > 20));
+        const beam = widest(ink.filter((r) =>
+          r.ink.height >= 2 && r.ink.height <= 14 && r.ink.width >= 8 && r.ink.width <= 180 && aspect(r) <= 20));
+        const labels = [...document.querySelectorAll('.note-name')].map((el) => el.getBoundingClientRect()).filter(inside);
+        const heads2 = (kind) => heads.filter((h) => h.staff === kind).map((h) => ({ x: Math.round(h.x), y: Math.round(h.y) }));
+        /*
+         * A CANDIDATE IS ONLY THE POINT IT CLAIMS TO BE IF THE HIT TEST AGREES.
+         *
+         * Three of the four decoration rows are PINNED over the music — the open-string letters
+         * sit in a fixed left column and travel across the engraving as it scrolls — so a
+         * notehead's own centre can have a string-letter span on top of it. Taking it anyway
+         * would leave the check named "TAB digit" quietly measuring a label instead, which is the
+         * same class of mistake as a probe that never fails: it reports on something else and
+         * passes. So each kind offers a LIST, and the first candidate whose topmost element is
+         * what the kind is about wins. wantLabel is true for the one point that IS a label.
+         */
+        const controls = '.note-name, .tab-mark, .string-letter, .part-label-hit';
+        const pick = (cands, wantLabel) => cands.find((p) => {
+          const el = document.elementFromPoint(p.x, p.y);
+          if (!el || !el.closest('.triview-scroll')) return false;
+          return wantLabel ? !!el.closest(controls) : !el.closest(controls);
+        }) ?? null;
+        const out = [];
+        const add = (name, p) => { if (p) out.push({ name, x: p.x, y: p.y }); };
+        add('notehead', pick(heads2('notation'), false));
+        add('beam', pick(beam ? [centre(beam)] : [], false));
+        add('staff line', pick(
+          // Several points along the line, so one that happens to sit under a pinned letter or a
+          // notehead is not the only one tried.
+          staffLine ? [0.62, 0.78, 0.4, 0.9, 0.2].map((f) => ({
+            x: Math.round(staffLine.left + staffLine.width * f),
+            y: Math.round((staffLine.top + staffLine.bottom) / 2)
+          })) : [], false));
+        add('TAB digit', pick(heads2('tab'), false));
+        add('name label', pick(labels.map(centre), true));
+        // THE BASELINE: below the last stave, inside the pane. The pixel the owner says works.
+        const host = document.querySelector('.at-host').getBoundingClientRect();
+        const below = Math.round(Math.min(s.bottom - 6, host.bottom + 20));
+        add('below the music', below > host.bottom && below < s.bottom ? { x: Math.round(s.left + s.width / 2), y: below } : null);
+        // WHAT THE CLASSIFIER SAW, so a missing kind is a diagnosis rather than a shrug.
+        const seen = {
+          ink: ink.length,
+          staffLines: ink.filter((r) => r.ink.height <= 3 && r.ink.width >= 40 && aspect(r) > 20).length,
+          beams: ink.filter((r) => r.ink.height >= 2 && r.ink.height <= 14 && r.ink.width >= 8 && r.ink.width <= 180 && aspect(r) <= 20).length,
+          // The eight biggest boxes as [width, height], which is what says WHY a shape rule missed.
+          widest: ink.slice().sort((a, b) => b.ink.width - a.ink.width).slice(0, 8)
+            .map((r) => [Math.round(r.ink.width), Number(r.ink.height.toFixed(2))]),
+          heads: heads.length,
+          labels: labels.length,
+          pane: [Math.round(s.width), Math.round(s.height)],
+          music: [Math.round(host.width), Math.round(host.height)],
+          scrollLeft: Math.round(document.querySelector('.triview-scroll').scrollLeft)
+        };
+        return JSON.stringify({ points: out, seen });
+      })()`);
+
+      /** Four ctrl-wheel notches through the browser's OWN hit test and routing. */
+      const wheelBurst = async (x, y, sign) => {
+        await cdp.send('Input.dispatchMouseEvent', { type: 'mouseMoved', x, y, button: 'none' });
+        for (let i = 0; i < 4; i++) {
+          await cdp.send('Input.dispatchMouseEvent', {
+            type: 'mouseWheel', x, y, deltaX: 0, deltaY: sign * 40,
+            modifiers: 2, pointerType: 'mouse', button: 'none', clickCount: 0
+          });
+          await settle(25);
+        }
+        await settle(320);
+      };
+
+      /**
+       * One WebKit pinch at (x, y): start, four changes, end — dispatched at the node the
+       * platform would have latched to. The cumulative scale steps by 1.06 per event so the two
+       * roads are asking for exactly the same zoom and their numbers are directly comparable.
+       */
+      const gestureBurst = async (x, y, sign) => {
+        await ev(`(() => {
+          const el = document.elementFromPoint(${x}, ${y});
+          if (!el) return 'no element';
+          const fire = (type, scale) => {
+            const e = new Event(type, { bubbles: true, cancelable: true });
+            if (scale !== null) e.scale = scale;
+            e.altKey = false; e.clientX = ${x}; e.clientY = ${y};
+            el.dispatchEvent(e);
+          };
+          fire('gesturestart', 1);
+          for (let i = 1; i <= 4; i++) fire('gesturechange', Math.pow(${sign > 0 ? '1/1.06' : '1.06'}, i));
+          fire('gestureend', null);
+          return true;
+        })()`);
+        await settle(320);
+      };
+
+      /**
+       * One measurement at one point: what the pinch was worth, and whether the node the platform
+       * latched to was still in the document when the zoom it caused had been engraved.
+       */
+      const measure = async (name, burst) => {
+        await restScale();
+        await settle(120);
+        // RE-RESOLVED HERE, not once for the pass. `restScale` walks in 1.25 steps and lands
+        // NEAR 1 rather than on it, so the row of names is not laid out identically to the frame
+        // the points were first read from — and a "name label" point that has drifted off its
+        // label is a check quietly measuring bare pane instead of the control it is named for.
+        //
+        // RETRIED, because alphaTab's partials land one at a time after the render returns: read
+        // a frame too early and the surface has staves but not yet the ink on them. This waits
+        // for the engraving, it does not retry a failure — a kind that is still missing after two
+        // seconds of a settled sheet is reported as missing and fails the check.
+        let p = null;
+        let lastSeen = null;
+        for (let i = 0; i < 14 && !p; i++) {
+          const read = await sheetPoints();
+          p = read.points.find((q) => q.name === name) ?? null;
+          if (!p) { lastSeen = read.seen; await settle(150); }
+        }
+        if (!p) return { name, hit: 'gone from the pane', survived: false, ratio: 0, seen: lastSeen };
+        await ev(`(() => { window.__P4NODE__ = document.elementFromPoint(${p.x}, ${p.y}); return true; })()`);
+        const before = (await vp()).sheetScale;
+        await burst(p.x, p.y, -1);
+        const after = (await vp()).sheetScale;
+        const survived = await ev('!!(window.__P4NODE__ && window.__P4NODE__.isConnected)');
+        const hit = await ev(`(() => { const n = window.__P4NODE__; if (!n) return 'none';
+          const c = (n.className && n.className.baseVal !== undefined ? n.className.baseVal : n.className) || '';
+          return n.tagName + (c ? '.' + String(c).split(' ')[0] : ''); })()`);
+        return { name: p.name, hit, survived, ratio: Number((after / before).toFixed(4)) };
+      };
+
+      /** Drive the face to a wanted scale by resizing the viewport, and wait for it to arrive. */
+      const setFace = async (w, h, wantScale) => {
+        await cdp.send('Emulation.setDeviceMetricsOverride', { width: w, height: h, deviceScaleFactor: 1, mobile: false });
+        for (let i = 0; i < 40; i++) {
+          const f = await json('JSON.stringify(window.__RIFFSHEET_FACE__())');
+          if (Math.abs(f.scale - wantScale) < 0.01) break;
+          await settle(150);
+        }
+        await settle(600);
+      };
+
+      for (const face of [{ w: 1440, h: 900, scale: 1 }, { w: 900, h: 600, scale: 0.68 }]) {
+        await setFace(face.w, face.h, face.scale);
+        const got = (await json('JSON.stringify(window.__RIFFSHEET_FACE__())')).scale;
+        check(
+          `P4 face ${face.scale}: the probe is measuring at the face scale it claims`,
+          Math.abs(got - face.scale) < 0.01,
+          `faceScale = ${got}, wanted ${face.scale}`
+        );
+        await restScale();
+        const points = (await sheetPoints()).points;
+        check(
+          `P4 face ${face.scale}: all five kinds of engraved ink plus the below-sheet baseline are on screen`,
+          points.length === 6,
+          points.map((p) => p.name).join(', ') || 'none found'
+        );
+        // Measure whatever WAS found rather than skipping the pass: a missing kind is already its
+        // own failed check above, and the parity numbers for the other five are the evidence of
+        // what the pane is doing. Only the baseline is indispensable — there is nothing to
+        // compare against without it.
+        if (!points.some((p) => p.name === 'below the music')) continue;
+
+        for (const [road, burst] of [['ctrl-wheel', wheelBurst], ['GestureEvent', gestureBurst]]) {
+          const rows = [];
+          for (const p of points) rows.push(await measure(p.name, burst));
+          const baseline = rows[rows.length - 1];
+          say(`P4 face ${face.scale} ${road}`, rows);
+          // The gain is real, so "they all agree" cannot be "they all did nothing": four notches
+          // of 1.06 is x1.26, and a saturated or dead pane would sit at x1.00.
+          check(
+            `P4 face ${face.scale}, ${road}: the below-sheet baseline really zooms, so parity means something`,
+            baseline.ratio > 1.2,
+            `baseline x${baseline.ratio}`
+          );
+          const off = rows.filter((r) => Math.abs(r.ratio - baseline.ratio) > 0.005);
+          check(
+            `P4 face ${face.scale}, ${road}: every on-engraving point zooms exactly as the empty pane below does`,
+            off.length === 0,
+            off.length === 0
+              ? `all six at x${baseline.ratio}`
+              : off.map((r) => `${r.name} x${r.ratio} != x${baseline.ratio}`).join('; ')
+          );
+          const lost = rows.filter((r) => !r.survived);
+          check(
+            `P4 face ${face.scale}, ${road}: the node the pinch latches to outlives the zoom it causes`,
+            lost.length === 0,
+            lost.length === 0
+              ? rows.map((r) => `${r.name}->${r.hit}`).join(' ')
+              : `destroyed mid-gesture: ${lost.map((r) => `${r.name}->${r.hit}`).join(', ')}`
+          );
+        }
+      }
+      await cdp.send('Emulation.clearDeviceMetricsOverride');
+      await settle(600);
+      await restScale();
+    }
+
+    // =====================================================================
+    // P5 — BPM CHANGES TIME, NOT TYPOGRAPHY
+    //
+    // THE REPORT: type 30 into the tempo box and the SHEET gets bigger. The owner calls that a
+    // bug and it is one — a tempo is a statement about the clock under the music, not about how
+    // large to print it.
+    //
+    // THE MECHANISM, in the app's own numbers. A tempo rebuild re-maps written ticks onto
+    // seconds; `onSheetRenderSettled` then re-measures the engraving through the NEW map, so at
+    // a quarter of the tempo the same page is worth a quarter of the pixels per second. The
+    // authoritative window is in SECONDS and is deliberately retained across a rebuild, so
+    // `applyViewportToSheet` handed the new engraving the old span and `absoluteSheetScale`
+    // answered the only way it can: about four times `display.scale`. The clamp at 3 is what
+    // stopped it, not any part of the design. `faceScale` is not involved at any point.
+    //
+    // THE LAW NOW (`timeAxis.RebuildViewportPolicy`): a tempo rebuild carries
+    // `preserve-sheet-scale`. The size is held and the SECONDS WINDOW is rebased around the bar
+    // at the left edge — which is what a tempo change means, and the pick out of the three-way
+    // constraint (size, old window, endpoint alignment: any two) that the owner adjudicated.
+    //
+    // MEASURED BEFORE THE FIX, both doors, so nothing below is a rubber stamp:
+    //
+    //   the meter door, on this very fixture — 4/4 -> 6/8 re-states the same tempo in a beat
+    //     worth 1.5x, and `display.scale` went 0.9753 -> 0.8032 while the retained window sat at
+    //     13.08 s throughout. `display.scale` multiplies every engraved coordinate, so the staff
+    //     went with it. It comes back 0.9753 -> 0.9753 here.
+    //   the BPM door, on the blank-score fixture below, where a typed tempo really does decide
+    //     the clock (with detected beats the pipeline uses THOSE and the box is inert, which is
+    //     why the meter is the door this demo can be moved through at all) — 120 -> 30 took
+    //     `display.scale` 0.9837 -> 3.0, the hard clamp, and 120 -> 240 took it to 0.6, the other
+    //     one. Both are held below.
+    //
+    // AND THE HARD EDGE, ASSERTED RATHER THAN HIDDEN. A slower tempo needs MORE seconds on screen
+    // to keep the same size, and a document only has so many: at 30 BPM the fixture below wants a
+    // 157 s window out of a 96 s document, and no policy can conjure the other 61 s. The window is
+    // clamped, the size moves, and `rebuildRebase.sizeHeld` says so — the one case where the
+    // engraving may still change size, and it is reported rather than silent. Lifting it needs a
+    // shared virtual extent past the end of the recording for all three panes, which is a separate
+    // piece of work (codex-voices-critique, ranked tempo fix 5).
+    // =====================================================================
+    {
+      const setSel = (v) => `(() => { const s = document.querySelector('[data-role="tempo-source"]'); if (!s) return 'missing'; s.value = ${JSON.stringify(v)}; s.dispatchEvent(new Event('change', { bubbles: true })); return s.value; })()`;
+      const setBpm = (v) => `(() => { const b = document.querySelector('[data-role="bpm"]'); if (!b) return 'missing'; b.value = '${v}'; b.dispatchEvent(new Event('change', { bubbles: true })); return b.value; })()`;
+      const setSig = (v) => `(() => { const s = document.querySelector('[data-role="timesig"]'); if (!s) return 'missing'; s.value = ${JSON.stringify(v)}; s.dispatchEvent(new Event('change', { bubbles: true })); return s.value; })()`;
+
+      /**
+       * The two numbers the claim is made of, plus what the app says it did.
+       *
+       * `staffGap` is the TYPOGRAPHY, measured off the SVG and not off any app state: the median
+       * vertical gap between engraved staff lines, in client pixels. It is the number the eye is
+       * reading when it says "the sheet got bigger", and it is independent of `display.scale`,
+       * which is the app's own claim about the same thing. Both, or this only proves the app is
+       * consistent with itself.
+       */
+      const tempoState = () => json(`(() => {
+        const v = window.__RIFFSHEET_VIEWPORT__();
+        const lines = [...document.querySelectorAll('.at-host .at-surface svg path, .at-host .at-surface svg rect')]
+          .map((el) => el.getBoundingClientRect())
+          .filter((r) => r.height <= 3 && r.width >= 40 && r.width / Math.max(0.01, r.height) > 20);
+        const ys = [...new Set(lines.map((r) => Math.round((r.top + r.bottom) / 2 * 4) / 4))].sort((a, b) => a - b);
+        const gaps = [];
+        for (let i = 1; i < ys.length; i++) { const g = ys[i] - ys[i - 1]; if (g > 1) gaps.push(g); }
+        gaps.sort((a, b) => a - b);
+        const bpm = document.querySelector('[data-role="bpm"]');
+        return JSON.stringify({
+          scale: v.sheetScale,
+          staffGap: gaps.length ? gaps[Math.floor(gaps.length / 2)] : null,
+          staffLines: ys.length,
+          spanSec: v.spanSec,
+          fromSec: v.viewport && v.viewport.fromSec,
+          leftEdgeSec: v.sheetLeftEdgeSec,
+          rebase: v.rebuildRebase,
+          limits: v.limits,
+          doc: v.documentSec,
+          bpmBox: bpm ? bpm.value : null
+        });
+      })()`);
+
+      const sameScale = (a, b) => Math.abs(a - b) <= Math.max(a, b) * 1e-4;
+      const setFaceTo = async (w, h, wantScale) => {
+        await cdp.send('Emulation.setDeviceMetricsOverride', { width: w, height: h, deviceScaleFactor: 1, mobile: false });
+        for (let i = 0; i < 40; i++) {
+          const f = await json('JSON.stringify(window.__RIFFSHEET_FACE__())');
+          if (Math.abs(f.scale - wantScale) < 0.01) break;
+          await settle(150);
+        }
+        await settle(700);
+      };
+
+      for (const face of [{ w: 1440, h: 900, scale: 1 }, { w: 900, h: 600, scale: 0.68 }]) {
+        await setFaceTo(face.w, face.h, face.scale);
+        await ev(setSel('manual'));
+        await settle(1200);
+        const at120 = await tempoState();
+
+        // --- the meter door: a re-labelling that moves the clock by 1.5x -------------------
+        await ev(setSig('6/8'));
+        await settle(1800);
+        const at68 = await tempoState();
+        await ev(setSig('4/4'));
+        await settle(1800);
+        const back = await tempoState();
+
+        say(`P5 face ${face.scale}: 4/4 -> 6/8 -> 4/4`, {
+          scale: [at120.scale, at68.scale, back.scale].map((n) => Number(n.toFixed(4))),
+          staffGap: [at120.staffGap, at68.staffGap, back.staffGap],
+          spanSec: [at120.spanSec, at68.spanSec, back.spanSec],
+          rebase: at68.rebase
+        });
+        check(
+          `P5 face ${face.scale}: the sheet has staff lines to measure`,
+          at120.staffLines >= 5 && at68.staffLines >= 5,
+          `${at120.staffLines} / ${at68.staffLines} distinct staff-line rows`
+        );
+        check(
+          `P5 face ${face.scale}: a meter change does not touch display.scale (it went 0.975 -> 0.803)`,
+          sameScale(at120.scale, at68.scale) && sameScale(at120.scale, back.scale),
+          `${at120.scale.toFixed(6)} -> ${at68.scale.toFixed(6)} -> ${back.scale.toFixed(6)}`
+        );
+        check(
+          `P5 face ${face.scale}: and the ENGRAVING is the same size on the glass`,
+          at120.staffGap !== null && at68.staffGap !== null && Math.abs(at68.staffGap - at120.staffGap) <= 0.26,
+          `staff-line spacing ${at120.staffGap}px -> ${at68.staffGap}px -> ${back.staffGap}px`
+        );
+        check(
+          `P5 face ${face.scale}: the SECONDS window is what moved instead`,
+          at68.rebase !== null && at68.rebase.sizeHeld === true &&
+            Math.abs(at68.spanSec - at120.spanSec) / at120.spanSec > 0.05,
+          `span ${at120.spanSec}s -> ${at68.spanSec}s, wanted ${at68.rebase?.wantedSpanSec}s and got ${at68.rebase?.grantedSpanSec}s`
+        );
+        check(
+          `P5 face ${face.scale}: and the sheet's left edge still names the window's own first second`,
+          Math.abs(at68.leftEdgeSec - at68.fromSec) < Math.max(0.02, at68.spanSec * 0.01),
+          `left edge ${at68.leftEdgeSec}s vs window from ${at68.fromSec}s`
+        );
+
+        // --- the BPM box, on a take whose beats the pipeline detected ----------------------
+        // Inert here BY DESIGN (detected beats decide the grid, not a typed number), so this is
+        // the other half of the same claim: the new policy must not invent movement either.
+        const bpms = [];
+        for (const bpm of [30, 240, 120]) {
+          await ev(setBpm(bpm));
+          await settle(1600);
+          const s = await tempoState();
+          bpms.push({ bpm, scale: Number(s.scale.toFixed(6)), staffGap: s.staffGap, span: s.spanSec });
+        }
+        say(`P5 face ${face.scale}: manual BPM 30/240/120`, bpms);
+        check(
+          `P5 face ${face.scale}: 30 <-> 240 <-> 120 BPM leaves display.scale exactly where it was`,
+          bpms.every((b) => sameScale(b.scale, at120.scale)),
+          bpms.map((b) => `${b.bpm}:${b.scale}`).join(' ')
+        );
+
+        // --- and an explicit zoom is still a zoom ------------------------------------------
+        // The whole risk of this fix is over-reach: a policy that froze `display.scale` outright
+        // would kill the pinch as well. Scale-follows-span is correct for a GESTURE and wrong
+        // only for a clock change, so the gesture is measured immediately afterwards.
+        const beforePinch = await vp();
+        const sheetRect = await rectOf('.triview-scroll');
+        for (let i = 0; i < 4; i++) {
+          await ev(wheelAt('.triview-scroll', sheetRect.left + sheetRect.width / 2, sheetRect.top + sheetRect.height / 2, 0, -40, true));
+          await settle(90);
+        }
+        await settle(600);
+        const afterPinch = await vp();
+        say(`P5 face ${face.scale}: pinch after a tempo change`, {
+          scale: [Number(beforePinch.sheetScale.toFixed(4)), Number(afterPinch.sheetScale.toFixed(4))],
+          span: [beforePinch.spanSec, afterPinch.spanSec]
+        });
+        check(
+          `P5 face ${face.scale}: an explicit pinch still scale-follows-span`,
+          afterPinch.sheetScale > beforePinch.sheetScale * 1.05 &&
+            afterPinch.spanSec < beforePinch.spanSec * 0.96,
+          `scale ${beforePinch.sheetScale.toFixed(4)} -> ${afterPinch.sheetScale.toFixed(4)}, span ${beforePinch.spanSec}s -> ${afterPinch.spanSec}s`
+        );
+        await ev('(async () => { await window.__RIFFSHEET_SHEETSCALE__(1); return true; })()', true);
+        await settle(400);
+      }
+      await cdp.send('Emulation.clearDeviceMetricsOverride');
+      await settle(700);
+
+      // =====================================================================
+      // P5b — THE BPM BOX ITSELF, on a take where a typed tempo IS the clock
+      // =====================================================================
+      //
+      // A blank score has no detected beats, so `bpmOverride` decides the grid outright — which
+      // is the owner's own case (a typed 30 that really re-times the page) and the one the demo
+      // above cannot reach. 48 bars so the document is long enough to zoom inside; anything
+      // shorter saturates and has nothing left to measure.
+      {
+        const built = await ev(`(async () => {
+          const menu = document.querySelector('[data-role="main-menu"]');
+          if (!menu) return 'no main menu';
+          menu.click();
+          await new Promise((r) => setTimeout(r, 250));
+          const blank = [...document.querySelectorAll('.dropzone-screen button')].find((b) => /blank/i.test(b.textContent || ''));
+          if (!blank) return 'no blank button';
+          blank.click();
+          await new Promise((r) => setTimeout(r, 250));
+          const form = document.querySelector('[data-role="blank-score-setup"]');
+          if (!form) return 'no form';
+          form.elements.title.value = 'Tempo probe';
+          form.elements.tempo.value = '120';
+          form.elements.bars.value = '48';
+          form.elements.meter.value = '4/4';
+          form.requestSubmit();
+          for (let i = 0; i < 60; i++) {
+            const ok = document.querySelector('[data-role="confirm-ok"]');
+            if (ok) { ok.click(); break; }
+            await new Promise((r) => setTimeout(r, 50));
+          }
+          await new Promise((r) => setTimeout(r, 1800));
+          return document.querySelector('.triview') ? 'main' : 'still opening';
+        })()`, true);
+        await settle(1500);
+        check('P5b: a 48-bar blank score is on screen to type a tempo at', built === 'main', String(built));
+
+        if (built === 'main') {
+          const rows = [];
+          // The FIRST slow-down pays the document's own wall (below); every change after it is
+          // inside the limits and must be exact. Both are asserted, separately.
+          for (const bpm of [30, 120, 240, 30, 120, 240]) {
+            await ev(setBpm(bpm));
+            await settle(1800);
+            const s = await tempoState();
+            rows.push({
+              bpm, scale: Number(s.scale.toFixed(6)), staffGap: s.staffGap, span: s.spanSec,
+              sizeHeld: s.rebase?.sizeHeld ?? null,
+              wanted: s.rebase?.wantedSpanSec ?? null, granted: s.rebase?.grantedSpanSec ?? null,
+              docSec: s.doc, box: s.bpmBox
+            });
+            if ([30, 120, 240].includes(bpm) && rows.length > 3) await shot(`04-bpm-${bpm}`);
+          }
+          say('P5b: manual BPM on a beatless take', rows);
+          const settled = rows.slice(3);
+          check(
+            'P5b: the typed tempo really reaches the clock on this take (the demo above cannot)',
+            rows.every((r) => String(r.box) === String(r.bpm)),
+            rows.map((r) => `${r.bpm}->${r.box}`).join(' ')
+          );
+          check(
+            'P5b: 30 <-> 120 <-> 240 BPM engraves at ONE size (it used to run 3.0 / 0.98 / 0.6)',
+            settled.every((r) => sameScale(r.scale, settled[0].scale)) &&
+              settled.every((r) => r.staffGap !== null && Math.abs(r.staffGap - settled[0].staffGap) <= 0.26),
+            settled.map((r) => `${r.bpm}:scale ${r.scale}/gap ${r.staffGap}px`).join('  ')
+          );
+          check(
+            'P5b: and the window is what carried the change instead',
+            settled.every((r) => r.span > 0) &&
+              Math.max(...settled.map((r) => r.span)) / Math.min(...settled.map((r) => r.span)) > 3,
+            settled.map((r) => `${r.bpm}:${r.span}s`).join(' ')
+          );
+          // THE DOCUMENTED EDGE, asserted as a REPORT rather than as an absence: the run must
+          // contain at least one honest "I could not hold the size", and it must be for the one
+          // legal reason — the window it wanted is longer than the document is.
+          const walls = rows.filter((r) => r.sizeHeld === false);
+          check(
+            'P5b: where size CANNOT be held the app says so, and only because the document is too short',
+            walls.every((r) => r.granted < r.wanted && Math.abs(r.granted - r.docSec.audio) < 0.5),
+            walls.length === 0
+              ? 'no clamp was needed on this run'
+              : walls.map((r) => `${r.bpm}BPM wanted ${r.wanted}s, document is ${r.docSec.audio}s, took ${r.granted}s`).join('; ')
+          );
+        }
+      }
+    }
+
     check('no console errors', errors.length === 0, errors.slice(0, 3).join(' | '));
     console.log(`\n${failures === 0 ? 'ALL PASS' : `${failures} FAILED`}  (${results.length} checks)`);
     await writeFile(join(OUT, 'scrollzoom-probe.json'), JSON.stringify({ results }, null, 2));

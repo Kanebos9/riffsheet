@@ -95,8 +95,29 @@ export { validateIR, writtenTicks } from './validate.js';
 export { quantizeOnsets } from './quantize.js';
 export type { QuantNote, QuantResult, QuantTupletGroup } from './quantize.js';
 
-export { collectChords, clampOverlaps, chordWindowSec, CHORD_WINDOW_MIN_SEC } from './chords.js';
+export { collectChords, clampOverlaps, chordGroupsOf, chordWindowSec, CHORD_WINDOW_MIN_SEC } from './chords.js';
 export type { ChordEvent } from './chords.js';
+
+/**
+ * THE TOTAL PROJECTION — what happened to every input note, and the published chord law.
+ *
+ * `chordGroupsOf` above answers "which of these notes are one chord" WITHOUT a build;
+ * `BuildResult.projection.chordGroups` is the answer a particular engraved page was made from.
+ * `CHORD_WINDOW_MIN_SEC` is neither: it is the floor of the base window, it is not a conservative
+ * approximation of the law in either direction, and a caller that groups with it will disagree
+ * with the page. See the warning on `chordWindowSec`.
+ */
+export { assembleProjection, glyphsBySourceId, projectionIds } from './projection.js';
+export type {
+  ChordGroupProjection,
+  DropReason,
+  GlyphRef,
+  IntentIgnored,
+  MergeReason,
+  NoteProjection,
+  Projection,
+  ProjectionLedger
+} from './projection.js';
 
 export { detectKey, semitoneTransitionScores, majorTonicOf } from './key.js';
 export type { KeyInput } from './key.js';

@@ -56,7 +56,7 @@ import { t, TIPS } from '../ui/tips';
 // `getBoundingClientRect()` are VISUAL pixels; alphaTab's bounds lookup, `LEFT_INSET_PX`, the
 // scroller's `scrollLeft` and every engraved measurement are LOGICAL ones. One conversion, in
 // `ui/faceScale.ts`, and every hit test on this surface goes through it.
-import { logicalPoint, logicalRect, logicalX, toLogical, toVisual } from '../ui/faceScale';
+import { faceScale, logicalPoint, logicalRect, logicalX, toLogical, toVisual } from '../ui/faceScale';
 import type { RiffScore } from '../pipeline';
 
 export type NamesPlacement = 'between' | 'above' | 'below';
@@ -347,6 +347,20 @@ const NAME_HEIGHT = 13;
 function nameHalfWidth(text: string): number {
   return (text.length * 6.3 + 4) / 2;
 }
+
+/**
+ * One element for one of the three decoration rows: a class, and a tooltip if the row has one.
+ *
+ * The three `sync*` builders had the same four lines each, and all three now also have to be
+ * reachable from the parked pool (§THE PARKED POOLS) — so the "make a fresh one" half is stated
+ * once, here, and each row is left saying only which class and which tip it wants.
+ */
+function labelSpan(className: string, tip?: string): HTMLSpanElement {
+  const el = document.createElement('span');
+  el.className = className;
+  if (tip) el.setAttribute('title', tip);
+  return el;
+}
 /** Chord names stack upward from the anchor by this much per extra note. */
 const NAME_STACK_STEP = 12;
 /** How far above the top of the system the LOWEST name of an 'above' row sits. */
@@ -616,6 +630,28 @@ export class TriView {
   private stringLetters: Array<NameLabel & { y: number }> = [];
   /** One transparent button per printed part name. See `syncPartLabelHits`. */
   private partLabelButtons: HTMLButtonElement[] = [];
+  /**
+   * THE PARKED POOLS — retired label elements, hidden but STILL IN THE DOCUMENT (P4).
+   *
+   * The four rows above reuse their elements across renders, and until now a render that wanted
+   * fewer of them `.remove()`d the surplus. That is the second half of the swallowed-gesture bug
+   * described at §THE PANE IS THE HIT SURFACE: these four classes are the only things over the
+   * engraving that are deliberately still hit-testable, so a pinch whose fingers happen to be
+   * over a note name is latched to that `<span>` — and zooming OUT is exactly the direction that
+   * makes labels stop fitting, so the very first event of the gesture could delete the element
+   * the rest of the gesture was being delivered to.
+   *
+   * Retired elements are therefore hidden and kept, never removed, and taken back from here when
+   * the row grows again. Nothing else changes: the live arrays still hold exactly the live
+   * elements, so every reader of `labels.length` / `tabMarks.length` still counts what is on
+   * screen. The pools are bounded by the largest row the session has ever drawn.
+   */
+  private readonly parked = {
+    labels: [] as HTMLElement[],
+    tabMarks: [] as HTMLElement[],
+    stringLetters: [] as HTMLElement[],
+    partLabelButtons: [] as HTMLButtonElement[]
+  };
   /** noteId -> semitones the TAB position was folded by. Empty for anything in range. */
   private tabShifts = new Map<string, number>();
   private opts: TriViewOptions;
@@ -628,8 +664,43 @@ export class TriView {
   private lastRenderInfo: RenderInfo | null = null;
   private namesPlacement: NamesPlacement;
   private showNames: boolean;
-  /** Which note ids are highlighted. Kept so a re-render can redraw them. */
+  /**
+   * Which note ids are highlighted RIGHT NOW — a render input, and no longer an authority.
+   *
+   * IT USED TO BE ONE, and that was audit finding 7. Four places held a selection: the app's
+   * runtime store, this array, `PianoRoll`'s private `Set`, and the waveform's time range. Every
+   * rebuild path updated a different subset. `rebuildNotation` cleared only the runtime, so the
+   * old rings survived on a page that no longer contained those notes; `renderMain` destroyed and
+   * rebuilt both views without reapplying anything, so a fresh TriView started empty while the
+   * runtime still believed something was selected; and `load()` deliberately RETAINED this array
+   * across a score replacement, which is how a ring came to be drawn around whichever note in the
+   * new score happened to inherit the same id.
+   *
+   * Now: `DocumentState.selection` (the runtime store) is the only authority, and this is a copy
+   * of it that arrives WITH the score it applies to. `load()` takes the selection as an argument
+   * rather than keeping the old one, so there is no frame in which this array describes a
+   * different score from `this.index`.
+   */
   private selectedIds: string[] = [];
+  /**
+   * THE REVISION THIS VIEW'S MODEL AND INDEX DESCRIBE, and separately the one its BOUNDS do.
+   *
+   * These are two numbers because they really can differ, which is audit finding 8 and the
+   * mechanism behind the intermittent dead click after an edit. `load()` replaces the score, the
+   * index and alphaTab's model and then asks for a render — but a render into a host that is
+   * hidden, zero-width or not yet renderable returns early WITHOUT replacing
+   * `renderer.boundsLookup`. The bounds then still describe the PREVIOUS engraving, so
+   * `hitTest` resolves a real `Note` object out of them, looks it up in the NEW index, finds
+   * nothing, and returns `noteId: null` — which the app reads as "empty space" and answers with
+   * a seek. A click on a visible notehead did nothing, intermittently, and only after an edit.
+   *
+   * Stamping both sides and comparing turns that silent wrong answer into a refusal: a hit whose
+   * bounds predate the current index is REJECTED. See `hitTest`.
+   */
+  private modelRevision = 0;
+  private boundsRevision = -1;
+  /** Rejections since construction, so a probe can prove one happened rather than infer it. */
+  private staleHitRejections = 0;
   /** Built lazily from the bounds, thrown away by every `rebuildOverlays`. */
   private axis: TickAxis | null = null;
   /** The last viewport we told the caller about, so we only fire on a real change. */
@@ -812,6 +883,62 @@ export class TriView {
     this.scroller = opts.container.querySelector('.triview-scroll')!;
     this.stack = opts.container.querySelector('.triview-stack')!;
     this.host = opts.container.querySelector('.at-host')!;
+    /*
+     * §THE PANE IS THE HIT SURFACE (P4) — the engraving is a PICTURE, not a target.
+     *
+     * THE BUG THIS FIXES, as the owner reported it: a pinch over the sheet zooms perfectly when
+     * the pointer is over the empty space BELOW the music and is dead, or dies after one event,
+     * when it is directly over the engraving.
+     *
+     * THE MECHANISM, and it is not "something calls preventDefault". Every listener below is on
+     * `this.scroller`, and events bubble, so where the pointer is cannot change WHICH handler
+     * runs — it changes which node the platform DELIVERS the gesture to. On macOS both roads
+     * (see view/gesture.ts) are LATCHED: WebKit hit-tests once, at the start of the gesture, and
+     * routes every later `wheel`, `gesturechange` and `gestureend` of that same pinch to the node
+     * it found. If that node leaves the document mid-gesture the latch is dropped and the rest of
+     * the pinch is dispatched to nobody.
+     *
+     * And over the engraving the latched node is ALWAYS destroyed, by the pinch itself: the hit
+     * is an alphaTab `<path>` or `<text>` inside a partial `<div>`, the first event of the pinch
+     * asks for a zoom, the zoom re-engraves, and alphaTab replaces every partial. One event
+     * lands, the fingers keep moving, nothing else arrives — "dead/unreliable". Below the music
+     * the hit is `.triview-scroll` itself, which is built once in this constructor and outlives
+     * every render there will ever be, so the latch holds and the same pinch works perfectly.
+     * That is the whole of the difference the owner was seeing.
+     *
+     * MEASURED, not deduced. With this line reverted, scripts/scrollzoom-probe.mjs §P4 reports at
+     * a notehead, a beam, a staff line, a TAB digit and a name label: the node under the pointer
+     * is `isConnected === false` one pinch event later, where the node below the music is the one
+     * it always was — and on the GestureEvent road, which is delivered to one latched node the
+     * way macOS delivers it, the same pinch is worth x1.06 over the engraving against x1.2625
+     * over the empty pane. One event of four. Both faces, both roads, level at x1.2625 with this.
+     *
+     * SO THE STACK STOPS BEING HIT-TESTABLE, and with it the whole engraving underneath it: at
+     * every pixel of the pane, glyph or not, the node a gesture latches to is now `.triview-scroll`.
+     * Nothing is lost, because nothing here has ever asked the DOM what is under the pointer —
+     * `hitTest`/`hitTestByX`/`targetAt` all work from client coordinates against alphaTab's
+     * bounds lookup, the hover cursor is written to the scroller, and no alphaTab mouse event
+     * (`beatMouseDown` and friends) is subscribed anywhere in this app.
+     *
+     * AND IT GIVES THE NAME LABELS BACK, which nobody had noticed was missing. alphaTab gives
+     * each engraved partial `z-index: 1` and the four decoration rows have none, so the music was
+     * painted — and therefore hit-tested — ON TOP of the very labels those rows exist to make
+     * clickable: with this line reverted the probe cannot find a single `.note-name` whose topmost
+     * element is itself, out of the forty-eight on screen. `onPointerDown`'s `.note-name` branch
+     * (P6, "the label's OWN note first") was unreachable anywhere over the engraving. It is not
+     * unreachable now, because the thing that was covering the labels no longer takes hits.
+     *
+     * THE FOUR EXCEPTIONS ARE THE FOUR CONTROLS, and they say so themselves: `.note-name`,
+     * `.tab-mark`, `.string-letter` and `.part-label-hit` set `pointer-events: auto` in
+     * ui/styles.css and stay clickable, hoverable and focusable through this. They are the reason
+     * §THE PARKED POOLS exists — being a hit target is exactly what makes being deleted mid-pinch
+     * dangerous.
+     *
+     * IN CODE RATHER THAN IN THE STYLESHEET on purpose. This is not how the pane looks; it is the
+     * contract between the pane and the four handlers registered thirty lines below, and the two
+     * have to be read together or the next person moves one without the other.
+     */
+    this.stack.style.pointerEvents = 'none';
     this.namesRow = opts.container.querySelector('.names-row')!;
     this.tabMarksRow = opts.container.querySelector('.tabmarks-row')!;
     this.stringLettersRow = opts.container.querySelector('.stringletters-row')!;
@@ -932,8 +1059,17 @@ export class TriView {
     return this.awaitingRender;
   }
 
-  /** Full load: build the alphaTab object graph from the pipeline's data and render it. */
-  load(score: RiffScore): void {
+  /**
+   * Full load: build the alphaTab object graph from the pipeline's data and render it.
+   *
+   * `selection` IS NOT OPTIONAL IN SPIRIT, only in signature. It is the authority's answer for
+   * the score being loaded, and passing it here rather than in a separate `setSelection` call is
+   * what makes the publish atomic: there is no instant in which this view holds a new index and
+   * an old selection. Omitting it means "nothing is selected in this score", which is the correct
+   * reading for every caller that has no authority to consult — not "keep what you had", which is
+   * what this method used to do and which is finding 7.
+   */
+  load(score: RiffScore, selection: ReadonlyArray<string> = []): void {
     this.currentScore = score;
     this.keyFifths = score.ir.key.fifths ?? 0;
     this.accidentals = accidentalsForKey(score.ir.key.fifths);
@@ -948,6 +1084,17 @@ export class TriView {
     const built = buildAlphaTabScore(score.data, this.api.settings);
     this.index = built.index;
     this.builtModel = built.score;
+    /*
+     * THE ATOMIC PUBLISH. Model, index and selection are replaced together, under one new
+     * revision, BEFORE the render is requested — and the bounds are left explicitly behind
+     * (`boundsRevision` keeps its old value) until a render actually produces new ones.
+     *
+     * That asymmetry is the fix rather than an oversight. The bounds are the one part of this
+     * quartet that alphaTab owns and that a render may decline to replace; pretending they are
+     * current at publish time is precisely the assumption that produced the dead click.
+     */
+    this.modelRevision++;
+    this.selectedIds = [...selection];
     // A braced system needs a wider reserved column than a single staff, and it needs it BEFORE
     // the first render rather than one corrective render later. See BRACED_LEFT_OVERHANG_PER_SCALE.
     this.reserveLeftColumnFor(built.score);
@@ -1197,6 +1344,16 @@ export class TriView {
     // a request `tuneLeftInset` is about to raise, not the one that has just been served — so
     // this is cleared here and `startRender` sets it again if there is more to come.
     this.awaitingRender = false;
+    /*
+     * THE BOUNDS NOW DESCRIBE THE CURRENT MODEL — the one moment in the lifecycle at which that
+     * is true, and therefore the only place this may be stamped.
+     *
+     * `postRenderFinished` fires after alphaTab has replaced `renderer.boundsLookup`. A render
+     * that returned early (hidden host, zero width, not yet renderable) never reaches here, so
+     * `boundsRevision` correctly stays behind and `hitTest` refuses to answer from bounds that
+     * describe an engraving the index no longer knows about.
+     */
+    this.boundsRevision = this.modelRevision;
     // Before anything measures the host: a stale placeholder is ink, and `measureLeftInk()`
     // and `scrollWidth` would both take it for part of this engraving.
     this.trimSurface();
@@ -2800,17 +2957,35 @@ export class TriView {
     return kept;
   }
 
+  /**
+   * Retire one label element: hidden, kept in the document, offered back on the next growth.
+   *
+   * `hidden` rather than `remove()` — that one word is the whole point. See §THE PARKED POOLS:
+   * these elements are hit targets, a hit target that vanishes mid-pinch takes the rest of the
+   * gesture with it on macOS, and a render that shrinks a row is exactly what a zoom-out is.
+   * A hidden element is not hit-testable and not drawn, so nothing else can tell the difference.
+   */
+  private park<T extends HTMLElement>(el: T, pool: T[]): void {
+    el.hidden = true;
+    pool.push(el);
+  }
+
+  /** Take a retired element back into use, or `null` when the pool is empty and one must be made. */
+  private unpark<T extends HTMLElement>(pool: T[]): T | null {
+    const el = pool.pop();
+    if (!el) return null;
+    el.hidden = false;
+    return el;
+  }
+
   /** Reuse label elements across renders; creating 400 divs per keystroke is not free. */
   private syncLabels(wanted: Array<WantedName>): void {
     while (this.labels.length < wanted.length) {
-      const el = document.createElement('span');
-      el.className = 'note-name';
-      this.namesRow.appendChild(el);
+      const el = this.unpark(this.parked.labels) ?? this.namesRow.appendChild(labelSpan('note-name'));
       this.labels.push({ el, x: 0 });
     }
     while (this.labels.length > wanted.length) {
-      const extra = this.labels.pop()!;
-      extra.el.remove();
+      this.park(this.labels.pop()!.el, this.parked.labels);
     }
     for (let i = 0; i < wanted.length; i++) {
       const w = wanted[i];
@@ -2874,6 +3049,13 @@ export class TriView {
   private syncPartLabelHits(lookup: alphaTab.rendering.BoundsLookup): void {
     const wanted = this.opts.onPartLabelClick ? this.partLabelBoxes(lookup) : [];
     while (this.partLabelButtons.length < wanted.length) {
+      // A parked button is a button that has already been through here, so it still carries the
+      // one `click` listener bound below — taking it back must NOT bind a second one.
+      const reused = this.unpark(this.parked.partLabelButtons);
+      if (reused) {
+        this.partLabelButtons.push(reused);
+        continue;
+      }
       const button = document.createElement('button');
       button.type = 'button';
       button.className = 'part-label-hit';
@@ -2891,7 +3073,7 @@ export class TriView {
       this.partLabelButtons.push(button);
     }
     while (this.partLabelButtons.length > wanted.length) {
-      this.partLabelButtons.pop()!.remove();
+      this.park(this.partLabelButtons.pop()!, this.parked.partLabelButtons);
     }
     for (let i = 0; i < wanted.length; i++) {
       const w = wanted[i];
@@ -2977,18 +3159,16 @@ export class TriView {
    */
   private syncStringLetters(wanted: Array<{ x: number; y: number; text: string }>): void {
     while (this.stringLetters.length < wanted.length) {
-      const el = document.createElement('span');
-      el.className = 'string-letter';
       // The plate the pinned row needs to be readable over music lives in `.string-letter`
       // (ui/styles.css). It was set inline here while the row was being built; nothing about
       // it depends on anything this file knows, so it is a stylesheet's job.
-      const tip = t(TIPS.stringLetters);
-      if (tip) el.setAttribute('title', tip);
-      this.stringLettersRow.appendChild(el);
+      const el =
+        this.unpark(this.parked.stringLetters) ??
+        this.stringLettersRow.appendChild(labelSpan('string-letter', t(TIPS.stringLetters)));
       this.stringLetters.push({ el, x: 0, y: 0 });
     }
     while (this.stringLetters.length > wanted.length) {
-      this.stringLetters.pop()!.el.remove();
+      this.park(this.stringLetters.pop()!.el, this.parked.stringLetters);
     }
     for (let i = 0; i < wanted.length; i++) {
       const w = wanted[i];
@@ -3037,17 +3217,15 @@ export class TriView {
    */
   private syncTabMarks(wanted: Array<{ x: number; y: number; text: string }>): void {
     while (this.tabMarks.length < wanted.length) {
-      const el = document.createElement('span');
-      el.className = 'tab-mark';
-      // Set once: the tooltip layer moves `title` to `data-riff-tip` on first hover, and
-      // re-setting it afterwards resurrects the native OS tooltip alongside ours.
-      const tip = t(TIPS.tabOctaveShift);
-      if (tip) el.setAttribute('title', tip);
-      this.tabMarksRow.appendChild(el);
+      // The tip is set once, at creation: the tooltip layer moves `title` to `data-riff-tip` on
+      // first hover, and re-setting it afterwards resurrects the native OS tooltip alongside ours.
+      const el =
+        this.unpark(this.parked.tabMarks) ??
+        this.tabMarksRow.appendChild(labelSpan('tab-mark', t(TIPS.tabOctaveShift)));
       this.tabMarks.push({ el, x: 0 });
     }
     while (this.tabMarks.length > wanted.length) {
-      this.tabMarks.pop()!.el.remove();
+      this.park(this.tabMarks.pop()!.el, this.parked.tabMarks);
     }
     for (let i = 0; i < wanted.length; i++) {
       const w = wanted[i];
@@ -3118,9 +3296,49 @@ export class TriView {
     this.drawHover();
   }
 
-  /** Which notes are highlighted right now. Lets the piano roll round-trip a selection. */
+  /** Which notes are highlighted right now. A read of the copy, never of an authority. */
   get selection(): string[] {
     return [...this.selectedIds];
+  }
+
+  /**
+   * DO THE BOUNDS DESCRIBE THE SCORE THE INDEX DESCRIBES?
+   *
+   * Every pointer road has to ask, not just `hitTest`: the name-label road (`hitTestByName`) and
+   * the nearest-beat fallback (`hitTestByX`) read the same `boundsLookup` and would happily
+   * answer from an engraving that has been replaced. `hitTestByX` in particular is the one that
+   * turns a refusal into a SEEK — `onPointerDown` falls through to it when nothing was hit — so
+   * gating `hitTest` alone would have moved the playhead instead of selecting, which is the
+   * original symptom wearing a different hat.
+   *
+   * Counted rather than merely returned, so `probe()` can show a rejection happened. A number
+   * that stays at zero through a normal session and rises during a deferred/hidden rebuild is
+   * the evidence that this gate is doing something.
+   */
+  private boundsAreCurrent(): boolean {
+    if (this.boundsRevision === this.modelRevision) return true;
+    this.staleHitRejections++;
+    return false;
+  }
+
+  /**
+   * The revision pair and what the gate has done with it. For `__RIFFSHEET_SEAM__`.
+   *
+   * `current` is the invariant a probe asserts between interactions; `staleHitRejections` is the
+   * evidence that the gate fires when it should, which is the half a passing session cannot show.
+   */
+  revisionProbe(): {
+    model: number;
+    bounds: number;
+    current: boolean;
+    staleHitRejections: number;
+  } {
+    return {
+      model: this.modelRevision,
+      bounds: this.boundsRevision,
+      current: this.boundsRevision === this.modelRevision,
+      staleHitRejections: this.staleHitRejections
+    };
   }
 
   // -------------------------------------------------------------------------
@@ -3185,9 +3403,18 @@ export class TriView {
       const notes = this.index.idToNotes?.get(id) ?? [];
       const single = notes.length === 0 ? this.index.idToNote.get(id) : null;
       const chain = notes.length > 0 ? notes : single ? [single] : [];
+      // The same screen-pixel floor the selection gets, one step lighter. A hover ring at 1.75
+      // engraving units is 0.48 screen pixels on a 0.273 face — not a lighter answer to "is this
+      // the note I mean?", just no answer. See `drawSelection` for the arithmetic.
+      const width = Math.max(HOVER_RING_UNITS, HOVER_RING_MIN_SCREEN_PX / Math.max(faceScale(), 0.05));
       for (const r of chain.flatMap((n) => this.noteGlyphRects(n))) {
         this.hoverGroup.appendChild(
-          selectionRect(r, 5, { fill: 'none', strokeWidth: '1.75', opacity: '0.65' }, 'sel-rect hover-rect')
+          selectionRect(
+            r,
+            Math.max(5, width * 0.9),
+            { fill: 'none', strokeWidth: String(width), opacity: '0.65' },
+            'sel-rect hover-rect'
+          )
         );
       }
     }
@@ -3235,7 +3462,37 @@ export class TriView {
   private drawSelection(): void {
     const lookup = this.api.renderer.boundsLookup;
     this.selectionGroup.replaceChildren();
+    this.syncLabelSelection();
     if (!lookup || !this.index) return;
+
+    /*
+     * THE UNIT CONVERSION THAT MAKES THIS VISIBLE, and whose absence is the whole of finding 11.
+     *
+     * The overlay is drawn in the ENGRAVING's own coordinates, which are logical pixels — the
+     * same space `logicalPoint` converts a pointer into. The face is then scaled onto the screen
+     * by ONE number (`faceScale`, see ui/faceScale.ts §THE ONE-PROPORTION LAW). So
+     *
+     *     screen px = engraving units x faceScale
+     *
+     * and every weight written here as a constant was in fact a promise about a 1:1 window. At
+     * REAPER's 360x280 the scale is about 0.273, so the "firm 2.5 px ring" was 0.68 screen
+     * pixels and the 6 px halo at 30% opacity was 1.64 of them — a highlight that technically
+     * rendered on every glyph and could readily look like nothing at all, which is exactly what
+     * was reported.
+     *
+     * Dividing the screen-pixel minimum by the scale gives the engraving-unit weight that comes
+     * out at that many real pixels. Above the base size the scale is 1 and nothing changes, so
+     * this cannot make the highlight heavier than it was designed to be on a large window; it
+     * only refuses to let it become invisible on a small one.
+     */
+    const scale = Math.max(faceScale(), 0.05);
+    const unitsFor = (screenPx: number) => screenPx / scale;
+    const ringWidth = Math.max(SEL_RING_UNITS, unitsFor(SEL_RING_MIN_SCREEN_PX));
+    const haloWidth = Math.max(SEL_HALO_UNITS, unitsFor(SEL_HALO_MIN_SCREEN_PX));
+    // The padding has to grow with the strokes or the halo swallows the ring and both swallow
+    // the notehead: a 7-unit pad under a 12-unit stroke is a solid blob.
+    const ringPad = Math.max(SEL_RING_PAD_UNITS, ringWidth * 0.9);
+    const haloPad = ringPad + haloWidth * 0.5;
 
     for (const id of this.selectedIds) {
       // EVERY notehead of the note, not just the first. A note held across a bar line is
@@ -3252,10 +3509,38 @@ export class TriView {
       for (const r of rects) {
         // Halo first so it sits behind the ring.
         this.selectionGroup.appendChild(
-          selectionRect(r, 7, { fill: 'none', strokeWidth: '6', opacity: '0.3' })
+          selectionRect(r, haloPad, {
+            fill: 'none',
+            strokeWidth: String(haloWidth),
+            opacity: String(SEL_HALO_OPACITY)
+          })
         );
-        this.selectionGroup.appendChild(selectionRect(r, 4, { strokeWidth: '2.5' }));
+        // ...then the firm ring, WITH ITS FILL. The fill used to come from `.sel-rect`'s
+        // `accent-soft` (20% alpha), which on paper-coloured staff is a tint you have to be
+        // looking for. `sel-rect-firm` gives it a solid-enough wash to read as "this one" at a
+        // glance, which is what the owner asked for in the words "it should really attract".
+        this.selectionGroup.appendChild(
+          selectionRect(r, ringPad, { strokeWidth: String(ringWidth) }, 'sel-rect sel-rect-firm')
+        );
       }
+    }
+  }
+
+  /**
+   * The clicked note's NAME gets the treatment too.
+   *
+   * Finding 11 lists this as part of why selection reads as faint: the note-names row is the
+   * thing a player is often actually reading, and it never received a selected class at all, so
+   * the one piece of the interface that spells out which note you picked stayed ordinary ink.
+   *
+   * Driven from `drawSelection` rather than from the label sync, because selection changes far
+   * more often than the label row is rebuilt and this is a class toggle on a few dozen elements.
+   */
+  private syncLabelSelection(): void {
+    const selected = new Set(this.selectedIds);
+    for (const label of this.labels) {
+      const id = label.el.dataset.noteId;
+      label.el.classList.toggle('selected', !!id && selected.has(id));
     }
   }
 
@@ -3772,6 +4057,18 @@ export class TriView {
   hitTest(clientX: number, clientY: number): NoteHit | null {
     const lookup = this.api.renderer.boundsLookup;
     if (!lookup) return null;
+    /*
+     * REVISION GATE (finding 8). The bounds and the index must describe the same engraving, or
+     * every answer this method gives is about a page that is no longer on screen.
+     *
+     * Returning null here is NOT the same as the null this used to return. That one meant "there
+     * is no note under the pointer", and `App.onNoteClick` correctly answered it with a seek —
+     * which is why a click on a plainly visible notehead sometimes just moved the playhead. This
+     * one means "ask again once the page has caught up", and the app distinguishes them: a
+     * rejected hit does nothing at all. Doing nothing for one frame is invisible; seeking to the
+     * wrong place because a stale `Note` object failed a lookup is the reported defect.
+     */
+    if (!this.boundsAreCurrent()) return null;
 
     // THE LAW'S CONVERSION (G1): alphaTab's bounds lookup is in the engraving's own pixels.
     const { x, y } = logicalPoint(this.host, clientX, clientY);
@@ -4267,6 +4564,10 @@ export class TriView {
     // Without this the press falls through to the seek below and the transport jumps to bar 1
     // underneath the rename field that is opening. See `syncPartLabelHits`.
     if (target.classList.contains('part-label-hit')) return;
+    // THE PAGE UNDER THE POINTER IS NOT THE CURRENT PAGE. Do nothing — not even the seek this
+    // method falls through to, which is the whole point of gating here rather than in `hitTest`.
+    // See `boundsAreCurrent`.
+    if (!this.boundsAreCurrent()) return;
     const hit = target.classList.contains('note-name')
       ? // The label's OWN note first (P6); the nearest beat anchor only when it has none.
         (this.hitTestByName(target) ?? this.hitTestByX(e.clientX))
@@ -4303,6 +4604,9 @@ export class TriView {
    */
   private onContextMenu = (e: MouseEvent): void => {
     e.preventDefault();
+    // Same gate as the primary press: a menu raised against stale bounds would name one note and
+    // edit another. See `boundsAreCurrent`.
+    if (!this.boundsAreCurrent()) return;
     const target = this.targetAt(e.clientX, e.clientY);
     if (!target) return;
     this.opts.onSheetContextMenu?.(target);
@@ -4537,6 +4841,43 @@ function readOverlayColors(): { accent: string; danger: string; paper: string } 
 // ---------------------------------------------------------------------------
 
 /** One highlight rectangle, inflated by `pad` and given its weight inline. See drawSelection. */
+/*
+ * ---------------------------------------------------------------------------------------------
+ * THE SELECTION TREATMENT, in numbers.
+ *
+ * Two weights per glyph — a soft halo and a firm ring — expressed twice: as ENGRAVING UNITS
+ * (what they should be on a full-size window, where one unit is one screen pixel) and as a
+ * SCREEN-PIXEL FLOOR (what they may never fall below, whatever the face scale does). See
+ * `drawSelection` for the arithmetic and for why the floor is the entire fix.
+ *
+ * The floors are chosen against a hostile host rather than a comfortable one. At REAPER's
+ * 360x280 the face scale is ~0.273, so the old 2.5-unit ring landed at 0.68 screen px: a
+ * sub-pixel line, antialiased into a grey suggestion. 2 screen px is the smallest weight that
+ * survives that treatment as a definite line on both the light and the dark papers, and 5 px of
+ * halo behind it is what separates "outlined" from "glowing" at a glance.
+ * ---------------------------------------------------------------------------------------------
+ */
+/** The firm ring's weight on a 1:1 window. */
+const SEL_RING_UNITS = 2.5;
+/** ...and the screen pixels it may never be thinner than. */
+const SEL_RING_MIN_SCREEN_PX = 2;
+/** The halo's weight on a 1:1 window. */
+const SEL_HALO_UNITS = 6;
+/** ...and its screen-pixel floor. */
+const SEL_HALO_MIN_SCREEN_PX = 5;
+/**
+ * The halo's opacity. RAISED from 0.30.
+ *
+ * 0.3 was chosen when the halo was 6 real pixels wide. It is a different mark at 5 px on a small
+ * face — thinner, so it needs more of the accent in it to register as the same emphasis.
+ */
+const SEL_HALO_OPACITY = 0.45;
+/** The gap between the notehead's box and the firm ring, on a 1:1 window. */
+const SEL_RING_PAD_UNITS = 4;
+/** The hover ring: a lighter answer to the same question, under the same floor. See `drawHover`. */
+const HOVER_RING_UNITS = 1.75;
+const HOVER_RING_MIN_SCREEN_PX = 1.4;
+
 function selectionRect(
   r: { x: number; y: number; w: number; h: number },
   pad: number,

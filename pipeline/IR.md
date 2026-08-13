@@ -158,6 +158,7 @@ carry the offset and the source is the authority on how it was engraved.
 8. Detect legato before assigning strings and frets.
 9. Split across bars, compute ties, tuplets, and beams.
 10. Emit the shared IR and adapt it to MusicXML, MIDI, and alphaTab.
+11. Assemble the projection: account for every input note. See "Projection" below.
 
 ## Output behavior
 
@@ -196,6 +197,147 @@ summary in the part/track name so printed and exported sheets are self-describin
 Quantized MIDI follows IR tempo and meter changes. As-played MIDI uses the original note seconds and
 a constant tick clock, preserving wall-clock performance timing. A symbolic MIDI import retains its
 original bytes for exact re-export at the webcore boundary.
+
+## Projection — what happened to every input note
+
+`BuildResult.projection` is a TOTAL account of the build's input. For every id the build was
+handed, `projection.byId` holds exactly one outcome, and
+
+```
+counts.engraved + counts.merged + counts.dropped === counts.input === byId.size
+```
+
+holds on every build, on every grid. This is the contract the sheet/roll seam is built against: the
+roll draws every performed note and the sheet draws what survived engraving, so "this note is not on
+the page" must be answerable with a reason rather than inferred from a note count. `PartBuild`
+carries the same structure per part, keyed by the NAMESPACED id (`p2-n0`) — the id the IR and both
+emitters carry.
+
+```ts
+interface Projection {
+  byId: Map<string, NoteProjection>;      // total: one entry per input id
+  chordGroups: ChordGroupProjection[];    // the chord law's own partition, in onset order
+  counts: { input: number; engraved: number; merged: number; dropped: number };
+}
+
+type NoteProjection =
+  | { kind: 'engraved'; id: string; glyphs: GlyphRef[]; engravedTicks: number;
+      intentIgnored?: IntentIgnored }
+  | { kind: 'merged'; id: string; mergedInto: string; reason: MergeReason }
+  | { kind: 'dropped'; id: string; reason: DropReason };
+
+interface GlyphRef {
+  bar: number;      // index into ir.bars
+  voice: number;    // IRVoice.id (1 or 2), NOT an index
+  beat: number;     // index into that voice's beats
+  note: number;     // index into that beat's notes
+  startTick: number;  // absolute: bar.startTick + beat.startTick
+  durTicks: number;
+  tieStart: boolean;
+  tieStop: boolean;
+}
+
+type MergeReason =
+  | 'chord-duplicate-pitch'     // chords.ts: one notehead cannot be printed twice
+  | 'quantize-collision'        // quantize.ts: two events landed on one grid tick
+  | 'symbolic-tick-collision';  // symbolic.ts / the exact quantizer: one printable slot
+
+type DropReason =
+  | 'past-audio-end'          // guards.ts: onset at or past audioDurationSec
+  | 'below-min-duration'      // guards.ts: under MIN_NOTE_SEC and nothing declared it
+  | 'past-score-end'          // buildScore.ts: quantized onset at or past the last barline
+  | 'zero-length-after-clamp' // buildScore.ts: the overlap clamp left it no ticks
+  | 'unengraved';             // BACKSTOP — see below
+```
+
+`glyphs` lists EVERY glyph the note became, in printed order: a span the bar law split into tied
+pieces is several entries, and `engravedTicks` is their sum. A consumer that wants "the notehead for
+note X" must take all of them.
+
+`merged` means the note is still audible on the page, inside another note's slot. `mergedInto` is
+resolved TRANSITIVELY: it always names an id that is not itself merged, so a consumer follows one
+pointer and never a chain. Do not treat a merged note as deleted.
+
+`unengraved` is a BACKSTOP, and its presence in a build is a bug report rather than a normal
+outcome: it means a station removed a note without recording it. The assembly ends with a sweep over
+the input ids that assigns it to anything no station claimed, so a loss point added upstream cannot
+re-open the silent door — it surfaces as an honest count instead. The property sweep in
+`test/projection.test.ts` asserts it never fires.
+
+Precedence in the assembly is: the page wins, then the ledger, then the backstop. An id with a glyph
+is `engraved` whatever any station recorded, because the glyph is the observable fact.
+
+### The chord law, published
+
+`chords.ts` owns the only definition of "these notes are one chord", and it is a GREEDY PARTITION of
+the whole note list, not a pairwise predicate:
+
+```ts
+interface ChordGroupProjection {
+  id: string;              // build-local event id (`e0`, `e1`, ...); stable within ONE build
+  memberIds: string[];     // every id the LAW admitted, low pitch first, merged members included
+  engravedIds: string[];   // the subset that reached the page
+  onsetSec: number;
+  endSec: number;
+  windowSec: number;       // the window as it stood when the group closed; 0 on a written source
+  law: 'performance-window' | 'written-tick';
+}
+```
+
+Two laws, chosen per group. A PERFORMED group takes attacks inside `max(35 ms, 1/64 whole note)`
+measured from the group's first note, WIDENED by half a base window for every arrival in the last
+quarter of the current one, with no ceiling. A WRITTEN group (a note carrying `sourceTiming`) admits
+exactly the notes on its own written tick and consults no window at all.
+
+`CHORD_WINDOW_MIN_SEC` IS NOT A CONSERVATIVE APPROXIMATION OF THIS, in either direction, and a
+caller that groups with it will disagree with the page. Two counterexamples, both in the test file:
+
+- **Chaining.** Onsets at 0, 34 and 68 ms with a 35 ms base. The engraver takes 0 and 34 (the window
+  widens to 52.5 ms), then finds 68 > 52.5 and starts a second group. A caller asking "is anything
+  within 35 ms of this note" calls 34 and 68 one chord — it merged a pair the page splits.
+- **Written sources.** Two imported notes 3 ms apart on different written ticks are two events here
+  and one chord to anything holding a millisecond threshold. No number fixes this: the law on that
+  path is not a window.
+
+Ask the partition, never a threshold: `chordGroupsOf(notes, beatPeriodSec)` answers without a build,
+and `projection.chordGroups` is the answer a particular engraved page was made from.
+
+### Notation intent, and when it goes stale
+
+A stored `notationIntent` is HONOURED when the note's quantized span could legally carry it — the
+page gave it the declared number of ticks to within ONE SUBDIVISION of the lattice the note was
+measured against (the containing tuplet's `unitTicks` inside a group, `basicQuantTicks` outside one;
+the same `durUnit` the quantizer snaps with). Otherwise the projection raises a verdict:
+
+```ts
+interface IntentIgnored {
+  reason: 'not-carried' | 'tuplet-lattice' | 'chord-superseded' | 'symbolic-source' | 'unprintable';
+  declaredTicks: number | null;  // null when the value names nothing printable
+  engravedTicks: number;         // summed over every piece of a tie split
+  toleranceTicks: number;
+}
+```
+
+- `not-carried` — THE STALE CASE. The declaration asked for a length the note's position cannot
+  hold: the next attack trimmed it, or the last barline clipped it. A declaration is stored together
+  with the seconds that match it, and a later timing edit — a roll drag, a snap, a cut ripple, a
+  neighbour moving — changes what the span can hold while leaving the declaration behind.
+- `tuplet-lattice` — not a whole number of the containing group's units, so nothing else was
+  printable there.
+- `chord-superseded` — a chord is one slot with one value, and a longer declaration from another
+  member of the same chord won.
+- `symbolic-source` — a written source decided every tick before a declaration could be consulted.
+  The stored intent is inert rather than wrong.
+- `unprintable` — `notationIntentTicks` refused the value (a dotted 1/32 names no length).
+
+THE PIPELINE REPORTS AND DOES NOT CLEAR. It is a pure function of its input and the stored intent
+lives in the caller's document; clearing it here would last exactly one build and then be
+re-supplied. The seam owns the value, so the SEAM clears it on seeing `not-carried`, and the next
+build measures the note. That loop converges: with no declaration there is nothing left to
+contradict. The pipeline cannot tell "stale" from "fresh" by comparing the declaration against the
+seconds, because the whole point of a declaration is that it outranks the measurement — what it can
+tell is that the page could not carry the value, which is exactly the condition under which the
+stored intent is a lie.
 
 ## Multi-part scores (Parts)
 

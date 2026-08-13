@@ -49,6 +49,31 @@ export interface ThemeTokens {
   'accent-hover': string;
   'accent-ink': string;
   'accent-soft': string;
+  /**
+   * THE ACCENT AS IT IS DRAWN ON THE ENGRAVING'S PAPER — selection rings, hover rings.
+   *
+   * A SEPARATE TOKEN because the paper is not any of the three surfaces the accent was ever
+   * checked against. `--accent` is tuned to sit on `--bg-panel` and its friends, which in three
+   * of the four themes are near-black; the paper is near-white in all four. Ember's orange
+   * measures 2.24:1 on its own paper and Tide's cyan 2.28:1 — both well under the 3:1 a shape
+   * needs, which is why a selection ring could be technically present and practically invisible
+   * regardless of how thick it was drawn. Thickening it (see `triview.ts` §SELECTION TREATMENT)
+   * fixes the size half of finding 11; this fixes the contrast half, and the two are independent.
+   *
+   * Where the accent already clears the bar on paper the value IS the accent, unchanged — this
+   * is not a second palette, it is the same colour with the two themes that needed it darkened.
+   */
+  'accent-on-paper': string;
+  /**
+   * The wash INSIDE a selection ring on paper. Alpha, like `--accent-soft`, and for the same
+   * reason not contrast-checked: it is a tint behind engraving ink, never a colour anything is
+   * read against.
+   *
+   * Stronger than `--accent-soft` (which is 20%) because that token's job is a gentle chrome
+   * state — a hovered label, an armed card — and this one's is "you cannot miss which note this
+   * is". Sharing the chrome's tint is how selection came to be described as not attracting.
+   */
+  'accent-select': string;
   paper: string;
   ink: string;
   danger: string;
@@ -106,6 +131,9 @@ export const THEMES: readonly Theme[] = [
       // side by side: it was always "near-black, not white" (`ui/styles.css §--accent-ink`).
       'accent-ink': '#110a1e',
       'accent-soft': '#8b5cf633',
+      // 3.92:1 on this theme's paper — clear of the 3:1 a shape needs, so the accent itself.
+      'accent-on-paper': '#8b5cf6',
+      'accent-select': '#8b5cf64d',
       paper: '#f8f6f0',
       ink: '#16181d',
       danger: '#e05252',
@@ -140,6 +168,9 @@ export const THEMES: readonly Theme[] = [
       'accent-hover': '#4a27a8',
       'accent-ink': '#ffffff',
       'accent-soft': '#5b32c422',
+      // 7.78:1 on white. The light theme's accent was already darkened for text and this inherits it.
+      'accent-on-paper': '#5b32c4',
+      'accent-select': '#5b32c440',
       paper: '#ffffff',
       ink: '#181a20',
       danger: '#b3261e',
@@ -170,6 +201,11 @@ export const THEMES: readonly Theme[] = [
       'accent-hover': '#f5a95c',
       'accent-ink': '#22150a',
       'accent-soft': '#e8913c33',
+      // #e8913c measures 2.24:1 on this paper — the worst of the four and the reason this token
+      // exists. Darkened until it clears 3:1 with margin (4.44:1); still recognisably Ember's
+      // orange, because the hue is unchanged and only the light is turned down.
+      'accent-on-paper': '#a85f14',
+      'accent-select': '#a85f1440',
       paper: '#f8f4ec',
       ink: '#1a1614',
       danger: '#e05252',
@@ -199,6 +235,10 @@ export const THEMES: readonly Theme[] = [
       'accent-hover': '#5bd0dc',
       'accent-ink': '#04191d',
       'accent-soft': '#31b6c433',
+      // #31b6c4 measures 2.28:1 on this paper. Same treatment as Ember: hue held, light down,
+      // 5.64:1.
+      'accent-on-paper': '#0e6d78',
+      'accent-select': '#0e6d7840',
       paper: '#f4f8f8',
       ink: '#111a20',
       danger: '#e05252',
@@ -368,6 +408,20 @@ export const CONTRAST_PAIRS: readonly ContrastPair[] = [
   { what: 'the accent as text on the app background', fg: 'accent-hover', bg: 'bg', min: 4.5 },
   { what: 'the accent as text on a panel', fg: 'accent-hover', bg: 'bg-panel', min: 4.5 },
   { what: "the engraving's ink on its paper", fg: 'ink', bg: 'paper', min: 4.5 },
+  /*
+   * THE SELECTION RING ON THE PAGE — the pair this table did not have, and the audit's finding 11.
+   *
+   * Every other row here is about the CHROME. The engraving is the one surface in the app with a
+   * near-white ground in all four themes, and the only mark the app draws on it in its own accent
+   * is the selection/hover ring — so the accent's legibility there was never asked about. It
+   * turned out that two of the four themes could not answer: Ember's orange measured 2.24:1 on
+   * its paper and Tide's cyan 2.28:1, against the 3:1 a shape needs. That is a highlight the
+   * player has to hunt for however thick it is drawn, and it is half of "selection does not
+   * really attract" (the other half being the face-scale weight collapse, fixed in `triview.ts`).
+   *
+   * 3:1 rather than 4.5:1 because a ring is a SHAPE, like the chip fill and the waveform above.
+   */
+  { what: 'the selection ring on the page', fg: 'accent-on-paper', bg: 'paper', min: 3 },
   { what: 'the accent as a fill on a panel', fg: 'accent', bg: 'bg-panel', min: 3 },
   { what: 'the waveform against its pane', fg: 'wave', bg: 'bg-raised', min: 3 },
   { what: 'the played waveform against its pane', fg: 'wave-played', bg: 'bg-raised', min: 3 },

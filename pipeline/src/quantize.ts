@@ -75,6 +75,15 @@ export interface QuantResult {
   basicQuantTicks: number;
   /** Robust timing jitter of the take, in ticks. Diagnostic. */
   jitterTicks: number;
+  /**
+   * EVENTS THAT LOST A COLLISION, and the event id that kept the slot.
+   *
+   * The fusion below is the one place quantization removes an attack outright, and the removal
+   * used to leave no trace at all: `notes` simply came back shorter than it went in. `intoId` is
+   * the survivor AFTER the pitch pick, so it is the id whose chord the caller should follow — not
+   * necessarily the earlier arrival.
+   */
+  fused: { id: string; intoId: string }[];
 }
 
 /**
@@ -417,7 +426,9 @@ function quantizeFree(notes: QuantNote[]): QuantResult {
     // is not), so it already lies on free's own lattice.
     out.push({ id: n.id, startTick, offTick: startTick + (n.intentTicks ?? units * unit) });
   }
-  return { notes: out, tuplets: [], basicQuantTicks: unit, jitterTicks: 0 };
+  // `fused` is empty and always will be: this path PUSHES collisions to the next free slot
+  // rather than absorbing them, so free is the one grid on which no attack is ever lost.
+  return { notes: out, tuplets: [], basicQuantTicks: unit, jitterTicks: 0, fused: [] };
 }
 
 /**
@@ -434,15 +445,20 @@ function quantizeExact(notes: QuantNote[]): QuantResult {
     }))
     .sort((a, b) => a.startTick - b.startTick);
   const fused: QuantResult['notes'] = [];
+  const fusedInto: QuantResult['fused'] = [];
   for (const n of rounded) {
     const prev = fused[fused.length - 1];
     if (prev && prev.startTick === n.startTick) {
       prev.offTick = Math.max(prev.offTick, n.offTick);
+      // The first arrival keeps the slot on this path and nothing re-picks it afterwards, so the
+      // survivor is known here. Recorded because a written note leaving no glyph is precisely the
+      // loss the projection exists to name.
+      fusedInto.push({ id: n.id, intoId: prev.id });
       continue;
     }
     fused.push(n);
   }
-  return { notes: fused, tuplets: [], basicQuantTicks: 1, jitterTicks: 0 };
+  return { notes: fused, tuplets: [], basicQuantTicks: 1, jitterTicks: 0, fused: fusedInto };
 }
 
 export function quantizeOnsets(
@@ -688,10 +704,18 @@ export function quantizeOnsets(
   // difference away; the earlier arrival keeps the slot on a tie.
   const rawDurById = new Map(notes.map((n) => [n.id, Math.max(0, n.rawOffTick - n.rawStartTick)]));
   const deduped: QuantResult['notes'] = [];
+  /**
+   * EVERY ID THAT PASSED THROUGH EACH SLOT, parallel to `deduped`. The losers cannot be named
+   * inside the loop: the pitch pick can hand the slot to a later arrival, which turns an id that
+   * was the survivor a moment ago into a loser. The list is resolved against the FINAL winner
+   * once the loop has finished, which is the only point at which the survivor is settled.
+   */
+  const slotIds: string[][] = [];
   for (const n of out) {
     const prev = deduped[deduped.length - 1];
     if (prev && prev.startTick === n.startTick) {
       prev.offTick = Math.max(prev.offTick, n.offTick);
+      slotIds[slotIds.length - 1].push(n.id);
       if ((rawDurById.get(n.id) ?? 0) > (rawDurById.get(prev.id) ?? 0)) {
         prev.id = n.id;
         if (n.tupletId === undefined) delete prev.tupletId;
@@ -700,12 +724,20 @@ export function quantizeOnsets(
       continue;
     }
     deduped.push({ ...n });
+    slotIds.push([n.id]);
+  }
+
+  const fused: QuantResult['fused'] = [];
+  for (let i = 0; i < deduped.length; i++) {
+    const winner = deduped[i].id;
+    for (const id of slotIds[i]) if (id !== winner) fused.push({ id, intoId: winner });
   }
 
   return {
     notes: deduped,
     tuplets: tuplets.filter((t) => deduped.some((n) => n.tupletId === t.id)),
     basicQuantTicks: finestStraight,
-    jitterTicks: jitter
+    jitterTicks: jitter,
+    fused
   };
 }

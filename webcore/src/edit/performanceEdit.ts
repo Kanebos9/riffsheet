@@ -38,6 +38,7 @@
  */
 
 import { CHORD_WINDOW_MIN_SEC, type InputNote, type NotationIntent } from '@pipeline';
+import { chordMemberIds, sameEvent, type ChordEventTable } from './chordEvents';
 import type { CutSpan } from './cuts';
 import { editedToAudioSec } from './cuts';
 import {
@@ -59,18 +60,64 @@ import {
 const EPS = 1e-6;
 
 /**
- * SECONDS WITHIN WHICH TWO ATTACKS ARE ONE CHORD. The engraver's own number (see @pipeline).
+ * SECONDS WITHIN WHICH TWO ATTACKS ARE ONE CHORD — THE FALLBACK ONLY. The engraver's floor.
  *
- * Every simultaneity question in this file asks it: chord membership for the duration command,
- * and "same onset, so not a collision" in the settling pass. Both used to ask `EPS`, which meant
- * the reducer disagreed with the page it was editing about what a chord is — see the note on the
- * re-export in `src/pipeline/index.ts` for the fault that produced.
+ * NO LONGER THE MEMBERSHIP AUTHORITY, and that demotion is the point. This file used to answer
+ * every simultaneity question with a flat symmetric window around whichever note was clicked,
+ * which is a different RELATION from the greedy partitioning the engraver actually runs — not a
+ * looser or tighter version of it. `edit/chordEvents.ts` carries the full argument; the short
+ * form is that with attacks at 0/34/68 ms the page draws {0,34} and {68}, and clicking the middle
+ * one made this file rewrite all three, one of them a note the player can see is a separate
+ * event.
+ *
+ * Membership now arrives in `SheetEditContext.chordEvents`, computed once by the engraver's own
+ * `collectChords`. This constant survives for exactly two jobs, both of which are genuinely about
+ * PROXIMITY rather than membership:
+ *
+ *   - the no-event fallback below, for a feed the caller could not build a table for;
+ *   - nothing else. The settling pass now asks the table.
  */
 const CHORD_SEC = CHORD_WINDOW_MIN_SEC;
 
-/** The notes struck with this one, itself included, in the engraver's own grouping. */
-function chordMates(feed: ReadonlyArray<InputNote>, at: InputNote): InputNote[] {
-  return feed.filter((n) => Math.abs(n.startSec - at.startSec) <= CHORD_SEC);
+/**
+ * The ids that change together with this one.
+ *
+ * The table is the authority. The window fallback runs only when no table was supplied — a
+ * caller that has not been converted, or an empty feed — and is kept so that this reducer remains
+ * usable standalone (its unit tests construct contexts directly).
+ */
+function chordMemberIdsFor(
+  feed: ReadonlyArray<InputNote>,
+  at: InputNote,
+  events: ChordEventTable | undefined
+): string[] {
+  if (events && at.id !== undefined && events.byNoteId.has(at.id)) {
+    return chordMemberIds(events, at.id);
+  }
+  return feed
+    .filter((n) => Math.abs(n.startSec - at.startSec) <= CHORD_SEC)
+    .map((n) => n.id)
+    .filter((id): id is string => !!id);
+}
+
+/**
+ * Are these two written as ONE event — so not each other's collision?
+ *
+ * Asked by the settling pass, which previously asked "are their onsets within 35 ms". That test
+ * called two notes chord mates whenever they happened to be close, including across a group
+ * boundary the engraver had drawn between them, and refused the relation for two notes the
+ * engraver HAD grouped at a slow tempo (its window reaches 62.5 ms at 60 BPM). Membership is the
+ * question; proximity was only ever a proxy for it.
+ */
+function areChordMates(
+  events: ChordEventTable | undefined,
+  a: InputNote,
+  b: InputNote
+): boolean {
+  if (events && a.id !== undefined && b.id !== undefined && events.byNoteId.has(a.id)) {
+    return sameEvent(events, a.id, b.id);
+  }
+  return Math.abs(a.startSec - b.startSec) <= CHORD_SEC;
 }
 
 /**
@@ -126,6 +173,19 @@ export interface SheetEditContext {
    * error `edit/rollPerformance.ts` still has on `sourceTiming`.
    */
   intentLengthSec: (startSec: number, intent: NotationIntent) => number | null;
+  /**
+   * THE PUBLISHED CHORD/NOTATION EVENTS for this feed — the membership authority.
+   *
+   * Built ONCE per revision by `App.chordEvents()` from the engraver's own `collectChords`, so
+   * "which notes change together" has the same answer here that it has on the page. See
+   * `edit/chordEvents.ts` for what the three competing definitions used to cost.
+   *
+   * OPTIONAL only so that this reducer stays usable without one — its unit tests build contexts
+   * by hand, and a caller with an empty feed has no table to build. When it is absent the window
+   * fallback runs, which is the OLD behaviour and is documented as such at `chordMemberIdsFor`.
+   * Every live path in the app supplies it.
+   */
+  chordEvents?: ChordEventTable;
 }
 
 export interface SheetEditResult {
@@ -157,28 +217,25 @@ export interface SheetEditResult {
  *   COLLAPSE       a victim is never deleted by a TRIM. It keeps `MIN_DUR_SEC`, the floor
  *                  pipeline/src/guards.ts drops notes below; shortening it further would remove
  *                  a note the player never asked to remove.
+ *   ACTIVE OVERRUNS the active note's own end stops at the next later attack that is not one of
+ *                  its chord mates.
  *
- * ...and then the two commands part company, because they mean opposite things:
+ * THIS IS NOW THE ONLY LAW, and there used to be a second one. `settleCollisions` took an
+ * `editedWins` flag, and the duration menu passed it as TRUE. Quoting the rule that is gone:
  *
- *   `editedWins: false` — ADD and MOVE. The active note's own end stops at the next later
- *   attack. A note DRAWN in front of an existing one becomes as long as the room it was given,
- *   which is what a player means by putting a note there; a note DRAGGED somewhere keeps its
- *   length only as far as the next thing along. Neither gesture named a length, so neither one
- *   gets to overrule one.
+ *   "`editedWins: true` — THE DURATION MENU (P1), which named a length explicitly. The chosen
+ *    value is the value the note gets and the page rearranges itself around it:
+ *        SWALLOWED   a neighbour that begins AND ends inside the new span is gone — there is
+ *                    nothing left of it to hear. Deleted, and NAMED, so one undo brings it back
+ *                    with everything else the command did.
+ *        OVERLAPPED  a neighbour that begins inside the span but outlives it keeps its END and
+ *                    loses its head: it attacks where the active note stops."
  *
- *   `editedWins: true` — THE DURATION MENU (P1), which named a length explicitly. The chosen
- *   value is the value the note gets and the page rearranges itself around it:
- *
- *       SWALLOWED   a neighbour that begins AND ends inside the new span is gone — there is
- *                   nothing left of it to hear. Deleted, and NAMED, so one undo brings it back
- *                   with everything else the command did.
- *       OVERLAPPED  a neighbour that begins inside the span but outlives it keeps its END and
- *                   loses its head: it attacks where the active note stops. Trimmed rather than
- *                   deleted, because there is still something of it left to play.
- *
- *   That branch is IDEMPOTENT by construction, which the unit tests and the live probe both
- *   assert: afterwards every survivor either ends at or before the active note's start or
- *   begins at or after its end, so running the same command again moves nothing.
+ * It is deleted rather than left unreachable, because an unreachable destruction law is one
+ * refactor away from being reachable again. The argument for removing it is at the `setDuration`
+ * case, which is the only thing that ever set the flag; the short version is that a duration pick
+ * silently deleting the next two seconds of music is the owner's reported defect and the audit's
+ * first Critical. Add and move never set it and are unchanged.
  *
  * NO CHAIN REACTIONS, enforced rather than assumed: a victim is never itself treated as active,
  * so trimming B cannot go on to trim C.
@@ -188,67 +245,42 @@ function settleCollisions(
   activeIds: ReadonlySet<string>,
   touched: Set<string>,
   tempoBpm: number,
-  editedWins = false
+  events?: ChordEventTable
 ): InputNote[] {
   const out = after.slice();
-  const deleted = new Set<string>();
   for (let i = 0; i < out.length; i++) {
     const a = out[i];
     if (!a.id || !activeIds.has(a.id)) continue;
 
-    if (!editedWins) {
-      // ACTIVE OVERRUNS: the next attack that is genuinely later, chords excepted.
-      let end = a.endSec;
-      for (const b of out) {
-        if (b === a || (b.id && activeIds.has(b.id))) continue;
-        if (b.startSec > a.startSec + CHORD_SEC && b.startSec < end - EPS) end = b.startSec;
-      }
-      if (Math.abs(end - a.endSec) > EPS) {
-        out[i] = resize(a, Math.max(MIN_DUR_SEC, end - a.startSec), tempoBpm);
-      }
+    // ACTIVE OVERRUNS: the next attack that is genuinely later, chord mates excepted.
+    let end = a.endSec;
+    for (const b of out) {
+      if (b === a || (b.id && activeIds.has(b.id))) continue;
+      if (areChordMates(events, a, b)) continue;
+      if (b.startSec > a.startSec && b.startSec < end - EPS) end = b.startSec;
+    }
+    if (Math.abs(end - a.endSec) > EPS) {
+      out[i] = resize(a, Math.max(MIN_DUR_SEC, end - a.startSec), tempoBpm);
     }
     const active = out[i];
 
     for (let j = 0; j < out.length; j++) {
       const b = out[j];
-      if (j === i || !b.id || activeIds.has(b.id) || deleted.has(b.id)) continue;
+      if (j === i || !b.id || activeIds.has(b.id)) continue;
 
-      // SAME ONSET: a chord mate of the active note, and nobody's collision.
-      if (Math.abs(b.startSec - active.startSec) <= CHORD_SEC) continue;
+      // ONE EVENT: a chord mate of the active note, and nobody's collision. The engraver's
+      // grouping, not a window — see `areChordMates`.
+      if (areChordMates(events, b, active)) continue;
+      if (b.startSec >= active.startSec) continue;
 
-      if (b.startSec < active.startSec) {
-        // RANG INTO IT.
-        if (b.endSec > active.startSec + EPS) {
-          out[j] = resize(b, Math.max(MIN_DUR_SEC, active.startSec - b.startSec), tempoBpm);
-          touched.add(b.id);
-        }
-        continue;
-      }
-
-      // Attacks at or after the active note's own end: untouched, and the reason the
-      // edited-wins pass converges.
-      if (!editedWins || b.startSec >= active.endSec - EPS) continue;
-
-      if (b.endSec <= active.endSec + EPS) {
-        // SWALLOWED.
-        deleted.add(b.id);
+      // RANG INTO IT.
+      if (b.endSec > active.startSec + EPS) {
+        out[j] = resize(b, Math.max(MIN_DUR_SEC, active.startSec - b.startSec), tempoBpm);
         touched.add(b.id);
-        continue;
       }
-      // OVERLAPPED: keeps its end, attacks where the active note stops.
-      out[j] = movedTo(b, active.endSec, tempoBpm);
-      touched.add(b.id);
     }
   }
-  return deleted.size ? out.filter((n) => !(n.id && deleted.has(n.id))) : out;
-}
-
-/** A note re-attacked at `startSec`, keeping its END rather than its length. See OVERLAPPED. */
-function movedTo(n: InputNote, startSec: number, tempoBpm: number): InputNote {
-  const moved = { ...n, startSec, endSec: Math.max(startSec + MIN_DUR_SEC, n.endSec) };
-  const timing = movedTiming(n.sourceTiming, startSec - n.startSec, tempoBpm);
-  const resized = resizedTiming(timing ?? n.sourceTiming, moved.endSec - moved.startSec, tempoBpm);
-  return resized ? { ...moved, sourceTiming: resized } : moved;
+  return out;
 }
 
 function resize(n: InputNote, durationSec: number, tempoBpm: number): InputNote {
@@ -287,6 +319,16 @@ export function applySheetEditToNotes(
      * Membership comes from `CHORD_SEC` — the engraver's window — so the editor's idea of the
      * chord is the page's idea of the chord.
      */
+    /*
+     * NO LIVE CALLER REACHES THIS BRANCH ANY MORE — `ui/app.ts §applySheetEdit` intercepts
+     * `setDuration` and routes it to `applyDurationRipple`, because a duration edit is a
+     * STRUCTURAL splice of the score timeline rather than a rewrite of a note list. See
+     * `edit/ripple.ts`, which carries the law, and the note at the foot of this case.
+     *
+     * It is kept rather than deleted for one reason: it is the definition of what a duration edit
+     * does to ONE event in isolation — chord-wide, no destruction — and `performanceEdit.test.ts`
+     * states that definition. The ripple builds on it; it does not contradict it.
+     */
     case 'setDuration': {
       const at = feed.find((n) => n.id === edit.noteId);
       if (!at) return null;
@@ -299,9 +341,9 @@ export function applySheetEditToNotes(
       // be a second edit nobody asked for — but they stop together, which is what one written
       // value means.
       const chordEnd = at.startSec + Math.max(MIN_DUR_SEC, length);
-      const mates = chordMates(feed, at);
-      for (const m of mates) if (m.id) touched.add(m.id);
-      const mateIds = new Set(mates.map((m) => m.id).filter((id): id is string => !!id));
+      // MEMBERSHIP FROM THE PUBLISHED EVENT, not from a window around the clicked note.
+      const mateIds = new Set(chordMemberIdsFor(feed, at, ctx.chordEvents));
+      for (const id of mateIds) touched.add(id);
       const next = feed.map((n) =>
         n.id !== undefined && mateIds.has(n.id)
           ? {
@@ -310,8 +352,46 @@ export function applySheetEditToNotes(
             }
           : n
       );
+      /*
+       * THE DESTRUCTION LAW IS DISARMED. TRANSITIONAL — see the note on `SheetEditResult`.
+       *
+       * WHAT IT USED TO DO, quoted from the rule it replaced so the change is legible:
+       * "`editedWins: true` — THE DURATION MENU (P1), which named a length explicitly. The
+       * chosen value is the value the note gets and the page rearranges itself around it:
+       * SWALLOWED — a neighbour that begins AND ends inside the new span is gone... OVERLAPPED —
+       * a neighbour that begins inside the span but outlives it keeps its END and loses its
+       * head."
+       *
+       * WHY IT GOES NOW. That rule reads as a local tidy-up and is not one. A duration pick is
+       * "my note wins this entire time span", so choosing Whole for a note at 0 deletes every
+       * note in the following two seconds and re-attacks the one that survives. The audit rates
+       * it Critical — silent, unasked-for, multi-note data loss — and it is the first and
+       * loudest half of the owner's "changing one duration changes another note". The other half
+       * was duplicate ids, fixed in `app/identity.ts`.
+       *
+       * WHY NOT SIMPLY `editedWins: false`. That branch is the ADD/MOVE law: it would clamp the
+       * player's chosen value back to the next attack, so picking Whole would silently give them
+       * a sixteenth. Refusing to honour the pick is a different wrong answer, not a better one.
+       *
+       * SO: NEITHER. The chord takes the value the player chose, and no neighbour is touched at
+       * all. An overlap that results is not a corruption — it is the same overlap a detector
+       * produces constantly, and the engraver already has a law for it
+       * (`pipeline/src/chords.ts` §noOverlap truncates a ring-out at the next attack in its own
+       * derived copy). So the page draws exactly what it draws today for overlapping input,
+       * while the PERFORMANCE keeps every note the player has.
+       *
+       * WHAT REPLACED IT: THE RIPPLE, and it has landed (`edit/ripple.ts`). It moves the
+       * neighbours rather than deleting them — the thing a player actually means by lengthening a
+       * note in a line of music — and it does so as a stored structural splice rather than as a
+       * rewritten note list, so the recording underneath is not touched at all. `ui/app.ts` sends
+       * every live duration pick there; what is left here is the isolated definition above.
+       *
+       * The settling pass still runs with `editedWins: false` disabled entirely for this branch;
+       * we call it with no active ids so the RANG-INTO-IT trim is not applied either. A note
+       * already sounding when this chord attacks was already sounding before the edit too.
+       */
       return {
-        notes: settleCollisions(next, new Set(touched), touched, ctx.tempoBpm, true),
+        notes: next,
         touchedIds: touched,
         label: durationLabel(edit.intent)
       };
@@ -341,7 +421,7 @@ export function applySheetEditToNotes(
       touched.add(id);
       const next = [...feed, added].sort(byTimeThenPitch);
       return {
-        notes: settleCollisions(next, new Set(touched), touched, ctx.tempoBpm),
+        notes: settleCollisions(next, new Set(touched), touched, ctx.tempoBpm, ctx.chordEvents),
         touchedIds: touched,
         label: 'Add note'
       };
@@ -368,7 +448,7 @@ export function applySheetEditToNotes(
         )
         .sort(byTimeThenPitch);
       return {
-        notes: settleCollisions(next, new Set(touched), touched, ctx.tempoBpm),
+        notes: settleCollisions(next, new Set(touched), touched, ctx.tempoBpm, ctx.chordEvents),
         touchedIds: touched,
         label: 'Move note'
       };
@@ -511,6 +591,14 @@ export function mergePerformanceEditOntoCutTake(
  * across. (Confirmed against the engraver: same-pitch pieces merge only on identical snapped
  * start ticks, which two pieces a bar apart can never have.)
  */
+/**
+ * The longest document this app may declare, and it is the PIPELINE's number.
+ *
+ * `resolveMinimumBars` (pipeline/src/types.ts) clamps to 1..256. Exported so `app/persist.ts`
+ * validates an incoming document against the same ceiling rather than a second opinion.
+ */
+export const MAX_DOCUMENT_BARS = 256;
+
 export interface BarOp {
   kind: 'insertBar' | 'deleteBar';
   /** 0-based index of the bar the menu was opened on. */
@@ -634,6 +722,14 @@ function spliceNotes(
  *
  * Returns null only when the operation is not expressible — a bar of no length, or the last bar
  * of a one-bar document, which would leave a score with nothing to engrave.
+ *
+ * NO LIVE CALLER REACHES THIS ANY MORE, for the reason the ripple exists: `ui/app.ts` used to run
+ * this over the FEED and merge the answer back into the recording with `mergeEditedOntoRaw`, which
+ * DROPS every note hidden under a cut and writes edited-clock seconds into audio-coordinate
+ * storage. A bar operation is now a `RippleOp` — a seam, a delta and the split law — applied to
+ * the derived feed and never written back (`edit/ripple.ts`, `ui/app.ts §applyBarOperation`).
+ * This remains the statement of the splice ARITHMETIC that `performanceEdit.test.ts` pins down,
+ * and the ripple's `split` / `dropSpan` laws are the same rules in the tick domain.
  */
 export function applyBarOp(
   feed: ReadonlyArray<InputNote>,
@@ -650,7 +746,11 @@ export function applyBarOp(
       notes: spliceNotes(feed, 'insertBar', seam, bar, ctx.splitId, touched),
       touchedIds: touched,
       label: op.where === 'after' ? 'Insert bar after' : 'Insert bar before',
-      barCount: Math.min(512, ctx.barCount + 1),
+      // 256, NOT 512 — `resolveMinimumBars` clamps `BuildInput.minimumBars` to 1..256, so a
+      // document that declared 400 bars was engraved with 256 and every consumer that trusted the
+      // declaration was wrong about where the score ended. The pipeline is the authority and is
+      // read-only; the contradiction is resolved on this side. See `persist.ts §documentBars`.
+      barCount: Math.min(MAX_DOCUMENT_BARS, ctx.barCount + 1),
       durationDeltaSec: bar
     };
   }

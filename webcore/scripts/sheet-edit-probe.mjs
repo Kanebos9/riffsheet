@@ -778,7 +778,26 @@ const main = async () => {
     // picture — pixel for pixel, off a real screenshot of the element rather than off a number
     // the app reports about itself.
     {
+      /**
+       * A photograph of the strip, WITH THE SELECTION BRACKET CLEARED FIRST.
+       *
+       * The claim these shots support is that the waveform's PEAKS are immutable — a recording is
+       * a photograph and a bar operation may not resize it. The selection bracket is a different
+       * thing painted on the same canvas: it is chrome that tracks the selected note, so it moves
+       * whenever the selection does, entirely legitimately.
+       *
+       * That distinction started to matter when the right-click road began synchronising the
+       * selection to the note it is about to edit (audit finding 4: the menu used to mutate one
+       * note while a different one held the only visible ring). The bar-op sequence right-clicks
+       * between the two shots, so the second frame gained a bracket the first did not have and
+       * the comparison failed on chrome while the peaks were in fact identical.
+       *
+       * Clearing selection on both sides isolates the thing being asserted instead of loosening
+       * the assertion, which is the direction that keeps it worth having.
+       */
       const waveShot = async () => {
+        await ev(`(() => { window.__RIFFSHEET_SELECT__ && window.__RIFFSHEET_SELECT__([]); return true; })()`);
+        await settle(150);
         const box = await json(`JSON.stringify((() => {
           const el = document.querySelector('.waveform') || document.querySelector('canvas.waveform-canvas') ||
                      document.querySelector('.waveform-pane');

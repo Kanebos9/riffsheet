@@ -149,7 +149,31 @@ const byId = (notes: readonly InputNote[], id: string): InputNote => {
   near(byId(again.notes, 'c2').endSec, 1, 'and changes nothing: no successive shortening');
   near(byId(again.notes, 'c3').endSec, 1, 'for either member');
 
-  // SWALLOWED AND OVERLAPPED, named victims, one command.
+  /*
+   * A DURATION PICK TOUCHES THE CHORD AND NOTHING ELSE.
+   *
+   * THIS ASSERTION IS REVERSED, AND THE OLD ONE IS QUOTED HERE BECAUSE IT WAS WRONG ON PURPOSE.
+   * It used to read, over this very fixture:
+   *
+   *     assert(!wins.notes.some((n) => n.id === 'inside'),
+   *       'a neighbour entirely inside the new span is deleted');
+   *     assert(wins.touchedIds.has('inside'), 'and NAMED, so one undo brings it back');
+   *     near(byId(wins.notes, 'crossing').startSec, 2,
+   *       'a neighbour that outlives the span attacks where it stops');
+   *
+   * — i.e. the suite REQUIRED that choosing Whole for a note at 0 delete the note at 0.6 and
+   * re-attack the one at 1.4. That is the owner's "changing one duration changes another note",
+   * asserted as the specification. The audit rates it Critical: silent, unasked-for, multi-note
+   * data loss from a gesture that named a length and nothing else.
+   *
+   * The destruction law is disarmed (`performanceEdit.ts §setDuration` carries the full argument,
+   * including why `editedWins: false` would not do instead — it would clamp the player's chosen
+   * value back to the next attack, refusing the pick rather than honouring it). TRANSITIONAL:
+   * the ripple wave will MOVE these neighbours, which is what a player means by lengthening a
+   * note in a line of music. Until then the honest interim is that the chord takes the value and
+   * the neighbours are left alone; an overlap engraves exactly as an overlapping detection does
+   * today, because the engraver already has a law for that (`pipeline/src/chords.ts §noOverlap`).
+   */
   const victims = [
     note('a', 0, 0.25, 40),
     note('inside', 0.6, 0.8, 42),
@@ -162,13 +186,21 @@ const byId = (notes: readonly InputNote[], id: string): InputNote => {
   );
   assert(wins !== null, 'the command applies');
   near(byId(wins.notes, 'a').endSec, 2, 'the edited note gets the whole two seconds it asked for');
-  assert(!wins.notes.some((n) => n.id === 'inside'), 'a neighbour entirely inside the new span is deleted');
-  assert(wins.touchedIds.has('inside'), 'and NAMED, so one undo brings it back');
-  near(byId(wins.notes, 'crossing').startSec, 2, 'a neighbour that outlives the span attacks where it stops');
-  near(byId(wins.notes, 'crossing').endSec, 3, 'and keeps its own end');
-  assert(wins.touchedIds.has('crossing'), 'named as well');
+  assert(
+    wins.notes.some((n) => n.id === 'inside'),
+    'a neighbour inside the new span SURVIVES — a duration pick is not a delete command'
+  );
+  near(byId(wins.notes, 'inside').startSec, 0.6, 'and is not moved');
+  near(byId(wins.notes, 'inside').endSec, 0.8, 'and is not resized');
+  near(byId(wins.notes, 'crossing').startSec, 1.4, 'nor is a neighbour that outlives the span');
+  near(byId(wins.notes, 'crossing').endSec, 3, 'which keeps both its ends');
+  assert(
+    wins.touchedIds.size === 1 && wins.touchedIds.has('a'),
+    'exactly one note was touched: the one whose duration was picked'
+  );
+  assert(wins.notes.length === victims.length, 'and nothing was deleted');
 
-  // And that outcome is a fixed point too.
+  // Still a fixed point — now trivially, which is the point.
   const winsAgain = applySheetEditToNotes(
     wins.notes,
     { kind: 'setDuration', noteId: 'a', intent: { denominator: 1, dots: 0 } },
@@ -176,8 +208,8 @@ const byId = (notes: readonly InputNote[], id: string): InputNote => {
   );
   assert(winsAgain !== null, 're-applying applies');
   near(byId(winsAgain.notes, 'a').endSec, 2, 'the edited note is unchanged');
-  near(byId(winsAgain.notes, 'crossing').startSec, 2, 'and so is the trimmed neighbour');
-  assert(winsAgain.notes.length === wins.notes.length, 'nothing else is deleted on a repeat');
+  near(byId(winsAgain.notes, 'crossing').startSec, 1.4, 'and so is every neighbour');
+  assert(winsAgain.notes.length === wins.notes.length, 'nothing is deleted on a repeat');
 }
 
 // ---------------------------------------------------------------------------

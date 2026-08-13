@@ -21,6 +21,7 @@ import {
   buildTickSecondsMap,
   type AlphaTabScoreData,
   type BuildInput,
+  type BuildResult,
   type BuildSettings,
   type ExternalGrid,
   type InputNote,
@@ -38,6 +39,21 @@ import type { AppSettings } from '../app/state';
 import { customTuning, TUNING_PRESETS, tuningById, type TuningPreset } from '../score/tuning';
 
 export type { AlphaTabScoreData, RiffsheetIR, InputNote, NotationIntent, TempoSegment, TempoSource, TickSecondsMap };
+
+/**
+ * THE PROJECTION'S OWN VOCABULARY, re-exported so consumers can name an outcome without reaching
+ * past this adapter. See `RiffScore.projection`; the contract is `pipeline/IR.md §Projection`.
+ */
+export type {
+  ChordGroupProjection,
+  DropReason,
+  GlyphRef,
+  IntentIgnored,
+  MergeReason,
+  NoteProjection,
+  Projection as PipelineProjection
+} from '@pipeline-impl';
+export { chordGroupsOf } from '@pipeline-impl';
 
 /**
  * THE WRITTEN-VALUE VOCABULARY, re-exported so the editing surface and the engraver agree.
@@ -108,6 +124,26 @@ export interface RiffScore {
   stringCount: number;
   capo: number;
   diagnostics: string[];
+  /**
+   * THE BUILD'S TOTAL CORRESPONDENCE RESULT — what became of every note it was handed.
+   *
+   * `pipeline/IR.md §Projection` is the contract; the short form is that `byId` holds exactly one
+   * outcome per input id and the three are exhaustive: `engraved` (with every glyph it became),
+   * `merged` (naming the input id whose glyph now speaks for it, resolved transitively so it is
+   * always one pointer and never a chain), or `dropped` (with the rule that removed it).
+   *
+   * WHY IT IS ON `RiffScore` RATHER THAN LEFT IN `BuildResult`. Everything the sheet↔roll seam
+   * needs to stop guessing is in here. Before it, a note that the guards dropped and a note that
+   * the quantizer fused into its neighbour were both simply ABSENT from the engraved score, and
+   * absence was the only signal any consumer had — so selecting either one lit the roll and drew
+   * nothing on the page, with no way to tell that from a bug. `score/projection.ts` consumes this
+   * and turns it into an answer the interface can give.
+   *
+   * `chordGroups` is the same idea for membership: the chord law is a greedy partition, so no
+   * threshold a caller holds can reproduce it (`pipeline/src/chords.ts §chordWindowSec`), and the
+   * only correct way to ask is to read what the build decided.
+   */
+  projection: BuildResult['projection'];
 }
 
 /**
@@ -386,6 +422,7 @@ export function buildRiffScore(request: BuildRequest, settings: AppSettings): Ri
     tuningLowToHigh: ir.tab === 'omit' ? [] : ir.instrument.tuningMidi,
     stringCount: ir.tab === 'omit' ? 0 : ir.instrument.stringCount,
     capo: ir.instrument.capo,
-    diagnostics
+    diagnostics,
+    projection: result.projection
   };
 }

@@ -162,11 +162,15 @@ export function placeSymbolicEvents(
   // this only fires when the printable floor pulled two neighbours onto one slot.)
   const fused: QuantResult['notes'] = [];
   let fusedAttacks = 0;
+  /** The absorbed events, named. Here the first arrival always keeps the slot, so this is exact
+   * inside the loop — unlike the quantizer, nothing re-picks the winner afterwards. */
+  const fusedInto: QuantResult['fused'] = [];
   for (const note of placed) {
     const previous = fused[fused.length - 1];
     if (previous && previous.startTick === note.startTick) {
       previous.offTick = Math.max(previous.offTick, note.offTick);
       fusedAttacks++;
+      fusedInto.push({ id: note.id, intoId: previous.id });
       continue;
     }
     fused.push(note);
@@ -178,6 +182,7 @@ export function placeSymbolicEvents(
     basicQuantTicks: 1,
     jitterTicks: 0,
     reducedBeats: snappedBeats.size,
-    fusedAttacks
+    fusedAttacks,
+    fused: fusedInto
   };
 }

@@ -32,6 +32,16 @@
   --accent-hover: #a78bfa;
   --accent-ink: #150c26;
   --accent-soft: #8b5cf633;
+  /*
+   * The accent AS DRAWN ON THE ENGRAVING'S PAPER, and the wash inside a selection ring there.
+   *
+   * The paper is the one near-white surface in every theme, so an accent tuned against the dark
+   * chrome is not automatically legible on it — Ember's and Tide's are not. See
+   * `ui/theme.ts §accent-on-paper`, which carries the measurements and the contrast law.
+   * Midnight's accent clears the bar unchanged (3.92:1), so these are its own colour.
+   */
+  --accent-on-paper: #8b5cf6;
+  --accent-select: #8b5cf64d;
   --paper: #f8f6f0;
   --ink: #16181d;
   --danger: #e05252;
@@ -1306,6 +1316,22 @@ button[data-drag="midi"]:hover .drag-grip { opacity: 0.9; }
 }
 .note-name.uncertain { color: var(--danger); }
 .note-name:hover { color: var(--accent); }
+/*
+ * THE SELECTED NOTE'S NAME. Part of finding 11's answer: the names row is what a player is often
+ * actually reading, and it used to stay ordinary ink while the staff and tab both lit up — so
+ * the clearest statement of WHICH note is selected was the one place that did not make it.
+ *
+ * Deliberately heavier than `:hover`, which is only a colour change: this is a state you can act
+ * on, and it has to survive the same quarter-size face the rings do. The box is what does that —
+ * a coloured word at 10.5px x 0.273 is not a mark, a filled chip is.
+ */
+.note-name.selected {
+  /* `--accent-ink` is the app's existing "text printed on a filled accent" token, and the pair is
+     already asserted at 4.5:1 for every theme (`ui/theme.ts §the ink on a filled accent`). */
+  color: var(--accent-ink);
+  background: var(--accent-on-paper);
+  box-shadow: 0 0 0 1px var(--accent-on-paper);
+}
 
 /*
  * Octave-fold markers on the tab (IRNote.tabOctaveShift). Warning-coloured, because the
@@ -1478,8 +1504,30 @@ button[data-drag="midi"]:hover .drag-grip { opacity: 0.9; }
 }
 .triview-overlay .sel-rect {
   fill: var(--accent-soft);
-  stroke: var(--accent);
+  /*
+   * `--accent-on-paper`, NOT `--accent`. This is the one mark the app draws in its accent on the
+   * engraving's near-white ground, and two of the four themes' accents are illegible there
+   * (Ember 2.24:1, Tide 2.28:1). See `ui/theme.ts §accent-on-paper`.
+   */
+  stroke: var(--accent-on-paper);
   stroke-width: 1;
+}
+/*
+ * THE FIRM RING'S FILL — a stronger wash than `accent-soft`, and its own token so the themes
+ * can answer for it.
+ *
+ * `--accent-soft` is 20% alpha and is used for the "gently tinted" states all over the chrome
+ * (a dragging dropzone, a hovered part label, an armed theme card). Selection on PAPER is a
+ * different job: the mark sits on the lightest surface in the app, next to black engraving ink,
+ * and has to be findable at a glance on a face scaled to a quarter size. Sharing the chrome's
+ * tint is how it came to be describable as "not really attracting".
+ *
+ * The stroke weights are set inline by `drawSelection` (they depend on the face scale and this
+ * stylesheet cannot see it); the COLOURS stay here, which is the existing division and the
+ * reason the app's accent is still in one place.
+ */
+.triview-overlay .sel-rect-firm {
+  fill: var(--accent-select);
 }
 
 /* ------------------------------------------------------------------ popover */

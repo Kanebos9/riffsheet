@@ -32,6 +32,7 @@
 
 import { buildScore, type BuildDiagnostics, type BuildResult } from './buildScore.js';
 import { applyGuards } from './guards.js';
+import { type Projection } from './projection.js';
 import { buildTimeSkeleton } from './timeSkeleton.js';
 import { type IRBar, type RiffsheetIR } from './ir.js';
 import { toMultiPartMusicXML, abbreviatePartName, defaultPartName, type MusicXmlOptions } from './musicxml.js';
@@ -139,6 +140,13 @@ export interface PartBuild {
   nudgeSec: number;
   ir: RiffsheetIR;
   diagnostics: BuildDiagnostics;
+  /**
+   * THIS PART'S TOTAL PROJECTION, keyed by the NAMESPACED id (`p2-n0`), which is the id the IR
+   * and both emitters carry. A part is an ordinary build, so this is exactly the projection that
+   * build produced; the score-wide view is the union of them, and `resolveNoteId` says which part
+   * an id belongs to. See buildScore.ts `BuildResult.projection`.
+   */
+  projection: Projection;
 }
 
 /**
@@ -396,7 +404,8 @@ export function buildMultiPartScore(
       idPrefix: prefixes[index],
       nudgeSec: parts[index].nudgeSec ?? 0,
       ir: build.ir,
-      diagnostics: build.diagnostics
+      diagnostics: build.diagnostics,
+      projection: build.projection
     };
   });
 

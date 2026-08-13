@@ -45,6 +45,13 @@ import { applyBeams, markTupletEdges } from './beaming.js';
 import { toMusicXML } from './musicxml.js';
 import { toMidi } from './midi.js';
 import { toAlphaTabModelData, type AlphaTabScoreData } from './alphatab.js';
+import {
+  assembleProjection,
+  type DropReason,
+  type IntentIgnored,
+  type MergeReason,
+  type Projection
+} from './projection.js';
 
 export interface BuildDiagnostics {
   meterReason: string;
@@ -71,6 +78,14 @@ export interface BuildDiagnostics {
 export interface BuildResult {
   ir: RiffsheetIR;
   diagnostics: BuildDiagnostics;
+  /**
+   * WHERE EVERY INPUT NOTE WENT — engraved, absorbed into a neighbour, or removed by a named rule.
+   *
+   * Total by construction: one entry per input id, and the three counts sum to the input count.
+   * It also carries the chord law's own partition, which is the only published answer to "are
+   * these two notes one chord". See projection.ts.
+   */
+  projection: Projection;
   /** The shared clock this part was engraved against. Multi-part MIDI needs it per part. */
   skeleton: TimeSkeleton;
   /** The guarded notes this part was engraved from — the as-played MIDI export is made of them. */
@@ -164,6 +179,123 @@ function intentTicksOf(chord: ChordEvent): number | undefined {
     if (ticks !== null && (longest === null || ticks > longest)) longest = ticks;
   }
   return longest ?? undefined;
+}
+
+/**
+ * EVERY INPUT ID THE CHORD LAW ADMITTED, printable members first and then the duplicate pitches
+ * it could not give a notehead to. Both halves belong to the event: when the event is fused away
+ * or clipped off the end of the score, all of them go with it.
+ */
+function membersOf(chord: ChordEvent | undefined): string[] {
+  if (!chord) return [];
+  const out: string[] = [];
+  for (const note of chord.notes) if (note.id !== undefined) out.push(note.id);
+  for (const duplicate of chord.duplicates) out.push(duplicate.id);
+  return out;
+}
+
+/** The id that speaks for a chord: its lowest printable member. */
+function representativeOf(chord: ChordEvent | undefined): string | undefined {
+  return chord?.notes.find((note) => note.id !== undefined)?.id;
+}
+
+/**
+ * MAKE `mergedInto` POINT AT SOMETHING THAT IS NOT ITSELF MERGED.
+ *
+ * A duplicate pitch is absorbed into its chord mate, and that whole chord can then lose a
+ * quantize collision — so a naive pointer chain ends at a note with no glyph of its own and every
+ * consumer has to walk it. The walk happens once, here. A cycle cannot arise from the two sites
+ * that feed this (dedup points backwards within a group, fusion points at a different group) and
+ * is broken by the visited set rather than trusted not to appear.
+ */
+function resolveMergeChains(
+  records: { id: string; mergedInto: string; reason: MergeReason }[]
+): { id: string; mergedInto: string; reason: MergeReason }[] {
+  const first = new Map<string, { id: string; mergedInto: string; reason: MergeReason }>();
+  for (const record of records) if (!first.has(record.id)) first.set(record.id, record);
+  return [...first.values()].map((record) => {
+    const seen = new Set<string>([record.id]);
+    let target = record.mergedInto;
+    for (let hop = first.get(target); hop && !seen.has(target); hop = first.get(target)) {
+      seen.add(target);
+      target = hop.mergedInto;
+    }
+    return { ...record, mergedInto: target };
+  });
+}
+
+/**
+ * WHEN A STORED `notationIntent` DID NOT DECIDE THE WRITTEN VALUE — the invalidation rule.
+ *
+ * The rule, stated once (IR.md repeats it verbatim): a declaration is HONOURED when the note's
+ * quantized span could legally carry it, which means the page gave it the declared number of
+ * ticks to within ONE SUBDIVISION of the lattice the note was measured against. Everything else
+ * is a declaration the page contradicts, and the four ways that happens are named separately
+ * because they call for different repairs.
+ *
+ * `not-carried` is the STALE case the seam cares about. A declaration is stored together with the
+ * seconds that match it; a later timing edit — a roll drag, a snap, a cut ripple, a neighbour
+ * moving — changes what the span can hold while leaving the declaration behind. The pipeline
+ * cannot tell "stale" from "fresh" by looking at the seconds, because the whole point of a
+ * declaration is that it outranks the measurement; what it CAN tell is that the page could not
+ * carry the value, and that is exactly the condition under which the stored intent is a lie.
+ *
+ * THE PIPELINE REPORTS AND DOES NOT CLEAR. It is a pure function of its input and the stored
+ * intent lives in the caller's document; clearing it here would last exactly one build and then
+ * be re-supplied. The seam owns the value, so the seam clears it, and the next build measures the
+ * note. That loop converges: with no declaration there is nothing left to contradict.
+ */
+function intentVerdictFor(
+  /*
+   * UNUSED HERE ON PURPOSE, and underscored so it stays that way visibly.
+   *
+   * Every fact this function needs about the note has already been looked up BY id at the call
+   * site and handed over in `context` — the note itself, its chord's intent, its tuplet unit. The
+   * id remains in the signature because a verdict is about a named note and a future reason may
+   * well need to say which one; dropping it would make that a signature change rather than a
+   * one-line one.
+   *
+   * The underscore is load-bearing across the repo boundary: `webcore/tsconfig.json` sets
+   * `noUnusedParameters` and compiles these sources through its `@pipeline-impl` path alias, so an
+   * unused name here fails the webcore build even though the pipeline's own tsconfig permits it.
+   */
+  _id: string,
+  engravedTicks: number,
+  context: {
+    note: InputNote | undefined;
+    exactSymbolicTiming: boolean;
+    chordIntentTicks: number | undefined;
+    tupletUnitTicks: number | undefined;
+    basicQuantTicks: number;
+  }
+): IntentIgnored | undefined {
+  const note = context.note;
+  if (!note?.notationIntent) return undefined;
+  // One subdivision of the lattice this note was measured against — the tuplet's unit inside a
+  // group, the finest straight grid outside one. It is the same `durUnit` quantize.ts snaps with,
+  // so "within one subdivision" means "the page could not have come closer".
+  const toleranceTicks = context.tupletUnitTicks ?? context.basicQuantTicks;
+  const declaredTicks = notationIntentTicks(note.notationIntent);
+  const verdict = (reason: IntentIgnored['reason']): IntentIgnored => ({
+    reason,
+    declaredTicks,
+    engravedTicks,
+    toleranceTicks
+  });
+
+  if (declaredTicks === null) return verdict('unprintable');
+  // A written source decided every tick before a declaration could be consulted (types.ts).
+  if (context.exactSymbolicTiming) return verdict('symbolic-source');
+  // A chord is one slot with one value, and the longest declaration in it won.
+  if (context.chordIntentTicks !== undefined && context.chordIntentTicks !== declaredTicks) {
+    return verdict('chord-superseded');
+  }
+  // A value that is not a whole number of the containing group's units has no symbol there.
+  if (context.tupletUnitTicks !== undefined && declaredTicks % context.tupletUnitTicks !== 0) {
+    return verdict('tuplet-lattice');
+  }
+  if (Math.abs(engravedTicks - declaredTicks) > toleranceTicks) return verdict('not-carried');
+  return undefined;
 }
 
 /** Add ordinary bars only when a snapped final onset (or exact symbolic duration) needs one. */
@@ -339,14 +471,54 @@ export function buildScore(input: BuildInput, settings: BuildSettings, options: 
   //
   // ZIP FIRST, FILTER SECOND. `clamped[i]` is positional against `qNotes`; filtering before
   // the map silently pairs each surviving note with the wrong result.
-  const placed: PlacedEvent[] = qNotes
-    .map((n, i) => ({
+  //
+  // The two rejections are RECORDED (station 9). This is the last place a whole event can leave
+  // the build, and it left without a word: an event snapped past the final barline, or clamped
+  // down to no ticks at all, simply never reached `buildBars` and its notes were gone from the
+  // page with the note count as the only evidence.
+  const eventDrops: { eventId: string; reason: DropReason }[] = [];
+  const placed: PlacedEvent[] = [];
+  for (let i = 0; i < qNotes.length; i++) {
+    const n = qNotes[i];
+    const offTick = Math.min(clamped[i].offTick, skel.totalTicks);
+    if (!(n.startTick < skel.totalTicks)) {
+      eventDrops.push({ eventId: n.id, reason: 'past-score-end' });
+      continue;
+    }
+    if (!(offTick > n.startTick)) {
+      eventDrops.push({ eventId: n.id, reason: 'zero-length-after-clamp' });
+      continue;
+    }
+    placed.push({
       chord: chordById.get(n.id)!,
       startTick: n.startTick,
-      offTick: Math.min(clamped[i].offTick, skel.totalTicks),
+      offTick,
       ...(n.tupletId ? { tupletId: n.tupletId } : {})
-    }))
-    .filter((p) => p.startTick < skel.totalTicks && p.offTick > p.startTick);
+    });
+  }
+
+  // ---- station 9 (part 2): what each declaration was judged against --------------------------
+  // Built here because this is the last point at which the event a note belongs to, and the
+  // tuplet lattice that event landed on, are both still in scope. Only notes that carry a
+  // declaration are indexed; on the overwhelmingly common detected take these maps are empty.
+  const intentNoteById = new Map<string, InputNote>();
+  const chordIntentTicksByNoteId = new Map<string, number>();
+  const tupletUnitByNoteId = new Map<string, number>();
+  const tupletUnitById = new Map(quant.tuplets.map((t) => [t.id, t.unitTicks]));
+  for (const note of identified) if (note.notationIntent) intentNoteById.set(note.id!, note);
+  if (intentNoteById.size) {
+    for (const n of qNotes) {
+      const chord = chordById.get(n.id);
+      if (!chord) continue;
+      const chordIntent = intentTicksOf(chord);
+      const unit = n.tupletId !== undefined ? tupletUnitById.get(n.tupletId) : undefined;
+      for (const memberId of membersOf(chord)) {
+        if (!intentNoteById.has(memberId)) continue;
+        if (chordIntent !== undefined) chordIntentTicksByNoteId.set(memberId, chordIntent);
+        if (unit !== undefined) tupletUnitByNoteId.set(memberId, unit);
+      }
+    }
+  }
 
   // ---- station 5: tab (legato pairs FIRST) ---------------------------------------------------
   const tabInputs: TabNoteInput[] = notes.map((n) => ({
@@ -620,9 +792,62 @@ export function buildScore(input: BuildInput, settings: BuildSettings, options: 
     mixedMeter: skel.mixedMeter
   };
 
+  // ---- station 9: the projection --------------------------------------------------------------
+  // Every loss the stations recorded on the way down, collected into one total statement. See
+  // projection.ts for the contract; the ONLY thing that happens here is naming, since each site
+  // already knows what it removed and why.
+  const projection = assembleProjection(ir, {
+    inputIds: identified.map((n) => n.id!),
+    merged: resolveMergeChains([
+      // Chord dedup first: it happens first, and a duplicate absorbed here can go on to lose a
+      // quantize collision as part of its winner's event, which is what the chain resolution
+      // below exists to follow.
+      ...chords.flatMap((chord) =>
+        chord.duplicates.map((duplicate) => ({
+          id: duplicate.id,
+          mergedInto: duplicate.ofId,
+          reason: 'chord-duplicate-pitch' as const
+        }))
+      ),
+      ...quant.fused.flatMap((fusion) =>
+        membersOf(chordById.get(fusion.id)).map((id) => ({
+          id,
+          mergedInto: representativeOf(chordById.get(fusion.intoId)) ?? id,
+          // Both written-source paths — `placeSymbolicEvents` and the `exact` quantizer it falls
+          // back to — fuse on a printable slot rather than on a measured grid, so they report the
+          // symbolic reason. Only a detected take collides at quantization proper.
+          reason: (exactSymbolicTiming ? 'symbolic-tick-collision' : 'quantize-collision') as MergeReason
+        }))
+      )
+    ]),
+    dropped: [
+      ...guard.dropped,
+      ...eventDrops.flatMap((drop) =>
+        membersOf(chordById.get(drop.eventId)).map((id) => ({ id, reason: drop.reason }))
+      )
+    ],
+    chordGroups: chords.map((chord, i) => ({
+      id: `e${i}`,
+      memberIds: membersOf(chord),
+      onsetSec: chord.onsetSec,
+      endSec: chord.endSec,
+      windowSec: chord.windowSec,
+      law: chord.law
+    })),
+    intentVerdict: (id, engravedTicks) =>
+      intentVerdictFor(id, engravedTicks, {
+        note: intentNoteById.get(id),
+        exactSymbolicTiming,
+        chordIntentTicks: chordIntentTicksByNoteId.get(id),
+        tupletUnitTicks: tupletUnitByNoteId.get(id),
+        basicQuantTicks: quant.basicQuantTicks
+      })
+  });
+
   return {
     ir,
     diagnostics,
+    projection,
     skeleton: skel,
     notes,
     toMusicXML: () => toMusicXML(ir),

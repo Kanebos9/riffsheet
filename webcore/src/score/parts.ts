@@ -424,6 +424,16 @@ export function buildPartedRiffScore(
     ir,
     musicxml: () => result.toMusicXML(),
     midi: (quantized: boolean) => result.toMidi(quantized),
+    /*
+     * THE LIVE PART'S PROJECTION, and only it.
+     *
+     * `RiffScore.projection` answers "what became of the notes THIS document can edit", and in a
+     * multi-part score that is the live take — imported parts are notation-only in v1 and their
+     * ids live in the pipeline's collision-proof namespace rather than in the feed the editor
+     * holds. Merging every part's map together would put ids in here that no `performanceFeed`
+     * contains, and `score/projection.ts` promises totality over the FEED.
+     */
+    projection: live.projection,
     tempoBpm: ir.tempo.displayBpm,
     timeSignature: { numerator: ir.timeSig[0], denominator: ir.timeSig[1] },
     divisions: ir.divisions,

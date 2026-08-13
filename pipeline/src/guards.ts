@@ -33,6 +33,16 @@ export interface GuardResult {
   notes: InputNote[];
   pastEndDropped: number;
   tooShortDropped: number;
+  /**
+   * WHICH NOTES THE TWO FILTERS REMOVED, not merely how many.
+   *
+   * The counts above say a take lost three notes and refuse to say which, so a caller that wants
+   * to explain the loss — or to stop drawing the removed notes in a second view — has to diff the
+   * input against the output and guess at the reason. The ids are free here (the filter already
+   * knows them) and the projection is total because of them. Kept alongside the counts rather
+   * than replacing them: the counts are what the diagnostics print.
+   */
+  dropped: { id: string; reason: 'past-audio-end' | 'below-min-duration' }[];
   repeatLoops: IRRepeatSuspect[];
 }
 
@@ -141,6 +151,7 @@ export function applyGuards(
 ): GuardResult {
   let pastEndDropped = 0;
   let tooShortDropped = 0;
+  const dropped: GuardResult['dropped'] = [];
   /** The audio's length is only a boundary on the notes while they still share its timeline. */
   const boundarySec = detachedTimeline ? undefined : audioDurationSec;
 
@@ -152,12 +163,16 @@ export function applyGuards(
     }
     if (boundarySec !== undefined && n.startSec >= boundarySec) {
       pastEndDropped++;
+      // An id is only absent when the caller supplied a note without one and nothing upstream
+      // assigned it; `buildScore` always assigns before calling, so this is total in practice.
+      if (n.id !== undefined) dropped.push({ id: n.id, reason: 'past-audio-end' });
       return;
     }
     // Clamp a note that rings past the end of the audio rather than dropping it.
     const endSec = boundarySec !== undefined ? Math.min(n.endSec, boundarySec) : n.endSec;
     if (endSec - n.startSec < MIN_NOTE_SEC && !isDeclared(n)) {
       tooShortDropped++;
+      if (n.id !== undefined) dropped.push({ id: n.id, reason: 'below-min-duration' });
       return;
     }
     kept.push({ note: { ...n, endSec }, originalIndex });
@@ -172,6 +187,7 @@ export function applyGuards(
     notes: kept.map((k) => k.note),
     pastEndDropped,
     tooShortDropped,
+    dropped,
     repeatLoops: suspects
   };
 }

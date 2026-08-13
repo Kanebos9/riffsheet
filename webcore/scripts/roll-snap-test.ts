@@ -458,6 +458,150 @@ assert(
   'a strummed chord stays a chord — one attack, one position'
 );
 
+// --- 9b-bis. THE LEADER AND ITS FOLLOWERS: rhythm across a beat midpoint -------------------
+//
+// THE DEFECT. Every event used to run `Math.round((raw - origin) / beatSec)` on its own, and the
+// cascade could only rearrange events that had already claimed the SAME beat. A pair played a
+// sixteenth apart either side of a midpoint was therefore torn in half — 2.01 back to 2.00, 2.26
+// forward to 2.50 — and an interval of 0.25 s came out as 0.50 s. Both notes moved a defensible
+// distance; the RHYTHM BETWEEN THEM doubled, and nothing could see it because the two never met.
+//
+// The fix is a fixed cluster leader (`app/snap.ts` §"THE LEADER AND ITS FOLLOWERS"). These are the
+// cases that pin it down, one row of the table per block.
+{
+  const at = (starts: ReadonlyArray<number>): InputNote[] =>
+    starts.map((s, i) => ({ id: `f${i}`, startSec: s, endSec: s + 0.08, midi: 40 + i }));
+  const where = (notes: ReadonlyArray<InputNote>): string =>
+    notes.map((n) => `${n.id}@${Number(n.startSec.toFixed(6))}`).join(' ');
+
+  // THE OWNER'S REPRO. Beat 0.5, ruler 1/16, origin 0.
+  assert(
+    where(snapPerformanceToBeat(at([2.01, 2.26]), BEAT, CELL16, 0, 120)) === 'f0@2 f1@2.25',
+    `the pair must keep its sixteenth: ${where(snapPerformanceToBeat(at([2.01, 2.26]), BEAT, CELL16, 0, 120))}`
+  );
+  // …AND ON A RULER THAT HAS NO SIXTEENTH ON IT. The candidate ladder is the cascade's own — cell,
+  // cell/2, … down to `finestStepSec` — so a 1/4 ruler still finds the 1/16 the playing implies.
+  assert(
+    where(snapPerformanceToBeat(at([2.01, 2.26]), BEAT, rollSnapUnitSec('quarter', 120), 0, 120)) === 'f0@2 f1@2.25',
+    'a coarse ruler subdivides for a follower exactly as it subdivides for a collision'
+  );
+  // GRID IS THE CONTROL and is not touched by any of this: it rounds both ends to the ruler, full
+  // stop, which is what the two switches mean by their own names.
+  assert(
+    where(snapPerformanceToGrid(at([2.01, 2.26]), rollSnapUnitSec('eighth', 120), 0, 120)) === 'f0@2 f1@2.25',
+    'Grid rounds to its own ruler and knows nothing about leaders'
+  );
+  assert(
+    where(snapPerformanceToGrid(at([2.01, 2.26]), rollSnapUnitSec('quarter', 120), 0, 120)) === 'f0@2 f1@2.5',
+    'Grid on a 1/4 ruler still has only 1/4 lines to offer — the control the Beat case is measured against'
+  );
+
+  // SPACING, NOT PACKING. Three notes with a hole between the second and third: the follower rule
+  // preserves the played gap instead of compacting them onto consecutive cells.
+  assert(
+    where(snapPerformanceToBeat(at([2.01, 2.14, 2.39]), BEAT, CELL16, 0, 120)) === 'f0@2 f1@2.125 f2@2.375',
+    `played spacing must survive: ${where(snapPerformanceToBeat(at([2.01, 2.14, 2.39]), BEAT, CELL16, 0, 120))}`
+  );
+
+  // THE BEAT WINS AND RE-PHASES. 2.50 is exactly on a beat, so it beats every relative candidate
+  // and becomes the next leader; 2.76 is then measured from IT, not from 2.24.
+  assert(
+    where(snapPerformanceToBeat(at([2.24, 2.5, 2.76]), BEAT, CELL16, 0, 120)) === 'f0@2 f1@2.5 f2@2.75',
+    `a genuine beat onset must reset the phase: ${where(snapPerformanceToBeat(at([2.24, 2.5, 2.76]), BEAT, CELL16, 0, 120))}`
+  );
+
+  // A FOLLOWER MAY BE A CHORD. Membership is decided before any of this, so both noteheads take
+  // the one position their event was placed at.
+  assert(
+    where(snapPerformanceToBeat(at([2.01, 2.26, 2.27]), BEAT, CELL16, 0, 120)) === 'f0@2 f1@2.25 f2@2.25',
+    'a follower chord is one event and stands on one position'
+  );
+
+  // TWO FOLLOWERS WANTING ONE CELL. Separation outranks the preference: the later one takes the
+  // next free slot, exactly as an ordinary collision claimant does.
+  assert(
+    where(snapPerformanceToBeat(at([2.01, 2.26, 2.301]), BEAT, CELL16, 0, 120)) === 'f0@2 f1@2.25 f2@2.375',
+    `a relative collision cascades: ${where(snapPerformanceToBeat(at([2.01, 2.26, 2.301]), BEAT, CELL16, 0, 120))}`
+  );
+
+  // NO LEGATO CHAIN. Every comparison is against the FIXED leader and the cluster spans strictly
+  // less than one beat, so a run of short gaps cannot drag the take: the fifth note here is a whole
+  // beat past the leader and starts a cluster of its own.
+  const chain = snapPerformanceToBeat(at([2.01, 2.13, 2.26, 2.39, 2.51, 2.63]), BEAT, CELL16, 0, 120);
+  assert(
+    where(chain) === 'f0@2 f1@2.125 f2@2.25 f3@2.375 f4@2.5 f5@2.625',
+    `a legato chain may not accumulate: ${where(chain)}`
+  );
+  for (let i = 0; i < chain.length; i++) {
+    assert(
+      Math.abs(chain[i].startSec - at([2.01, 2.13, 2.26, 2.39, 2.51, 2.63])[i].startSec) <= BEAT / 2 + 1e-9,
+      'no event may be moved further than half a pulse — the bound plain nearest-beat already had'
+    );
+  }
+
+  // THE CHORD WINDOW, at min(20 ms, cell/2), and the float fix on its comparison: an exactly-20 ms
+  // gap written as decimal seconds is 0.020000000000000018, and without `+ EPS` the float
+  // representation rather than the performance decided whether a strum was one chord.
+  const twoAt = (gap: number, cellSec: number) =>
+    new Set(snapPerformanceToBeat(at([2.0, 2.0 + gap]), BEAT, cellSec, 0, 120).map((n) => n.startSec)).size;
+  assert(twoAt(0.019, CELL16) === 1, 'just inside the window is one chord');
+  assert(twoAt(2.02 - 2.0, CELL16) === 1, 'EXACTLY at the window is one chord — the float fix');
+  assert(twoAt(0.021, CELL16) === 2, 'just outside the window is two events');
+  // …and on an unusually fine ruler the cap is cell/2 rather than 20 ms, so the window can never
+  // swallow a subdivision the player can see on the roll.
+  assert(twoAt(0.019, 0.02) === 2, 'on a 20 ms cell the window is capped at 10 ms');
+
+  // A FOLLOWER'S `sourceTiming` FOLLOWS IT. The symbolic path engraves written ticks, so a follower
+  // whose rectangle moved and whose ticks did not would snap the roll and leave the sheet put.
+  const symbolic: InputNote[] = [
+    { id: 'y0', startSec: 2.01, endSec: 2.2, midi: 40, sourceTiming: { startTick: 1929, endTick: 2112, ppq: 480 } },
+    { id: 'y1', startSec: 2.26, endSec: 2.45, midi: 43, sourceTiming: { startTick: 2169, endTick: 2352, ppq: 480 } }
+  ];
+  const snappedSymbolic = snapPerformanceToBeat(symbolic, BEAT, CELL16, 0, 120);
+  assert(
+    // 2169 written ticks, moved by the snap's own delta of -0.01 s at 960 ticks/s -> 2159.
+    snappedSymbolic[1].startSec === 2.25 && snappedSymbolic[1].sourceTiming!.startTick === 2159,
+    `a follower's written ticks move with it: ${JSON.stringify(snappedSymbolic[1].sourceTiming)}`
+  );
+
+  // ENDS ARE STILL THE RELEASE PASS'S BUSINESS. A pair that does not overlap keeps its own ends…
+  const apart = snapPerformanceToBeat(
+    [
+      { id: 'g0', startSec: 2.01, endSec: 2.2, midi: 40 },
+      { id: 'g1', startSec: 2.26, endSec: 2.45, midi: 43 }
+    ],
+    BEAT,
+    CELL16,
+    0,
+    120
+  );
+  assert(apart[0].endSec <= apart[1].startSec + 1e-9, 'a tidied end may not swallow the follower after it');
+  // …and a sustain the recording itself held across the next attack is not capped by one.
+  const held = snapPerformanceToBeat(
+    [
+      { id: 'h0', startSec: 2.01, endSec: 2.9, midi: 40 },
+      { id: 'h1', startSec: 2.26, endSec: 2.45, midi: 43 }
+    ],
+    BEAT,
+    CELL16,
+    0,
+    120
+  );
+  assert(held[0].endSec > held[1].startSec + 1e-9, 'a bass note sustained under a follower keeps sustaining');
+
+  // THE BOUND IS THE DOCUMENT'S, NOT THE AUDIO FILE'S. Passing an obsolete audio length is what
+  // pulls a detached tail back onto the last line inside the recording — see `snap.ts` §the tape.
+  const late: InputNote[] = [{ id: 'z0', startSec: 4.51, endSec: 4.7, midi: 40 }];
+  assert(
+    snapPerformanceToBeat(late, BEAT, CELL16, 0, 120, 5.0)[0].startSec === 4.5,
+    'with the document extent the late attack keeps its own beat'
+  );
+  assert(
+    snapPerformanceToBeat(late, BEAT, CELL16, 0, 120, 4.0)[0].startSec < 4.0,
+    'with a stale audio extent it is dragged back inside it — which is why the caller must pass the document'
+  );
+}
+
 // --- 9c. ORDER IS PRESERVED ----------------------------------------------------------------
 //
 // The §2 take, whose ids are deliberately not in time order. Beat mode may move every note, but
@@ -497,11 +641,59 @@ const beatAt32 = snapPerformanceToBeat(raw, BEAT, rollSnapUnitSec('thirtysecond'
 const beatBackAt16 = snapPerformanceToBeat(raw, BEAT, CELL16, originSec, 120);
 assert(fingerprint(beatAt32) !== fingerprint(beatRaw), 'a finer grid must actually pack the cascade differently');
 assert(fingerprint(beatBackAt16) === fingerprint(beatRaw), 'Beat -> 1/32 -> Beat lands where the first Beat did');
+/*
+ * ONE ASSERTION CHANGED HERE, INTENTIONALLY, and the old one is quoted so the change is legible:
+ *
+ *   const beatCumulative = snapPerformanceToBeat(beatRaw, BEAT, CELL16, originSec, 120);
+ *   assert(
+ *     fingerprint(beatCumulative) !== fingerprint(beatRaw),
+ *     'snapping an already-snapped take must differ — otherwise this proves nothing about
+ *      measuring from raw'
+ *   );
+ *
+ * WHY IT IS NOW FALSE, AND WHY THAT IS AN IMPROVEMENT. Under independent nearest-beat rounding a
+ * cascade position was an artefact — the second note of a crowded beat stood a cell past a beat it
+ * had never claimed — so feeding the output back in re-classified it and it walked. The
+ * leader-follower rule places every event on `leaderBeat + k * step`, which is a lattice position
+ * the rule itself will reproduce: BEAT SNAP IS NOW A PROJECTION. Snapping its own output at the
+ * same ruler is a fixed point, which is a property worth asserting rather than a gap.
+ *
+ * WHAT THE OLD ASSERTION WAS GUARDING is still guarded, one line down: that CHAINING rulers is not
+ * the same as re-deriving from the take. It just needs a case where the two genuinely differ,
+ * because `beatRaw` no longer is one.
+ */
 const beatCumulative = snapPerformanceToBeat(beatRaw, BEAT, CELL16, originSec, 120);
 assert(
-  fingerprint(beatCumulative) !== fingerprint(beatRaw),
-  'snapping an already-snapped take must differ — otherwise this proves nothing about measuring from raw'
+  fingerprint(beatCumulative) === fingerprint(beatRaw),
+  'Beat is a projection: snapping its own output at the same ruler may not move anything'
 );
+// RE-DERIVE, NEVER CHAIN — the claim the old assertion above was really making. A take whose 1/32
+// answer sits on lines the 1/16 lattice does not have: chaining lands p3 on 2.375 where re-deriving
+// from the recording puts it on 2.25. `App.performanceFeed()` re-derives, always.
+{
+  const chainable: InputNote[] = [
+    { id: 'p0', startSec: 1.2077, endSec: 1.5796, midi: 40 },
+    { id: 'p1', startSec: 1.6234, endSec: 1.7277, midi: 41 },
+    { id: 'p2', startSec: 2.0573, endSec: 2.352, midi: 42 },
+    { id: 'p3', startSec: 2.3467, endSec: 2.6881, midi: 43 }
+  ];
+  const direct = snapPerformanceToBeat(chainable, BEAT, CELL16, originSec, 120);
+  const chained = snapPerformanceToBeat(
+    snapPerformanceToBeat(chainable, BEAT, rollSnapUnitSec('thirtysecond', 120), originSec, 120),
+    BEAT,
+    CELL16,
+    originSec,
+    120
+  );
+  assert(
+    direct.map((n) => `${n.id}@${n.startSec}`).join(' ') === 'p0@1 p1@1.5 p2@2 p3@2.25',
+    `re-deriving from the take: ${direct.map((n) => `${n.id}@${n.startSec}`).join(' ')}`
+  );
+  assert(
+    fingerprint(chained) !== fingerprint(direct),
+    'chaining one ruler onto another must differ from re-deriving — otherwise "measured from the raw take" proves nothing'
+  );
+}
 // And a hand edit through the Beat layer stores the dragged position as the new raw, exactly as
 // it does through Grid: one shared merge, so there is one answer.
 const beatDrag = mergeEditedOntoRaw(raw, beatRaw.map((n) => (n.id === 'n2' ? { ...n, startSec: 1.75, endSec: 1.97 } : n)), new Set(['n2']));
@@ -581,12 +773,47 @@ for (const id of ['b4', 'b5', 'b6', 'b7', 'b8', 'b9']) {
     `${id} was played in bar 2 and must be snapped inside bar 2, not to ${note.startSec}`
   );
 }
-// …and they subdivide rather than stack: six distinct positions, and the two that shared a beat
-// with a neighbour are an EIGHTH apart, which is the answer the report asked for by name.
+/*
+ * …and they subdivide rather than stack: six distinct positions, all inside bar 2.
+ *
+ * THIS EXACT STRING CHANGED WITH THE LEADER-FOLLOWER RULE, INTENTIONALLY. The old claim, quoted:
+ *
+ *   assert(
+ *     riffSnapped.map((n) => `${n.id}@${n.startSec}`).join(' ')
+ *       .includes('b4@2 b5@2.25 b6@2.5 b7@2.75 b8@3 b9@3.5'),
+ *     `bar 2 must subdivide onto eighths: …`
+ *   );
+ *
+ * WHY IT MOVED. `b6` is played at 2.41 — 0.41 s after `b4` at 2.00, so it is inside `b4`'s cluster
+ * window and its nearest 1/16 relative to `b4`'s snapped beat is 2.375, which is 35 ms from where
+ * it was played. Independent bucketing sent it to 2.50, 90 ms away, and then `b7` (2.62) had to
+ * cascade off it to 2.75. Under the new rule `b6` is a legitimate relative follower at 2.375 and
+ * `b7` keeps its own beat at 2.50 — both notes end up CLOSER to where the player put them.
+ * `b5` moves 2.25 → 2.125 as a consequence: it is an ordinary claimant on `b4`'s beat, and the
+ * bucket's lattice is now the 1/16 that `b6`'s preference requires (2.19 is 60 ms from 2.25 and
+ * 65 ms from 2.125, so the cost of that is a quarter of one screen pixel's worth of timing).
+ *
+ * What is NOT negotiable and is asserted above and below unchanged: all six stay inside bar 2, all
+ * six are distinct, and every one of them reaches the page.
+ */
 assert(
-  riffSnapped.map((n) => `${n.id}@${n.startSec}`).join(' ').includes('b4@2 b5@2.25 b6@2.5 b7@2.75 b8@3 b9@3.5'),
+  riffSnapped.map((n) => `${n.id}@${n.startSec}`).join(' ').includes('b4@2 b5@2.125 b6@2.375 b7@2.5 b8@3 b9@3.5'),
   `bar 2 must subdivide onto eighths: ${riffSnapped.map((n) => `${n.id}@${n.startSec}`).join(' ')}`
 );
+// EVERY ONE OF THEM IS CLOSER TO WHERE IT WAS PLAYED, or no further — the property the string
+// above is an instance of, stated so a future change to the rule cannot quietly get worse.
+{
+  const old = new Map([['b4', 2], ['b5', 2.25], ['b6', 2.5], ['b7', 2.75], ['b8', 3], ['b9', 3.5]]);
+  let improved = 0;
+  for (const [id, was] of old) {
+    const played = riff.find((n) => n.id === id)!.startSec;
+    const now = riffSnapped.find((n) => n.id === id)!.startSec;
+    const better = Math.abs(now - played) - Math.abs(was - played);
+    assert(better < 0.006, `${id} may not be moved further from where it was played (${was} -> ${now})`);
+    if (better < -1e-9) improved++;
+  }
+  assert(improved >= 2, 'the leader-follower rule must actually pull notes closer to the performance');
+}
 // THE SHEET, which is where the notes were actually going missing. Every played note reaches the
 // page, and it reaches the bar it was played in.
 const riffPage = engraved(riffSnapped);
@@ -764,6 +991,58 @@ for (let trial = 0; trial < TRIALS; trial++) {
   );
   checkedNotes += events.length;
 }
+
+// ---------------------------------------------------------------------------
+// 9g. MIDPOINT-STRADDLING MOTIFS, deterministically, across pulses and rulers
+// ---------------------------------------------------------------------------
+//
+// The 240 trials above check survival, separation and movement; they say nothing about the
+// INTERVAL between two attacks, which is the whole of the leader-follower defect. These do: one
+// motif, played either side of a beat midpoint, at four pulse lengths and on every ruler including
+// the triplet one. The claim is the one the owner reported — a played gap of a subdivision may not
+// come out as a gap of a whole beat.
+let motifs = 0;
+for (const beatSec of [0.4, 0.5, 0.6, 1.0]) {
+  for (const ruler of RULERS) {
+    const cell = rollSnapUnitSec(ruler, 60 / beatSec);
+    // THE PAIR STRADDLES THE MIDPOINT: the first is 0.3 of a beat past a downbeat and rounds BACK
+    // to it, the second is a quarter of a beat later at 0.55 and rounds FORWARD to the next one.
+    // That is the boundary the independent round used to tear a rhythm in half across.
+    const a = (4 + 0.3) * beatSec;
+    const b = a + beatSec / 4;
+    const pair = snapPerformanceToBeat(
+      [
+        { id: 'm0', startSec: a, endSec: a + beatSec / 8, midi: 40 },
+        { id: 'm1', startSec: b, endSec: b + beatSec / 8, midi: 43 }
+      ],
+      beatSec,
+      cell,
+      0,
+      60 / beatSec
+    );
+    const played = b - a;
+    const written = pair[1].startSec - pair[0].startSec;
+    assert(pair.length === 2, `${ruler}@${beatSec}: the motif lost a note`);
+    assert(written > 1e-9, `${ruler}@${beatSec}: the motif collapsed onto one position`);
+    // HALF A BEAT IS THE CEILING, on every ruler. The old rule answered a quarter-beat gap with a
+    // WHOLE beat, because the two notes rounded to adjacent beats and never met.
+    assert(
+      written <= beatSec / 2 + 1e-9,
+      `${ruler}@${beatSec}: a ${played.toFixed(3)}s gap came out as ${written.toFixed(3)}s — more than half a pulse`
+    );
+    // …AND EXACTLY THE PLAYED GAP wherever the ruler has a line fine enough to say it. A 1/4 ruler
+    // on a 1/16 figure genuinely cannot, and answers with the finest thing the ladder admits; a
+    // 1/16 or triplet ruler can, and must.
+    if (cell > 0 && cell <= played + 1e-9) {
+      assert(
+        written <= played + 1e-9,
+        `${ruler}@${beatSec}: the ruler has a ${cell.toFixed(4)}s cell and still stretched ${played.toFixed(3)}s to ${written.toFixed(3)}s`
+      );
+    }
+    motifs++;
+  }
+}
+assert(motifs === 24, 'every pulse/ruler pairing must be exercised');
 
 console.log(
   `roll-snap-test: free/straight ${freeStraight.glyphs}g ${freeStraight.rests}r ${freeStraight.ties}t · ` +

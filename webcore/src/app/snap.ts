@@ -262,6 +262,11 @@ function finestStepSec(cellSec: number, beatSec: number): number {
   return Math.min(beatSec, Math.max(Math.min(cellSec, beatSec / 4), MIN_STEP_SEC));
 }
 
+/** The furthest slot in a placement. Slots are non-decreasing, so this is the last one. */
+function maxOf(slots: ReadonlyArray<number>): number {
+  return slots.length ? slots[slots.length - 1] : 0;
+}
+
 /**
  * ======================= SNAP TO BEAT (G25) =======================
  *
@@ -276,9 +281,10 @@ function finestStepSec(cellSec: number, beatSec: number): number {
  *
  * THREE RULES, in the order they are applied.
  *
- * 1. NEAREST BEAT. Every attack goes to the closest beat, not the preceding one: a note played
- *    12 ms early was aiming at the beat it is early FOR, and flooring would drag it a whole beat
- *    backwards.
+ * 1. NEAREST BEAT — FOR THE LEADER OF A CLUSTER, and everything else is measured against it.
+ *    See §"THE LEADER AND ITS FOLLOWERS" below for the whole rule; the short form is that a note
+ *    played 12 ms early was aiming at the beat it is early FOR, and flooring would drag it a whole
+ *    beat backwards, so the leader rounds to the closest beat.
  *
  * 2. SUBDIVIDE THE BEAT — never push the take forward. Several notes can want the same beat;
  *    stacking them there would delete the run, so the beat is divided into as many equal parts
@@ -319,6 +325,52 @@ function finestStepSec(cellSec: number, beatSec: number): number {
  *
  * MEASURED FROM THE RAW TAKE, ALWAYS, and nothing is mutated — the same contract grid mode
  * keeps, which is what makes Off/Grid/Beat/Off return the recording to the bit.
+ *
+ * ======================= THE LEADER AND ITS FOLLOWERS =======================
+ *
+ * WHAT WAS WRONG WITH RULE 1 ON ITS OWN. Every event ran `Math.round((raw - origin) / beatSec)`
+ * INDEPENDENTLY, and the cascade could only ever rearrange events that had already claimed the
+ * same beat. So a pair played a sixteenth apart across a beat midpoint — 2.01 and 2.26 against a
+ * half-second pulse — was torn in half: 2.01 rounded back to 2.00, 2.26 rounded FORWARD to 2.50,
+ * and an interval of 0.25 s came out as 0.50 s. Two notes, both moved by a defensible amount on
+ * their own, and the RHYTHM BETWEEN THEM doubled. Nothing in the cascade could see it, because
+ * the two never met in one bucket.
+ *
+ * THE RULE NOW: a FIXED cluster leader, and "nearest of the independent beat or a leader-relative
+ * subdivision" for everything that follows it.
+ *
+ *   THE LEADER      the first unassigned event. It takes its own clamped nearest beat, exactly as
+ *                   rule 1 always did.
+ *   THE WINDOW      an event is a candidate follower only while
+ *                       0 < followerRaw - leaderRaw < beatSec
+ *                   measured against THE LEADER and never against the previous follower. Equality
+ *                   at one whole beat starts a new cluster. That is what stops a legato chain from
+ *                   growing without bound: adjacent-onset chaining refreshes the window on every
+ *                   short gap and can drag a whole take, which is the suffix-wide debt rule 2
+ *                   already refuses.
+ *   SAME BEAT       a follower whose own nearest beat IS the leader's is left as an ordinary
+ *                   collision claimant — desired offset 0 — so the cascade below reproduces
+ *                   exactly what it did before for every take this rule does not touch.
+ *   LATER BEAT      otherwise, candidates come off the cascade's OWN halving ladder:
+ *                       step ∈ cell, cell/2, … down to `finestStepSec`
+ *                       k    = max(1, round((followerRaw - leaderRaw) / step))
+ *                       candidate = leaderSnappedBeat + k * step
+ *                   and only candidates STRICTLY before the next beat are admissible. The nearest
+ *                   admissible candidate to the raw onset is compared with the independent beat:
+ *                   the relative one must be STRICTLY closer to win, the beat wins an exact tie,
+ *                   and when the beat wins that event becomes the next leader — which is what
+ *                   re-phases the cluster on a genuine downbeat (2.24, 2.50, 2.76 → 2.00, 2.50,
+ *                   2.75 rather than a run of relative offsets from 2.24).
+ *
+ * MOVEMENT IS BOUNDED EXACTLY AS BEFORE. A relative candidate only wins by being strictly closer
+ * to the raw onset than the independent nearest beat, and that beat is within half a pulse — so
+ * no event this rule places is further from where it was played than plain rule 1 would have put
+ * it. Nothing here can move a note more than the old code could.
+ *
+ * WHY NOT A FULL LATTICE DECODER. The notation quantizer scores every onset in an occupied beat
+ * against one lattice (`pipeline/src/quantize.ts`), which is theoretically stronger — and importing
+ * it here would blur Beat, Grid and the sheet's own Quantize, whose separation is the point of
+ * this file.
  */
 export function snapPerformanceToBeat(
   notes: ReadonlyArray<InputNote>,
@@ -353,14 +405,17 @@ export function snapPerformanceToBeat(
   const events: { members: number[]; rawStart: number }[] = [];
   for (const { n, i } of order) {
     const open = events[events.length - 1];
-    if (open && n.startSec - open.rawStart <= chordWindow) {
+    // `+ EPS` because the window is a MUSICAL claim about two attacks, and a take whose notes were
+    // written as decimal seconds can state an exactly-20 ms gap as 0.020000000000000018. Without
+    // it the float representation, not the performance, decides whether a strum is one chord.
+    if (open && n.startSec - open.rawStart <= chordWindow + EPS) {
       open.members.push(i);
       continue;
     }
     events.push({ members: [i], rawStart: n.startSec });
   }
 
-  // --- 1: every event goes to its NEAREST beat -------------------------------------------
+  // --- 1: LEADER-FOLLOWER classification -------------------------------------------------
   // Beats are addressed by INDEX rather than by time so that two of them can never collapse
   // onto the same second at the head of the take, which is what a bare `Math.max(0, …)` on the
   // position would do to a note played before written second 0.
@@ -371,12 +426,80 @@ export function snapPerformanceToBeat(
   // the function it always was. See §"the end of the tape".
   const lastLine = lastLineBefore(takeDurationSec, originSec, beatSec);
   const maxIdx = lastLine === null ? Number.POSITIVE_INFINITY : Math.round((lastLine - originSec) / beatSec);
+  const nearestBeatIdx = (rawStart: number): number =>
+    Math.min(maxIdx, Math.max(minIdx, Math.round((rawStart - originSec) / beatSec)));
+
   const buckets = new Map<number, number[]>();
-  for (let e = 0; e < events.length; e++) {
-    const idx = Math.min(maxIdx, Math.max(minIdx, Math.round((events[e].rawStart - originSec) / beatSec)));
+  /**
+   * How far into its bucket's beat this event WANTS to stand, in seconds. Zero for every ordinary
+   * claimant, which is what makes the allocator below reproduce the old cascade exactly.
+   */
+  const desiredSec = new Array<number>(events.length).fill(0);
+  /**
+   * The COARSEST ladder step that states this event's `desiredSec` exactly, or Infinity for an
+   * ordinary claimant, which has no preference to state. The bucket's own step may never be
+   * coarser than this or the offset could not be represented — it would round to a slot that is
+   * not the position the classification chose, and a 3/16 preference would land on the next beat.
+   */
+  const desiredStep = new Array<number>(events.length).fill(Number.POSITIVE_INFINITY);
+
+  let leader = -1;
+  let leaderBeatIdx = 0;
+  const openCluster = (e: number, idx: number): void => {
+    leader = e;
+    leaderBeatIdx = idx;
     const at = buckets.get(idx);
     if (at) at.push(e);
     else buckets.set(idx, [e]);
+  };
+  const joinLeader = (e: number, offsetSec: number, step: number): void => {
+    desiredSec[e] = offsetSec;
+    desiredStep[e] = step;
+    const at = buckets.get(leaderBeatIdx);
+    if (at) at.push(e);
+    else buckets.set(leaderBeatIdx, [e]);
+  };
+
+  for (let e = 0; e < events.length; e++) {
+    const rawStart = events[e].rawStart;
+    const ownIdx = nearestBeatIdx(rawStart);
+    const fromLeader = leader < 0 ? Number.POSITIVE_INFINITY : rawStart - events[leader].rawStart;
+    // OUTSIDE THE WINDOW — including exactly one beat away, which starts a new cluster by rule.
+    if (!(fromLeader > EPS && fromLeader < beatSec - EPS)) {
+      openCluster(e, ownIdx);
+      continue;
+    }
+    // INSIDE, AND CLAIMING THE LEADER'S OWN BEAT: an ordinary collision claimant. The cascade
+    // already has the right answer for these and this rule must not change it.
+    if (ownIdx === leaderBeatIdx) {
+      joinLeader(e, 0, Number.POSITIVE_INFINITY);
+      continue;
+    }
+    // INSIDE, CLAIMING A LATER BEAT: the case the independent round tore in half.
+    const leaderBeatSec = originSec + leaderBeatIdx * beatSec;
+    const nextBeatSec = leaderBeatSec + beatSec;
+    let bestPos = 0;
+    let bestStep = 0;
+    let bestErr = Number.POSITIVE_INFINITY;
+    for (let step = cell; step >= finest - EPS; step /= 2) {
+      const k = Math.max(1, Math.round(fromLeader / step));
+      const pos = leaderBeatSec + k * step;
+      // STRICTLY before the next beat. A candidate ON it is that beat, and the beat is the other
+      // side of the comparison below rather than a relative offset from somewhere else.
+      if (!(pos < nextBeatSec - EPS)) continue;
+      const err = Math.abs(pos - rawStart);
+      // Later position wins an exact tie; a finer step landing on a position a coarser one already
+      // reached does not replace it, so the bucket keeps the coarsest lattice that can say this.
+      if (err < bestErr - EPS || (Math.abs(err - bestErr) <= EPS && pos > bestPos + EPS)) {
+        bestPos = pos;
+        bestStep = step;
+        bestErr = err;
+      }
+    }
+    const beatErr = Math.abs(originSec + ownIdx * beatSec - rawStart);
+    // THE BEAT WINS AN EXACT TIE, and winning makes this event the next leader — the re-phase.
+    if (bestErr < beatErr - EPS) joinLeader(e, bestPos - leaderBeatSec, bestStep);
+    else openCluster(e, ownIdx);
   }
 
   // --- 2: each beat subdivides itself until its own notes fit ----------------------------
@@ -386,6 +509,25 @@ export function snapPerformanceToBeat(
   const indices = [...buckets.keys()].sort((a, b) => a - b);
   const lastIdx = indices[indices.length - 1];
   let spilled: number[] = [];
+  /**
+   * The slot each event of `here` ends up in at a given step.
+   *
+   * DESIRED FIRST, THEN SEPARATION: `max(desiredSlot, previousActualSlot + 1)` — an event asks for
+   * the slot its classification chose and is pushed one further only when the event before it is
+   * already standing there. With every desire at 0 this degenerates to 0, 1, 2 … which IS the old
+   * cascade, so the legacy path is reproduced algebraically rather than by a special case.
+   */
+  const slotsAt = (here: ReadonlyArray<number>, step: number): number[] => {
+    const out: number[] = [];
+    let prev = -1;
+    for (const e of here) {
+      const want = Math.round(desiredSec[e] / step);
+      const actual = Math.max(want, prev + 1);
+      out.push(actual);
+      prev = actual;
+    }
+    return out;
+  };
   // EVERY beat from the first occupied one onward, not only the occupied ones: a spill goes to
   // the beat AFTER the one that was full, and an empty beat is exactly where it should land.
   // The furthest position handed out so far, so a group the end of the take pushes backwards can
@@ -394,6 +536,13 @@ export function snapPerformanceToBeat(
   for (let idx = indices[0]; idx <= lastIdx || spilled.length; idx++) {
     const own = buckets.get(idx);
     const here = spilled.length ? [...spilled, ...(own ?? [])] : (own ?? []);
+    // A SPILLED EVENT LOSES ITS PREFERENCE. Its offset was stated against a beat it is no longer
+    // standing on, so carrying it here would place it by arithmetic that no longer means anything.
+    // Count, ordering and separation outrank relative spacing — that is what spilling IS.
+    for (const e of spilled) {
+      desiredSec[e] = 0;
+      desiredStep[e] = Number.POSITIVE_INFINITY;
+    }
     spilled = [];
     if (!here.length) continue;
     const beatStart = originSec + idx * beatSec;
@@ -403,10 +552,16 @@ export function snapPerformanceToBeat(
     // puts its own notes where the pipeline's guards will drop them.
     const room =
       lastLine === null ? beatSec : Math.min(beatSec, Math.max(0, (takeDurationSec as number) - END_EPS - beatStart));
-    // HALVE THE RULER'S CELL UNTIL THEY FIT. The last note of the group has to stand strictly
-    // inside the room this beat has, so `(count - 1) * step` must be shorter than that.
+    // HALVE THE RULER'S CELL UNTIL THEY FIT. The LAST SLOT ACTUALLY HANDED OUT has to stand
+    // strictly inside the room this beat has — the actual slot rather than `count - 1`, because a
+    // follower's desired offset can be further out than its position in the queue.
+    //
+    // …AND NEVER COARSER THAN A PREFERENCE IN THE BUCKET. A 3/16 offset cannot be stated on a
+    // quarter lattice; rounding it there would put the follower on the next beat, which is the
+    // exact tear this rule exists to close.
     let step = cell;
-    while ((here.length - 1) * step >= room - EPS && step / 2 >= finest - EPS) step /= 2;
+    for (const e of here) if (desiredStep[e] < step) step = desiredStep[e];
+    while (maxOf(slotsAt(here, step)) * step >= room - EPS && step / 2 >= finest - EPS) step /= 2;
     // THE LAST BEAT HAS NOWHERE TO HAND ANYTHING TO — the beat after it is off the end of the
     // recording — so it takes the one step the halving loop cannot reach. Halving is right while
     // spilling is available: it keeps the cascade on lines that are multiples of the ruler's own
@@ -416,12 +571,24 @@ export function snapPerformanceToBeat(
     // the next beat, which is the end of the tape. Dropping straight to the finest step the sheet
     // can read back is the answer the whole cascade is already built on.
     const atLastBeat = idx >= maxIdx;
-    if (atLastBeat && (here.length - 1) * step >= room - EPS && finest < step) step = finest;
-    // How many the beat can hold at the step it settled on. Anything past that is handed to the
-    // next beat, which will subdivide for them in turn.
+    if (atLastBeat && maxOf(slotsAt(here, step)) * step >= room - EPS && finest < step) step = finest;
+    // How many the beat can hold at the step it settled on. Anything standing past that is handed
+    // to the next beat, which will subdivide for them in turn — and it is the SLOT that decides,
+    // not the count, because a preferred hole means the two are no longer the same number.
     const capacity = Math.max(1, Math.floor((room - EPS) / step) + 1);
-    if (here.length > capacity && !atLastBeat) spilled = here.slice(capacity);
-    const placed = atLastBeat ? here.length : Math.min(here.length, capacity);
+    const slots = slotsAt(here, step);
+    let placed = here.length;
+    if (!atLastBeat) {
+      for (let j = 0; j < here.length; j++) {
+        if (slots[j] >= capacity) {
+          // Never hand the whole beat on: it would arrive at the next one no less crowded, and a
+          // beat that places nothing cannot advance `lastPos` either.
+          placed = Math.max(1, j);
+          break;
+        }
+      }
+      if (placed < here.length) spilled = here.slice(placed);
+    }
     // WHERE THE GROUP STARTS. The beat itself, unless its last member would then stand past the
     // end of the take — in which case the whole group keeps its step and its order and moves back
     // just far enough to fit. Notes arriving a little early is a picture of the performance being
@@ -435,7 +602,7 @@ export function snapPerformanceToBeat(
     // A whole step back keeps every position on the beat's own lattice, where the quantizer finds
     // them already where it would have put them.
     let base = beatStart;
-    const overshoot = (placed - 1) * step - room;
+    const overshoot = slots[placed - 1] * step - room;
     if (overshoot > 0) base = Math.max(0, beatStart - Math.ceil(overshoot / step) * step);
     // Separation wins over the end bound in the one case where they disagree — a take that ends a
     // few milliseconds into a crowded beat. Two events on one position are ONE event to the
@@ -443,7 +610,7 @@ export function snapPerformanceToBeat(
     // the overshoot is at most one step.
     if (base <= lastPos) base = lastPos + step;
     for (let j = 0; j < placed; j++) {
-      const pos = base + j * step;
+      const pos = base + slots[j] * step;
       lastPos = pos;
       for (const m of events[here[j]].members) {
         positions[m] = pos;

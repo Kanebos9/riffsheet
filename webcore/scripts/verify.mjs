@@ -1026,11 +1026,97 @@ async function main() {
         const b = e.getBoundingClientRect();
         return { right: Math.round(b.right), bottom: Math.round(b.bottom), w: Math.round(b.width), h: Math.round(b.height) }; };
       const btns = [...document.querySelectorAll('.app-header button')].map(b => Math.round(b.getBoundingClientRect().right));
+      /*
+       * THE ONE-PROPORTION LAW, AS THE PAGE SEES IT (G1) — this replaced appZoom.
+       *
+       * appZoom read the CSS zoom off #app, which was the old two-rung ladder. There is no
+       * ladder and no zoom on #app any more: the face carries ONE factor, on the body, written by
+       * ui/faceScale.ts and reported here by the app's own probe so the harness and the app
+       * cannot disagree about what the scale is. faceScale is kept as a bare number because
+       * several checks below want to compare it.
+       */
+      const face = window.__RIFFSHEET_FACE__ ? window.__RIFFSHEET_FACE__() : null;
+      /*
+       * IS THE ROW JUSTIFIED EDGE TO EDGE? (G1)
+       *
+       * The law's second clause. Measured as the distance from the row's content box to its first
+       * and last visible child, in LOGICAL pixels — the rect is visual and the padding is logical,
+       * so the rect side is converted by the row's own measured scale (rect.width / offsetWidth)
+       * rather than by a number passed in. Zero at both ends is a justified row; a positive
+       * rightGap is dead space at the right-hand end, which is what the header had at every
+       * width above the one where the old ladder started squeezing.
+       */
+      const justify = (sel) => {
+        const host = document.querySelector(sel);
+        if (!host) return null;
+        const cs = getComputedStyle(host);
+        const box = host.getBoundingClientRect();
+        const k = host.offsetWidth > 0 ? box.width / host.offsetWidth : 1;
+        const kids = [...host.children].filter((c) => getComputedStyle(c).display !== 'none');
+        if (kids.length === 0) return null;
+        const first = kids[0].getBoundingClientRect();
+        const last = kids[kids.length - 1].getBoundingClientRect();
+        return {
+          leftGap: Math.round((first.left - box.left) / k - parseFloat(cs.paddingLeft)),
+          rightGap: Math.round((box.right - last.right) / k - parseFloat(cs.paddingRight)),
+          overflow: Math.max(0, host.scrollWidth - host.clientWidth),
+          rows: new Set(kids.map((c) => {
+            const b = c.getBoundingClientRect();
+            return Math.round((b.top + b.height / 2) / 4);
+          })).size
+        };
+      };
+      // The blend fader, in LOGICAL px, because its floor is written in the stylesheet in the same
+      // space (ui/styles.css §.fader). This is P7 asserted rather than assumed.
+      const faderEl = document.querySelector('.fader');
+      const faderSlider = document.querySelector('.fader input[type="range"]');
+      // Both raster canvases: a backing store must be the rendered size times the device pixel
+      // ratio, or the picture is resampled on the way to the screen (G1).
+      const backing = ['canvas.pianoroll', '.waveform canvas', 'canvas.waveform'].map((sel) => {
+        const c = document.querySelector(sel);
+        if (!(c instanceof HTMLCanvasElement) || c.clientWidth === 0) return null;
+        const want = Math.round(c.getBoundingClientRect().width * (window.devicePixelRatio || 1));
+        return { sel, store: c.width, want, logical: c.clientWidth };
+      }).filter(Boolean);
       return JSON.stringify({
-        // PROPORTIONAL, NOT WRAPPED (#11). Two numbers say whether the shell scaled or
-        // re-flowed: the zoom actually in force, and how many ROWS the header came out as
-        // (distinct top edges among its children — wrapping is what pushes that above one).
-        appZoom: Number(getComputedStyle(document.querySelector('#app')).zoom) || 1,
+        face,
+        faceScale: face ? face.scale : 1,
+        justify: {
+          header: justify('.app-header'),
+          transport: justify('.transport'),
+          notation: justify('[data-role="notation-toolbar"]')
+        },
+        /*
+         * THE BLEND FADER (P7/G5), THREE WAYS, AND THE THIRD IS THE ONE THAT SURVIVES A REFACTOR.
+         *
+         *   w / slider   what the two boxes ACTUALLY measure, in logical px.
+         *   cssMin       the floors the stylesheet still declares. A layout that happens to be
+         *                wide enough at these four viewports would satisfy the measurements
+         *                alone; this fails the moment either floor is deleted, on any path.
+         *   fits         the slider is INSIDE its parent. The reported bug was a slider squeezed
+         *                to a hairline by the two endpoint labels beside it, which is a
+         *                containment failure and not a width one — the parent was 56px and
+         *                perfectly happy.
+         */
+        fader: faderEl
+          ? {
+              w: faderEl.offsetWidth,
+              slider: faderSlider ? faderSlider.offsetWidth : 0,
+              cssMin: {
+                row: Math.round(parseFloat(getComputedStyle(faderEl).minWidth) || 0),
+                slider: faderSlider ? Math.round(parseFloat(getComputedStyle(faderSlider).minWidth) || 0) : 0
+              },
+              fits: !!faderSlider &&
+                faderSlider.getBoundingClientRect().left >= faderEl.getBoundingClientRect().left - 1 &&
+                faderSlider.getBoundingClientRect().right <= faderEl.getBoundingClientRect().right + 1,
+              // The row it lives in must not be scrolling to hold it either.
+              rowOverflow: (() => {
+                const row = document.querySelector('.transport');
+                return row ? Math.max(0, row.scrollWidth - row.clientWidth) : 0;
+              })()
+            }
+          : null,
+        backing,
         // COUNTED OFF CENTRES, NOT TOPS, and that correction is the whole of what this number
         // is worth. The header centre-aligns its items, so a 19px filename, a 24px chip group,
         // a 27px chip, a 30px button and a 32px gear all have DIFFERENT top edges while sitting
@@ -1166,7 +1252,14 @@ async function main() {
         const cs = getComputedStyle(e);
         return {
           text: e.textContent.trim(),
-          w: Math.round(r.width),
+          // THE WIDTH IS THE DESIGN'S, NOT THE WINDOW'S (G1). It was rect.width, which is VISUAL:
+          // at REAPER's floor the face is painted at 0.27, so a caption at its full designed width
+          // measures 16 device px and the >= 24 threshold failed on a caption that had not been
+          // touched. offsetWidth is the same box in LOGICAL pixels, which is the space the
+          // threshold and the font size beside it were both written in — and under the law it is
+          // the same number at every window size, which is the claim being made.
+          w: e.offsetWidth,
+          visualW: Math.round(r.width),
           fontPx: Math.round(parseFloat(cs.fontSize) * 10) / 10,
           onScreen: r.width > 0 && r.left >= -1 && r.right <= window.innerWidth + 1
         };
@@ -1261,7 +1354,9 @@ async function main() {
         transport: scan('.transport'),
         // The app's own measurement of the same rule, so the two cannot drift.
         appSaysClipped: window.__RIFFSHEET_BARCLIP__ ? window.__RIFFSHEET_BARCLIP__() : null,
-        // Whole or absent — never a fragment. See ui/app.ts §fitHeaderName.
+        // WHOLE, ALWAYS — "or absent" is gone with fitHeaderName (G1). The name is laid out in
+        // a row that never sees less than the design width, so there is no window at which the app
+        // has to choose between showing all of it and showing none of it.
         takeName: name
           ? {
               shown: getComputedStyle(name).display !== 'none',
@@ -1274,8 +1369,13 @@ async function main() {
       });
     })()`;
 
-    phase('checking responsive layouts', 40_000);
+    // 60s rather than 40: the one-proportion law is exercised ABOVE the design size as well as
+    // below it, so this loop visits a fourth viewport and re-engraves once more (G1).
+    phase('checking responsive layouts', 60_000);
     for (const [w, h, key, file] of [
+      // Above the design size, where the law says the scale is exactly 1 and the surplus goes to
+      // the gaps rather than to the controls.
+      [1440, 900, 'sweepFace1440', 'app-1440x900.png'],
       [900, 600, 'narrow', 'app-900x600.png'],
       [1100, 700, 'mid', 'app-1100x700.png'],
       // REAPER's floor. An FX window can be dragged this small, and everything on the chrome
@@ -1287,6 +1387,12 @@ async function main() {
       result[key] = { ...view.overflow, layout: view.layout, roll: view.roll };
       result[key].reach = await evalJson(REACH);
       result[key].bars = await evalJson(BAR_SWEEP);
+      // The pointer helper, round-tripped on the real engraving at THIS scale — see
+      // ui/app.ts §__RIFFSHEET_HITROUNDTRIP__. The one check in the run that is not a tautology
+      // at face scale 1.
+      result[key].hitRoundTrip = await evalJson(
+        'JSON.stringify(window.__RIFFSHEET_HITROUNDTRIP__ ? window.__RIFFSHEET_HITROUNDTRIP__() : null)'
+      );
     }
     /*
      * …AND AT THE THREE WIDTHS Z6 NAMES: 1440, 900 and 390.
@@ -1608,13 +1714,23 @@ async function main() {
     // The staff<->tab padding exists only to hold the names row, so switching the row off
     // re-engraves with a smaller gap. That is a live `updateSettings()` + `render()` on a
     // loaded score, which is exactly the sort of thing that throws.
+    /*
+     * DRIVEN FROM THE CLEF MENU'S SECOND SECTION (G2), not from the settings panel.
+     *
+     * The switch was a checkbox two panels away from the names it switches; it is the "Note
+     * names: On/Off" section of the Clef drop-down now, beside the staff whose notes are being
+     * named — the same rule the Tab menu's Fingering section follows. Moved, not duplicated, so
+     * this drives the one control there is. The toggle is read back off the tick in the option
+     * text, which is how a `<select>` shows a state it cannot "select".
+     */
     const NAMES_SWITCH = `(() => {
-      const row = [...document.querySelectorAll('.settings-panel label.switch')]
-        .find((l) => (l.textContent || '').includes('Show note names'));
-      const box = row && row.querySelector('input');
-      if (!box) return JSON.stringify({ clicked: false });
-      box.click();
-      return JSON.stringify({ clicked: true, checked: box.checked });
+      const select = document.querySelector('[data-role="clef-view"]');
+      const group = select && select.querySelector('[data-role="clef-names"]');
+      if (!group) return JSON.stringify({ clicked: false });
+      const on = [...group.querySelectorAll('option')].some((o) => /^✓ Note names: On/.test(o.textContent || ''));
+      select.value = on ? 'names:off' : 'names:on';
+      select.dispatchEvent(new Event('change', { bubbles: true }));
+      return JSON.stringify({ clicked: true, checked: !on });
     })()`;
     result.namesOffClick = await evalJson(NAMES_SWITCH);
     await settle(900);
@@ -1696,6 +1812,210 @@ async function main() {
     await settle(1200);
     await evalJson(setSelect('clef-view', 'auto'));
     await settle(1200);
+
+    /*
+     * ------------------------------------------------------------------------------------
+     * G2 — THE CLEF MENU'S TWO SECTIONS, AND THE OFF+OFF GUARD
+     * ------------------------------------------------------------------------------------
+     *
+     * Section one is the clef plus OFF; section two is the note-name row. The claims:
+     *
+     *   1. both sections exist, as `<optgroup>`s, with the settings they own declared on them
+     *      (the settings census counts controls, and `showStaff` and `showNoteNames` have no
+     *      other home now);
+     *   2. Clef: Off really hides the notation staff — measured as the engraving LOSING HEIGHT
+     *      while it keeps its ink, which is what one staff instead of two looks like;
+     *   3. the guard holds in both directions: with the tab off, Clef: Off is disabled and says
+     *      "one staff must remain"; with the clef off, Tab: Off is;
+     *   4. and it comes back. A hide that could not be undone would pass 2 and be unusable.
+     */
+    phase('checking the clef menu, tabs-only and the off+off guard', 90_000);
+    const CLEF_MENU = `(() => {
+      const select = document.querySelector('[data-role="clef-view"]');
+      if (!select) return JSON.stringify({ present: false });
+      const group = (role) => select.querySelector('[data-role="' + role + '"]');
+      const read = (g) => g
+        ? {
+            label: g.getAttribute('label'),
+            setting: g.getAttribute('data-setting'),
+            options: [...g.querySelectorAll('option')].map((o) => ({
+              value: o.value,
+              text: (o.textContent || '').trim(),
+              selected: o.selected,
+              disabled: o.disabled,
+              title: o.getAttribute('title')
+            }))
+          }
+        : null;
+      const host = document.querySelector('.at-host');
+      /*
+       * THE ENGRAVING'S HEIGHT, and its ink.
+       *
+       * Counting "staff lines" was the obvious measure and it is not available: alphaTab draws
+       * a stave's five lines as ONE <path> with five subpaths, so there is nothing thin to
+       * count — the element's box is the whole stave. What a hidden staff DOES do is take its
+       * height off the system, so the tallest partial's height is the honest number, and the
+       * ink count beside it is what stops "shorter" from being satisfied by an empty page.
+       */
+      let svgH = 0;
+      let ink = 0;
+      if (host) {
+        for (const svg of host.querySelectorAll('svg')) {
+          svgH = Math.max(svgH, Math.round(svg.getBoundingClientRect().height));
+        }
+        ink = host.querySelectorAll('svg path, svg rect, svg text').length;
+      }
+      const L = window.__RIFFSHEET_LAYOUT__ ? window.__RIFFSHEET_LAYOUT__() : null;
+      const tab = document.querySelector('[data-role="tab-view"]');
+      const tabOff = tab ? [...tab.options].find((o) => o.value === 'off') : null;
+      return JSON.stringify({
+        present: true,
+        value: select.value,
+        staffGroup: read(group('clef-staff')),
+        namesGroup: read(group('clef-names')),
+        svgH,
+        ink,
+        // The MODEL's stave count, which is what a grand system loses two of. One entry per
+        // stave, published by the tri-view for the key-signature check (P8).
+        staves: L && Array.isArray(L.keySignaturePerStave) ? L.keySignaturePerStave.length : null,
+        names: document.querySelectorAll('.note-name').length,
+        tabOff: tabOff ? { disabled: tabOff.disabled, title: tabOff.getAttribute('title') } : null
+      });
+    })()`;
+
+    // Stated rather than inherited: every claim below is about a page with BOTH a staff and a
+    // tab on it, and the run has been through a dozen phases by now.
+    await evalJson(setSelect('tab-view', 'bass'));
+    await settle(1200);
+    result.clefBefore = await evalJson(CLEF_MENU);
+    // Tab off first: this is where Clef: Off must be refused.
+    await evalJson(setSelect('tab-view', 'off'));
+    await settle(1200);
+    result.clefGuardTabOff = await evalJson(CLEF_MENU);
+    await evalJson(setSelect('tab-view', 'bass'));
+    await settle(1200);
+    // …and now the real thing: the staff goes, the tab stays.
+    result.clefOffSet = await evalJson(setSelect('clef-view', 'staff:off'));
+    await settle(1500);
+    result.clefOff = await evalJson(CLEF_MENU);
+    const tabsOnlyShot = await cdp.send('Page.captureScreenshot', { format: 'png' });
+    await writeFile(join(ROOT, 'spike-results', 'app-tabs-only.png'), Buffer.from(tabsOnlyShot.data, 'base64'));
+    // THE EXPORT, AT ITS SOURCE. The hidden print instance is built from `score.data` — the
+    // same object the projection edits — so what the PDF will engrave is exactly these staves.
+    // Asserted here rather than by rendering a second PDF, because a picture of a page cannot
+    // say whether the MusicXML beside it kept its notation, and this can.
+    result.clefOffSelf = await evalJson(SELFTEST);
+    await evalJson(setSelect('clef-view', 'auto'));
+    await settle(1500);
+    result.clefBackOn = await evalJson(CLEF_MENU);
+    result.clefBackOnSelf = await evalJson(SELFTEST);
+
+    /*
+     * ------------------------------------------------------------------------------------
+     * G3 — THE THEME CARDS: FOUR PALETTES, AND THE CANVASES FOLLOW WITHOUT A RELOAD
+     * ------------------------------------------------------------------------------------
+     *
+     * The chrome is CSS and moves on its own. The two RASTER surfaces do not: `PianoRoll` and
+     * `WaveformStrip` read their colours once, in their constructors, into a private table — so
+     * the thing worth checking is not that `--accent` changed (it is a stylesheet write and
+     * cannot fail) but that the roll and the waveform are painted in the new palette afterwards.
+     *
+     * Measured by SAMPLING THE CANVASES: the pixels of the roll and of the waveform strip are
+     * read back through `getImageData` and compared between themes. A cached palette shows up
+     * as two identical pictures under two different token sets, which is exactly the bug Codex
+     * warned about, and no amount of DOM inspection would see it.
+     *
+     * A screenshot of every theme is kept beside the numbers, because a palette also has to be
+     * looked at.
+     */
+    phase('checking the theme cards and what follows them', 90_000);
+    await evalJson(clickRole('settings-gear'));
+    await settle(700);
+    const THEME_READ = `(() => {
+      const root = document.documentElement;
+      const cs = getComputedStyle(root);
+      // THE LIVE PANEL, which is the LAST one in the document. The probes that boot a second
+      // app off-screen mount their panels on \`document.body\` too, and a bare
+      // \`querySelectorAll\` therefore counts four rows of cards belonging to four apps.
+      const panel = [...document.querySelectorAll('.settings-panel')].pop();
+      const cards = panel ? [...panel.querySelectorAll('[data-role="theme-card"]')] : [];
+      // A canvas's own pixels, reduced to one number. Sampled on a grid rather than whole:
+      // a 1200x160 strip is 190k pixels and this runs four times.
+      const sample = (sel) => {
+        const c = document.querySelector(sel);
+        if (!(c instanceof HTMLCanvasElement) || !c.width || !c.height) return null;
+        const ctx = c.getContext('2d');
+        if (!ctx) return null;
+        let sum = 0;
+        let n = 0;
+        try {
+          const step = Math.max(1, Math.floor(c.width / 40));
+          const rows = Math.max(1, Math.floor(c.height / 10));
+          for (let y = 2; y < c.height; y += rows) {
+            const line = ctx.getImageData(0, y, c.width, 1).data;
+            for (let x = 0; x < c.width; x += step) {
+              sum += line[x * 4] * 65536 + line[x * 4 + 1] * 256 + line[x * 4 + 2];
+              n++;
+            }
+          }
+        } catch (e) {
+          return { error: String(e) };
+        }
+        return n ? Math.round(sum / n) : null;
+      };
+      return JSON.stringify({
+        theme: root.getAttribute('data-theme'),
+        colorScheme: cs.getPropertyValue('color-scheme').trim(),
+        tokens: {
+          bg: cs.getPropertyValue('--bg').trim(),
+          text: cs.getPropertyValue('--text').trim(),
+          accent: cs.getPropertyValue('--accent').trim(),
+          rollNote: cs.getPropertyValue('--roll-note').trim(),
+          wave: cs.getPropertyValue('--wave').trim()
+        },
+        cards: cards.map((c) => ({
+          id: c.getAttribute('data-theme-id'),
+          on: c.classList.contains('on'),
+          pressed: c.getAttribute('aria-pressed'),
+          // The swatch shows the theme's OWN colours, not the ones in force.
+          swatch: [...c.querySelectorAll('.theme-swatch > span')].map((s) => s.style.background)
+        })),
+        // One row, and it is one row: every card on the same line.
+        rows: new Set(cards.map((c) => Math.round(c.getBoundingClientRect().top))).size,
+        roll: sample('canvas.pianoroll'),
+        wave: sample('.waveform canvas') ?? sample('canvas.waveform'),
+        // The panel must not have grown a horizontal scrollbar to hold the row.
+        panelOverflow: panel ? Math.max(0, panel.scrollWidth - panel.clientWidth) : null
+      });
+    })()`;
+    const pickTheme = (id) => `(() => {
+      const panel = [...document.querySelectorAll('.settings-panel')].pop();
+      const card = panel && panel.querySelector('[data-role="theme-card"][data-theme-id="${id}"]');
+      if (!card) return JSON.stringify({ picked: false });
+      card.click();
+      return JSON.stringify({ picked: true });
+    })()`;
+
+    result.themes = {};
+    for (const id of ['midnight', 'daylight', 'ember', 'tide']) {
+      await evalJson(pickTheme(id));
+      await settle(900);
+      result.themes[id] = await evalJson(THEME_READ);
+      const themeShot = await cdp.send('Page.captureScreenshot', { format: 'png' });
+      await writeFile(join(ROOT, 'spike-results', `app-theme-${id}.png`), Buffer.from(themeShot.data, 'base64'));
+    }
+    // Back to the default, and it must SURVIVE a reload — the whole point of a preference.
+    await evalJson(pickTheme('midnight'));
+    await settle(700);
+    result.themeStored = await evalJson(
+      `JSON.stringify({ stored: localStorage.getItem('riffsheet.theme') })`
+    );
+    result.themeSystemLine = await evalJson(`(() => {
+      const line = document.querySelector('[data-role="system-line"]');
+      return JSON.stringify({ text: line ? (line.textContent || '').trim() : null });
+    })()`);
+    await evalJson(clickRole('settings-gear'));
+    await settle(500);
 
     // --- engine setup: guide and find ------------------------------------------------
     //
@@ -3300,6 +3620,34 @@ async function main() {
     );
 
     /*
+     * F/P9 — THE EDITOR COMES BACK SILENTLY, AND ONLY WHEN THE HOST SAYS SO.
+     *
+     * The prompt above and this are the two halves of one rule, and each is the other's guard: a
+     * fix that asked in every case is the bug the owner reported (switch FX in REAPER and back,
+     * and Riffsheet is on its main menu asking about work that never stopped); a fix that never
+     * asked would let a project loaded from disk quietly decide what you are working on.
+     *
+     * The probe boots two real second apps and hands each the answer a real shell would give.
+     * See `ui/app.ts §__RIFFSHEET_SILENTRESTORE__` for why that substitution is the honest one
+     * and for how "zero menu frames" is counted rather than assumed.
+     */
+    phase('checking silent session restore', 120_000);
+    result.silentRestore = await evalJson(
+      `window.__RIFFSHEET_SILENTRESTORE__
+        ? window.__RIFFSHEET_SILENTRESTORE__({ show: true }).then(r => JSON.stringify(r), e => JSON.stringify({ error: String(e) }))
+        : Promise.resolve('null')`,
+      110_000
+    );
+    // WHAT A RECREATED EDITOR COMES BACK TO, photographed. The restored app is left on screen
+    // by `show: true` — the same one the numbers above were taken from — and taken away again
+    // immediately after. A menu frame count of zero is the claim; this is the picture of it.
+    await settle(500);
+    const silentShot = await cdp.send('Page.captureScreenshot', { format: 'png' });
+    await writeFile(join(ROOT, 'spike-results', 'app-silent-restore.png'), Buffer.from(silentShot.data, 'base64'));
+    await evalJson(`JSON.stringify({ cleared: !!(window.__RIFFSHEET_SILENTRESTORE_CLEAR__ && window.__RIFFSHEET_SILENTRESTORE_CLEAR__()) })`);
+    await settle(300);
+
+    /*
      * ------------------------------------------------------------------------------------
      * H3 — CUT LIVES IN THE STRIP'S LEFT GUTTER, NOT IN A ROW UNDER IT
      * ------------------------------------------------------------------------------------
@@ -3444,6 +3792,77 @@ async function main() {
       });
     })()`;
     result.menuShape = await evalJson(MENU_SHAPE);
+
+    /*
+     * ------------------------------------------------------------------------------------
+     * E1/E3 — ONE ENTRY PER REAL FILE, AND NOTHING IN THE LIST THAT CANNOT BE OPENED
+     * ------------------------------------------------------------------------------------
+     *
+     * THE REPORTED CLUTTER (P10): the shell copied every opened file into its own takes folder
+     * under a dated name, and the Recent list deduplicated by exact path — so one file opened
+     * three times was three entries, `2.wav-20260810-…`, `2.wav-20260812-…`, `2.wav-20260812-…`.
+     *
+     * The seed below is a list in exactly that state, plus the three other things storage can
+     * hold: a session-only capture, a relative "path" that is really a browser file's name, and
+     * the same real file listed twice under different dates. What comes back out of
+     * `loadRecent()` is the whole claim:
+     *
+     *   - the dated cache copies are GONE, and no original was invented by stripping a
+     *     timestamp off one of their names (Codex's rule — the original is genuinely not
+     *     recoverable from the copy, so a reconstruction would open the wrong file);
+     *   - the session take is gone, because a `session:` identity cannot be reopened tomorrow;
+     *   - the relative name is gone, for the same reason;
+     *   - the two entries for one real file are ONE, dated from the newer of them;
+     *   - what survives carries `file:<path>`, and STORAGE has been rewritten, so the clutter
+     *     is actually gone rather than merely filtered out of sight on every read.
+     *
+     * Driven through the real `loadRecent()` (via the menu re-render) rather than by calling a
+     * migration function directly: the migration only matters if the list the player sees is
+     * the migrated one.
+     */
+    result.recentsTruth = await evalJson(`(() => {
+      const now = Date.now();
+      const takes = '/Users/x/Library/Application Support/Riffsheet/takes/';
+      localStorage.setItem('riffsheet.recent', JSON.stringify([
+        { name: '2.wav', path: takes + '2.wav-20260812-231145.wav', at: now - 1000 },
+        { name: '2.wav', path: takes + '2.wav-20260812-224401.wav', at: now - 2000 },
+        { name: '2.wav', path: takes + '2.wav-20260810-101500.wav', at: now - 3000 },
+        { name: 'Captured take', path: '', at: now - 4000, identity: 'session:tok-9' },
+        { name: 'dropped.wav', path: 'dropped.wav', at: now - 5000 },
+        { name: 'riff.wav', path: '/Users/x/Music/riff.wav', at: now - 6000 },
+        { name: 'riff.wav', path: '/Users/x/Music/riff.wav', at: now - 500, identity: 'file:/Users/x/Music/riff.wav' },
+        { name: 'sketch.riffsheet', path: '/Users/x/Music/sketch.riffsheet', at: now - 7000 }
+      ]));
+      return JSON.stringify({ seeded: 8 });
+    })()`);
+    // The menu is what reads it. Leave and come back so the list is re-rendered from storage.
+    await evalJson(clickRole('resume-current'));
+    await settle(400);
+    await evalJson(clickRole('main-menu'));
+    await settle(700);
+    result.recentsAfter = await evalJson(`(() => {
+      const select = document.querySelector('[data-role="recent-select"]');
+      const stored = JSON.parse(localStorage.getItem('riffsheet.recent') || '[]');
+      return JSON.stringify({
+        // The placeholder row plus one option per surviving entry.
+        options: select ? select.options.length : 0,
+        placeholder: select && select.options[0] ? select.options[0].textContent : null,
+        shown: select ? [...select.options].slice(1).map((o) => o.getAttribute('title')) : [],
+        stored: stored.map((r) => ({ path: r.path, identity: r.identity })),
+        storedCount: stored.length,
+        // Nothing that cannot be reopened, said three ways so a partial fix cannot pass.
+        anyTakesCache: stored.some((r) => /Riffsheet[/\\\\]takes[/\\\\]/.test(r.path || '')),
+        anySession: stored.some((r) => String(r.identity || '').startsWith('session:')),
+        anyRelative: stored.some((r) => !String(r.path || '').startsWith('/')),
+        allHaveFileIdentity: stored.every((r) => String(r.identity || '').startsWith('file:')),
+        uniquePaths: new Set(stored.map((r) => r.path)).size
+      });
+    })()`);
+
+    // The list as a player sees it, after the migration: two entries where eight were stored.
+    const recentShot = await cdp.send('Page.captureScreenshot', { format: 'png' });
+    await writeFile(join(ROOT, 'spike-results', 'app-recents.png'), Buffer.from(recentShot.data, 'base64'));
+
     await cdp.send('Emulation.setDeviceMetricsOverride', { width: 900, height: 600, deviceScaleFactor: 1, mobile: false });
     await settle(600);
     result.menuShape900 = await evalJson(MENU_SHAPE);
@@ -3454,6 +3873,7 @@ async function main() {
     // Back to the sheet, because the engine chip only exists on the main screen.
     result.menuResume = await evalJson(clickRole('resume-current'));
     await settle(900);
+
 
     /*
      * ------------------------------------------------------------------------------------
@@ -4342,13 +4762,27 @@ async function main() {
         !!result.floor?.reach && result.floor.reach.linkControl === null
       ],
       [
-        // G7. Both axis captions readable at the product's floor: on screen, not clipped, and
-        // not shrunk below 9px, which is where 8 uppercase characters stop being a word.
-        'zoom: both axis captions are legible at 360x280',
+        // G7, AND IT IS NOW A CLAIM ABOUT THE DESIGN (G1). Both axis captions on screen, whole,
+        // and at their designed size — 24 logical px and 9pt is where 8 uppercase characters stop
+        // being a word. Measured in the design's pixels rather than the window's, because under
+        // the one-proportion law a caption is never SHRUNK, it is only painted smaller along with
+        // everything else; the old visual measurement asked how big the host window was, which is
+        // not a question about this control.
+        'zoom: both axis captions keep their designed size at 360x280',
         (result.floor?.reach?.zoomAxes ?? []).length === 2 &&
           result.floor.reach.zoomAxes.every(
             (a) => a.onScreen === true && a.w >= 24 && a.fontPx >= 9 && /^(Vertical|Horizontal)$/.test(a.text)
           )
+      ],
+      [
+        // …AND THE SAME SIZE AT EVERY WINDOW, which is the law itself measured on one control.
+        'zoom: the axis captions are the same designed size at 1440x900 and at the floor',
+        (() => {
+          const wide = result.sweepFace1440?.reach?.zoomAxes ?? [];
+          const floor = result.floor?.reach?.zoomAxes ?? [];
+          return wide.length === 2 && floor.length === 2 &&
+            wide.every((a, i) => Math.abs(a.w - floor[i].w) <= 1 && a.fontPx === floor[i].fontPx);
+        })()
       ],
       [
         // The player asked for it ON out of the box. Safe to default on only because the
@@ -4963,31 +5397,164 @@ async function main() {
           (result.resumePrompt?.resumedNotes ?? 0) > 0
       ],
 
+      // --- F/P9: silent restore -------------------------------------------------------
       [
-        // PROPORTIONAL, NOT WRAPPED (#11). Below the threshold the shell SCALES. It used to
-        // answer a narrow window by wrapping its bars into more rows, which spends the height
-        // that was already short on chrome — the opposite of what somebody dragging a window
-        // edge is asking for.
-        'layout: at 360x280 the shell scales down instead of wrapping',
-        typeof result.floor?.appZoom === 'number' && result.floor.appZoom < 1
+        // THE WHOLE OF THE REPORTED BUG, as one number. `menuFrames` counts every moment the
+        // opening screen existed inside the second app's root during its boot — not the state
+        // at the end, which a 200ms flash would pass.
+        'silent restore: a recreated editor shows no main menu at all',
+        !result.silentRestore?.error &&
+          result.silentRestore?.silent?.menuFrames === 0 &&
+          result.silentRestore?.silent?.everSawMenu === false &&
+          result.silentRestore?.silent?.menuAtEnd === false,
+        JSON.stringify(result.silentRestore?.silent ?? result.silentRestore)
       ],
       [
-        // The measurable half of the same claim: the header is ONE row at 900x600 and, at
-        // REAPER's 360x280 floor, has not multiplied. It is measured rather than asserted as
-        // one row because 360 px cannot hold a filename, five chips, an Export menu and a
-        // labelled gear on one line at any legible scale — what it must not do is answer a
-        // smaller window by spending more of it on chrome, which is exactly what wrapping did.
-        //
-        // `headerRows` counts distinct row CENTRES now rather than distinct top edges, which
-        // is what makes the first half of this check mean anything at all: a centre-aligned
-        // header of mixed-height controls always had four or five distinct TOPS, so the old
-        // `<= 3` was a threshold the bar could never have been under. See the probe. At 900px
-        // the header is `nowrap`, so the honest number there is exactly 1.
-        'layout: narrowing the window scales the shell rather than multiplying the chrome',
-        typeof result.narrow?.header?.h === 'number' &&
-          typeof result.floor?.header?.h === 'number' &&
-          result.narrow.headerRows === 1 &&
-          result.floor.header.h <= result.narrow.header.h * 2
+        'silent restore: it asks nothing, and the take is back on the sheet',
+        result.silentRestore?.silent?.prompted === false &&
+          result.silentRestore?.silent?.onSheet === true &&
+          (result.silentRestore?.savedNotes ?? 0) > 0 &&
+          (result.silentRestore?.silent?.notes ?? 0) === (result.silentRestore?.savedNotes ?? -1),
+        JSON.stringify(result.silentRestore?.silent ?? result.silentRestore)
+      ],
+      [
+        // The guard on the other side: state that arrived from outside still asks, once.
+        'silent restore: state from outside the process still puts the question',
+        result.silentRestore?.ask?.prompted === true,
+        JSON.stringify(result.silentRestore?.ask ?? result.silentRestore)
+      ],
+
+      /*
+       * ---------------------------------------------------------------- THE ONE-PROPORTION LAW
+       *
+       * These replaced the two "proportional, not wrapped" checks that asserted the old ladder
+       * (`#app`'s CSS zoom below 860px, and "the header has not multiplied at the floor"). Both
+       * were the right INSTINCT measured at the wrong place: they asked whether a two-rung
+       * breakpoint had fired, and allowed the header to grow to twice its height at the floor
+       * because at that size the ladder could not hold one row. The law makes a stronger claim and
+       * these make it, at every viewport this run visits.
+       */
+      ...[
+        ['1440x900', result.sweepFace1440],
+        ['900x600', result.narrow],
+        ['1100x700', result.mid],
+        ['360x280', result.floor]
+      ].flatMap(([size, v]) => [
+        [
+          // 1. THE SCALE IS THE LAW'S OWN ARITHMETIC. The app computes
+          // `min(1, innerW/1320, innerH/700)` and applies it; `wanted` is that expression
+          // evaluated fresh against the live viewport. A difference means the installer stopped
+          // following the window, which nothing else here would catch.
+          `${size}: the face scale is exactly the law's arithmetic`,
+          !!v?.face && Math.abs(v.face.scale - v.face.wanted) < 0.002 &&
+            v.face.scale > 0 && v.face.scale <= 1,
+          `scale=${v?.face?.scale} wanted=${v?.face?.wanted}`
+        ],
+        [
+          // 2. THE INVARIANT EVERY NO-CLIP CLAIM RESTS ON: the LAYOUT never sees a viewport
+          // smaller than the design size, whatever the host window does. This is what retired
+          // every breakpoint, so it is asserted rather than assumed.
+          `${size}: the layout never sees less than the ${result.floor?.face?.baseW ?? 1320}x${result.floor?.face?.baseH ?? 700} design`,
+          !!v?.face && v.face.neverBelowBase === true &&
+            v.face.logicalW >= v.face.baseW - 1 && v.face.logicalH >= v.face.baseH - 1,
+          `logical=${v?.face?.logicalW}x${v?.face?.logicalH}`
+        ],
+        [
+          // 3. IT IS ON THE BODY, AND IT IS THE ONLY ONE. The whole mechanism is one declaration;
+          // a stylesheet that lost it would look correct at 1440x900 and clip everywhere else.
+          `${size}: the one factor is on the body and matches the app's own number`,
+          !!v?.face && Math.abs(v.face.bodyZoom - v.face.scale) < 0.002,
+          `bodyZoom=${v?.face?.bodyZoom}`
+        ],
+        [
+          // 4. EVERY ROW IS ONE ROW AND JUSTIFIED EDGE TO EDGE. The law's second clause, and the
+          // half the old checks could not make: at REAPER's floor all three rows are single lines
+          // with their first child on the left edge and their last child on the right one.
+          // Two pixels of tolerance for sub-pixel layout under a fractional scale.
+          `${size}: all three rows are one line, justified edge to edge`,
+          ['header', 'transport', 'notation'].every((row) => {
+            const j = v?.justify?.[row];
+            return !!j && j.rows === 1 && j.overflow <= 1 &&
+              Math.abs(j.leftGap) <= 2 && Math.abs(j.rightGap) <= 2;
+          }),
+          JSON.stringify(v?.justify)
+        ],
+        [
+          // 5. P7, EXPLICITLY, AT EVERY SIZE. The blend fader collapsed to a hairline at some
+          // plugin window sizes because its parent's floor did not cover the slider inside it.
+          // Both floors are asserted: the row's 182 and the slider's own 88.
+          `${size}: the blend fader is never below its floor`,
+          !!v?.fader && v.fader.w >= 182 && v.fader.slider >= 88,
+          JSON.stringify(v?.fader)
+        ],
+        [
+          /*
+           * 5b. G5 — THE FLOOR IS STILL DECLARED, AND THE SLIDER IS STILL INSIDE ITS ROW.
+           *
+           * W1a set the two numbers (182 for the row, 88 for the range input) and the check above
+           * measures the consequence. This checks the CAUSE, at every viewport including the
+           * smallest: a stylesheet edit that removed either `min-width` would leave the boxes
+           * legal at these four sizes and collapse again at the fifth. Containment is asserted
+           * separately because P7 was a containment failure — a slider crushed to a hairline by
+           * the labels beside it inside a parent that was perfectly happy.
+           */
+          `${size}: the fader's floors are declared and the slider fits inside them`,
+          !!v?.fader && v.fader.cssMin?.row >= 182 && v.fader.cssMin?.slider >= 88 &&
+            v.fader.fits === true && v.fader.rowOverflow <= 1,
+          JSON.stringify(v?.fader)
+        ],
+        [
+          /*
+           * 6. THE POINTER HELPER SURVIVES THE SCALE, MEASURED ON THE ENGRAVING.
+           *
+           * Every notehead alphaTab drew, published in client pixels and handed straight back to
+           * the sheet's hit test, has to come back as itself. This is the check that makes the
+           * other coordinate-dependent probes in this run mean anything: they all drive the app at
+           * 1440x900, where the face scale is 1 and the conversion is the identity.
+           */
+          `${size}: every notehead round-trips through the pointer helper`,
+          !!v?.hitRoundTrip && v.hitRoundTrip.heads > 0 &&
+            v.hitRoundTrip.missed === 0 && v.hitRoundTrip.matched === v.hitRoundTrip.heads,
+          JSON.stringify(v?.hitRoundTrip)
+        ],
+        [
+          // 7. AND THE HIT RADIUS IS A FACT ABOUT THE HAND, NOT ABOUT THE DRAWING. A press half a
+          // notehead off centre still finds it at every face scale — which only holds because
+          // `NOTE_HIT_RADIUS_PX` is divided by the scale on the way into the search
+          // (view/triview.ts §nearestNoteHead). Half a notehead rather than a fixed number of
+          // pixels, so the offset means the same thing at 1.0 and at 0.27.
+          `${size}: a press half a notehead off centre still finds it`,
+          v?.hitRoundTrip?.nearMiss === true,
+          `nearMiss=${v?.hitRoundTrip?.nearMiss}`
+        ],
+        [
+          // 8. THE RASTER SURFACES ARE CRISP. A canvas is displayed at `logical x faceScale`
+          // visual pixels; its backing store must be that times the device pixel ratio or the
+          // picture is resampled. The old code used `clientWidth x dpr`, which ignores the scale.
+          `${size}: canvas backing stores are sized for the face and the device`,
+          Array.isArray(v?.backing) && v.backing.length > 0 &&
+            v.backing.every((b) => Math.abs(b.store - b.want) <= 2),
+          JSON.stringify(v?.backing)
+        ]
+      ]),
+      [
+        // AND THE SCALE ACTUALLY MOVES. Three of the four sizes above are below the design size
+        // and one is above it, so the law is exercised in both directions rather than merely
+        // being self-consistent at one window.
+        'layout: the face scale is 1 at the design size and shrinks below it',
+        result.sweepFace1440?.face?.scale === 1 &&
+          (result.narrow?.face?.scale ?? 1) < 1 &&
+          (result.floor?.face?.scale ?? 1) < (result.narrow?.face?.scale ?? 1)
+      ],
+      [
+        // A VISUAL LENGTH SURVIVES BOTH CONVERSIONS. The pointer helper's contract in one number:
+        // everything that turns a pointer into geometry goes through `logicalPoint`, and every
+        // coordinate-dependent probe in this run (the roll's click-to-seek, the sheet's hit test,
+        // the edit probe's synthetic presses) is only trustworthy because this holds.
+        'layout: the visual/logical conversion round-trips exactly',
+        [result.narrow, result.mid, result.floor].every(
+          (v) => !!v?.face && Math.abs(v.face.roundTrip - 100) < 0.01
+        )
       ],
       [
         // G4. TWO ROWS BETWEEN THE ROLL AND THE SHEET, not three. The transport is one of them
@@ -5022,9 +5589,9 @@ async function main() {
          * at 900x600, which is the product's stated floor and the width people work at, and
          * nothing clipped or overflowing at any size.
          */
-        'transport: at the 360x280 floor nothing is clipped and the row count is bounded',
+        'transport: at the 360x280 floor it is still ONE row and nothing in it is clipped',
         !!result.floor &&
-          result.floor.transportRows <= 3 &&
+          result.floor.transportRows === 1 &&
           (result.floor.transportClipped ?? []).length === 0 &&
           (result.floor.transportOverflow ?? 0) <= 1
       ],
@@ -6544,6 +7111,177 @@ async function main() {
         )
       ],
 
+      // --- E1/E3: the Recent list tells the truth ---------------------------------------
+      [
+        // The reported clutter, gone: three dated copies of one file collapse to nothing at all
+        // (no original can honestly be recovered from a cache copy's name), the session take and
+        // the browser's relative "path" are refused, and the file listed twice is listed once.
+        'recents: one entry per real file, and nothing in it that cannot be opened',
+        !!result.recentsAfter &&
+          result.recentsAfter.anyTakesCache === false &&
+          result.recentsAfter.anySession === false &&
+          result.recentsAfter.anyRelative === false &&
+          result.recentsAfter.allHaveFileIdentity === true &&
+          result.recentsAfter.storedCount === 2 &&
+          result.recentsAfter.uniquePaths === 2,
+        JSON.stringify(result.recentsAfter?.stored)
+      ],
+      [
+        // …and STORAGE was rewritten, not merely filtered on the way to the screen. Eight
+        // entries went in; two came back, and the drop-down shows exactly those two.
+        'recents: the migration is written back, so the clutter is actually gone',
+        !!result.recentsAfter && result.recentsAfter.options === 3 &&
+          result.recentsAfter.shown?.length === 2 &&
+          result.recentsAfter.shown.every((t) => /^\//.test(t ?? '') === false),
+        JSON.stringify(result.recentsAfter)
+      ],
+
+      // --- G2: the clef menu's two sections ---------------------------------------------
+      [
+        'clef menu: two sections, each owning its own setting',
+        !!result.clefBefore?.present &&
+          result.clefBefore.staffGroup?.setting === 'showStaff' &&
+          result.clefBefore.namesGroup?.setting === 'showNoteNames' &&
+          result.clefBefore.staffGroup?.options.length === 5 &&
+          result.clefBefore.staffGroup.options.some((o) => o.value === 'staff:off') &&
+          result.clefBefore.namesGroup?.options.length === 2,
+        JSON.stringify({
+          staff: result.clefBefore?.staffGroup?.options.map((o) => o.value),
+          names: result.clefBefore?.namesGroup?.options.map((o) => o.value)
+        })
+      ],
+      [
+        // THE HIDE, MEASURED ON THE PAGE: the system loses a staff's worth of height and keeps
+        // its ink. Both halves matter — "shorter" alone is also what an empty page looks like.
+        'clef Off: the notation staff goes and the tablature stays',
+        !!result.clefOff && !!result.clefBefore &&
+          result.clefBefore.svgH > 0 &&
+          result.clefOff.svgH <= result.clefBefore.svgH * 0.85 &&
+          result.clefOff.ink > 20,
+        JSON.stringify({
+          before: { h: result.clefBefore?.svgH, ink: result.clefBefore?.ink },
+          off: { h: result.clefOff?.svgH, ink: result.clefOff?.ink }
+        })
+      ],
+      [
+        // The export is the same description of the page, so it cannot disagree: every stave
+        // the renderer is handed is tab-only while the staff is hidden.
+        'clef Off: the printed page is engraved from the same tab-only staves',
+        Array.isArray(result.clefOffSelf?.staves) &&
+          result.clefOffSelf.staves.length > 0 &&
+          result.clefOffSelf.staves.every((track) =>
+            track.length > 0 && track.every((s) => s.notation === false && s.tab === true)
+          ),
+        JSON.stringify(result.clefOffSelf?.staves)
+      ],
+      [
+        // Both directions of the one rule, with the reason on the option rather than the option
+        // silently missing: a control that vanishes teaches nothing.
+        'clef menu: Off and Off cannot both be chosen, and it says why',
+        (() => {
+          const clefOffOption = (m) => m?.staffGroup?.options.find((o) => o.value === 'staff:off');
+          const withTabOff = clefOffOption(result.clefGuardTabOff);
+          const withStaffOff = result.clefOff?.tabOff;
+          return (
+            !!withTabOff && withTabOff.disabled === true &&
+            /one staff must remain/.test(withTabOff.title ?? '') &&
+            !!withStaffOff && withStaffOff.disabled === true &&
+            /one staff must remain/.test(withStaffOff.title ?? '') &&
+            // …and neither is disabled when the other side is on.
+            clefOffOption(result.clefBefore)?.disabled === false &&
+            result.clefBefore?.tabOff?.disabled === false
+          );
+        })(),
+        JSON.stringify({
+          tabOffGuard: result.clefGuardTabOff?.staffGroup?.options.find((o) => o.value === 'staff:off'),
+          staffOffGuard: result.clefOff?.tabOff
+        })
+      ],
+      [
+        'clef Off: and the staff comes back',
+        !!result.clefBackOn && !!result.clefBefore &&
+          result.clefBackOn.svgH >= result.clefBefore.svgH * 0.95 &&
+          Array.isArray(result.clefBackOnSelf?.staves) &&
+          result.clefBackOnSelf.staves.some((track) => track.some((s) => s.notation === true)),
+        JSON.stringify({ h: result.clefBackOn?.svgH, staves: result.clefBackOnSelf?.staves })
+      ],
+
+      // --- G3: the theme cards ----------------------------------------------------------
+      [
+        'themes: four cards in one row, the current one lit, and the panel does not scroll',
+        (() => {
+          const t = result.themes?.midnight;
+          return (
+            !!t && t.cards?.length === 4 && t.rows === 1 &&
+            t.cards.filter((c) => c.on).length === 1 &&
+            t.cards.find((c) => c.on)?.id === 'midnight' &&
+            t.cards.every((c) => c.swatch?.length === 3 && c.swatch.every(Boolean)) &&
+            t.panelOverflow === 0
+          );
+        })(),
+        JSON.stringify(result.themes?.midnight?.cards)
+      ],
+      [
+        // Every card really repaints: four distinct palettes, and the light one tells the
+        // platform so — `color-scheme` is what turns the native drop-down popups and the
+        // scrollbars over with the rest of the face.
+        'themes: each card applies its own palette, and the light one says it is light',
+        (() => {
+          const ids = ['midnight', 'daylight', 'ember', 'tide'];
+          const read = ids.map((id) => result.themes?.[id]);
+          if (read.some((t) => !t)) return false;
+          const accents = new Set(read.map((t) => t.tokens.accent));
+          const backgrounds = new Set(read.map((t) => t.tokens.bg));
+          return (
+            read.every((t, i) => t.theme === ids[i]) &&
+            accents.size === 4 && backgrounds.size === 4 &&
+            result.themes.daylight.colorScheme === 'light' &&
+            result.themes.midnight.colorScheme === 'dark'
+          );
+        })(),
+        JSON.stringify(Object.fromEntries(Object.entries(result.themes ?? {}).map(([k, v]) => [k, v?.tokens])))
+      ],
+      [
+        /*
+         * THE CANVASES FOLLOW, WITHOUT A RELOAD — the one thing a theme can quietly fail at.
+         * Both raster surfaces cache their colours in their constructors, so this compares the
+         * PIXELS: four palettes must produce four different pictures of the same music.
+         */
+        'themes: the piano roll and the waveform are repainted in the new palette',
+        (() => {
+          const ids = ['midnight', 'daylight', 'ember', 'tide'];
+          const rolls = ids.map((id) => result.themes?.[id]?.roll);
+          const waves = ids.map((id) => result.themes?.[id]?.wave);
+          const usable = (v) => typeof v === 'number';
+          return (
+            rolls.every(usable) && waves.every(usable) &&
+            new Set(rolls).size === 4 && new Set(waves).size === 4
+          );
+        })(),
+        JSON.stringify({
+          roll: Object.fromEntries(Object.entries(result.themes ?? {}).map(([k, v]) => [k, v?.roll])),
+          wave: Object.fromEntries(Object.entries(result.themes ?? {}).map(([k, v]) => [k, v?.wave]))
+        })
+      ],
+      [
+        'themes: the choice is remembered as a preference',
+        result.themeStored?.stored === 'midnight'
+      ],
+
+      // --- G4: the system line says how busy the machine is -----------------------------
+      [
+        /*
+         * "LOAD", NOT "CPU", and the arithmetic behind it. The mock reports a 1.8 one-minute
+         * load average on 8 cores, which is 23% of the machine — the number the owner asked
+         * for. The word matters as much as the figure: a load average is not a utilisation
+         * percentage, and labelling it "CPU 23%" would be a claim the shell never made.
+         */
+        'system line: it says the machine’s load as a share of its cores',
+        /·\s*Load 23%/.test(result.themeSystemLine?.text ?? '') &&
+          !/CPU\s*\d/.test(result.themeSystemLine?.text ?? ''),
+        JSON.stringify(result.themeSystemLine)
+      ],
+
       // --- H8: the engine chip notices somebody else's server ---------------------------
       [
         // A poll that stopped re-arming after a negative answer is asked exactly once. Two or
@@ -6914,9 +7652,12 @@ async function main() {
             sweep.docScrollW <= sweep.innerW + 1
         ],
         [
-          // WHOLE OR ABSENT. Dropping the take's name is the sanctioned answer when the row
-          // genuinely cannot afford it (`ui/app.ts §fitHeaderName`); showing four letters of it
-          // is not. At these three widths it is present AND whole, which is what the fit bought.
+          // WHOLE, AND PRESENT — a strictly stronger claim than this used to make (G1).
+          // Dropping the name whole was the sanctioned answer when the row could not afford it,
+          // and `fitHeaderName` took it at 900px of window, where the name had 36px for 161px of
+          // text. Under the one-proportion law the header is laid out in 1320 logical px at every
+          // window size, so the name is present AND whole at all three widths, and the drop
+          // machinery is deleted rather than merely unused.
           `${width}: the take’s name is on screen whole`,
           !!sweep?.takeName && sweep.takeName.shown === true && sweep.takeName.whole === true
         ]

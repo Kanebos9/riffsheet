@@ -79,12 +79,34 @@ html, body {
   height: 100%;
 }
 
+/*
+ * THE ONE-PROPORTION LAW LIVES ON THIS ONE DECLARATION (G1).
+ *
+ * `zoom: var(--face-scale)` is the WHOLE of the app's responsiveness. The face is designed at
+ * one size — 1320x700, see `ui/faceScale.ts` — and `ui/faceScale.ts` writes the single factor
+ * `min(1, innerW/1320, innerH/700)` into `--face-scale` on `:root`. Everything below this line
+ * is written in the design's own pixels and is never re-flowed, re-laddered or re-broken.
+ *
+ * WHY THE BODY AND NOT `#app`: the settings overlay, the sheet menu, the tooltips and the toasts
+ * are mounted under `document.body`, not inside `#app`. Scaling `#app` would leave every popover
+ * at a different size from the face that opened it. `zoom` scales layout as well as paint, so
+ * the body's containing block becomes `viewport / scale` logical pixels, `height: 100%` still
+ * fills the window exactly, and `position: fixed` children place themselves in the same logical
+ * space as everything else.
+ *
+ * THE ARITHMETIC THAT RETIRED THE BREAKPOINTS: because the scale is capped at 1 and is otherwise
+ * the smaller of the two ratios, the LAYOUT never sees a viewport narrower than 1320 or shorter
+ * than 700 — at any window size, including REAPER's 360x280 floor and below it. So there is no
+ * width at which the design is under pressure, and nothing left for a media query to react to.
+ * Every one of them was deleted rather than disabled; see the foot of this file for the list.
+ */
 body {
   background: var(--bg);
   color: var(--text);
   font: 13px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
   user-select: none;
   overflow: hidden;
+  zoom: var(--face-scale, 1);
 }
 
 button, input, select, textarea { font: inherit; color: inherit; }
@@ -141,13 +163,15 @@ input[type="number"], input[type="text"], select {
   border-bottom: 1px solid var(--border);
   flex: 0 0 auto;
   /*
-   * IT SCALES BEFORE IT WRAPS — see §"toolbars scale" at the foot of this file for the ladder
-   * and the reasoning. `flex-wrap` stays as the floor's safety net and nothing else: by the
-   * time the scale has bottomed out there is genuinely not a row's worth of room, and a second
-   * row is still better than a control pushed off the edge of the window.
+   * ONE ROW, AT EVERY WINDOW SIZE, WITH NO LADDER UNDER IT (G1).
+   *
+   * This row carried its own `zoom: var(--bar-zoom)` on a ten-rung media-query ladder, plus
+   * `flex-wrap: wrap` as the floor's safety net. Both are deleted. Under the one-proportion law
+   * the layout never sees less than 1320 logical px of window, which is more than this row's
+   * natural width, so there is no size at which it needs either — and a `wrap` that can never
+   * fire is a second layout nobody tests.
    */
-  zoom: var(--bar-zoom, 1);
-  flex-wrap: wrap;
+  flex-wrap: nowrap;
 }
 /*
  * ------------------------------------------------------------------ the brand block (F17/F18)
@@ -210,7 +234,14 @@ input[type="number"], input[type="text"], select {
   font-size: 10px;
   line-height: 1;
   font-weight: 700;
-  color: var(--accent);
+  /*
+   * THE LIGHTER STEP, BECAUSE THIS IS TEXT (G3). `--accent` is the FILL colour — a chip's
+   * background, the slider's track, the played half of the strip — and at 4.19:1 on `--bg` it
+   * was never a legal colour for 10px type. `--accent-hover` is the same violet with the light
+   * turned up, 6.5:1, and every theme is held to that in `ui/theme.test.ts`. Nothing about the
+   * app's palette changed; the two jobs the one token was doing are now on the right tokens.
+   */
+  color: var(--accent-hover);
   font-variant-numeric: tabular-nums;
   white-space: nowrap;
 }
@@ -245,14 +276,20 @@ input[type="number"], input[type="text"], select {
  * name cut to four letters is not a shorter name; it is a different one.
  *
  * So it does not shrink: `min-width: max-content` puts a floor under `flex-shrink` at its own
- * text. What happens when the row genuinely cannot afford it is decided in JS rather than at a
- * breakpoint, because the width needed is the length of somebody's file name and no media query
- * can know it — `ui/app.ts §fitTopBars` measures the row and DROPS the name whole when it will not
- * go, exactly as the tempo detail is dropped whole below 1150px. It is still one press away in the
- * Main menu, which prints it under "Current work".
+ * text.
  *
- * It stays `flex: 0 1 auto` rather than growing: the space it used to soak up now belongs to the
- * spacer, so the export buttons and the gear stay where they are as the name changes length.
+ * AND IT IS NEVER DROPPED ANY MORE EITHER (G1). There used to be a JS half to this rule —
+ * `fitHeaderName()` measured the row after layout and set `display: none` on the name when it
+ * overflowed, because "the width needed is the length of somebody's file name and no media query
+ * can know it". That is deleted. Under the one-proportion law the row is laid out in at least
+ * 1320 logical pixels whatever the window is doing, so the only thing that can still overrun it
+ * is a genuinely enormous file name — and the honest answer to that is the same one every other
+ * elastic item in the row gets: the SPACER gives its width up first, and then the name is allowed
+ * to be as long as it is. A name that pushed a control off the edge would be a fault; a name that
+ * eats the empty middle of the header is just a long name.
+ *
+ * It stays `flex: 0 1 auto` rather than growing: the surplus belongs to the spacer, so the export
+ * buttons and the gear stay pinned to the right edge as the name changes length.
  */
 .app-header .filename {
   font-weight: 600;
@@ -261,7 +298,20 @@ input[type="number"], input[type="text"], select {
   overflow: hidden;
   white-space: nowrap;
 }
-.app-header .spacer { flex: 0 1 auto; }
+/*
+ * THE ROW IS JUSTIFIED EDGE TO EDGE, AND THIS IS WHAT DOES IT (G1).
+ *
+ * It was `flex: 0 1 auto` — a spacer that could shrink but never grow — which meant that above
+ * the width where the row was under pressure everything packed to the LEFT and the right-hand
+ * end of the header was dead space. The law says every row is justified at every scale, and the
+ * way a row is justified is that its ONE flexible gap absorbs the surplus: the brand, the name
+ * and the view chips stay left, Export and the gear stay hard against the right edge, and the
+ * distance between them is whatever the window has spare. Controls keep their designed size at
+ * every scale; only the gap moves. (Codex's correction, adopted: one uniform scale cannot fill
+ * two dimensions at an arbitrary aspect ratio without distorting something, so the gaps and the
+ * panes take the surplus and no control is ever stretched.)
+ */
+.app-header .spacer { flex: 1 1 auto; min-width: 8px; }
 /*
  * THE LISTENER CHIP (G17). It is on screen only while a listening SERVER is actually up, which
  * is a minority of the time, and it says a whole sentence — "MuScriptor running — click to
@@ -708,28 +758,27 @@ input[type="number"], input[type="text"], select {
 .take-cut-note { font-size: 11px; opacity: 0.7; cursor: help; }
 
 /*
- * IT SCALES, AND ONLY WRAPS AT THE FLOOR.
+ * ONE ROW, AT EVERY WINDOW SIZE (G1).
  *
- * The history matters, because both of the obvious answers have already failed here. It was
+ * The history matters, because all three of the obvious answers have already failed here. It was
  * once a horizontal scroller with its scrollbar switched off, and the moment Key and Capo were
  * added, Capo came to rest 39px past the right edge at 900x600 with nothing on screen saying
  * so — reported, correctly, as the button having disappeared. So it was made to WRAP, which
  * fixed that and bought a second failure: at every intermediate width the bar spent a whole
  * extra row of a short plugin window on chrome, which is the opposite of what somebody dragging
- * a window edge is asking for.
+ * a window edge is asking for. Then it was given its own `zoom` ladder on top of the wrap, and
+ * that bought a third: the bar was drawn at a scale the app's own measurements did not know
+ * about, so a box sized with 23 CSS px of arrow allowance arrived with 14 visual px of it.
  *
- * What it does now is scale — the same answer, and the same mechanism (`zoom`), that the shell
- * as a whole already uses below 860px. See §"toolbars scale" at the foot of this file. Wrapping
- * survives underneath as the last resort, because at REAPER's 360px floor no legible scale fits
- * eight controls on one line and a second row is still infinitely better than a control off the
- * edge of the window.
+ * The law replaces all three. The face carries ONE scale, this bar carries none of its own, and
+ * the layout never sees less than 1320 logical px of window — which is wider than this bar's
+ * natural width with every control on it. So it is `nowrap` with no fallback, and there is no
+ * width at which the fallback would have been reached.
  */
 .notation-toolbar {
   flex: 0 0 auto; display: flex; align-items: center; gap: 7px; min-height: 38px;
   padding: 5px 10px; background: var(--bg-raised); border-top: 1px solid var(--border);
-  border-bottom: 1px solid var(--border); flex-wrap: wrap; row-gap: 5px;
-  /* Same ladder as the header — §"toolbars scale" below. Wrapping is the floor's fallback. */
-  zoom: var(--bar-zoom, 1);
+  border-bottom: 1px solid var(--border); flex-wrap: nowrap; row-gap: 5px;
 }
 /*
  * NOTHING ON THIS BAR IS EVER CUT SHORT. NO ELLIPSIS, AT ANY WIDTH.
@@ -751,17 +800,26 @@ input[type="number"], input[type="text"], select {
  */
 .notation-toolbar > * { flex: 0 0 auto; max-width: 100%; }
 /*
+ * …EXCEPT THE ONE GAP (G1). The staff group and the tab group sit at the two ends of the row and
+ * this is what holds them there — see `ui/app.ts §notation-toolbar` for which control belongs to
+ * which end. It has to out-specify the `flex: 0 0 auto` above, which is why it is written as a
+ * descendant rather than as a child selector.
+ */
+.notation-toolbar .spacer { flex: 1 1 auto; min-width: 8px; }
+/*
  * THE DROP-DOWN ARROW IS OURS, and that is what turns the width above from a guess into a
  * measurement.
  *
  * `fitTopBars` sizes each box to the words it is SHOWING plus the room its arrow needs. With
  * the PLATFORM arrow that second number is not knowable from the page: the engine reserves a
  * glyph region of its own choosing, and it does not shrink in step with the `zoom` on this bar.
- * Measured at the 390px floor, where the bar is drawn at about 0.62: the Key box was sized with
- * 23 CSS px of arrow allowance, which arrived as 14 visual px against an arrow that still wanted
- * ~20, and the difference came out of the end of the text — "Key: Auto — C majo", clipped with no
- * ellipsis to announce it. A key signature missing its last letters is a wrong key signature, and
- * silently so, which is worse than the truncation this bar was rewritten to remove.
+ * Measured at the 390px floor under the OLD ladder, where this bar carried a zoom of its own at
+ * about 0.62: the Key box was sized with 23 CSS px of arrow allowance, which arrived as 14 visual
+ * px against an arrow that still wanted ~20, and the difference came out of the end of the text —
+ * "Key: Auto — C majo", clipped with no ellipsis to announce it. A key signature missing its last
+ * letters is a wrong key signature, and silently so, which is worse than the truncation this bar
+ * was rewritten to remove. The nested zoom that caused it is deleted (G1); the drawn chevron
+ * stays, because it is also what makes the reserve knowable on a platform whose own arrow is not.
  *
  * `appearance: none` plus a drawn chevron makes the reserve exactly the padding written here, at
  * every zoom and on every platform, so `fitSelects` can stop estimating and simply add the frame.
@@ -1016,9 +1074,10 @@ input[type="number"], input[type="text"], select {
  * cannot tell whether the app is telling them something they need.
  *
  * So it does not shrink at all. `flex: 0 0 auto` and `max-content` mean the box is always as
- * wide as the words in it, and when the row genuinely runs out of room the detail is DROPPED
- * whole, at the breakpoint below — it is a corroboration of the numbers beside it, not a control
- * anybody has to reach, so its absence costs nothing and its truncation cost trust.
+ * wide as the words in it. It used to be DROPPED whole below 1150px of window, on the reasoning
+ * that it is a corroboration of the numbers beside it rather than a control anybody has to reach.
+ * That breakpoint is deleted (G1): the sentence is inside the design's own width, so it is on
+ * screen at every window size, which is what a corroborating readout should be.
  */
 .tempo-source .tempo-detail {
   font-size: 11px;
@@ -1041,24 +1100,42 @@ input[type="number"], input[type="text"], select {
  */
 .transport [data-role="sound-picker-row"] { flex: 0 0 auto; min-width: max-content; }
 /* The room kept for "loading…", so the row does not jump when a sample set is being fetched. It
-   is a courtesy, and it is the first thing this row gives back when the width runs out — see the
-   breakpoint below. */
+   used to be the first thing this row gave back when the width ran out, at a breakpoint that is
+   now deleted (G1) — the row is laid out at its design width whatever the window does, so the
+   courtesy is simply kept. */
 .transport [data-role="sound-picker-note"] { min-width: 7ch; }
 
 /*
- * The first thing to give. A blend fader is still usable at 60px and the row is not usable at all
- * if this refuses to move.
+ * THE ROW'S ONE FLEXIBLE GAP, AND THE CONTROL THAT LIVES IN IT.
  *
- * WITH A FLOOR UNDER IT (Z6). "Gives first" used to mean "gives everything": with `min-width: 0` on
- * both the fader and its range, a squeezed transport took the fader to 0px and the control simply
- * was not there — which is the same fault as a clipped readout, arrived at from the other side.
- * 56px is the number the range's own `clamp()` already calls its minimum.
+ * The transport is justified edge to edge by growing the fader: the buttons and the clock stay
+ * left, the sound picker and the tempo source stay hard against the right edge, and the blend
+ * fader takes whatever the window has spare. That is why it is `flex: 1 1 auto` — not because it
+ * is expendable, which is what it used to mean.
+ *
+ * ITS FLOOR IS THE SUM OF ITS PARTS, AND IT IS NEVER BELOW IT (P7 / G5). The reported fault was
+ * this control collapsing to a hairline at some plugin window sizes, and the CSS said exactly
+ * that: `.fader` had `min-width: 56px` while the box it names holds "Original", two 8px gaps, the
+ * slider and "MIDI" — and the slider itself carried `min-width: 0`, so everything the parent's
+ * floor did not cover came out of the one part you have to be able to grab.
+ *
+ * So the slider gets a real minimum of its own, and the parent's floor is the arithmetic:
+ *
+ *     left label (44) + gap (8) + slider floor (88) + gap (8) + right label (34) = 182
+ *
+ * The one-proportion law is what makes that affordable — the transport is laid out in at least
+ * 1320 logical px whatever the host window is doing, and its fixed contents come to well under
+ * that — but the floor is written down here anyway rather than left as a consequence, because a
+ * local invariant that depends on a global one is a local invariant that breaks silently. The
+ * `12vw` the slider's width used to be measured in went with it: `vw` is the VISUAL viewport,
+ * which under the face scale is not the space this row is laid out in.
  */
-.fader { display: flex; align-items: center; gap: 8px; min-width: 56px; flex: 1 1 auto; }
+.fader { display: flex; align-items: center; gap: 8px; min-width: 182px; flex: 1 1 auto; }
 .fader label { font-size: 11.5px; color: var(--text-dim); }
-.fader input[type="range"] { width: clamp(56px, 12vw, 132px); min-width: 0; flex: 1 1 auto; }
+.fader input[type="range"] { width: 132px; min-width: 88px; flex: 1 1 auto; }
 .fader .end { font-size: 11.5px; }
-.fader .end.active { color: var(--accent); font-weight: 600; }
+/* Text, so the lighter step — see .brand-version for the rule. */
+.fader .end.active { color: var(--accent-hover); font-weight: 600; }
 
 /*
  * The numbers on the DAW-grid chip.
@@ -1480,9 +1557,10 @@ button[data-drag="midi"]:hover .drag-grip { opacity: 0.9; }
   text-align: left;
 }
 .menu-popover .menu-item:hover:not(:disabled) { background: var(--bg-raised); border-color: var(--border); }
-.menu-popover .menu-item.on .menu-label { color: var(--accent); font-weight: 600; }
+/* Text, so the lighter step — see .brand-version for the rule. */
+.menu-popover .menu-item.on .menu-label { color: var(--accent-hover); font-weight: 600; }
 /* Fixed tick column, so the labels do not jump when the remembered choice moves. */
-.menu-popover .tick { width: 1em; flex: 0 0 auto; color: var(--accent); }
+.menu-popover .tick { width: 1em; flex: 0 0 auto; color: var(--accent-hover); }
 .menu-popover .menu-label { flex: 0 0 auto; }
 /* The sampled-bass status sits between two controls; without this it reads as a caption
    for the one below it. */
@@ -1520,6 +1598,63 @@ button[data-drag="midi"]:hover .drag-grip { opacity: 0.9; }
 .settings-row { display: flex; align-items: center; gap: 8px; margin-bottom: 7px; flex-wrap: wrap; }
 .settings-row > .label { font-size: 12.5px; min-width: 96px; }
 .chip-group { display: flex; gap: 5px; flex-wrap: wrap; }
+
+/*
+ * THE THEME CARDS (G3) — one row, four cards, no colour pickers.
+ *
+ * A GRID AND NOT A FLEX ROW, and the difference is the whole layout: `repeat(N, minmax(0, 1fr))`
+ * gives every card the same width whatever its name is, so the row reads as a set of four equal
+ * choices rather than as four buttons of assorted lengths. The panel is 340px wide, which is
+ * about 76px a card at four — enough for a swatch and a one-word name, which is exactly what a
+ * card has to carry. `minmax(0, …)` for the same reason it is used above: without the zero
+ * minimum a long name pushes its track and the whole panel wider than the drawer.
+ *
+ * THE SWATCH SHOWS THE PALETTE, NOT THE NAME. Three bands in the theme's own tokens — the app
+ * background, the accent, the text — drawn as inline styles from the table in `ui/theme.ts`, so
+ * a card cannot claim a colour the theme does not actually apply. The light theme is recognisable
+ * across the room, which is the entire point of a card over a drop-down of four words.
+ */
+.theme-row {
+  display: grid;
+  /* The count is written by `ui/settings.ts §themeCards` from the length of the palette table,
+     so adding a fifth palette is one entry there and nothing here. */
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 6px;
+}
+.theme-card {
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 5px;
+  padding: 5px;
+  background: var(--bg-panel);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  cursor: pointer;
+  text-align: center;
+}
+.theme-card:hover:not(:disabled) { border-color: var(--accent-hover); }
+.theme-card.on { border-color: var(--accent); background: var(--accent-soft); }
+.theme-card .theme-swatch {
+  display: flex;
+  height: 26px;
+  border-radius: 4px;
+  overflow: hidden;
+  /* Its own hairline: a dark theme's swatch against a dark panel would otherwise have no edge. */
+  box-shadow: inset 0 0 0 1px rgb(255 255 255 / 0.09);
+}
+.theme-card .theme-swatch > span { flex: 1 1 0; }
+/* The accent gets the middle third and a little more — it is the band anybody is choosing by. */
+.theme-card .theme-swatch > span.accent { flex-grow: 1.4; }
+.theme-card .theme-name {
+  font-size: 11px;
+  font-weight: 600;
+  line-height: 1.2;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: clip;
+}
+.theme-card.on .theme-name { color: var(--accent-hover); }
 
 /*
  * A CHECKBOX ROW IS TWO COLUMNS, AND THE TEXT WRAPS IN THE SECOND ONE.
@@ -1846,232 +1981,64 @@ button[data-drag="midi"]:hover .drag-grip { opacity: 0.9; }
   color: var(--text);
 }
 
-/* ------------------------------------------------------------------ narrow */
+/* --------------------------------------------- THE RESPONSIVE MACHINERY, AND WHY IT IS GONE */
 
 /*
- * The product's floor is 900x600 (a plugin window a user can actually make small).
- * Nothing above uses a fixed pixel width that cannot shrink; these rules buy the last
- * bit of room by trimming chrome rather than by clipping content.
+ * EVERY BREAKPOINT IN THIS FILE WAS DELETED HERE (G1). Not disabled — deleted, and this is the
+ * inventory, because a rule that is removed without a reason written down is a rule somebody
+ * puts back.
+ *
+ * THE ARGUMENT, ONCE, FOR ALL OF THEM. A media query asks a question about the VISUAL viewport:
+ * "is the window narrower than 900 px?" Under the one-proportion law that question has stopped
+ * being about the layout at all. The layout is done in LOGICAL pixels, of which there are always
+ * at least 1320 by 700 (`ui/faceScale.ts` — the scale is `min(1, w/1320, h/700)`, so dividing the
+ * window by it can never give back less than the base). A 360 px window lays the face out in 1320
+ * logical px and paints it at 0.27; a 900 px window lays it out in 1320 and paints it at 0.68.
+ * Every rule below fired on the window and adjusted a layout that was not under any pressure —
+ * so at best it did nothing visible, and at worst it hid a control that had plenty of room.
+ *
+ *   1. `@media (max-width: 1150px) .tempo-detail { display: none }`
+ *      The tempo sentence was dropped whole below a MEASURED width. It fits at the base size, so
+ *      it is now on screen at every window size, which is what a corroborating readout should be.
+ *
+ *   2. `@media (max-width: 1000px)` — the transport's gap and padding trimmed, `.fader .end`
+ *      hidden, the sound picker's label hidden and its note un-reserved, the header's padding and
+ *      every button's padding cut, `.fader` type shrunk, `.brand-check` hidden, the brand block
+ *      squeezed. Eleven separate degradations of the design, all of them triggered at a width the
+ *      design no longer sees. The blend fader's endpoint labels in particular are half of what
+ *      makes it readable as a BLEND, and they were the first thing to go.
+ *
+ *   3. `@media (max-width: 860px) #app { zoom: 0.9 }` and
+ *      `@media (max-width: 620px), (max-height: 420px) #app { zoom: 0.8 }`, with `.gear-label`
+ *      and `.brand-wordmark` dropped at the second rung. This was the law in embryo — the right
+ *      idea, applied in two steps, to the wrong element, with no coordinate correction anywhere
+ *      in the app. It is replaced by one continuous factor on `body` and by `logicalPoint()`.
+ *
+ *   4. The `--bar-zoom` LADDER: ten media queries putting a SECOND, independent `zoom` on
+ *      `.app-header` and `.notation-toolbar`, whose rungs had to be divided by the shell's own
+ *      zoom to keep the sequence smooth (the table in the deleted comment stepped from 0.84 UP to
+ *      0.92 at 860px for exactly that reason). Two nested zooms is two coordinate systems the app
+ *      could not name, and it is what made a `<select>` sized with 23 CSS px of arrow allowance
+ *      arrive with 14 visual px of it and clip a key signature with no ellipsis to announce it.
+ *
+ *   5. `@media (min-width: 700px) .app-header { flex-wrap: nowrap }` and its mirror,
+ *      `.notation-toolbar { flex-wrap: wrap }`, and `@media (max-width: 800px)` putting the
+ *      transport on two or three rows. All three rows are `nowrap` unconditionally now. Wrapping
+ *      was always the wrong answer for a plugin window — the narrower it gets, the more of its
+ *      height goes to rows of chrome — and it is now also an unreachable one.
+ *
+ *   6. `@media (max-width: 720px)` (the blank-score grid and "Current work" re-stacked) and
+ *      `@media (max-height: 660px)` (a shorter waveform, a tighter dropzone). Both fired below the
+ *      base size in a space the layout cannot reach; both were dead code the moment the law landed.
+ *
+ * WHAT SURVIVED, AND WHY. `fitSelects` (`ui/dom.ts`) is NOT part of this machinery and is kept:
+ * it exists because a native `<select>`'s intrinsic width is its LONGEST option rather than the
+ * one it is showing, which is a fact about the control and not about the window. It would be just
+ * as necessary on a fixed-size face.
  */
-/*
- * THE TEMPO DETAIL IS DROPPED WHOLE, AND EARLY (H6).
- *
- * It used to go at 1000px, and between 1000 and about 1090 it was still on screen being squeezed
- * — which, with the old `text-overflow: ellipsis`, is where "heard in y…" came from. It does not
- * squeeze any more (§.tempo-detail), so the width it needs is the width it has, and the
- * breakpoint has to be where the rest of the row stops leaving room for it.
- *
- * MEASURED, not guessed: the transport's other contents come to 954px at their natural sizes,
- * and the longest sentence this element can hold is the DAW one — "222 · 13/16 · tempo only",
- * about 135px. 954 + 135 = 1089, so anything at 1151px and above fits with room to spare, and
- * below that the sentence goes rather than shrinks. It is a corroboration of the numbers beside
- * it, never a control anybody has to reach, which is what makes dropping it the cheap answer and
- * cutting it in half the expensive one.
- */
-@media (max-width: 1150px) {
-  .transport .tempo-detail { display: none; }
-}
-
-@media (max-width: 1000px) {
-  .transport { gap: 9px; padding: 7px 10px; }
-  .fader .end { display: none; }
-  /*
-   * THE SOUND ROW GIVES BACK ITS TWO COURTESIES HERE, AND KEEPS ITS CONTROL (Z6).
-   *
-   * G4's rule is ONE transport row at 900x600 — the product's floor and the width people work at
-   * — and H6's is that nothing in it is ever cut short. Both, at once, is arithmetic: measured at
-   * 900px the row's contents came to 972px against 900 of window, and the 72px had been coming
-   * out of the blend fader (crushed to nothing) and out of this row's own `<select>` (148px of
-   * "Sound · Finger bass" spilling out of a 126px box).
-   *
-   * These two are what a row can afford to lose: the WORD "Sound", which introduces a box that
-   * already reads "Finger bass", and the blank space held for a "loading…" that is on screen for
-   * a second or two the first time a sampled voice is chosen. 91px between them, which is what
-   * buys the fader its floor and the row its single line. The picker itself — the thing anybody
-   * came to this row to change — is untouched at every width.
-   */
-  .transport [data-role="sound-picker-label"] { display: none; }
-  .transport [data-role="sound-picker-note"] { min-width: 0; }
-  .app-header { padding: 7px 10px; }
-  button { padding: 5px 8px; }
-  .fader label, .fader .end { font-size: 11px; }
-  /* The brand keeps its name and its version and loses only the invitation — the version is
-     still a link and the tooltip still says so. Same trade as the gear's word. */
-  .brand-check { display: none; }
-  .brand-block { padding: 2px 4px; gap: 6px; }
-}
 
 /*
- * PROPORTIONAL, NOT WRAPPED.
- *
- * Below the threshold the shell is SCALED rather than re-flowed. The reasoning is the plugin's:
- * REAPER's docked FX window bottoms out around 360x280, and the previous answer — flex-wrap
- * everywhere — spent that height on extra ROWS of chrome, so the narrower the window got the
- * less of it was the sheet. Scaling keeps the same picture and makes it smaller, which is what
- * somebody dragging a window edge is asking for.
- *
- * `zoom` and not `transform: scale()`. A transform would leave the element laid out at its old
- * size, so the page would keep a scrollbar for space that is no longer occupied and every
- * getBoundingClientRect() the app measures (the roll's hit-testing, the sheet's bounds, the
- * tooltip's clamping) would be reading pre-transform coordinates. `zoom` scales layout as well
- * as paint, so the measurements stay honest — which is the whole reason a canvas-heavy app can
- * use it and could not use the other one.
- *
- * The step is deliberate rather than continuous: two named sizes are predictable, and a
- * continuously-scaled UI resizes text under your eyes on every drag frame.
- */
-@media (max-width: 860px) {
-  #app { zoom: 0.9; }
-}
-@media (max-width: 620px), (max-height: 420px) {
-  #app { zoom: 0.8; }
-  /* The gear keeps its glyph and loses its word — the one place a label is worth the space
-     only while there is space. */
-  .settings-gear .gear-label { display: none; }
-  .settings-gear { padding: 5px 9px; }
-  /* And the brand keeps its mark and its version and loses the word, by the same rule and for
-     the same reason: at REAPER's 360px floor the header is already wrapping, and a logotype is
-     the one thing in the row that is not a control anybody has to reach. The R is still the R,
-     the version is still a link, and the tooltip still says what pressing it does. */
-  .brand-wordmark { display: none; }
-}
-
-/* ------------------------------------------------------- toolbars scale */
-/*
- * THE SAME ARGUMENT AS ABOVE, ONE LEVEL DOWN: THE TWO TOP BARS SCALE BEFORE THE SHELL DOES.
- *
- * The shell's own zoom starts at 860px, and the two bars ran out of room long before that:
- * the notation bar was already on TWO ROWS at 1280px with a tab, a tuning and a capo on it,
- * and the header followed at about 1000. A plugin window is short before it is narrow — this
- * is a strip of chrome above somebody's music — so every extra row of bar is a row of sheet
- * nobody gets, and it appears at exactly the widths people actually work at.
- *
- * `zoom` again, for the reasons written out above: it scales layout as well as paint, so every
- * getBoundingClientRect() in the app keeps reading true coordinates, and the controls keep
- * their proportions — a scaled bar is the same bar, smaller, not a bar with different-sized
- * things in it.
- *
- * THE NUMBERS ARE A LADDER OF COMBINED SCALES, and the combined one is what a person sees:
- * below 860px the shell is already at 0.9 and below 620px at 0.8, so the bar's own figure has
- * to be divided by that to keep the sequence smooth. That is why the ladder appears to step UP
- * at 860 — 0.9 x 0.92 is 0.83, which is the next rung down from 0.84 and not a jump.
- *
- *      width   bar    shell   what you see
- *     >1150    1.00   1.00    1.00
- *      1150    0.96   1.00    0.96
- *      1080    0.93   1.00    0.93
- *      1010    0.90   1.00    0.90
- *       950    0.87   1.00    0.87
- *       900    0.84   1.00    0.84
- *       860    0.92   0.90    0.83
- *       820    0.89   0.90    0.80
- *       780    0.86   0.90    0.77
- *       740    0.82   0.90    0.74
- *       700    0.78   0.90    0.70
- *
- * Measured against the worst bar this app can draw — label, clef, key, quantize, the coarse-grid
- * warning, tab, frets, tuning and capo, 1375px of controls at full size — every one of those
- * rungs is ONE ROW with nothing clipped and nothing off the edge. The last of the slack comes
- * from the selects, which reserve width for their longest option and give it back under
- * `flex-shrink` long before any label is touched; the warning truncates first and by design.
- *
- * BELOW 700px THE BARS WRAP AGAIN, and that is the floor's fallback rather than a failure. At
- * REAPER's 360x280 there is no legible scale that fits nine controls on a line, and the two
- * alternatives are both worse: a scroller hides controls behind a scrollbar nobody can see
- * (that shipped once — Capo, 39px past the right edge, reported as the button disappearing),
- * and a smaller scale is a bar you cannot read. A second row is the honest answer down there.
- */
-.app-header, .notation-toolbar { --bar-zoom: 1; }
-@media (max-width: 1150px) { .app-header, .notation-toolbar { --bar-zoom: 0.96; } }
-@media (max-width: 1080px) { .app-header, .notation-toolbar { --bar-zoom: 0.93; } }
-@media (max-width: 1010px) { .app-header, .notation-toolbar { --bar-zoom: 0.9; } }
-@media (max-width: 950px)  { .app-header, .notation-toolbar { --bar-zoom: 0.87; } }
-@media (max-width: 900px)  { .app-header, .notation-toolbar { --bar-zoom: 0.84; } }
-@media (max-width: 860px)  { .app-header, .notation-toolbar { --bar-zoom: 0.92; } }
-@media (max-width: 820px)  { .app-header, .notation-toolbar { --bar-zoom: 0.89; } }
-@media (max-width: 780px)  { .app-header, .notation-toolbar { --bar-zoom: 0.86; } }
-@media (max-width: 740px)  { .app-header, .notation-toolbar { --bar-zoom: 0.82; } }
-@media (max-width: 700px)  { .app-header, .notation-toolbar { --bar-zoom: 0.78; } }
-
-/*
- * ONE ROW, and it is this line that makes the scaling above mean anything.
- *
- * A wrapping flex container does not shrink its items — it puts them on another line the moment
- * their natural sizes overrun, and `flex-shrink` only ever redistributes WITHIN a line that has
- * already been laid out. So `flex-wrap: wrap` and "give ground gracefully" are mutually
- * exclusive, and the bars have to say `nowrap` to get the shrinking they were given.
- *
- * Only above the floor. Under 700px the declaration lapses and both bars go back to wrapping,
- * which is what keeps every control reachable at 360x280. 700 itself is on the ONE-ROW side of
- * the line, because "down to 700" is the promise and a promise that stops one pixel early is
- * the kind of thing somebody finds by dragging a window edge.
- */
-@media (min-width: 700px) {
-  .app-header { flex-wrap: nowrap; }
-}
-
-/*
- * …AND THE NOTATION BAR IS NOT IN THAT RULE ANY MORE.
- *
- * `nowrap` was how the bar bought its single row, and what it bought it with was the selects:
- * they were allowed to shrink past their own text and the difference came out as an ellipsis.
- * That is now forbidden (§"nothing on this bar is ever cut short"), so `nowrap` has nothing left
- * to spend — it would simply push the last control off the right-hand edge, which is the exact
- * failure the whole of this section exists to prevent (a Capo button 39px past the window, and
- * the report that said the button had disappeared).
- *
- * It does not cost the row that was gained. Cut to their own words the controls come to about
- * 990px of bar, and the scale ladder above leaves 997px of room at 700px and 1071 at 900 — so
- * the bar holds ONE LINE all the way down to the 700px floor on its natural widths, with nothing
- * shrunk and nothing truncated, and wraps below that exactly as the header does.
- *
- * A SECOND ROW IS STILL THE HONEST ANSWER AT THE FLOOR, and the arithmetic has not changed since
- * it was first written down: at 390px the ladder leaves 500px of layout width, the same controls
- * measure about 990, and no scale that fits them on one line (0.4 of 13px is 5px of type) is a
- * scale anybody can read. Wrapping shows all of it; the alternatives hide half of it.
- */
-.notation-toolbar { flex-wrap: wrap; }
-
-/*
- * …AND THE TRANSPORT TAKES THE SAME FLOOR FALLBACK (H6).
- *
- * Above 700px it is one row and shrinks, which is the whole of §.transport and is not being
- * undone here. Below it, the same argument that already applies to the two bars applies to this
- * one: at REAPER's 360x280 there is no legible way to fit nine controls on a line, and holding
- * `nowrap` there does not fit them either — it CLIPS them. Measured at 390px: the clock was
- * given 29px for "0:00.00 / 0:22.77" and the blend fader 13px, both cut off inside
- * `overflow: hidden`, with the row's contents 132px past its own edge.
- *
- * A clipped clock is the same fault as an ellipsized sentence: half a readout is worth less than
- * a second row. So at the floor the row wraps, and the clock is allowed to be as wide as its own
- * digits again — there is no longer any slack for it to be giving up.
- *
- * 800px RATHER THAN THE BARS' 700, and the number is measured rather than matched: this row
- * holds a clock, a fader, a sound picker and a three-part tempo control, and its contents stop
- * fitting one line at about 810px (821px of content in a 779px row at a 701px window). Sharing
- * the bars' breakpoint would have left an 80px band where the row overflowed its own edge again.
- */
-@media (max-width: 800px) {
-  .transport { flex-wrap: wrap; row-gap: 8px; }
-  .transport .position { overflow: visible; flex: 0 0 auto; }
-  .fader { flex: 1 1 120px; }
-}
-
-@media (max-width: 720px) {
-  .blank-score-grid { grid-template-columns: repeat(2, minmax(110px, 1fr)); }
-  .current-work { align-items: stretch; flex-direction: column; }
-  .current-work .row { flex-wrap: wrap; }
-}
-
-@media (max-height: 660px) {
-  .waveform { height: 52px; }
-  .dropzone { padding: 18px; gap: 9px; }
-  .dropzone .explainer { font-size: 12.5px; }
-}
-
-/*
- * The piano roll used to shrink here too, and at the 360x280 floor. It still does — but from
- * `clampRollHeight()` in view/pianoroll.ts, because its height is now an inline style the
- * player drags, and no media query can outrank one. Same behaviour at the floor (46px), and
- * the player's own choice honoured everywhere there is room for it.
+ * The piano roll shrinks at short windows from `clampRollHeight()` in view/pianoroll.ts, because
+ * its height is an inline style the player drags and no media query could outrank one. It works
+ * against the LOGICAL viewport like everything else here.
  */

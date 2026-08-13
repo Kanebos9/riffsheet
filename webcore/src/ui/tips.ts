@@ -15,6 +15,10 @@
  * Texts are written for an amateur musician, generously — never manual-speak.
  */
 
+// The one-proportion law's coordinate correction (G1): a tooltip is `position: fixed` under a
+// zoomed body, so it is placed in LOGICAL pixels while the pointer arrives in visual ones.
+import { faceViewport, logicalRect, toLogical } from './faceScale';
+
 const HOVER_DELAY_MS = 250;
 
 let enabled = true;
@@ -72,11 +76,18 @@ function show(text: string, x: number, y: number): void {
   tipEl.style.visibility = 'hidden';
   tipEl.style.display = 'block';
 
-  // Measure, then clamp on all four edges — Basscribe only clamped right and bottom.
-  const rect = tipEl.getBoundingClientRect();
-  const left = Math.max(8, Math.min(x + 12, window.innerWidth - rect.width - 8));
+  /*
+   * MEASURED AND CLAMPED IN LOGICAL PIXELS (G1), because that is the space a `position: fixed`
+   * bubble is placed in under the face scale. `x` and `y` arrive as VISUAL client coordinates
+   * (see `show`'s callers) and are converted on the way in; the viewport they are clamped against
+   * has to be the logical one for the same reason, or the bubble is pushed off the right-hand edge
+   * by exactly the reciprocal of the scale.
+   */
+  const rect = logicalRect(tipEl);
+  const view = faceViewport();
+  const left = Math.max(8, Math.min(x + 12, view.width - rect.width - 8));
   let top = y + 16;
-  if (top + rect.height > window.innerHeight - 8) top = Math.max(8, y - rect.height - 10);
+  if (top + rect.height > view.height - 8) top = Math.max(8, y - rect.height - 10);
   tipEl.style.left = `${left}px`;
   tipEl.style.top = `${top}px`;
   tipEl.style.visibility = 'visible';
@@ -103,10 +114,11 @@ export function installTooltipLayer(): void {
     if (src.el === currentEl) return;
     hide();
     currentEl = src.el;
-    const { clientX, clientY } = e;
+    // VISUAL -> LOGICAL at the boundary, once (G1). See `ui/faceScale.ts`.
+    const at = { x: toLogical(e.clientX), y: toLogical(e.clientY) };
     timer = window.setTimeout(() => {
       if (currentEl !== src.el) return;
-      show(src.text, clientX, clientY);
+      show(src.text, at.x, at.y);
     }, HOVER_DELAY_MS);
   };
 
@@ -116,8 +128,8 @@ export function installTooltipLayer(): void {
     if (!src) return;
     hide();
     currentEl = src.el;
-    const r = src.el.getBoundingClientRect();
-    show(src.text, r.left + r.width / 2, r.bottom + 4);
+    const r = logicalRect(src.el);
+    show(src.text, r.left + r.width / 2, r.top + r.height + 4);
   };
 
   // Capture phase throughout, so nothing can stopPropagation these away.
@@ -299,7 +311,7 @@ export const TIPS = {
   parts:
     'Which part of the sheet you are working on, and what to do with it. The one marked ● is your own take — it is always on the page and always the one you hear. Add part reads a MusicXML file and prints it as an extra staff, up to four; imported parts are engraved but never played.',
   clef:
-    'Auto picks one stable clef for the whole part. Treble and Bass force one; Grand stacks both, for music that really needs the range.',
+    'Auto picks one stable clef for the whole part. Treble and Bass force one; Grand stacks both, for music that really needs the range. Off hides the staff altogether and leaves the tab — one of the two has to stay. The second section switches the row of letter names above the music.',
   fingering:
     'How the tab picks frets. Low positions keeps you near the nut; least movement keeps your hand in one place, even if that means higher frets.',
   maxFret:

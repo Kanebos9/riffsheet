@@ -48,6 +48,8 @@
  */
 
 import { el, type Store } from './dom';
+// The one-proportion law's coordinate correction (G1) — see `ui/faceScale.ts`.
+import { faceViewport, logicalRect } from './faceScale';
 import { t, TIPS } from './tips';
 import type { AppSettings, MidiExportMode } from '../app/state';
 import type { ExportOutcome, ExportPayload, NativeBridge } from '../bridge';
@@ -764,11 +766,17 @@ export class MenuPopover {
     this.root.style.display = 'flex';
     this.root.style.visibility = 'hidden';
     // Measure before placing, or the flip-up test uses a stale height.
-    const rect = this.root.getBoundingClientRect();
-    const anchorRect = anchor.getBoundingClientRect();
-    let left = Math.min(anchorRect.left, window.innerWidth - rect.width - 8);
-    let top = anchorRect.bottom + 6;
-    if (top + rect.height > window.innerHeight - 8) {
+    //
+    // IN LOGICAL PIXELS (G1). `.menu-popover` is `position: fixed`, and under the face scale a
+    // fixed element's `left`/`top` are read in the design's own pixels while
+    // `getBoundingClientRect()` and `window.innerWidth` answer in visual ones. Mixing them put
+    // the menu at `anchorLeft / scale` — further from its button the smaller the window was.
+    const rect = logicalRect(this.root);
+    const anchorRect = logicalRect(anchor);
+    const view = faceViewport();
+    let left = Math.min(anchorRect.left, view.width - rect.width - 8);
+    let top = anchorRect.top + anchorRect.height + 6;
+    if (top + rect.height > view.height - 8) {
       top = Math.max(8, anchorRect.top - rect.height - 6);
     }
     left = Math.max(8, left);

@@ -108,19 +108,20 @@
  * IS IT READABLE? THE STRETCHING IS FINE. THE RESOLUTION IS NOT, AND THAT IS NOT THIS FILE'S
  * BUG. `ui/app.ts` computes `PEAK_BUCKETS = 2000` for the WHOLE take, once. Linked mode shows
  * only the slice the sheet is on, so if a fraction `f` of the take is engraved on screen the
- * strip has `2000 * f` buckets to spread over its plot width. At the 1180px design target the
- * plot is ~1146px, so the envelope is at or above native resolution only while
+ * strip has `2000 * f` buckets to spread over its plot width. At the 1320px design target the
+ * plot is ~1286px (the base size less `TIMELINE_GUTTER_PX`), so the envelope is at or above
+ * native resolution only while
  *
- *     f >= 1146 / 2000 ≈ 0.57
+ *     f >= 1286 / 2000 ≈ 0.64
  *
- * — i.e. only while more than half the recording is on screen. On the 5-bar demo fixture the
- * whole score fits and it looks exactly like a waveform. On a real 3-minute take showing two
- * bars out of ninety, f ≈ 0.022: forty-five buckets across 1146px, i.e. one peak every 25
+ * — i.e. only while roughly two thirds of the recording is on screen. On the 5-bar demo fixture
+ * the whole score fits and it looks exactly like a waveform. On a real 3-minute take showing two
+ * bars out of ninety, f ≈ 0.022: forty-five buckets across 1286px, i.e. one peak every 29
  * pixels. That is a bar chart, not an envelope.
  *
  * Two things are done about it, and one is not done here:
  *   - a column narrower than one bucket interpolates the envelope between the two neighbouring
- *     bucket centres instead of repeating one bucket's value as a 25px plateau. This can never
+ *     bucket centres instead of repeating one bucket's value as a 29px plateau. This can never
  *     invent a peak larger than the data — every value lies between two real measurements —
  *     and it turns a staircase back into a shape. Columns a bucket or wider take the exact
  *     min/max, byte for byte what this file drew before: checked over 4704 columns at plot
@@ -193,6 +194,10 @@ import { type ViewportCommand } from '../view/timeAxis';
 // three surfaces, which is what view/gesture.ts is. The strip's own copy (a `claimPinch`, a
 // `gestureScale` baseline and a 250 ms timer) is gone with it.
 import { PinchGesture } from '../view/gesture';
+// THE ONE-PROPORTION LAW'S COORDINATE CORRECTION (G1). `clientX` and `getBoundingClientRect()`
+// are VISUAL pixels; this strip's gutter, its plot width and everything it paints are LOGICAL
+// ones. `logicalX` is the single conversion between them — see `ui/faceScale.ts`.
+import { fitCanvasBackingStore, logicalX, FACE_SCALE_EVENT } from './faceScale';
 
 /** A stretch of the RECORDING, in recording seconds. `fromSec` is always the earlier one. */
 export interface WaveformSelection {
@@ -370,6 +375,10 @@ export class WaveformStrip {
     this.canvas.addEventListener('gesturechange', this.onGestureChange, { passive: false });
     this.canvas.addEventListener('gestureend', this.onGestureEnd, { passive: false });
     window.addEventListener('resize', this.draw);
+    // A NEW FACE SCALE IS A NEW BACKING STORE (G1). The strip's CSS size has not changed, so no
+    // resize fires for it — but the number of DEVICE pixels it occupies has, and a store left at
+    // the old size is either soft or wastefully large. See `ui/faceScale.ts`.
+    window.addEventListener(FACE_SCALE_EVENT, this.draw);
     window.addEventListener('keydown', this.onKeyDown);
   }
 
@@ -814,8 +823,7 @@ export class WaveformStrip {
    *        the written page; navigation belongs to the overview ribbon above it.
    */
   private onPointerDown = (e: PointerEvent): void => {
-    const rect = this.canvas.getBoundingClientRect();
-    const x = e.clientX - rect.left;
+    const x = logicalX(this.canvas, e.clientX);
     this.pressX = x;
     this.pressMoved = false;
     this.pressing = false;
@@ -943,8 +951,7 @@ export class WaveformStrip {
   }
 
   private onPointerMove = (e: PointerEvent): void => {
-    const rect = this.canvas.getBoundingClientRect();
-    const x = e.clientX - rect.left;
+    const x = logicalX(this.canvas, e.clientX);
 
     if (this.dragging === 'marker') {
       if (!this.pressMoved && Math.abs(x - this.pressX) < WaveformStrip.DRAG_SLOP_PX) return;
@@ -1036,8 +1043,7 @@ export class WaveformStrip {
         }
         return;
       }
-      const rect = this.canvas.getBoundingClientRect();
-      const sec = this.secAt(e.clientX - rect.left);
+      const sec = this.secAt(logicalX(this.canvas, e.clientX));
       // The release lands where the finger is, not where the press was: the last live frame
       // may be a whole pointer-move behind, and a span that shrinks on release feels like a
       // dropped edit.
@@ -1122,6 +1128,8 @@ export class WaveformStrip {
     // The strip has one axis, like the sheet: a pitch zoom is swallowed, not forwarded.
     if (out.kind !== 'zoom' || out.axis !== 'time') return;
     const rect = this.canvas.getBoundingClientRect();
+    // A GestureEvent that carries no client x anchors on the middle of the strip. The fallback is
+    // written in VISUAL pixels because that is what `emitZoom` is given and what it converts.
     this.emitZoom(out.factor, g.clientX ?? rect.left + rect.width / 2);
   };
 
@@ -1131,12 +1139,16 @@ export class WaveformStrip {
     this.pinch.read({ kind: 'gestureend', atMs: performance.now() });
   };
 
-  /** A client x, as a fraction of the plot, as a zoom command. The gutter anchors at the edge. */
+  /**
+   * A client x, as a fraction of the plot, as a zoom command. The gutter anchors at the edge.
+   *
+   * `clientX` arrives VISUAL and `gutterPx` and `plotWidth` are LOGICAL, so the conversion has to
+   * happen before the subtraction rather than after it — see `ui/faceScale.ts`.
+   */
   private emitZoom(factor: number, clientX: number): void {
-    const rect = this.canvas.getBoundingClientRect();
     const frac = Math.max(
       0,
-      Math.min(1, (clientX - rect.left - this.gutterPx) / Math.max(1, this.plotWidth))
+      Math.min(1, (logicalX(this.canvas, clientX) - this.gutterPx) / Math.max(1, this.plotWidth))
     );
     this.opts.onViewportCommand?.({ kind: 'zoom', factor, anchorFrac: frac, source: 'waveform' });
   }
@@ -1174,16 +1186,18 @@ export class WaveformStrip {
 
   draw = (): void => {
     const canvas = this.canvas;
-    const dpr = window.devicePixelRatio || 1;
     const w = canvas.clientWidth;
     const h = canvas.clientHeight;
     if (w === 0 || h === 0) return;
-    if (canvas.width !== w * dpr || canvas.height !== h * dpr) {
-      canvas.width = w * dpr;
-      canvas.height = h * dpr;
-    }
+    // THE BACKING STORE IS SIZED FOR THE FACE, NOT ONLY FOR THE PANEL (G1). It was
+    // `clientWidth x devicePixelRatio`, which ignores the face scale entirely: under the law this
+    // strip is displayed at `logical x faceScale` visual pixels, so a store sized from the logical
+    // width alone is resampled on the way to the screen — soft at every scale below 1. The factor
+    // is all three multiplied together and it is also the drawing transform, so everything painted
+    // below stays in LOGICAL pixels and none of it has to know.
+    const k = fitCanvasBackingStore(canvas, w, h);
     const ctx = this.ctx;
-    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.setTransform(k, 0, 0, k, 0, 0);
     ctx.clearRect(0, 0, w, h);
     ctx.fillStyle = this.colors.bg;
     ctx.fillRect(0, 0, w, h);
@@ -1258,7 +1272,7 @@ export class WaveformStrip {
    *    1180, 900 and 360 wide.
    *  - a column NARROWER than a bucket is being asked for detail the peak data does not have,
    *    which happens as soon as the sheet is zoomed in. Repeating one bucket's value across
-   *    every column that lands in it turns the envelope into a staircase of 25px plateaus.
+   *    every column that lands in it turns the envelope into a staircase of 29px plateaus.
    *    Interpolating between the two neighbouring bucket centres cannot invent a peak — every
    *    value it produces lies between two real measurements — and it reads as audio again.
    */
@@ -1582,6 +1596,7 @@ export class WaveformStrip {
     this.canvas.removeEventListener('gesturechange', this.onGestureChange);
     this.canvas.removeEventListener('gestureend', this.onGestureEnd);
     window.removeEventListener('resize', this.draw);
+    window.removeEventListener(FACE_SCALE_EVENT, this.draw);
     window.removeEventListener('keydown', this.onKeyDown);
   }
 }

@@ -218,6 +218,17 @@ import {
 // are re-exported below, because they are the same law seen from the other end and half the app
 // imports them from this file.
 import { PinchGesture, wheelZoomFactor, WHEEL_ZOOM_MAX_STEP } from './gesture';
+// THE ONE-PROPORTION LAW'S COORDINATE CORRECTION (G1). Pointer coordinates and
+// `getBoundingClientRect()` are VISUAL pixels; every rect this roll paints, its gutter, its ruler
+// height and the height the player drags are LOGICAL ones. See `ui/faceScale.ts`.
+import {
+  faceViewport,
+  fitCanvasBackingStore,
+  logicalPoint,
+  logicalRect,
+  toLogical,
+  FACE_SCALE_EVENT
+} from '../ui/faceScale';
 
 export { wheelZoomFactor, WHEEL_ZOOM_MAX_STEP };
 
@@ -802,7 +813,19 @@ export function setTransientReserve(px: number): void {
   transientReservePx = Math.max(0, Math.round(px));
 }
 
-export function clampRollHeight(px: number, viewportH: number = window.innerHeight || 700): number {
+/**
+ * `viewportH` IS THE LOGICAL WINDOW HEIGHT, not `window.innerHeight` (G1).
+ *
+ * `px` is a logical height — it is written into a CSS inline style — so the room it is clamped
+ * against has to be measured in the same space. `window.innerHeight` is the VISUAL height, which
+ * under the face scale is a different number: at 900x600 the face is drawn at 0.76 and the layout
+ * has 787 logical px of window, so clamping against 600 would have taken a third of the roll away
+ * for room that was there all along.
+ */
+export function clampRollHeight(
+  px: number,
+  viewportH: number = faceViewport().height || 700
+): number {
   // The transient pane comes off the window FIRST, before either limit is worked out. Taking it
   // off only the fixed reserve was not enough: at 813px the 40% rule caps the roll at 325 and
   // the reserve allows 363, so the fraction binds and the roll never noticed the tuner had
@@ -1230,6 +1253,10 @@ export class PianoRoll {
     window.addEventListener('keyup', this.onKeyUp);
     window.addEventListener('blur', this.onWindowBlur);
     window.addEventListener('resize', this.onWindowResize);
+    // A NEW FACE SCALE IS A NEW BACKING STORE, and a re-clamp: the pane's height is a logical
+    // inline style and the room the window has for it is measured in the same space. See
+    // `ui/faceScale.ts`.
+    window.addEventListener(FACE_SCALE_EVENT, this.onWindowResize);
 
     if (this.handle) {
       this.handle.addEventListener('pointerdown', this.onHandleDown);
@@ -1905,8 +1932,13 @@ export class PianoRoll {
   private onHandleDown = (e: PointerEvent): void => {
     if (!this.pane || e.button !== 0) return;
     e.preventDefault();
+    // LOGICAL FROM THE FIRST FRAME (G1). `getBoundingClientRect().height` is VISUAL and
+    // `setHeight` writes a LOGICAL inline style, so under the face scale the drag used to move the
+    // pane by the wrong amount and, worse, to PERSIST a height in the wrong units — the stored
+    // number came back as a different pane the next time the app opened at another window size.
+    // `clientHeight` is already logical; the pointer delta below is converted.
     const startY = e.clientY;
-    const startH = this.pane.getBoundingClientRect().height;
+    const startH = this.pane.clientHeight;
     this.resizing = true;
     this.handle?.classList.add('dragging');
     // Capture keeps the drag alive over the sheet below; a synthetic pointer from the
@@ -1919,7 +1951,7 @@ export class PianoRoll {
 
     const move = (m: PointerEvent): void => {
       if (!this.resizing) return;
-      this.setHeight(startH + (m.clientY - startY), false);
+      this.setHeight(startH + toLogical(m.clientY - startY), false);
     };
     const detach = (): void => {
       window.removeEventListener('pointermove', move);
@@ -2547,8 +2579,11 @@ export class PianoRoll {
    * Only the ruler's own hit test wants this.
    */
   private canvasPoint(e: { clientX: number; clientY: number }): { x: number; y: number } {
-    const r = this.canvas.getBoundingClientRect();
-    return { x: e.clientX - r.left, y: e.clientY - r.top };
+    // THROUGH THE LAW'S ONE CONVERSION (G1). This is the roll's whole pointer funnel — the ruler
+    // hit test, `localPoint`, every rectangle grab, the pitch scrollbar and both pinch anchors go
+    // through here — so correcting it here corrects the surface. `clientX` minus `rect.left` is a
+    // VISUAL offset and the rects it is compared against are in the design's own pixels.
+    return logicalPoint(this.canvas, e.clientX, e.clientY);
   }
 
   /**
@@ -3614,9 +3649,15 @@ export class PianoRoll {
     this.draw();
   }
 
-  /** A rect in viewport coordinates, for whoever has to put a popover next to it. */
+  /**
+   * A rect in LOGICAL CLIENT coordinates, for whoever has to put a popover next to it.
+   *
+   * Logical, because a popover is `position: fixed` inside a body carrying the face scale and its
+   * offsets are read in the design's own pixels — and because `hit.x/y` are already in that space,
+   * so adding a VISUAL canvas origin to them would have been two units in one number (G1).
+   */
   private viewportRect(hit: RollRect | null, x = 0, y = 0): { x: number; y: number; w: number; h: number } {
-    const r = this.canvas.getBoundingClientRect();
+    const r = logicalRect(this.canvas);
     if (!hit) return { x: r.left + x, y: r.top + y, w: 0, h: 0 };
     return { x: r.left + hit.x, y: r.top + hit.y, w: hit.w, h: hit.h };
   }
@@ -3958,7 +3999,6 @@ export class PianoRoll {
 
   draw = (): void => {
     const canvas = this.canvas;
-    const dpr = window.devicePixelRatio || 1;
     const w = canvas.clientWidth;
     const h = canvas.clientHeight;
     if (w === 0 || h === 0) return;
@@ -3966,12 +4006,14 @@ export class PianoRoll {
     // "centre the pane on the music" needs to know how tall the pane is, and in the plugin the
     // canvas has no height at all until JUCE has laid the page out.
     this.ensureViewPlaced();
-    if (canvas.width !== w * dpr || canvas.height !== h * dpr) {
-      canvas.width = w * dpr;
-      canvas.height = h * dpr;
-    }
+    // THE BACKING STORE IS SIZED FOR THE FACE, NOT ONLY FOR THE PANEL (G1). `clientWidth x dpr`
+    // ignores the face scale, under which this canvas occupies `logical x faceScale x dpr` device
+    // pixels; a store sized without it is resampled on the way to the screen. The returned factor
+    // is the drawing transform, so every coordinate below stays LOGICAL — which is what keeps
+    // `paintedRects()`, the hit test and `canvasPoint()` in one coordinate system.
+    const k = fitCanvasBackingStore(canvas, w, h);
     const ctx = this.ctx;
-    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.setTransform(k, 0, 0, k, 0, 0);
     ctx.clearRect(0, 0, w, h);
     ctx.fillStyle = this.colors.bg;
     ctx.fillRect(0, 0, w, h);
@@ -4688,6 +4730,7 @@ export class PianoRoll {
     window.removeEventListener('keyup', this.onKeyUp);
     window.removeEventListener('blur', this.onWindowBlur);
     window.removeEventListener('resize', this.onWindowResize);
+    window.removeEventListener(FACE_SCALE_EVENT, this.onWindowResize);
     this.handle?.removeEventListener('pointerdown', this.onHandleDown);
     this.handle?.removeEventListener('keydown', this.onHandleKey);
     this.handle?.removeEventListener('dblclick', this.onHandleDouble);

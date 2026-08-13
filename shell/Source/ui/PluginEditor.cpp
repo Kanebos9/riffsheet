@@ -55,9 +55,24 @@ RiffsheetAudioProcessorEditor::RiffsheetAudioProcessorEditor (RiffsheetAudioProc
     const auto restoredWidth  = juce::jlimit (minEditorWidth,  4096, stored.x > 0 ? stored.x : defaultEditorWidth);
     const auto restoredHeight = juce::jlimit (minEditorHeight, 2600, stored.y > 0 ? stored.y : defaultEditorHeight);
 
+    // ASKING FOR THE DESIGN SIZE ONLY WHERE ASKING WORKS.
+    //
+    // preferredMinEditorWidth/Height is the size the face is drawn at (scale 1),
+    // and in the standalone it is a real minimum: the app owns its window, the
+    // OS enforces the constrainer, and nothing can drag it smaller. Inside a
+    // host it is a REQUEST that REAPER in particular declines - it shrinks its FX
+    // frame regardless and clips whatever the plugin claimed - so a plugin editor
+    // still hands over the low hard floor and lets the one-proportion law do the
+    // work: below the base size the face scales down whole rather than breaking.
+    // Either way both numbers are reported to the page (getShellInfo), which is
+    // what lets webcore tell "the user made it small" from "this is the floor".
+    const auto standalone = proc.wrapperType == juce::AudioProcessor::wrapperType_Standalone;
+    const auto floorWidth  = standalone ? preferredMinEditorWidth  : minEditorWidth;
+    const auto floorHeight = standalone ? preferredMinEditorHeight : minEditorHeight;
+
     setResizable (true, true);
-    setResizeLimits (minEditorWidth, minEditorHeight, 4096, 2600);
-    setSize (restoredWidth, restoredHeight);
+    setResizeLimits (floorWidth, floorHeight, 4096, 2600);
+    setSize (juce::jmax (floorWidth, restoredWidth), juce::jmax (floorHeight, restoredHeight));
 }
 
 RiffsheetAudioProcessorEditor::~RiffsheetAudioProcessorEditor()

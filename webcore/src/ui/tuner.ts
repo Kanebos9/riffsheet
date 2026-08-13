@@ -888,17 +888,15 @@ const CSS = `
 .tuner-actions button { padding: 2px 8px; font-size: 11px; line-height: 1.4; white-space: nowrap; }
 .tuner-hint { font-size: 10px; white-space: nowrap; }
 /*
- * Narrow: the verdict and the confidence line go, the readout and the way out stay. The close
- * button keeps its column at every width — it was moved here to be findable, and a breakpoint
- * that hid it would put it back where it started.
+ * THE NARROW BREAKPOINT IS DELETED (G1).
+ *
+ * It dropped the verdict, the confidence line and the close button's word below 760px of window.
+ * Under the one-proportion law that width does not exist as far as a layout is concerned: the
+ * face is laid out in at least 1320 logical pixels at every window size and scaled by one factor
+ * on the body (ui/faceScale.ts), so this panel is never narrower than the size it was designed
+ * at — and a rule that hid a verdict the panel had room for was taking away the one sentence
+ * somebody opened a tuner to read.
  */
-@media (max-width: 760px) {
-  .tuner { grid-template-columns: auto 1fr auto auto; grid-template-areas: "head main actions close"; }
-  .tuner-verdict { display: none; }
-  .tuner-hint { display: none; }
-  /* Under ~420px the word does not fit beside the readout; the glyph and the tooltip carry it. */
-  .tuner-close-word { display: none; }
-}
 `;
 
 function ensureStyles(): void {

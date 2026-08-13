@@ -7,6 +7,7 @@
 
 import { el, fitSelects, replace, type Store } from './dom';
 import { t, TIPS, tipsEnabled, setTipsEnabled } from './tips';
+import { THEMES, currentTheme, setTheme } from './theme';
 import {
   DEFAULT_SETTINGS,
   type AppSettings,
@@ -388,6 +389,17 @@ export interface SettingsPanelOptions {
   onRebuild: () => void;
   /** Called for changes that only affect the view or playback. */
   onViewChange: () => void;
+  /**
+   * A theme was chosen.
+   *
+   * SEPARATE FROM `onViewChange`, because it asks for something bigger and rarer: the palette
+   * lives in CSS custom properties, and CSS moves on its own, but the piano roll and the
+   * waveform read their colours ONCE into a private table when they are constructed. Only a
+   * full rebuild of the screen puts the new palette into those two canvases. `onViewChange`
+   * deliberately does not do that (it is called on every sound and grid change and would be a
+   * wholesale re-render per click); this one is, and can afford to be.
+   */
+  onThemeChange?: () => void;
   onClose: () => void;
   /**
    * Choose an engine, and do what choosing one MEANS.
@@ -717,18 +729,42 @@ export class SettingsPanel {
     else if (total > 0) bits.push(formatMb(total));
     else if (free > 0) bits.push(`${formatMb(free)} free`);
 
+    const threads = Number(st?.cpuThreads) || 0;
+    const load = typeof st?.cpuLoad1m === 'number' && st.cpuLoad1m >= 0 ? st.cpuLoad1m : null;
+    /*
+     * HOW BUSY THIS MACHINE IS, ON THE SAME LINE AS WHAT IT IS (G4).
+     *
+     * "LOAD", NOT "CPU". The shell reads the one-minute load average
+     * (`shell/Source/bridge/SystemProbe.cpp §processor`), which is the number of runnable
+     * threads averaged over a minute — NOT the fraction of the processor in use. Divided by the
+     * core count it is a fair reading of "how much of this machine is spoken for", and it can
+     * legitimately exceed 100% when more work is queued than there are cores to run it. Calling
+     * that "CPU 130%" would be nonsense; calling it "Load 130%" is exactly true, and it is the
+     * label the tooltip has always explained the raw figure with.
+     *
+     * PHYSICAL CORES ARE THE DIVISOR, matching the "8 cores" this line already prints, so the
+     * two numbers on the line are about the same machine. Threads are the fallback for a shell
+     * that could count them and not the cores.
+     *
+     * OMITTED WHERE ABSENT, like every other field here: Windows reports no load average at all
+     * (`cpuLoad1m: null`), and a machine that cannot say how many cores it has cannot turn a
+     * load figure into a share of anything. Either way the line is what it was.
+     */
+    const divisor = cores > 0 ? cores : threads;
+    if (load !== null && divisor > 0) {
+      bits.push(`Load ${Math.round((load / divisor) * 100)}%`);
+    }
+
     if (bits.length === 0) {
       replace(host);
       return;
     }
 
-    const threads = Number(st?.cpuThreads) || 0;
-    const load = typeof st?.cpuLoad1m === 'number' && st.cpuLoad1m >= 0 ? st.cpuLoad1m : null;
     const detail = [
       'This machine, as the shell reads it.',
       threads > 0 && threads !== cores ? `${threads} hardware threads.` : '',
-      // The number `uptime` prints, said as what it is. Not a percentage — turning it into one
-      // needs the core count and an assumption about how many of them a job will get.
+      // The raw figure behind the "Load" percentage on the line, said as what it is: the number
+      // `uptime` prints. The line divides it by the cores; this is what it divided.
       load !== null ? `One-minute load average ${load.toFixed(2)}.` : '',
       'Free memory is what the system could hand out right now without swapping, so it moves while you work.'
     ]
@@ -1896,6 +1932,57 @@ export class SettingsPanel {
   // which is where somebody comparing two sounds is already looking, and it carries the same
   // "loading…" / "not in this build" status the panel row did.
 
+  /**
+   * The theme row: one card per palette, the current one lit.
+   *
+   * THE SWATCH IS DRAWN FROM THE PALETTE ITSELF — three inline-styled bands in that theme's own
+   * `--bg`, `--accent` and `--text` — so a card can only ever show colours the theme will
+   * actually apply. Reading them off `getComputedStyle` instead would show four copies of the
+   * theme currently in force, which is precisely the picture that would make the row useless.
+   *
+   * `onThemeChange` is the canvases' half of the switch: CSS moves on its own, and the roll and
+   * the waveform read their colours once in their constructors, so the app rebuilds them. See
+   * `ui/theme.ts` §HOW A SWITCH REACHES THE CANVASES.
+   */
+  private themeCards(): HTMLElement {
+    const active = currentTheme().id;
+    return el(
+      'div',
+      {
+        class: 'theme-row',
+        'data-role': 'theme-row',
+        // The grid is told how many cards it has rather than counting them in CSS, so a fifth
+        // palette is one entry in `THEMES` and nothing else.
+        style: { gridTemplateColumns: `repeat(${THEMES.length}, minmax(0, 1fr))` }
+      },
+      ...THEMES.map((theme) =>
+        el(
+          'button',
+          {
+            class: `theme-card${theme.id === active ? ' on' : ''}`,
+            'data-role': 'theme-card',
+            'data-theme-id': theme.id,
+            'aria-pressed': theme.id === active ? 'true' : 'false',
+            title: t(`${theme.name} — ${theme.note}`),
+            onClick: () => {
+              if (theme.id === currentTheme().id) return;
+              setTheme(theme.id, () => this.opts.onThemeChange?.());
+              this.render();
+            }
+          },
+          el(
+            'span',
+            { class: 'theme-swatch' },
+            el('span', { style: { background: theme.tokens.bg } }),
+            el('span', { class: 'accent', style: { background: theme.tokens.accent } }),
+            el('span', { style: { background: theme.tokens.text } })
+          ),
+          el('span', { class: 'theme-name', text: theme.name })
+        )
+      )
+    );
+  }
+
   private render(): void {
     const s = this.opts.settings.get();
     const host = this.opts.runtime.get().host;
@@ -1968,17 +2055,12 @@ export class SettingsPanel {
         // claim an effect it does not have. The status row below says so out loud.
         // "Highest fret" stood here. It is on the notation toolbar now, beside the Tab menu
         // whose fret numbers it limits — see ui/app.ts §buildNotationToolbar.
-        el(
-          'label',
-          { class: 'switch settings-row', title: t(TIPS.noteNames) },
-          el('input', {
-            type: 'checkbox',
-            'data-setting': 'showNoteNames',
-            checked: s.showNoteNames,
-            onChange: (e: Event) => this.set('showNoteNames', (e.target as HTMLInputElement).checked, false)
-          }),
-          el('span', { text: 'Show note names' })
-        ),
+        //
+        // AND SO IS "SHOW NOTE NAMES" (G2). It is the second section of the Clef menu now —
+        // `ui/app.ts §buildNotationToolbar` — beside the staff whose notes it names, which is
+        // where somebody deciding "how should this page read?" is already looking. Moved, not
+        // duplicated: the panel's copy is deleted for the reason stated at the head of this
+        // group, that a control with two homes is two places for the answer to be stale.
         // "FOLLOW A DRIFTING TEMPO" STOOD HERE, and it is gone rather than moved. It bought a
         // whole second listening pass — minutes on a long take — for a beat grid that followed
         // the drift so closely the bar lines stopped meaning anything. `AppSettings.preciseBeats`
@@ -2035,6 +2117,23 @@ export class SettingsPanel {
       // The whole Playback group is gone with its two rows: the sound picker is on the
       // transport beside the fader, which is where somebody choosing a playback sound is
       // already looking, and the metronome no longer exists to be switched.
+
+      // --- appearance -------------------------------------------------------
+      // ONE ROW OF CARDS AND NOTHING ELSE (G3). No colour pickers, no "custom" card, no
+      // per-token controls: four palettes somebody designed, contrast-checked in
+      // `ui/theme.test.ts`, and the one you are using. See `ui/theme.ts` for why the values are
+      // a table rather than four stylesheets, and for what a switch has to do to the canvases.
+      el(
+        'div',
+        { class: 'settings-group', 'data-role': 'theme-group' },
+        el('h3', { text: 'Appearance' }),
+        this.themeCards(),
+        el('div', {
+          class: 'status-row dim',
+          'data-role': 'theme-note',
+          text: currentTheme().note
+        })
+      ),
 
       // --- help -------------------------------------------------------------
       el(

@@ -277,6 +277,62 @@ function resized(n: InputNote, durationSec: number, ctx: RollEditContext): Input
   return next;
 }
 
+/**
+ * RE-SEAT AN ANCHORED ADD ONTO THE ANCHOR'S OWN RECORDED ONSET (conviction C1).
+ *
+ * THE FAULT. The roll draws the SNAPPED feed, so two rectangles that begin at the same pixel can
+ * be two attacks tens of milliseconds apart in the recording. A double-click above one of them
+ * authors the pointer's grid-rounded second, which is a THIRD number — near both and equal to
+ * neither. `snapPerformanceToBeat` then groups raw attacks inside a 20 ms window: past that the
+ * new note is a separate event, claims its own slot, and the allocator pushes the note the player
+ * was aiming beside. "I added a note above that one and that one moved."
+ *
+ * THE FIX IS AN IDENTITY, NOT A TOLERANCE. Widening the grouping window would turn genuinely
+ * distinct crowded-beat claimants into chords and bypass the allocator's separation contract; it
+ * is also unfalsifiable, since there is no window that is right for every take. Instead the
+ * gesture states WHICH note it meant (`RollEdit.add.anchorId`) and the new note is placed at that
+ * note's own recorded onset, where the two are simultaneous by construction and there is nothing
+ * left for any window to decide.
+ *
+ * `notes` and `anchor` must be in the SAME clock — the recording's, post-cut and pre-snap, which
+ * is the clock the allocator groups in and the one `ui/app.ts` hands over after `unrippled()`.
+ *
+ * THE SYMBOLIC TIMING IS RE-DERIVED, NOT CARRIED. `addedTiming` measured the note's ticks off the
+ * position it was authored at, and that position has just changed; leaving the old ticks behind
+ * is the exact defect this file's header describes — a symbolic score engraves the ticks and
+ * ignores the seconds, so the note would print where it is no longer. The new ticks are the
+ * ANCHOR'S OWN attack tick with the length restated at the new position, which says "simultaneous"
+ * in the symbolic domain as well as in the recorded one. A take whose notes carry no ticks stays
+ * on the quantized path and the note carries none either.
+ */
+export function reseatAnchoredAdd(
+  notes: InputNote[],
+  addedId: string | null,
+  anchor: InputNote | null,
+  ctx: RollEditContext
+): InputNote[] {
+  if (!addedId || !anchor || !Number.isFinite(anchor.startSec)) return notes;
+  const at = notes.findIndex((n) => n.id === addedId);
+  if (at < 0) return notes;
+  const note = notes[at];
+  const startSec = anchor.startSec;
+  if (startSec === note.startSec) return notes;
+  const durationSec = Math.max(MIN_DUR_SEC, note.endSec - note.startSec);
+  const timing =
+    note.sourceTiming && anchor.sourceTiming
+      ? resizedTiming(anchor.sourceTiming, durationSec, ctx.tempoBpm, startSec, ctx.scoreTicks)
+      : null;
+  const next: InputNote = { ...note, startSec, endSec: startSec + durationSec };
+  if (timing) next.sourceTiming = timing;
+  else delete (next as { sourceTiming?: unknown }).sourceTiming;
+  const out = [...notes];
+  out[at] = next;
+  // The add moved in time, so the array's order is no longer the one `byTimeThenPitch` promises
+  // and everything downstream assumes.
+  out.sort(byTimeThenPitch);
+  return out;
+}
+
 export function applyRollEditToNotes(
   notes: InputNote[],
   edit: RollEdit,

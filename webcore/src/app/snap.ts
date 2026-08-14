@@ -629,14 +629,39 @@ export function snapPerformanceToBeat(
     const { n, i } = order[k];
     const startSec = positions[i];
     const step = stepOf[i];
-    // Rounded onto THIS BEAT's lattice rather than the origin's. They are the same lattice
-    // whenever the beat divides into the step a whole number of times, which is every straight
-    // ruler; where they differ — a triplet cell under a compound beat — the beat's own lines are
-    // the ones the note is standing on, and an end may not land between them.
-    let endSec = Math.max(
-      startSec + step,
-      anchorOf[i] + Math.round((n.endSec - anchorOf[i]) / step) * step
-    );
+    /*
+     * THE RELEASE FOLLOWS THE ATTACK IT BELONGS TO (conviction C1).
+     *
+     * THE LENGTH IS QUANTIZED, NOT THE RELEASE. This line used to round the raw END onto the
+     * beat's lattice as an ABSOLUTE — `anchor + round((rawEnd - anchor) / step) * step` — while
+     * the attack was placed by the allocator. The two answers are independent, so anything that
+     * moved a note's ATTACK without moving its raw release took the difference out of the note's
+     * length: an event the separation rule pushed one slot along lost exactly one step, and a
+     * note standing one step from its neighbour was flattened to a stub. Measured, at
+     * `anchored-matrix.json` cell 52: an untouched neighbour went from 4.1727-4.4455 to
+     * 4.3091-4.4455 — its onset a step later, its duration halved — with its RECORDING untouched
+     * on both sides. Nobody edited that note. Rounding the note's own DURATION and hanging it off
+     * wherever the attack landed makes the shape travel with the attack by construction, which is
+     * the only formulation under which no re-placement can reshape anything.
+     *
+     * THE ENDS STAY ON THE LATTICE. `startSec` is `base + slot * step` and the duration is a whole
+     * number of steps, so a release is still a lattice line — the property the old absolute
+     * rounding existed for is kept, and kept for the beat the note is actually standing on rather
+     * than for the one its raw release happened to fall in.
+     *
+     * AND IT IS A PROJECTION. Snapping this function's own output at the same ruler must not move
+     * anything, which the absolute form got for free and a translation does not: a duration that
+     * is already a whole number of steps rounds to itself, so the second pass reproduces the
+     * first exactly.
+     *
+     * That is the purity distinction this file has to keep. Beat is a global allocator and moving
+     * an untouched neighbour's derived ONSET is a documented cost of it (`ui/app.ts §the Beat
+     * exemption`). Reshaping that neighbour's ARTICULATION is not, and never was — an allocator
+     * decides where a note stands, not how long it is held. Only three things may change a
+     * derived length: this quantization of the note's own measured length, a genuine overlap the
+     * take itself did not have (the next-attack rule below), and the end of the tape (`boundEnd`).
+     */
+    let endSec = startSec + Math.max(step, Math.round((n.endSec - n.startSec) / step) * step);
     // `positions` is non-decreasing along `order`, so the first later note standing anywhere
     // past this one is the next attack — chords included, since they share this position.
     for (let j = k + 1; j < order.length; j++) {

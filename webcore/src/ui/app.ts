@@ -90,7 +90,7 @@ import {
   type RollEdit,
   type SheetMap
 } from '../view/pianoroll';
-import { addedTiming, applyRollEditToNotes } from '../edit/rollPerformance';
+import { addedTiming, applyRollEditToNotes, reseatAnchoredAdd } from '../edit/rollPerformance';
 // THE SHEET'S WRITE-THROUGH ROAD. Not `commitPerformance` directly — see the file's own note
 // for what that costs on a snapped or a cut take, and why the victims of a collision have to be
 // named rather than inferred from the command.
@@ -5313,6 +5313,13 @@ class App {
          * did.
          */
         originSec: r4(origin),
+        /**
+         * …AND THE DOCUMENT'S OWN STORED ANSWER, so a probe can tell a page that is USING the pin
+         * from one that is still deriving a number that happens to agree with it this frame.
+         * Null on a document that has none. See `SourceAudio.writtenOriginAudioSec`.
+         */
+        writtenOriginAudioSec:
+          rt.source?.writtenOriginAudioSec === undefined ? null : r4(rt.source.writtenOriginAudioSec),
         /** What the ROLL is drawing, from the same feed — so "the roll mirrors the sheet" is testable. */
         rollNotes: this.rollFeedNotes().map((n) => ({ id: n.id, startSec: r4(n.startSec), endSec: r4(n.endSec) }))
       };
@@ -9344,6 +9351,11 @@ class App {
       // dropped rather than remapped — a trim they have accepted is not still "trimmable".
       trim: null,
       barOneSec: audioToEditedSec(source.barOneSec, cuts),
+      // The document's pinned origin travels through the cuts exactly as bar 1 does: both are
+      // moments on the recording's clock, and the edited clock is the one the page draws on.
+      ...(source.writtenOriginAudioSec === undefined
+        ? {}
+        : { writtenOriginAudioSec: audioToEditedSec(source.writtenOriginAudioSec, cuts) }),
       // Cuts are not part of the edited view of the take; carrying them would invite a second
       // application of the same mapping.
       cuts: undefined,
@@ -9775,6 +9787,9 @@ class App {
       for (const part of source.importedParts ?? []) this.noteIds.seed(part.notes);
 
       const score = this.buildScoreFrom(source, feed);
+      // THE DOCUMENT'S WRITTEN ORIGIN, LEARNED ONCE (conviction C3). Before anything below reads
+      // `originSec()`, and a no-op on every build after the first. See `pinWrittenOrigin`.
+      this.pinWrittenOrigin(score);
       /*
        * ONE REVISION, PUBLISHED AS ONE THING (audit findings 5, 7 and 8).
        *
@@ -9892,11 +9907,63 @@ class App {
    * they had before this existed.
    */
   private originSec(score: RiffScore): number {
+    /*
+     * THE DOCUMENT'S OWN ANSWER FIRST (conviction C3). See `SourceAudio.writtenOriginAudioSec`.
+     *
+     * On the EDITED source, so a cut take reads the pin through the same mapping `barOneSec`
+     * goes through and the two cannot disagree about which clock they are in.
+     *
+     * The derivation below is unchanged and is still what the pin is MADE of — `pinWrittenOrigin`
+     * takes it once, on the first build of a document that has no pin, so adopting one is
+     * invisible. It also remains the answer for a document that has none and cannot be given one
+     * (nothing performed, nothing engraved yet), which is the state every build starts in.
+     */
+    const pinned = this.editedSource()?.writtenOriginAudioSec;
+    if (pinned !== undefined && Number.isFinite(pinned)) return pinned;
     return alignOriginSec(
       firstWrittenSecOf(score),
       this.firstPerformedSec(),
       scoreOriginSec(score, this.runtime.get().source?.barOneSec ?? 0)
     );
+  }
+
+  /**
+   * PIN THE DOCUMENT'S WRITTEN ORIGIN, ONCE (conviction C3).
+   *
+   * Called on every successful build and does something exactly once per document: the first time
+   * a score exists with a performance behind it, it writes down the alignment the page is already
+   * using and stops deriving one. Everything after that reads the stored number, so no edit can
+   * re-phase the page by changing which note is played or engraved first.
+   *
+   * ADOPTION IS INVISIBLE BY CONSTRUCTION. The value stored is `originSec()`'s own answer for this
+   * very build, taken before anything has drawn — not a fresh opinion about where bar 1 should be.
+   *
+   * OUTSIDE HISTORY, deliberately. This is not an edit: it is the document learning a fact about
+   * itself that was previously recomputed from scratch every time, and there is nothing for ⌘Z to
+   * put back. `restoreStructure` does not carry it for the same reason.
+   *
+   * STORED IN AUDIO SECONDS. `originSec()` above answers on the EDITED clock, which is where the
+   * page draws; the field lives beside `barOneSec` in the recording's own coordinates so a cut
+   * cannot make it mean two things.
+   */
+  private pinWrittenOrigin(score: RiffScore): void {
+    const source = this.runtime.get().source;
+    if (!source || source.writtenOriginAudioSec !== undefined) return;
+    // Nothing performed and nothing engraved is not a document with an origin to pin — it is one
+    // whose origin is still `scoreOriginSec`'s fallback, and pinning that would freeze a
+    // placeholder onto a take that is about to arrive.
+    const performed = this.firstPerformedSec();
+    const written = firstWrittenSecOf(score);
+    if (performed === null || written === null || !Number.isFinite(performed) || !Number.isFinite(written)) return;
+    const editedOrigin = this.originSec(score);
+    if (!Number.isFinite(editedOrigin)) return;
+    const cuts = this.cuts();
+    this.runtime.set({
+      source: {
+        ...source,
+        writtenOriginAudioSec: cuts.length ? editedToAudioSec(editedOrigin, cuts) : editedOrigin
+      }
+    });
   }
 
   /**
@@ -10611,35 +10678,6 @@ class App {
   }
 
   /**
-   * EVERY PART ON THE PAGE, not only the top one.
-   *
-   * `TriView.load()` engraves `renderScore(model, [0])` — the right answer, and the only one,
-   * for every score this app has ever built, because a single-part score has exactly one
-   * alphaTab track. A multi-part score has N, and alphaTab renders the ones it is handed.
-   *
-   * ASKED FOR FROM HERE, through `api`, which is TriView's own public handle onto alphaTab.
-   *
-   * AND ASKED FOR TWICE, which is not belt-and-braces. TriView holds renders back behind its
-   * own gate — a freshly built view defers its first render until alphaTab's facade has come up
-   * — so on a fresh screen the `renderScore(…, [0])` happens AFTER this returns and puts the
-   * selection back to one track. The call below covers the ordinary rebuild, where the gate is
-   * open and the render has already happened; the `postRenderFinished` subscription made when
-   * the view is built covers the deferred one, and stops as soon as the count agrees.
-   *
-   * A SINGLE-PART TAKE NEVER REACHES THE SECOND LINE OF THIS. It engraves exactly once, exactly
-   * as it always has.
-   */
-  private renderEveryPart(): void {
-    const view = this.triview;
-    const score = this.runtime.get().score;
-    if (!view || !score || score.data.tracks.length < 2) return;
-    const model = view.model;
-    if (!model || model.tracks.length < 2) return;
-    if ((view.api.tracks?.length ?? 0) >= model.tracks.length) return;
-    view.api.renderTracks(model.tracks);
-  }
-
-  /**
    * CLEF: OFF, AS A PROJECTION ON THE WAY TO THE PAGE (G2).
    *
    * WHERE IT HAPPENS AND WHY HERE. `score.data` is the renderer's input — plain JSON that
@@ -10729,8 +10767,18 @@ class App {
      * opinion of their own that could survive a rebuild.
      */
     const selection = this.runtime.get().selection;
+    /*
+     * ONE RENDER, EVERY TRACK, OWNED BY THIS REVISION.
+     *
+     * `renderEveryPart()` stood here and is gone. It engraved `[0]` in `TriView.load` and then
+     * called `api.renderTracks` from out here to put the other parts back — a compensation that
+     * was count-based (it stopped as soon as `api.tracks.length` reached the model's, which an
+     * OLD two-track selection already satisfied) and that went through alphaTab directly, outside
+     * the view's own render gate. At N=2 the result was a second part whose tablature was never
+     * engraved and decorations placed against the previous engraving's bounds. `TriView.load` now
+     * renders every track of the model it just published, in the render that model's revision owns.
+     */
     this.triview?.load(score, this.sheetSelectionFor(selection));
-    this.renderEveryPart();
     // ONE ORIGIN, PUSHED BEFORE ANYTHING THAT READS IT (codex-critique §7).
     //
     // `originSec()` is the app's canonical written second 0 — the first-attack alignment, §F13 —
@@ -13059,10 +13107,10 @@ class App {
       onSheetContextMenu: (target) => this.onSheetContextMenu(target)
     });
     this.transport.attachAlphaTab(this.triview.api);
-    // See `renderEveryPart`: a view built just now defers its first render, so the multi-part
-    // track selection has to be re-asserted once that render has actually landed. It settles
-    // after exactly one extra engrave and is a no-op on every single-part take.
-    this.triview.api.postRenderFinished.on(() => this.renderEveryPart());
+    // A `postRenderFinished` subscription stood here that re-asserted the multi-part track
+    // selection after the view's deferred first render. Nothing to re-assert: `TriView.load`
+    // renders every track of the model it publishes, and a render alphaTab defers is still THAT
+    // render when it happens. See `applyScoreToViews`.
     if (rt.score) this.applyScoreToViews(rt.score);
     // THE WAVEFORM'S BRACKET, RECOMPUTED FROM THE NOTES rather than restored from a remembered
     // span (audit finding 27). The range was worked out once, when the selection was written, and
@@ -13728,7 +13776,20 @@ class App {
   private onBarOneChange(sec: number, commit: boolean): void {
     const source = this.runtime.get().source;
     if (!source) return;
-    this.runtime.set({ source: { ...source, barOneSec: sec } });
+    /*
+     * THE ONE GESTURE THAT MAY RE-PHASE THE DOCUMENT (conviction C3).
+     *
+     * `SourceAudio.writtenOriginAudioSec` is pinned precisely so that ordinary editing cannot move
+     * written second 0. Dragging the bar-1 marker is not ordinary editing: it is the player
+     * saying, in as many words, that the sheet's clock and the tape's clock are pinned somewhere
+     * else. So the pin is CLEARED here and the rebuild below derives a new one from the alignment
+     * that answer produces — one visible re-phasing, asked for, instead of a hundred silent ones.
+     *
+     * ON COMMIT ONLY, with the rebuild: clearing it live would re-derive on every pixel of the
+     * drag, which is the behaviour this whole field exists to stop.
+     */
+    const repin = commit ? { writtenOriginAudioSec: undefined } : {};
+    this.runtime.set({ source: { ...source, barOneSec: sec, ...repin } });
     // On release only, and IMMEDIATELY on release. Saving every pixel of the drag would be a
     // save per mousemove; debouncing the release would put a moved bar line inside the window
     // where an editor teardown loses it (F).
@@ -14323,7 +14384,7 @@ class App {
     // the snap off the feed IS the raw take and this is the call it always was.
     const feed = this.performanceFeed();
     const map = this.rippleMap();
-    const result = applyRollEditToNotes(feed, edit, {
+    const ctx = {
       originSec: this.originSec(score),
       tempoBpm: score.tempoBpm,
       newNoteId: () => this.noteIds.next('add'),
@@ -14331,7 +14392,8 @@ class App {
       // rate that actually applies there rather than at one scalar BPM. See the field's note in
       // `edit/rollPerformance.ts`.
       ...(map ? { scoreTicks: { toTick: map.toTick, divisions: score.ir.divisions || 12 } } : {})
-    });
+    };
+    const result = applyRollEditToNotes(feed, edit, ctx);
     if (!result) return;
 
     /*
@@ -14361,7 +14423,31 @@ class App {
     // THE LOG, RUN BACKWARDS FIRST. The gesture's seconds are FEED seconds and the recording is
     // not; see `unrippled`. On a document with no log this is the identity and the road below is
     // the road it always was.
-    const edited = this.unrippled(result.notes);
+    /*
+     * AN ANCHORED ADD IS SEATED ON THE ANCHOR'S OWN RECORDED ONSET (conviction C1).
+     *
+     * AFTER `unrippled`, and that is the whole of why it is here rather than in the reducer. The
+     * reducer works on the FEED — the take with the cuts closed up, the snap applied and the
+     * ripple log on top — and the recorded onset the new note has to match is one layer below all
+     * three. `unrippled(result.notes)` lands in exactly that clock: the same one
+     * `editedSource().detected.notes` is stated in, and the same one `snapPerformanceToBeat`
+     * groups attacks in. Seating the note there makes it and its anchor simultaneous in the only
+     * domain that decides whether they are one event.
+     *
+     * THE ANCHOR IS READ FROM THE RECORDING, NEVER FROM THE FEED. The feed's copy is at whatever
+     * second the snap put it, which is precisely the number that is not shared.
+     *
+     * NOT SWITCHING BEAT TO DISPLAYED ONSETS. Grouping the allocator by drawn position would make
+     * every pair of crowded-beat claimants a chord and bypass the separation contract; the intent
+     * is carried by an identity so that exactly the notes the player named become simultaneous.
+     */
+    const anchorRecorded =
+      edit.kind === 'add' && edit.anchorId
+        ? (this.editedSource()?.detected?.notes ?? []).find((n) => n.id === edit.anchorId) ?? null
+        : null;
+    const edited = anchorRecorded
+      ? reseatAnchoredAdd(this.unrippled(result.notes), result.authoredIds[0] ?? null, anchorRecorded, ctx)
+      : this.unrippled(result.notes);
 
     /*
      * …AND PINNED, WHEN THERE IS A LOG TO BE OVERRULED BY (§A "raw-only is not sufficient").

@@ -570,6 +570,40 @@ export interface SourceAudio {
   trim: TrimResult | null;
   /** Where the user says bar 1 begins. Starts at the auto-trim point. */
   barOneSec: number;
+  /**
+   * WRITTEN SECOND 0 ON THE RECORDING'S CLOCK — the document's own answer, in AUDIO seconds.
+   *
+   * THE COORDINATE SYSTEM OF THE WHOLE PAGE. The roll subtracts it from every rectangle it
+   * paints, the cursor and the synth convert through it, and `rippleMap()` phases the entire
+   * structural layer against it. It is not one number among many: it is where the sheet's clock
+   * and the tape's clock are pinned together.
+   *
+   * WHY IT IS STORED (conviction C3). It used to be re-derived on every rebuild as
+   * `firstPerformedSec - firstWrittenSec` (`view/timeAxis.ts §alignOriginSec`), and BOTH ends of
+   * that subtraction are content. So any edit that changed which note was played first, or how the
+   * engraver placed the first note, silently moved written second 0 — and every untouched row on
+   * the page moved with it, with no note having been rewritten at all. Caught as `soak-8020.json`
+   * step 82: an add mid-take re-phased the origin from 0.809 to 0.536 and fifteen derived rows
+   * moved by exactly that difference while the recording underneath stood still. That is not one
+   * of Beat's documented costs and it happens with the snap OFF.
+   *
+   * WHO MAY WRITE IT. It is derived ONCE, from exactly the alignment the page was already using,
+   * on the first successful build of a document that does not have one — so adopting it is
+   * invisible. After that only an explicit re-alignment may change it, which today means the
+   * player moving the bar-1 marker: that gesture IS "the two clocks are pinned somewhere else",
+   * and it clears the field so the next build re-derives it. Ordinary adds, deletes, moves,
+   * resizes, snap changes and rebuilds never touch it.
+   *
+   * IN AUDIO SECONDS, beside `barOneSec` and mapped through cuts exactly as `barOneSec` is
+   * (`ui/app.ts §editedSource`), because a cut moves where a moment sits on the edited clock and
+   * the pin has to travel with it.
+   *
+   * OPTIONAL, and absence is the legacy state: a document written before this existed derives the
+   * value on open and keeps it from then on. `view/timeAxis.ts §alignOriginSec` remains the
+   * derivation and the fallback, so a blank document and a symbolic import with no performance
+   * behind it answer exactly as they always did.
+   */
+  writtenOriginAudioSec?: number;
   hostGrid?: HostGrid;
   /** Tempo and meter belong to this take/document, not to global preferences. */
   tempoBpm?: number;

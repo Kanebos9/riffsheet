@@ -360,6 +360,7 @@ const SOAK_INSTALL = String.raw`
        */
       rollOriginSec: r ? r.originSec : null,
       pendingEdit: r ? r.pendingEdit : null,
+      heldEdit: r ? r.heldEdit ?? null : null,
       dragging: r ? r.dragging : null,
       drawnRects: r ? r.drawnRects : null,
       snapMode: (document.querySelector('[data-role="roll-snap"]') || {}).value ?? null,
@@ -389,11 +390,24 @@ const SOAK_INSTALL = String.raw`
     const painted = rects() ?? [];
     const nulls = painted.filter((x) => x.noteId === null || x.noteId === undefined).length;
     const engraving = !!(s && s.sheet && s.sheet.current === false);
+    /*
+     * A HELD MICRO-EDIT IS WORK STILL OWED (conviction C2).
+     *
+     * The roll holds back a drag that travelled less than the double-click tolerance until it
+     * knows whether a second click is coming (view/pianoroll.ts, commitOrHold). The rectangle is
+     * already drawn where the hand left it, but nothing downstream has been told, so a harness
+     * that treated this as settled would snapshot a recording that is about to change and blame
+     * the NEXT gesture for the difference. It is answered by the player rather than by the app,
+     * which is why the roll publishes it under its own name.
+     */
+    const held = !!(r && r.heldEdit);
     return {
-      busy: !!((r && r.pendingEdit !== null) || nulls > 0 || (r && r.dragging !== null) || engraving),
+      busy: !!((r && r.pendingEdit !== null) || held || nulls > 0 || (r && r.dragging !== null) || engraving),
       nulls,
       engraving,
+      held,
       pendingEdit: r ? r.pendingEdit : null,
+      heldEdit: r ? r.heldEdit ?? null : null,
       dragging: r ? r.dragging : null,
       sheet: s ? s.sheet ?? null : null,
       rev: s ? s.revision : null
@@ -741,13 +755,85 @@ function checkInvariants(before, after, allowed, wide, projectionMayMove = false
    * by identity. Not asserted for `wide` bursts (undo/redo), and not for snap and grid flips —
    * those are the projection deliberately changing, which is the whole of what they do.
    */
+  const reallocated = [];
   if (!wide && !projectionMayMove) {
+    /*
+     * WHAT BEAT IS ALLOWED TO DO TO A NOTE NOBODY TOUCHED, STATED EXACTLY.
+     *
+     * This law used to be all-or-nothing, and it had to be switched off (`--snap-modes=off,grid`)
+     * to hunt anywhere else, because Beat is a global allocator and fires it on almost every add.
+     * That is a real cost, but "almost every add" is not a law — it is a law nobody can read. The
+     * adjudicated distinction is sharper than the old one and strictly stronger where it matters:
+     *
+     *   AN ONSET MAY MOVE under Beat. The allocator hands out slots on the pulse, and adding or
+     *     removing an event genuinely changes which slot its neighbours get. That is the
+     *     documented global cost the app already exempts (`ui/app.ts §the Beat exemption`).
+     *     Counted and reported, never failed on.
+     *   AN ARTICULATION MAY NOT. An allocator decides where a note stands, not how long it is
+     *     held. A derived duration that changes for a note nobody edited is the collapse
+     *     conviction C1's release translation exists to stop (`app/snap.ts §the release follows
+     *     the attack it belongs to`), and it is a failure under every snap mode.
+     *   A PITCH MAY NOT, under any mode. No snap has an opinion about pitch.
+     *
+     * Off and Grid keep the whole law: they map each note independently, so nothing an add does
+     * may reach a neighbour at all.
+     */
+    const beat = before.snapMode === 'beat' && after.snapMode === 'beat';
+    /*
+     * …AND THE ONE SHORTENING THAT IS NOT A RESHAPING: A NOTE SQUEEZED BY ITS OWN SUCCESSOR.
+     *
+     * Beat may move an onset. If it moves one FORWARD and the next attack does not follow it, the
+     * gap between them closes, and a note held to its full length would now overlap a note the
+     * RECORDING did not overlap — two notes sounding at once where the player played one after the
+     * other. `app/snap.ts` refuses that (its next-attack rule, which fires only where the raw take
+     * itself had no overlap), so the note ends exactly AT the next derived attack. That is the
+     * consequence of the permitted onset move, not a second liberty: the note is not reshaped by
+     * an allocator, it is stopped by the note after it.
+     *
+     * AND THE SAME RULE RELAXING IS THE SAME EVENT. A note the cap was holding short goes back to
+     * its own recorded length the moment the attack that was crowding it moves away — it is not
+     * being stretched, it is stopping being squeezed. Refusing that would make the exemption
+     * one-way and would fail the undo of every case it permits.
+     *
+     * Recognised, narrowly, by exactly that signature on the side it moved: SHORTER and now ending
+     * at the next derived attack, or LONGER and previously ending at the next derived attack. A
+     * length that changed while touching neither cap is a reshaping.
+     */
+    const attackFinder = (feed) => {
+      const starts = Object.values(feed ?? {})
+        .map((r) => r[0])
+        .sort((a, b) => a - b);
+      return (sec) => {
+        for (const s of starts) if (s > sec + 1e-6) return s;
+        return Number.POSITIVE_INFINITY;
+      };
+    };
+    const nextAttackAfter = attackFinder(after.feed);
+    const nextAttackBefore = attackFinder(before.feed);
     const drifted = [];
     for (const [id, row] of Object.entries(before.feed ?? {})) {
       if (allowed.includes(id)) continue;
       const now = (after.feed ?? {})[id];
       if (!now) continue;
-      if (JSON.stringify(row) !== JSON.stringify(now)) drifted.push({ id, before: row, after: now });
+      if (JSON.stringify(row) === JSON.stringify(now)) continue;
+      // A MILLISECOND OF SLACK, and it is about the PROBE rather than about the music: the feed is
+      // published rounded to four decimals, so a note translated by a whole step reports its two
+      // ends rounded independently and its duration can differ in the last digit. A real
+      // articulation change is a whole snap step — tens of milliseconds at any grid this app
+      // offers — so a millisecond cannot hide one and does stop the rounding crying wolf.
+      const grew = (now[1] - now[0]) - (row[1] - row[0]);
+      const reshaped = Math.abs(grew) > 1e-3;
+      const repitched = row[2] !== now[2];
+      const squeezed = grew < 0 && Math.abs(now[1] - nextAttackAfter(now[0])) <= 1e-3;
+      const released = grew > 0 && Math.abs(row[1] - nextAttackBefore(row[0])) <= 1e-3;
+      if (beat && !repitched && (!reshaped || squeezed || released)) {
+        reallocated.push({
+          id, before: row, after: now,
+          why: squeezed ? 'squeezed-by-next-attack' : released ? 'released-by-next-attack' : 'onset'
+        });
+        continue;
+      }
+      drifted.push({ id, before: row, after: now, why: repitched ? 'pitch' : reshaped ? 'articulation' : 'onset' });
     }
     if (drifted.length) {
       v.push({ law: 'a2/feed-row-moved', detail: drifted.slice(0, 12), count: drifted.length });
@@ -827,6 +913,8 @@ function checkInvariants(before, after, allowed, wide, projectionMayMove = false
   if (after.paintedNullIds > 0) {
     v.push({ law: 'b/provisional-leftover', detail: { nullIdRects: after.paintedNullIds } });
   }
+  // A held edit that survived settlement is an edit nobody will ever answer. See `busyNow`.
+  if (after.heldEdit) v.push({ law: 'b/held-edit-leftover', detail: after.heldEdit });
   if (after.paintedDupes.length) {
     v.push({ law: 'b/painted-twice', detail: after.paintedDupes });
   }
@@ -874,7 +962,14 @@ function checkInvariants(before, after, allowed, wide, projectionMayMove = false
   const stale = auth.filter((id) => !feedSet.has(id));
   if (stale.length) v.push({ law: 'd/selection-holds-dead-ids', detail: stale });
 
-  if (softNotes.length) v.soft = softNotes;
+  if (softNotes.length || reallocated.length) {
+    v.soft = [
+      ...softNotes,
+      ...(reallocated.length
+        ? [{ why: 'beat-reallocated-onsets', count: reallocated.length, detail: reallocated.slice(0, 6) }]
+        : [])
+    ];
+  }
   return v;
 }
 
@@ -1030,10 +1125,18 @@ function authorityOf(action, before, after) {
     case 'grid':
       return { allowed: [], wide: false };
     case 'delete':
-    case 'dblDelete':
+    case 'dblDelete': {
       // Same reasoning as move/resize: a double-click delete removes whatever rectangle is
-      // under the pointer, which is not necessarily the one a recorded coordinate was aimed at.
-      return { allowed: [...(action.ids ?? [action.noteId]), ...(before.sel ?? [])], wide: false };
+      // under the pointer, which is not necessarily the one a recorded coordinate was aimed at —
+      // so the transaction's own claim is taken beside the harness's aim. See the ledger note
+      // under 'move' below.
+      const claimed = new Set([...(action.ids ?? [action.noteId]), ...(before.sel ?? [])]);
+      for (const c of newCommits(before, after)) {
+        if (c.kind !== 'delete' && c.kind !== 'deleteMany') continue;
+        for (const id of c.authoredIds ?? []) claimed.add(id);
+      }
+      return { allowed: [...claimed], wide: false };
+    }
     case 'move':
     case 'resize': {
       // The grabbed note, plus whatever the SELECTION was when the drag started (a grab inside a
@@ -1059,6 +1162,24 @@ function authorityOf(action, before, after) {
         ...(after.rippleWriteback ?? [])
       ]);
       for (const id of after.userTouched ?? []) if (!(before.userTouched ?? []).includes(id)) claimed.add(id);
+      /*
+       * …AND THE LEDGER, WHICH IS THE APP SAYING IT RATHER THAN THE HARNESS GUESSING IT.
+       *
+       * `userTouched` is a cumulative set, so its DELTA is empty for a note that had been edited
+       * before — which is most notes late in a soak. The recorded `noteId` is the harness's AIM,
+       * and a replayed coordinate lands on whatever rectangle is there now. Together those two
+       * gaps produce a specific false positive that looks exactly like the fault under
+       * investigation: seed 8020 step 159 aimed at `add41`, the app moved `add45` (correctly, and
+       * said so), and the harness reported an untouched recording changing by 218 ms.
+       *
+       * `App.commitLog` is the transaction's own statement of what it authored, written inside the
+       * transaction. It is the only honest source, and it is bounded to the rows this burst
+       * produced — so a gesture that authored more than it should still fails law (a5).
+       */
+      for (const c of newCommits(before, after)) {
+        if (c.kind !== 'move' && c.kind !== 'resize' && c.kind !== 'moveMany' && c.kind !== 'resizeMany') continue;
+        for (const id of c.authoredIds ?? []) claimed.add(id);
+      }
       return { allowed: [...claimed], wide: false };
     }
     case 'sheetMenu': {

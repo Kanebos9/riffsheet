@@ -449,7 +449,25 @@ export interface SheetMap {
 export type RollEdit =
   | { kind: 'move'; noteId: string; deltaSec: number; deltaSemitones: number }
   | { kind: 'resize'; noteId: string; newDurationSec: number }
-  | { kind: 'add'; midi: number; startSec: number; durationSec: number }
+  /**
+   * `anchorId` — THE NOTE THIS ADD WAS AIMED BESIDE, when the gesture named one (conviction C1).
+   *
+   * `startSec` is a ROLL coordinate: the pointer's written second, rounded onto the roll's own
+   * grid. That is the right answer for an add in open space and the wrong one for the gesture
+   * people actually make most — a note placed directly above or below one that is already there,
+   * meaning "at the same time as THAT". The roll draws the SNAPPED feed, so two rectangles that
+   * begin at the same pixel can be two attacks 25 ms apart in the recording; authoring the
+   * pointer's grid-rounded second then produces a note that is visually simultaneous and
+   * musically separate, and Beat's allocator — which groups raw attacks inside a 20 ms window —
+   * splits them into two events and re-places the one the player was aiming beside.
+   *
+   * So the geometry is used only to RECOGNISE INTENT, and the intent is carried as an identity
+   * rather than as a number. `ui/app.ts` resolves it against the recording and seats the new note
+   * on the anchor's own recorded onset, where the two are simultaneous by construction and no
+   * allocator has anything to separate. Absent whenever the click was not beside anything, which
+   * is every add this type described before.
+   */
+  | { kind: 'add'; midi: number; startSec: number; durationSec: number; anchorId?: string }
   | { kind: 'delete'; noteId: string }
   | { kind: 'moveMany'; noteIds: string[]; deltaSec: number; deltaSemitones: number }
   | { kind: 'resizeMany'; noteIds: string[]; deltaSec: number }
@@ -758,6 +776,44 @@ const MIN_NOTE_W_PX = 2;
 const RESIZE_GRIP_PX = 6;
 /** Pointer travel that turns a press into a drag rather than a click. */
 const DRAG_SLOP_PX = 3;
+/**
+ * HOW FAR A HAND MAY WANDER AND STILL BE MAKING ONE DOUBLE-CLICK.
+ *
+ * The browser applies its own slop before it will emit `dblclick` at all; this is this file's
+ * side of the same tolerance, and it exists because `DRAG_SLOP_PX` is SMALLER than it. Three
+ * pixels of hand-wobble between the two presses of a double-click is simultaneously (a) enough
+ * to arm and commit a drag, and (b) inside the window in which the browser still calls the pair
+ * a double-click — so one gesture produced two edits. Caught as `soak-15939.json` step 140: a
+ * press at x=780 landed in a rectangle's six-pixel resize grip, travelled exactly three pixels,
+ * and pointerup committed a `resize` that shortened the note; the `dblclick` that followed was
+ * then outside the shortened rectangle and added a note instead of deleting the one the player
+ * had actually double-clicked.
+ *
+ * Six rather than three so the band this covers is non-empty (at exactly three the fault would
+ * still be reachable at four), and six rather than twelve because past half a dozen pixels a
+ * drag is a decision rather than a wobble and must commit at once.
+ */
+const DBLCLICK_SLOP_PX = 6;
+/**
+ * HOW CLOSE TO A RECTANGLE'S LEFT EDGE AN ADD COUNTS AS "AT THE SAME TIME AS THAT NOTE".
+ *
+ * See `RollEdit.add.anchorId`. This is a recognition threshold and nothing else: inside it the
+ * add carries the neighbour's identity and is authored at that note's own recorded onset; outside
+ * it the add is authored at the pointer's second exactly as it always was. Six pixels, the same
+ * as the resize grip, because it is the same kind of judgement — "the hand was aiming at this
+ * edge" — and because a player placing a note above another one aims at the notehead, not at a
+ * grid line they cannot see.
+ */
+const ANCHOR_GRAB_PX = 6;
+/**
+ * How long a micro-edit is held before it is taken to have been a gesture of its own.
+ *
+ * Longer than the platform's double-click interval (500 ms on macOS by default) so a slow
+ * double-click is still one gesture, and short enough that a deliberate hairline nudge does not
+ * feel unanswered. Nothing is lost either way: the edit is committed when the timer runs out, or
+ * on the next press that is not the second half of this gesture, whichever comes first.
+ */
+const DBLCLICK_HOLD_MS = 600;
 /**
  * A band smaller than this in BOTH axes is a click that wobbled, not a selection.
  *
@@ -1163,6 +1219,46 @@ export class PianoRoll {
   private pending: RollEdit | null = null;
   /** `pending`'s ids, pre-set. `provisional()` asks this once per rectangle per frame. */
   private pendingIds = new Set<string>();
+  /**
+   * WHAT WAS UNDER THE FIRST PRESS OF A POSSIBLE DOUBLE-CLICK (conviction C2).
+   *
+   * A double-click is four presses and a `dblclick`, and the app is free to change the picture
+   * between them — a pan moves the ruler, an edit moves a rectangle. So "was the player pointing
+   * at a note?" has to be answered from the state the GESTURE began in, not from whatever the
+   * fourth event happens to land on. Taken on the press that opens a gesture, kept while the
+   * following presses stay inside `DBLCLICK_SLOP_PX` of it, and consumed by `onDoubleClick`.
+   */
+  private gestureAnchor: { x: number; y: number; noteId: string | null } | null = null;
+  /**
+   * A MICRO-EDIT HELD BACK UNTIL WE KNOW WHETHER IT WAS PART OF A DOUBLE-CLICK (conviction C2).
+   *
+   * See `DBLCLICK_SLOP_PX`. A drag that travelled less than the double-click tolerance is not
+   * committed on pointerup: it is held here, and either DISCARDED (the second click arrived, so
+   * it was never an edit — it was the first half of a double-click) or committed (the timer ran
+   * out, or a genuinely new gesture began). One gesture, one entry in the history.
+   */
+  private bufferedEdit: { edit: RollEdit; timer: ReturnType<typeof setTimeout> } | null = null;
+  /** `bufferedEdit`'s ids, pre-set, for the same reason `pendingIds` is. */
+  private bufferedIds = new Set<string>();
+
+  /**
+   * WHAT THE ROLL IS DRAWING AS THOUGH IT HAD LANDED — emitted-and-unanswered, or held back.
+   *
+   * A held edit has not been emitted, but the hand has already let go of it, so the rectangle has
+   * to stay where the drag left it: reverting for the length of the hold and then jumping is a
+   * picture of the gesture failing and then succeeding. `pending` and `bufferedEdit` are drawn
+   * identically and are never both set — `commitOrHold` flushes one before it sets the other.
+   *
+   * KEPT SEPARATE FROM `probe().pendingEdit` DELIBERATELY. That field means "an edit I have
+   * emitted and nobody has answered", which is what a harness waits on; a held edit is the app
+   * not having spoken yet, and `probe().heldEdit` says so under its own name.
+   */
+  private get drawnEdit(): RollEdit | null {
+    return this.pending ?? this.bufferedEdit?.edit ?? null;
+  }
+  private get drawnIds(): ReadonlySet<string> {
+    return this.pending ? this.pendingIds : this.bufferedIds;
+  }
   /** What the last frame actually painted. Hit-testing and `probe()` read this. */
   private rects: RollRect[] = [];
   private outlinedRects = 0;
@@ -2668,6 +2764,25 @@ export class PianoRoll {
     const { x, y } = this.localPoint(e);
 
     /*
+     * IS THIS PRESS THE SECOND HALF OF THE GESTURE THAT IS ALREADY OPEN? (conviction C2)
+     *
+     * The browser's own click counter answers the timing half — `detail` is 1 on the press that
+     * opens a click sequence and 2 on the one that will produce a `dblclick` — and
+     * `DBLCLICK_SLOP_PX` answers the spatial half against the point the sequence started at. Only
+     * when BOTH say yes does this press continue the gesture in progress; anything else is a new
+     * gesture, which is the moment a held-back micro-edit becomes real and must be committed.
+     *
+     * The flush happens HERE, before the hit test below, so `hit` is taken from the picture the
+     * commit produced rather than from the one it replaced.
+     */
+    const continues =
+      (e.detail ?? 1) > 1 &&
+      !!this.gestureAnchor &&
+      Math.abs(x - this.gestureAnchor.x) <= DBLCLICK_SLOP_PX &&
+      Math.abs(y - this.gestureAnchor.y) <= DBLCLICK_SLOP_PX;
+    if (!continues) this.flushBufferedEdit();
+
+    /*
      * PANNING COMES FIRST, and it is allowed to start anywhere — including over the label
      * gutter, because a pan is the one gesture that can never be mistaken for a seek.
      *
@@ -2694,6 +2809,11 @@ export class PianoRoll {
     if (e.button !== undefined && e.button !== 0) return;
 
     const hit = this.hitTest(x, y);
+    // …and this is the state the gesture began in, for whatever `dblclick` follows. See
+    // `gestureAnchor`: a press that CONTINUES the open gesture must not restate it, or the
+    // second click's own (possibly moved) picture would become the one the double-click is
+    // classified against, which is the whole fault.
+    if (!continues) this.gestureAnchor = { x, y, noteId: hit?.note.noteId ?? null };
 
     /*
      * A RECTANGLE AND EMPTY SPACE MEAN DIFFERENT THINGS. This is the reported bug's home.
@@ -3256,20 +3376,85 @@ export class PianoRoll {
       this.draw();
       return;
     }
+    /*
+     * HOW FAR THE HAND ACTUALLY WENT, measured press-to-release rather than along the path —
+     * which is the same comparison the browser makes when it decides whether these two clicks
+     * were a double-click. See `commitOrHold`.
+     */
+    const at = this.localPoint(e);
+    const travelPx = Math.max(
+      Math.abs(at.x - g.startX),
+      g.kind === 'move' ? Math.abs(at.y - g.startY) : 0
+    );
     if (g.kind === 'move') {
       if (g.deltaSec === 0 && g.deltaSemitones === 0) {
         this.draw();
         return;
       }
-      this.emit(this.moveEdit(g.ids, g.noteId, g.deltaSec, g.deltaSemitones));
+      this.commitOrHold(this.moveEdit(g.ids, g.noteId, g.deltaSec, g.deltaSemitones), travelPx);
       return;
     }
     if (Math.abs(g.deltaSec) < 1e-6) {
       this.draw();
       return;
     }
-    this.emit(this.resizeEdit(g.ids, g.noteId, g.baseDurationSec, g.deltaSec));
+    this.commitOrHold(this.resizeEdit(g.ids, g.noteId, g.baseDurationSec, g.deltaSec), travelPx);
   };
+
+  /**
+   * COMMIT AN EDIT, OR HOLD IT UNTIL WE KNOW IT WAS A GESTURE OF ITS OWN (conviction C2).
+   *
+   * A drag that travelled further than the double-click tolerance is a decision and commits at
+   * once — nothing about the responsiveness of ordinary editing changes. A drag that travelled
+   * LESS than it is ambiguous: it is either a hairline nudge or the first half of a double-click
+   * that the hand wobbled through, and the only thing that can tell them apart is what happens
+   * next. So it waits, and `onDoubleClick` throws it away if the second click arrives.
+   *
+   * WHY NOT COMMIT AND UNDO. Rolling the edit back would mean pushing a step onto the history and
+   * taking it off again, which is visible (the label flickers, the redo tail is destroyed) and
+   * which a crash or a teardown in between would leave applied. An edit that has not been emitted
+   * has not happened; that is the only state the app cannot be caught in the middle of.
+   */
+  private commitOrHold(edit: RollEdit, travelPx: number): void {
+    if (travelPx > DBLCLICK_SLOP_PX) {
+      this.emit(edit);
+      return;
+    }
+    this.flushBufferedEdit();
+    this.bufferedEdit = {
+      edit,
+      timer: setTimeout(() => this.flushBufferedEdit(), DBLCLICK_HOLD_MS)
+    };
+    this.bufferedIds = new Set(rollEditNoteIds(edit));
+    /*
+     * DRAWN AS THOUGH IT HAD LANDED, even though it has not been emitted. See `drawnEdit`: the
+     * hand has let go, so the rectangle stays where the drag left it. Reverting it for the length
+     * of the hold and then moving it again is a picture of the gesture failing and then
+     * succeeding, which is worse than either.
+     */
+    this.draw();
+  }
+
+  /** Commit a held micro-edit. Safe to call when there is none, and re-entrant by construction. */
+  private flushBufferedEdit(): void {
+    const held = this.bufferedEdit;
+    if (!held) return;
+    this.bufferedEdit = null;
+    this.bufferedIds = new Set();
+    clearTimeout(held.timer);
+    this.emit(held.edit);
+  }
+
+  /** Throw a held micro-edit away — it was the first half of a double-click. True if there was one. */
+  private discardBufferedEdit(): boolean {
+    const held = this.bufferedEdit;
+    if (!held) return false;
+    this.bufferedEdit = null;
+    this.bufferedIds = new Set();
+    clearTimeout(held.timer);
+    this.draw();
+    return true;
+  }
 
   /**
    * Let go of whatever was in flight WITHOUT emitting anything.
@@ -3317,11 +3502,41 @@ export class PianoRoll {
       this.fitVertical();
       return;
     }
-    const hit = this.hitTest(x, y);
-    if (hit?.note.noteId) {
+    /*
+     * ONE USER GESTURE, ONE EDIT (conviction C2).
+     *
+     * Two things happen here and they are two halves of the same rule.
+     *
+     * THE HELD EDIT IS THROWN AWAY. Whatever tiny drag the first press of this double-click
+     * committed to was never an edit — it was the hand wobbling on its way to the second click —
+     * so it must not reach the history at all. See `commitOrHold`.
+     *
+     * AND THE CLASSIFICATION IS THE PRE-GESTURE ONE. `hitTest` here reads the LAST PAINTED FRAME,
+     * which the constituent presses of this very gesture are allowed to have changed: a press on
+     * empty background arms a pan, three pixels of travel moves the ruler, and the rectangle that
+     * was under the pointer when the player started is no longer under it now. `gestureAnchor`
+     * is what the roll was showing at the press that opened the gesture, which is what the player
+     * was looking at when they decided to double-click. Today's contract, unchanged: a point on a
+     * note deletes it, a point on empty space adds one.
+     *
+     * The anchor is CONSUMED. Four rapid clicks are two gestures, and the second one must be
+     * classified against the picture the first one produced — which is what makes
+     * double-click-to-add followed by double-click-to-delete work as it always has.
+     */
+    this.discardBufferedEdit();
+    const anchor = this.gestureAnchor;
+    this.gestureAnchor = null;
+    const anchored =
+      !!anchor &&
+      Math.abs(x - anchor.x) <= DBLCLICK_SLOP_PX &&
+      Math.abs(y - anchor.y) <= DBLCLICK_SLOP_PX;
+    // No anchor within tolerance — a lone synthetic `dblclick`, or a pointer that has travelled
+    // since — falls back to the live frame, which is the answer this has always given.
+    const hitId = anchored ? anchor!.noteId : this.hitTest(x, y)?.note.noteId ?? null;
+    if (hitId) {
       e.preventDefault();
       this.changeSelection(new Set());
-      this.emit({ kind: 'delete', noteId: hit.note.noteId });
+      this.emit({ kind: 'delete', noteId: hitId });
       return;
     }
     // WRITTEN SECONDS, ON THE APP'S ORIGIN AND NO OTHER. `edit/rollPerformance.ts` adds the app's
@@ -3337,8 +3552,48 @@ export class PianoRoll {
       const lastWritten = this.durationSec - this.originSec - durationSec;
       if (lastWritten > 0) startSec = Math.min(startSec, lastWritten);
     }
-    this.emit({ kind: 'add', midi: this.yToMidi(y), startSec, durationSec });
+    /*
+     * …AND WHICHEVER NOTE THIS ADD WAS AIMED BESIDE (conviction C1).
+     *
+     * Aimed at the point the player pressed, not at the grid-rounded second above: the question
+     * is what was under the hand, and `startSec` has already been through a rounding that exists
+     * for open space. Note that this is taken WHATEVER the modifier is — Alt bypasses the GRID,
+     * which is a lattice the player cannot see, and not an object they pointed at.
+     */
+    const anchorId = this.anchorForAdd(x, y);
+    this.emit({ kind: 'add', midi: this.yToMidi(y), startSec, durationSec, ...(anchorId ? { anchorId } : {}) });
   };
+
+  /**
+   * THE NOTE AN ADD WAS AIMED BESIDE, or null. See `RollEdit.add.anchorId`.
+   *
+   * "Beside" is: on ANOTHER pitch row (a point inside a rectangle is a delete, and never reaches
+   * here), and within `ANCHOR_GRAB_PX` of that rectangle's left edge — its onset, which is the
+   * thing the player is lining the new note up with. Nearest edge wins; a tie between two
+   * rectangles at the same displayed onset goes to the one the pointer is vertically closest to,
+   * because that is the one they were looking at.
+   *
+   * Reads the last painted frame, so it agrees with the picture the gesture was aimed at.
+   */
+  private anchorForAdd(x: number, y: number): string | null {
+    let best: string | null = null;
+    let bestDx = Number.POSITIVE_INFINITY;
+    let bestDy = Number.POSITIVE_INFINITY;
+    for (const r of this.rects) {
+      const id = r.note.noteId;
+      if (!id) continue;
+      if (y >= r.y && y <= r.y + r.h) continue;
+      const dx = Math.abs(r.x - x);
+      if (dx > ANCHOR_GRAB_PX) continue;
+      const dy = Math.abs(r.y + r.h / 2 - y);
+      if (dx < bestDx - 0.5 || (Math.abs(dx - bestDx) <= 0.5 && dy < bestDy)) {
+        best = id;
+        bestDx = dx;
+        bestDy = dy;
+      }
+    }
+    return best;
+  }
 
   /**
    * The note under a point in canvas coordinates, or null.
@@ -3702,6 +3957,10 @@ export class PianoRoll {
 
   /** One place edits leave the roll, so `pending` can never be forgotten. */
   private emit(edit: RollEdit): void {
+    // A held micro-edit is older than whatever is being emitted now — a keyboard nudge, a delete,
+    // the next drag — so it goes out first and the history keeps the order the hand made them in.
+    // Re-entrant by construction: `flushBufferedEdit` clears the field before it calls back in.
+    this.flushBufferedEdit();
     this.pending = edit;
     this.pendingIds = new Set(rollEditNoteIds(edit));
     this.opts.onEdit?.(edit);
@@ -3818,6 +4077,17 @@ export class PianoRoll {
     dragging: 'pan' | 'move' | 'resize' | 'band' | 'vscroll' | null;
     /** The last edit emitted, still drawn provisionally until the next refresh(). */
     pendingEdit: RollEdit | null;
+    /**
+     * AN EDIT THE HAND HAS FINISHED AND THE ROLL HAS NOT EMITTED (conviction C2).
+     *
+     * A drag that travelled less than `DBLCLICK_SLOP_PX` is held until it is known not to have
+     * been the first half of a double-click. It is drawn — the rectangle is where the hand left
+     * it — but nothing downstream has been told, so a harness waiting for the app to settle has
+     * to count this as work still owed, exactly as it counts `pendingEdit`. Distinct from it
+     * because the two are answered by different things: `pendingEdit` waits for the app,
+     * `heldEdit` waits for the player.
+     */
+    heldEdit: RollEdit | null;
     /** How many rects were painted (visible ones only — clipped notes are not drawn). */
     drawnRects: number;
     /**
@@ -3950,6 +4220,7 @@ export class PianoRoll {
       snapSec: Number(this.snapSec.toFixed(4)),
       dragging: this.gesture ? this.gesture.kind : null,
       pendingEdit: this.pending,
+      heldEdit: this.bufferedEdit?.edit ?? null,
       drawnRects: this.rects.length,
       emptyRowY: this.emptyRowY(),
 
@@ -4393,7 +4664,7 @@ export class PianoRoll {
      * It carries `noteId: null`, so it cannot be selected or dragged in the meantime — the
      * next authoritative publish brings back the real one, with a real id.
      */
-    const add = this.pending && this.pending.kind === 'add' ? this.pending : null;
+    const add = this.drawnEdit && this.drawnEdit.kind === 'add' ? this.drawnEdit : null;
     const source: PianoRollNote[] = add
       ? [
           ...this.notes,
@@ -4510,8 +4781,8 @@ export class PianoRoll {
         : resized(g.deltaSec);
     }
 
-    const p = this.pending;
-    if (!p || !this.pendingIds.has(id)) return base;
+    const p = this.drawnEdit;
+    if (!p || !this.drawnIds.has(id)) return base;
     if (p.kind === 'move') return moved(p.deltaSec, p.deltaSemitones);
     if (p.kind === 'moveMany') return moved(p.deltaSec, p.deltaSemitones);
     if (p.kind === 'resize') return { startSec: n.startSec, endSec: n.startSec + p.newDurationSec, midi: n.midi };
@@ -4531,7 +4802,7 @@ export class PianoRoll {
    */
   private paintRects(ctx: CanvasRenderingContext2D): void {
     const nowWritten = this.positionSec - this.originSec;
-    const deleting = this.pending && (this.pending.kind === 'delete' || this.pending.kind === 'deleteMany');
+    const deleting = this.drawnEdit && (this.drawnEdit.kind === 'delete' || this.drawnEdit.kind === 'deleteMany');
     this.autoMarksDrawn = 0;
 
     // The halo goes UNDER the fills, in its own pass, so it reads as something around the note
@@ -4585,7 +4856,7 @@ export class PianoRoll {
       const id = r.note.noteId;
       const selected = !!id && this.selection.has(id);
       const sounding = r.startSec <= nowWritten && nowWritten < r.endSec;
-      const ghost = !!id && deleting && this.pendingIds.has(id);
+      const ghost = !!id && deleting && this.drawnIds.has(id);
 
       /*
        * A COVERING RECTANGLE DOES NOT ERASE THE ONE UNDER IT (roll-purity critique §A.1).
@@ -4871,6 +5142,17 @@ export class PianoRoll {
     // The trailing "the scroll has stopped" timer would otherwise fire into a destroyed roll and
     // hand the integrator a view for a pane that no longer exists.
     this.clearViewCommitTimer();
+    /*
+     * A HELD MICRO-EDIT IS DROPPED, NOT COMMITTED, WHEN THE VIEW GOES AWAY.
+     *
+     * `destroy()` is called from `renderMain()` — a theme change, a pane rebuild — and the
+     * integrator's `onEdit` handler runs a full rebuild that ends by writing to the view being
+     * torn down. Emitting into that is a worse outcome than losing an edit of at most
+     * `DBLCLICK_SLOP_PX`, which by definition the player cannot see. The timer must go either
+     * way, or it fires into a destroyed roll.
+     */
+    this.discardBufferedEdit();
+    this.gestureAnchor = null;
     this.gesture = null;
   }
 }

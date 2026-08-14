@@ -494,6 +494,11 @@ const BRACED_LEFT_OVERHANG_PER_SCALE = 22;
 const INSET_TUNE_PASSES = 2;
 
 /**
+ * How long a render may be owed before the gate stops believing in it. See `armRenderWatchdog`.
+ */
+const RENDER_WATCHDOG_MS = 2000;
+
+/**
  * alphaTab display scale limits. 1.0 is the default.
  *
  * Exported because Align's coupled zoom is computed OUTSIDE this class — `coupledSheetScale`
@@ -778,6 +783,27 @@ export class TriView {
   private renderInFlight = false;
   private queuedRender: (() => void) | null = null;
   /**
+   * DID THE RENDER JUST STARTED ACTUALLY FINISH ENGRAVING?
+   *
+   * `renderInFlight` used to be cleared in a `finally` around the API call, which says a render is
+   * over when alphaTab's method RETURNS. That is true for an ordinary synchronous engrave and
+   * false for exactly the cases the gate exists for: a container that is not renderable yet, a
+   * hidden or zero-width host, a render alphaTab has postponed. Those return at once, the gate
+   * opens, the next request runs — and two engravings are in flight against one class that
+   * believes it is running none, which is how a late `postRenderFinished` comes to stamp the
+   * current model's revision onto the previous engraving's bounds.
+   *
+   * So completion is `postRenderFinished`, and `startRender` only clears the flag itself when
+   * that has already fired inside the call (the ordinary synchronous case, which is also what
+   * keeps a nested request queued rather than recursing). `renderWatchdog` bounds the other
+   * branch: a render that never lands must not close the gate for the rest of the session.
+   */
+  private renderSettled = false;
+  private renderDepth = 0;
+  private renderWatchdog = 0;
+  /** How many times a render failed to report completion in time. Published by `layoutProbe`. */
+  private renderWatchdogFires = 0;
+  /**
    * THE FACADE FRAME, and this is the THIRD ghosting mechanism — the one the render gate and
    * `reuseViewport: false` could not touch, because it is not about nesting or about reuse.
    *
@@ -1056,11 +1082,35 @@ export class TriView {
       return;
     }
     this.renderInFlight = true;
+    this.renderSettled = false;
+    this.renderDepth++;
     try {
       this.renderStartedAt = performance.now();
       run();
     } finally {
-      this.renderInFlight = false;
+      this.renderDepth--;
+    }
+    /*
+     * THE ORDINARY CASE IS SYNCHRONOUS. With workers and lazy loading off, alphaTab engraves
+     * inside the call and `postRenderFinished` has already run — `onPostRender` saw a non-zero
+     * `renderDepth`, left the flag alone (so anything it asked for was queued rather than nested,
+     * which is the behaviour this gate has always had), and set `renderSettled`. Finish here.
+     *
+     * If it has NOT settled, the render is genuinely still owed: alphaTab postponed it, or the
+     * host cannot be measured yet. The gate stays shut until `onPostRender` opens it, or until
+     * the watchdog decides no completion is coming.
+     */
+    if (this.renderSettled) this.finishRender();
+    else this.armRenderWatchdog();
+  }
+
+  /** The gate opens and the queue drains. One place, so the two can never come apart. */
+  private finishRender(): void {
+    if (!this.renderInFlight) return;
+    this.renderInFlight = false;
+    if (this.renderWatchdog) {
+      clearTimeout(this.renderWatchdog);
+      this.renderWatchdog = 0;
     }
     const queued = this.queuedRender;
     if (!queued) return;
@@ -1068,6 +1118,29 @@ export class TriView {
     // Not recursion in any meaningful sense: the stack is clear again, and the queue is one
     // deep, so this runs at most once more per render that asked for one.
     this.startRender(queued);
+  }
+
+  /**
+   * A BOUND ON "STILL ENGRAVING", because a gate with no bound is a deadlock waiting for a
+   * hidden pane.
+   *
+   * alphaTab declines to render into a container it cannot measure and re-renders when it can,
+   * which may be never — a sheet pane collapsed to zero height, a plugin window minimised before
+   * the first frame. Waiting forever would mean the next real render is queued behind a render
+   * that will not happen and the sheet stays blank after the pane is opened again. Two seconds is
+   * far longer than any engrave this app produces (30-50 ms on the demo fixture, measured through
+   * `renderInfo.durationMs`) and far shorter than a person's patience with a blank pane.
+   * `renderWatchdogFires` is published so a harness can assert it stays at zero rather than
+   * discover the timeout is load-bearing.
+   */
+  private armRenderWatchdog(): void {
+    if (this.renderWatchdog) clearTimeout(this.renderWatchdog);
+    this.renderWatchdog = setTimeout(() => {
+      this.renderWatchdog = 0;
+      if (!this.renderInFlight) return;
+      this.renderWatchdogFires++;
+      this.finishRender();
+    }, RENDER_WATCHDOG_MS) as unknown as number;
   }
 
   /**
@@ -1124,7 +1197,25 @@ export class TriView {
     // the first render rather than one corrective render later. See BRACED_LEFT_OVERHANG_PER_SCALE.
     this.reserveLeftColumnFor(built.score);
     this.insetTuneBudget = INSET_TUNE_PASSES;
-    this.startRender(() => this.api.renderScore(built.score, [0]));
+    /*
+     * EVERY TRACK, IN THE RENDER THIS REVISION OWNS.
+     *
+     * It used to be `[0]`, with `ui/app.ts §renderEveryPart` calling `api.renderTracks` afterwards
+     * to put the rest back. That was the right answer for exactly as long as a score had one
+     * track, and it is the whole of the missing second tablature at N=2: the repair was
+     * count-based (it did nothing once `api.tracks.length` reached the model's) and it went
+     * through alphaTab directly, OUTSIDE this class's render gate — so an old two-track selection
+     * satisfied a new two-track model, the second part's tab was never engraved, and the bounds
+     * the decorations were placed against belonged to the previous score. `hasTab === true` with
+     * no tab on the page is now a hard failure in the parts probe rather than a tolerated state.
+     *
+     * Explicit indices rather than alphaTab's `[-1]` shorthand: the array is what
+     * `api.tracks`/`renderTracks` compare against, and an explicit list is what makes "the render
+     * this model asked for" a statement a harness can check against `builtModel.tracks.length`.
+     *
+     * A SINGLE-PART TAKE IS UNCHANGED, LINE FOR LINE: one track, `[0]`, one render.
+     */
+    this.startRender(() => this.api.renderScore(built.score, built.score.tracks.map((_, i) => i)));
   }
 
   /**
@@ -1552,6 +1643,28 @@ export class TriView {
   // -------------------------------------------------------------------------
 
   private onPostRender(): void {
+    /*
+     * COMPLETION IS RECORDED FIRST AND THE GATE IS OPENED LAST (see `renderSettled`).
+     *
+     * When this fires INSIDE the render call — the ordinary synchronous engrave — `renderDepth` is
+     * non-zero and the flag is left alone, so anything the body below asks for is queued and
+     * drained by `startRender` exactly as it always was. When it fires afterwards, this is the
+     * only thing that can open the gate, and it does so in a `finally` because the body has an
+     * early return in it (`tuneLeftInset`).
+     */
+    this.renderSettled = true;
+    if (this.renderDepth > 0) {
+      this.onPostRenderInner();
+      return;
+    }
+    try {
+      this.onPostRenderInner();
+    } finally {
+      this.finishRender();
+    }
+  }
+
+  private onPostRenderInner(): void {
     // FIRST, before anything below can ask for another render: this render is done, whatever
     // else happens in this method. `renderPending()` is read by the Align anchor and it must see
     // a request `tuneLeftInset` is about to raise, not the one that has just been served — so
@@ -1999,6 +2112,12 @@ export class TriView {
     surfaceSvgs: number;
     partialsThisRender: number;
     ghostsTrimmed: number;
+    /**
+     * Renders that never reported completion and had to be timed out. See `armRenderWatchdog`:
+     * this must stay 0, or the render gate is being held open by a stopwatch rather than by the
+     * engraving it is waiting for.
+     */
+    renderWatchdogFires: number;
     /** Px the surface had to be grown past alphaTab's box. See `growSurfaceToPartials`. */
     surfaceGrownPx: number;
     /**
@@ -2138,6 +2257,7 @@ export class TriView {
         surfaceSvgs,
         partialsThisRender: this.partialsThisRender,
         ghostsTrimmed: this.ghostsTrimmed,
+        renderWatchdogFires: this.renderWatchdogFires,
         surfaceGrownPx: this.surfaceGrownPx,
         noteXs,
         keySignaturePerStave: this.keySignaturePerStave(),
@@ -2225,6 +2345,7 @@ export class TriView {
       surfaceSvgs,
       partialsThisRender: this.partialsThisRender,
       ghostsTrimmed: this.ghostsTrimmed,
+      renderWatchdogFires: this.renderWatchdogFires,
       surfaceGrownPx: this.surfaceGrownPx,
       noteXs,
       keySignaturePerStave: this.keySignaturePerStave(),
@@ -4909,6 +5030,11 @@ export class TriView {
     this.cursorFrame = 0;
     this.facadeFrame = 0;
     this.deferredRender = null;
+    // The gate's own timer. It would otherwise fire into a destroyed view and drain a queue whose
+    // closures render into an alphaTab instance that has been disposed. See `armRenderWatchdog`.
+    if (this.renderWatchdog) clearTimeout(this.renderWatchdog);
+    this.renderWatchdog = 0;
+    this.queuedRender = null;
     this.detachDragListeners();
     this.drag = null;
     this.scroller.removeEventListener('pointerdown', this.onPointerDown);

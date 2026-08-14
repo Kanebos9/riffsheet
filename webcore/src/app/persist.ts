@@ -48,8 +48,16 @@ import { MAX_DOCUMENT_BARS } from '../edit/performanceEdit';
  * v1 reader would ignore those fields, move the insertion atom through its own splice, and then
  * save the corrupted result without the evidence needed to recover it. New readers migrate v1
  * (which cannot contain that operation kind) and write v2 so old builds reject rather than guess.
+ *
+ * v3 gates the PINNED WRITTEN ORIGIN (`PersistedSource.writtenOriginAudioSec`, conviction C3). A
+ * v2 reader has no field for it, so it would open the session, re-derive an origin from the notes
+ * — which is the defect the pin exists to close — and then write the session back with the pin
+ * gone. The session blob is the one a plugin reload goes through on every launch, so that
+ * round-trip would happen silently and repeatedly. New readers accept v1 and v2 and migrate both
+ * (neither can carry a pin, so both simply adopt one on the first build) and write v3, so an
+ * older build refuses rather than quietly re-phasing the page.
  */
-export const SESSION_VERSION = 2;
+export const SESSION_VERSION = 3;
 
 /** How the take can be got back. See the file header. */
 export interface PersistedAudio {
@@ -104,6 +112,19 @@ export interface PersistedSource {
   name: string;
   durationSec: number;
   barOneSec: number;
+  /**
+   * THE DOCUMENT'S OWN WRITTEN ORIGIN, in audio seconds (`state.ts §writtenOriginAudioSec`).
+   *
+   * It HAS to be written and it must not be recomputed. It is the pin between the sheet's clock
+   * and the tape's, and the whole reason it exists is that re-deriving it from the notes moves
+   * every row on the page whenever an edit changes which note is played or engraved first. A
+   * reader that dropped it would do exactly that, once, on open — and then save the file without
+   * it, so the next reader would do it again.
+   *
+   * Omitted on a document that has never been built (nothing to pin to), so a blob written before
+   * this existed round-trips to the bytes it always had and adopts a pin on its first build.
+   */
+  writtenOriginAudioSec?: number;
   trim: TrimResult | null;
   hostGrid?: HostGrid;
   tempoBpm?: number;
@@ -278,6 +299,10 @@ export function encodeSource(source: SourceAudio | null): PersistedSource | null
     name: source.name,
     durationSec: source.durationSec,
     barOneSec: source.barOneSec,
+    // Omitted rather than written as 0, so a document with no pin yet keeps the bytes it had.
+    writtenOriginAudioSec: Number.isFinite(source.writtenOriginAudioSec as number)
+      ? source.writtenOriginAudioSec
+      : undefined,
     trim: source.trim,
     hostGrid: source.hostGrid,
     tempoBpm: source.tempoBpm,
@@ -331,6 +356,12 @@ export function decodeSource(source: PersistedSource | null | undefined): Source
     peaks: decodePeaks(source.peaks),
     trim: source.trim ?? null,
     barOneSec: Number(source.barOneSec) || 0,
+    // ABSENCE IS A VALUE: a legacy document has no pin and derives one on its first build. A
+    // hostile or corrupt one that is not a finite number is treated the same way rather than
+    // poisoning every x on the page with a NaN.
+    writtenOriginAudioSec: Number.isFinite(source.writtenOriginAudioSec as number)
+      ? Number(source.writtenOriginAudioSec)
+      : undefined,
     // A blob written before HostGrid grew a `source` field can only have come from a capture —
     // that was the sole way to get one. Filled in rather than left undefined so nothing
     // downstream has to ask "and what if it is missing?".
@@ -588,6 +619,16 @@ function validTimeSignature(value: unknown): { numerator: number; denominator: n
  * the legacy inclusive endpoint rule, move a release that must stay, and shift the new note a
  * second time before saving the file without the tags. That is wrong music plus evidence loss, so
  * this is exactly the case the format gate exists for.
+ *
+ * v7 ALSO CARRIES THE PINNED WRITTEN ORIGIN (`PersistedSource.writtenOriginAudioSec`, conviction
+ * C3), and that is an addition to v7 rather than a v8, deliberately. The two gates answer
+ * different questions. A format bump exists to stop an older reader producing WRONG MUSIC it
+ * cannot recover from; a reader that drops the pin produces the same notes at the same times and
+ * re-derives an origin on its first build — which is precisely the behaviour every build before
+ * this one had, and which the next save then re-pins. Nothing is lost that was not already being
+ * recomputed. The SESSION version is bumped instead, because the session is the blob a plugin
+ * reload goes through on every launch and is therefore the one where a silent drop-and-rewrite
+ * would actually happen.
  */
 export const RIFFSHEET_DOCUMENT_VERSION = 7;
 
@@ -1584,9 +1625,16 @@ export function readSession(json: string | null | undefined): PersistedSession |
   try {
     const parsed = JSON.parse(json) as Partial<PersistedSession>;
     if (!parsed || parsed.app !== 'riffsheet') return null;
-    // v1 has the same outer shape but predates sheet-insert semantics. Its absent kind/fixedIds
-    // decode through the legacy inclusive law; returning v2 makes the next normal save gated.
-    if (parsed.v !== 1 && parsed.v !== SESSION_VERSION) return null;
+    /*
+     * READERS ACCEPT OLDER, AND ONLY OLDER.
+     *
+     * v1 predates sheet-insert semantics: its absent kind/fixedIds decode through the legacy
+     * inclusive law. v2 predates the pinned written origin: it has no pin, so the document adopts
+     * one on its first build exactly as a fresh take does. Both migrate; returning the current
+     * version is what makes the next ordinary save gated. A version this build does not know is
+     * refused rather than guessed at — the whole point of the gate.
+     */
+    if (parsed.v !== 1 && parsed.v !== 2 && parsed.v !== SESSION_VERSION) return null;
     return {
       v: SESSION_VERSION,
       app: 'riffsheet',

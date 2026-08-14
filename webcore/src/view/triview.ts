@@ -1308,9 +1308,10 @@ export class TriView {
       letters: number;
       texts: string[];
     }>;
-    tracks: Array<{ trackIndex: number; hasTab: boolean; strings: number }>;
+    tracks: Array<{ trackIndex: number; hasTab: boolean; tabRendered: boolean; strings: number }>;
   } {
     const staffTops = this.nameLaneStaffTops();
+    const renderedTabs = this.renderedTabTracks();
 
     const names = new Map<string, typeof this.labels>();
     for (const label of this.labels) {
@@ -1376,9 +1377,41 @@ export class TriView {
       tracks: (this.builtModel?.tracks ?? []).map((track, trackIndex) => ({
         trackIndex,
         hasTab: track.staves.some((staff) => staff.showTablature),
+        tabRendered: renderedTabs.has(trackIndex),
         strings: tuningLowToHighFromScore(this.builtModel, trackIndex).length
       }))
     };
+  }
+
+  /**
+   * WHICH TRACKS ACTUALLY HAVE TABLATURE ON THE PAGE — not which ones ask for it.
+   *
+   * `hasTab` beside it is the MODEL's flag, `Staff.showTablature`, and the two are not the same
+   * claim. A track can carry `showTablature` and still have no tab engraved: the built model is
+   * read here and now, while the bounds were produced by the render that has actually happened,
+   * and a per-part instrument profile can turn a tab off between the two. A harness that reads
+   * `hasTab` as "there is a tab on screen to caption" is asking the wrong question, and gets a
+   * FAIL for a missing legend beside a staff that was never drawn.
+   *
+   * The tuning legend is owed to a RENDERED tab and to nothing else, so this answers from the
+   * same `BoundsLookup` every other decoration is placed against, by the same `staveKindsFromBars`
+   * rule `stringLettersFromBounds` uses to find the tab stave among a part's rendered staves.
+   * `BoundsLookup` holds one `BarBounds` per RENDERED stave, so a tab that was not engraved has
+   * no entry to find.
+   */
+  private renderedTabTracks(
+    lookup = this.api.renderer.boundsLookup
+  ): Set<number> {
+    const out = new Set<number>();
+    if (!lookup) return out;
+    for (const staffSystem of lookup.staffSystems) {
+      for (const masterBar of staffSystem.bars ?? []) {
+        for (const [trackIndex, bars] of this.partBarGroups(masterBar.bars ?? [])) {
+          if (tabStaveIndex(staveKindsFromBars(bars)) >= 0) out.add(trackIndex);
+        }
+      }
+    }
+    return out;
   }
 
   /** The top bound used to position each system/part pitch-name lane. */

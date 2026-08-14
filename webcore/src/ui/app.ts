@@ -5278,6 +5278,41 @@ class App {
         rawStarts: Object.fromEntries(
           (rt.source?.detected?.notes ?? []).map((n) => [n.id ?? '', r4(n.startSec)])
         ),
+        /*
+         * THE WHOLE RECORDING RECORD PER ID, BYTE FOR BYTE — for `scripts/soak-probe.mjs`.
+         *
+         * `rawStarts` above is an onset and nothing else, and an onset is not the layer a bad
+         * write-back damages: a resize that corrupts a NEIGHBOUR'S end, or a snap projection that
+         * leaks into the recording's midi, moves no start at all. `__RIFFSHEET_SHEETINSERTPROBE__`
+         * already makes exactly this comparison internally (`JSON.stringify(note)` per id, before
+         * and after) because a diff of the serialised note is the only statement of "nothing else
+         * changed" that cannot be fooled by a field the probe forgot to list. This publishes it so
+         * a soak that authors hundreds of edits can make that statement after EVERY one of them,
+         * against ids it did not author.
+         *
+         * Read-only and additive: the same notes the probe above already walks.
+         */
+        rawBytes: Object.fromEntries(
+          (rt.source?.detected?.notes ?? []).map((n) => [n.id ?? '', JSON.stringify(n)])
+        ),
+        /*
+         * THE PRE-COMMIT LEDGER, last forty rows — the per-transaction purity statement.
+         *
+         * A snapshot diff can say "this id changed and nobody claimed it"; it cannot say WHICH of
+         * the commands in a burst changed it, and a gesture that emits two commands is precisely
+         * the fault this exists for. See `App.commitLog` for the law a gate states over it.
+         */
+        commits: this.commitLog.slice(-40),
+        /**
+         * WRITTEN SECOND 0 ON THE RECORDING'S CLOCK — the number the whole page is phased against.
+         *
+         * The roll subtracts it from every rectangle and the ripple map phases itself against it,
+         * so a document whose origin is re-derived from its own content on every rebuild moves
+         * every untouched row on the page whenever an edit changes which note is engraved first.
+         * Published so a probe can assert it did not move rather than notice that everything else
+         * did.
+         */
+        originSec: r4(origin),
         /** What the ROLL is drawing, from the same feed — so "the roll mirrors the sheet" is testable. */
         rollNotes: this.rollFeedNotes().map((n) => ({ id: n.id, startSec: r4(n.startSec), endSec: r4(n.endSec) }))
       };
@@ -14142,6 +14177,41 @@ class App {
   private autoReviewCursor = 0;
   private autoPopover: HTMLElement | null = null;
 
+  /*
+   * THE PRE-COMMIT LEDGER — what each committed edit CLAIMED and what it actually CHANGED.
+   *
+   * WHY A LEDGER AND NOT A TEST. Every probe in `scripts/` compares two snapshots of the whole
+   * recording and infers authorship from the gesture it fired. That inference is exactly what let
+   * the roll-add faults hide: a gesture that emits TWO commands (a micro-resize swallowed by a
+   * double-click) looks, from the outside, like one command that touched two notes — and a
+   * harness cannot tell the difference because it never saw the commands. So the app writes down
+   * its own claim, per commit, at the moment it makes it:
+   *
+   *   kind               — the gesture that authored this commit ('add', 'delete', 'resize', …).
+   *   authoredIds        — the ids the reducer says the player named (`RollEditResult.authoredIds`).
+   *   changedExistingIds — every id that was in the recording BEFORE and serialises differently
+   *                        after, computed here rather than claimed.
+   *
+   * The law a gate asserts over it is the purity law stated per transaction rather than per
+   * session: for an ADD, `changedExistingIds` must be empty — an add has no pre-existing note to
+   * rewrite, so any id in that list is a write-back reaching a note nobody named. Deletes carry
+   * the one documented exception (`keepStructureCarriers` moves `sourceBars` off the removed
+   * carrier), which is why the gate is stated over adds.
+   *
+   * Read-only, capped, and read by nothing but `__RIFFSHEET_SHEETEDIT__`.
+   */
+  private commitIntent: { kind: string; authoredIds: string[] } | null = null;
+  private commitLog: Array<{
+    seq: number;
+    kind: string;
+    label: string;
+    authoredIds: string[];
+    addedIds: string[];
+    removedIds: string[];
+    changedExistingIds: string[];
+  }> = [];
+  private commitSeq = 0;
+
   /** Snapshots of the whole performance, one per roll edit. Entry 0 is "as transcribed". */
   private perfStack: InputNote[][] = [];
   private perfIndex = 0;
@@ -14318,6 +14388,8 @@ class App {
       }
     }
 
+    // WHAT THIS TRANSACTION CLAIMS, recorded before it is made. See `commitLog`.
+    this.commitIntent = { kind: edit.kind, authoredIds: [...touched] };
     this.commitPerformance(
       cuts.length
         ? mergeRollEditOntoCutTake(raw, edited, touched, cuts)
@@ -15732,6 +15804,10 @@ class App {
     const source = this.runtime.get().source;
     if (!source?.detected) return;
 
+    // The ledger, written BEFORE the notes are installed, so "what was there" is read off the
+    // recording this transaction is replacing rather than off the one it produced.
+    this.recordCommit(source.detected.notes, notes, label);
+
     // Drop the redo tail on both stacks — a new edit after an undo replaces the future.
     this.perfStack = this.perfStack.slice(0, this.perfIndex + 1);
     this.perfLabels = this.perfLabels.slice(0, this.perfIndex + 1);
@@ -15750,6 +15826,40 @@ class App {
 
     this.setPerformance(notes, cuts, rebuild);
     this.refreshUndoRedo();
+  }
+
+  /**
+   * One row of the pre-commit ledger. See `commitLog`.
+   *
+   * `commitIntent` is set by whichever editor is about to commit and consumed here, so a road that
+   * forgets to set it records `kind: 'other'` rather than borrowing the previous gesture's claim.
+   */
+  private recordCommit(before: ReadonlyArray<InputNote>, after: ReadonlyArray<InputNote>, label: string): void {
+    const intent = this.commitIntent;
+    this.commitIntent = null;
+    const was = new Map<string, string>();
+    for (const n of before) if (n.id) was.set(n.id, JSON.stringify(n));
+    const changed: string[] = [];
+    const added: string[] = [];
+    const live = new Set<string>();
+    for (const n of after) {
+      if (!n.id) continue;
+      live.add(n.id);
+      const before1 = was.get(n.id);
+      if (before1 === undefined) added.push(n.id);
+      else if (before1 !== JSON.stringify(n)) changed.push(n.id);
+    }
+    this.commitLog.push({
+      seq: ++this.commitSeq,
+      kind: intent?.kind ?? 'other',
+      label,
+      authoredIds: [...(intent?.authoredIds ?? [])].sort(),
+      addedIds: added.sort(),
+      removedIds: [...was.keys()].filter((id) => !live.has(id)).sort(),
+      changedExistingIds: changed.sort()
+    });
+    // A soak authors hundreds of edits; the ledger is evidence for the last few dozen, not a leak.
+    if (this.commitLog.length > 200) this.commitLog.splice(0, this.commitLog.length - 200);
   }
 
   /** What the document's structure is right now — one snapshot for the performance stack. */

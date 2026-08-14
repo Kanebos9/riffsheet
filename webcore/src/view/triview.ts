@@ -3554,17 +3554,55 @@ export class TriView {
    * `current` is the invariant a probe asserts between interactions; `staleHitRejections` is the
    * evidence that the gate fires when it should, which is the half a passing session cannot show.
    */
+  /*
+   * TWO OBJECT-IDENTITY ANSWERS BESIDE THE TWO NUMBERS, and they are here because the numbers can
+   * lie in exactly one way (soak-probe.mjs, Codex's race analysis §1).
+   *
+   * `boundsRevision = modelRevision` is stamped in `onPostRender`, which is the only moment at
+   * which it is true — PROVIDED the callback belongs to the render that has just finished. A
+   * post-render callback that arrives late, after the model has been replaced again, stamps the
+   * NEW revision onto bounds that still describe the PREVIOUS engraving: `current` then reads
+   * true, `boundsAreCurrent()` lets a hit test through, and the answer is resolved against an
+   * engraving the index no longer knows about — which is the dead-click mechanism wearing a
+   * clean revision pair. A numeric comparison cannot see that; a reference comparison can.
+   *
+   *   `apiScoreIsModel`  — the score alphaTab is holding IS the model this view built.
+   *   `boundsOwnScore`   — every bar in the bounds lookup belongs to that same score object.
+   *
+   * Read-only, and only ever read by the harness: nothing in the view branches on them.
+   */
   revisionProbe(): {
     model: number;
     bounds: number;
     current: boolean;
     staleHitRejections: number;
+    apiScoreIsModel: boolean;
+    boundsOwnScore: boolean;
+    boundsBars: number;
+    foreignBars: number;
   } {
+    const model = this.builtModel;
+    const lookup = this.api.renderer.boundsLookup;
+    let boundsBars = 0;
+    let foreignBars = 0;
+    for (const system of lookup?.staffSystems ?? []) {
+      for (const bar of system.bars ?? []) {
+        boundsBars++;
+        // `masterBar.score` is the score object the bar was engraved from. A bar whose owner is
+        // not the model on screen is a bar from a previous engraving still being consulted.
+        const owner = (bar as unknown as { masterBar?: { score?: unknown } }).masterBar?.score;
+        if (model && owner && owner !== model) foreignBars++;
+      }
+    }
     return {
       model: this.modelRevision,
       bounds: this.boundsRevision,
       current: this.boundsRevision === this.modelRevision,
-      staleHitRejections: this.staleHitRejections
+      staleHitRejections: this.staleHitRejections,
+      apiScoreIsModel: !!model && this.api.score === model,
+      boundsOwnScore: foreignBars === 0,
+      boundsBars,
+      foreignBars
     };
   }
 

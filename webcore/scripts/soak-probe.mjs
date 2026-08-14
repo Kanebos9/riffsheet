@@ -93,6 +93,8 @@ const WANT_PARTS = process.argv.includes('--parts') || process.argv.includes('--
 const ONLY_PARTS = process.argv.includes('--only-parts');
 const ONLY_ANCHOR = process.argv.includes('--only-anchored');
 const NO_ANCHOR = process.argv.includes('--no-anchored');
+const ONLY_WHERE = process.argv.includes('--only-where-clicked');
+const NO_WHERE = process.argv.includes('--no-where-clicked');
 const ONLY_GATES = process.argv.includes('--only-gates');
 const NO_GATES = process.argv.includes('--no-gates');
 const SNAP_MODES = (argOf('snap-modes', 'off,grid,beat')).split(',');
@@ -2172,6 +2174,189 @@ async function anchoredCell(cdp, url, { snap, jitterMs, rows, free, phase = 'ons
 }
 
 // -----------------------------------------------------------------------------
+// THE "ADD LANDS WHERE IT WAS CLICKED" MATRIX — the owner's Aug 14 18:09 report
+// -----------------------------------------------------------------------------
+/**
+ * "I DOUBLE-CLICK EMPTY SPACE AND THE NOTE APPEARS SOMEWHERE COMPLETELY DIFFERENT."
+ *
+ * The anchored matrix above asserts that NOTHING ELSE MOVES when a note is added. It is 120/120
+ * green and it was green while this fault was live, because it never once looked at where the ADDED
+ * note went. That blind spot is this matrix: it asserts the other half, and the two are run together
+ * so neither can be bought with the other — freeze every neighbour and the add gets pushed off to
+ * wherever there is room; re-derive the take and the add lands beautifully while the neighbours
+ * move.
+ *
+ *     THE ADD APPEARS AT THE SECOND THE POINTER WAS OVER, AND ON THE ROW THE POINTER WAS ON.
+ *
+ * WHAT IT VARIES, and why:
+ *
+ *   SNAP MODE — off, grid, beat. Only Beat has a global allocator and only Beat takes the
+ *     incremental placement road (`app/snap.ts §snapIncrementally`), which is where the fault was;
+ *     off and grid are the control that says the gesture and the harness are sound.
+ *
+ *   ROW OFFSET — 0 to 3 rows from a reference rectangle's own row, up and down. Row 0 is the
+ *     SAME row at a later time, which is the one case where the add can collide with the note it
+ *     was measured from; the others are the ordinary "put one above that one".
+ *
+ *   TIME OFFSET — 0 to 500 ms past the reference note's onset, which walks the click across a beat
+ *     boundary at every ruler this fixture uses. The one-sided search window that caused the fault
+ *     only misbehaved on one side of a beat, so an offset sweep is what makes it fall out.
+ *
+ * HOW THE EXPECTATION IS COMPUTED, and why it is not reconstructed from a clock. Both axes are read
+ * off a rectangle THAT IS ON SCREEN. `paintedRects()` publishes each rectangle's own `startSec` in
+ * WRITTEN seconds beside its own `x`, so written(x) = ref.startSec + (x - ref.x) * secPerPx is the
+ * roll's own mapping evaluated at the click, with nothing guessed; and the row is a whole number of
+ * `pxPerSemitone` from a real rectangle's centre, so the pitch the click is over is the reference's
+ * own midi offset by that number of rows. A harness that rebuilt the ruler height, the row origin
+ * and the rounding for itself would be asserting its arithmetic against the app's.
+ *
+ * THE TOLERANCE IS THE RULER'S OWN CELL, ONE OF THEM, IN EVERY MODE. The roll rounds every add onto
+ * the edit grid before it emits it (`view/pianoroll.ts §onDoubleClick`), which is half a cell on its
+ * own, and under Beat the pulse allocator may then move it to a free line on the same lattice — so
+ * one whole cell is generous and two would be slack. It is calibrated, not guessed: on this fixture
+ * (a 273 ms cell) the repaired app's worst cell is 125 ms and c7dcefb's is 455 ms, so the bound sits
+ * with better than a factor of two of daylight on each side of it. Anything looser is vacuous, and
+ * this gate was written loose first and measured until it was not — the first draft allowed two
+ * cells under Beat and passed the very build the owner was looking at.
+ */
+async function addLandsWhereClickedMatrix(cdp, opts) {
+  const url = `http://127.0.0.1:${PORT}/index.html?demo=${DEMO}&bars=${BARS}&tab=bass&verify=1`;
+  const snaps = opts.snaps ?? SNAP_MODES;
+  const rowOffsets = opts.rowOffsets ?? [0, 1, -1, 2, -2, 3, -3];
+  const timeOffsetsMs = opts.timeOffsetsMs ?? [0, 60, 125, 250, 375, 500];
+  const out = [];
+  for (const snap of snaps) {
+    for (const rows of rowOffsets) {
+      for (const offsetMs of timeOffsetsMs) {
+        const cell = await whereClickedCell(cdp, url, { snap, rows, offsetMs });
+        out.push(cell);
+        const tag = `snap=${snap} rows=${rows > 0 ? '+' : ''}${rows} +${offsetMs}ms`;
+        if (cell.error) console.log(`  WHERE   ${tag}: skipped — ${cell.error}`);
+        else if (cell.violations.length) {
+          console.log(`  WHERE   ${tag}: VIOLATION`);
+          for (const v of cell.violations) console.log(`      ${v.law}  ${JSON.stringify(v.detail ?? null).slice(0, 320)}`);
+        } else {
+          console.log(`  WHERE   ${tag}: clean (drift ${cell.driftMs}ms of ${cell.allowedMs}ms, pitch exact)`);
+        }
+      }
+    }
+  }
+  return out;
+}
+
+/** One cell: from a fresh page, double-click an empty point and ask where the note came out. */
+async function whereClickedCell(cdp, url, { snap, rows, offsetMs }) {
+  await boot(cdp, url);
+  await doAct(cdp, { kind: 'snap', value: snap });
+  await quiesce(cdp, 6000);
+
+  const geo = await geometry(cdp);
+  if (!geo || geo.painted.length < 4) return { snap, rows, offsetMs, error: 'not enough painted notes' };
+  const secPerPx = geo.secPerPx;
+  const rowH = geo.rowH;
+  if (!(secPerPx > 0) || !(rowH >= 3)) {
+    return { snap, rows, offsetMs, error: `unusable geometry (secPerPx ${secPerPx}, rowH ${rowH})` };
+  }
+
+  /*
+   * THE REFERENCE RECTANGLE, and it is a reference for the ARITHMETIC only — nothing about this
+   * cell is an edit of it. An interior note (never the first, which is the origin and a special
+   * case in the bar arithmetic) with room to its right for the largest time offset.
+   */
+  const byX = geo.painted.slice().sort((a, b) => a.x - b.x);
+  const room = 500 / 1000 / secPerPx;
+  const ref = byX.find((r, i) => i > 0 && i < byX.length - 1 && r.x + room + 8 < geo.width);
+  if (!ref) return { snap, rows, offsetMs, error: 'no interior rectangle with room to its right' };
+
+  const x = ref.x + offsetMs / 1000 / secPerPx;
+  const y = ref.y + ref.h / 2 - rows * rowH;
+  if (y < geo.rulerH + rowH || y > geo.height - rowH) {
+    return { snap, rows, offsetMs, error: `row ${rows} is outside the drawn pitch window` };
+  }
+  const occupied = await evalIn(cdp, `window.__SOAK.occupiedAt(${x}, ${y})`);
+  if (occupied !== false) return { snap, rows, offsetMs, error: 'that point is not empty — nothing to add' };
+
+  /*
+   * WHERE THE CLICK IS, IN THE APP'S OWN TWO UNITS. `startSec` is published beside `x` on every
+   * painted rectangle and the roll's time axis is linear, so this IS the roll's mapping — not a
+   * reconstruction of it. Likewise the row: a whole number of `pxPerSemitone` from a rectangle whose
+   * own midi the roll reports.
+   */
+  const clickedSec = ref.startSec + (x - ref.x) * secPerPx;
+  const clickedMidi = ref.midi + rows;
+
+  const before = await snapshot(cdp);
+  const idsBefore = new Set(Object.keys(before.feed ?? {}));
+  await doAct(cdp, { kind: 'add', tag: 'where-clicked', x, y, alt: false, gapMs: 14, driftX: 0, driftY: 0 });
+  const q = await quiesce(cdp, 8000);
+  const after = await snapshot(cdp);
+  const addedId = Object.keys(after.feed ?? {}).find((id) => !idsBefore.has(id)) ?? null;
+
+  const violations = [];
+  if (!q.ok) violations.push({ law: 'quiescence-timeout', detail: q.why });
+  if (!addedId) {
+    violations.push({ law: 'where/add-did-nothing', detail: { feedBefore: idsBefore.size, feedAfter: Object.keys(after.feed ?? {}).length } });
+    return { snap, rows, offsetMs, error: null, addedId, clickedSec, clickedMidi, driftMs: null, allowedMs: null, violations };
+  }
+
+  const painted = (after.painted ?? {})[addedId] ?? null;
+  if (!painted) {
+    violations.push({ law: 'where/added-note-not-drawn', detail: { addedId } });
+    return { snap, rows, offsetMs, error: null, addedId, clickedSec, clickedMidi, driftMs: null, allowedMs: null, violations };
+  }
+
+  // [startSec, endSec, midi, x, w] — WRITTEN seconds, the same clock `clickedSec` is in.
+  const landedSec = painted[0];
+  const landedMidi = painted[2];
+  const cellSec = geo.snapSec > 0 ? geo.snapSec : 0.125;
+  const allowedSec = cellSec;
+  const driftSec = Math.abs(landedSec - clickedSec);
+  if (driftSec > allowedSec + 1e-6) {
+    violations.push({
+      law: 'where/landed-somewhere-else',
+      detail: {
+        clickedSec: Number(clickedSec.toFixed(4)),
+        landedSec: Number(landedSec.toFixed(4)),
+        driftMs: Math.round(driftSec * 1000),
+        allowedMs: Math.round(allowedSec * 1000),
+        cellMs: Math.round(cellSec * 1000),
+        landedPx: Math.round(painted[3]),
+        clickedPx: Math.round(x)
+      }
+    });
+  }
+  if (landedMidi !== clickedMidi) {
+    violations.push({
+      law: 'where/landed-on-another-row',
+      detail: { clickedMidi, landedMidi, rows, refMidi: ref.midi, rowH: Number(rowH.toFixed(2)) }
+    });
+  }
+  /*
+   * AND THE OTHER HALF, ASSERTED IN THE SAME BREATH. Landing where the pointer was is worth nothing
+   * if it was bought by re-magnetising the take, so every pre-existing rectangle must be unchanged —
+   * the same claim the anchored matrix's 'onset' phase makes, restated here so this gate cannot be
+   * satisfied by giving that one up.
+   */
+  const drift = rectDriftOf(before, after, [addedId]);
+  if (drift.length) violations.push({ law: 'where/neighbour-rect-moved', detail: drift.slice(0, 6), count: drift.length });
+
+  return {
+    snap, rows, offsetMs, error: null, addedId,
+    clickedSec: Number(clickedSec.toFixed(4)),
+    clickedMidi,
+    landedSec: Number(landedSec.toFixed(4)),
+    landedMidi,
+    driftMs: Math.round(driftSec * 1000),
+    allowedMs: Math.round(allowedSec * 1000),
+    refId: ref.id,
+    clickPoint: { x: Number(x.toFixed(2)), y: Number(y.toFixed(2)) },
+    violations,
+    before: violations.length ? before : null,
+    after: violations.length ? after : null
+  };
+}
+
+// -----------------------------------------------------------------------------
 /*
  * A SEPARATE, MUCH SHORTER SOAK, because the fault has a different shape.
  *
@@ -2395,7 +2580,7 @@ const main = async () => {
      * a known mechanism reproduced by a scripted gesture, so a red gate names the fix that is
      * missing rather than the state that is wrong. The matrix and the soak run after.
      */
-    if (!NO_GATES && !ONLY_PARTS && !ONLY_ANCHOR) {
+    if (!NO_GATES && !ONLY_PARTS && !ONLY_ANCHOR && !ONLY_WHERE) {
       console.log('CONVICTION GATES');
       const gates = await convictionGates(cdp);
       const file = join(OUT, 'gates.json');
@@ -2420,6 +2605,26 @@ const main = async () => {
      * two hundred random ones: the matrix is deterministic, it names the axis that broke, and it
      * runs in a couple of minutes. The soak's job is the races the matrix cannot reach.
      */
+    /*
+     * WHERE THE ADD LANDED, BEFORE WHETHER ANYTHING ELSE MOVED. The two matrices are the two halves
+     * of one law and the order is deliberate: this one is the owner's live report, it is the
+     * cheapest of the pair, and a red cell here explains a red cell there.
+     */
+    if (!NO_WHERE && !ONLY_PARTS && !ONLY_ANCHOR) {
+      console.log('ADD-LANDS-WHERE-CLICKED MATRIX  snap x row x time offset');
+      const cells = await addLandsWhereClickedMatrix(cdp, {});
+      const bad = cells.filter((c) => !c.error && c.violations.length);
+      const file = join(OUT, 'where-clicked-matrix.json');
+      await writeFile(file, JSON.stringify(cells, null, 2));
+      const drifts = cells.filter((c) => typeof c.driftMs === 'number').map((c) => c.driftMs);
+      console.log(
+        `  matrix: ${cells.length} cells, ${bad.length} with violations, ${cells.filter((c) => c.error).length} skipped, ` +
+        `worst drift ${drifts.length ? Math.max(...drifts) : 0}ms -> ${file}`
+      );
+      if (bad.length) exitCode = 1;
+      if (ONLY_WHERE) return;
+    }
+
     if (!NO_ANCHOR && !ONLY_PARTS) {
       console.log('ANCHORED-ADD MATRIX  snap x jitter x direction x free');
       const cells = await anchoredAddMatrix(cdp, {});

@@ -329,13 +329,104 @@ function snapIncrementally(
   if (frozen.size === 0) return null;
 
   /*
-   * THE LINES THAT ARE TAKEN. Two events on one position are ONE event to the engraver, so an
-   * authored note may not be placed where a frozen one already stands. Keyed on the finest lattice
-   * the cascade can reach, which is the resolution at which "the same line" is a meaningful claim.
+   * THE LINES THAT ARE TAKEN — AND WHAT WAS PLAYED ON THEM.
+   *
+   * Two SEPARATE events on one position are one event to the engraver, so an authored note may not
+   * be placed where a frozen one already stands. Keyed on the finest lattice the cascade can reach,
+   * which is the resolution at which "the same line" is a meaningful claim.
+   *
+   * THE RAW ATTACK IS KEPT BESIDE THE LINE, and that is not bookkeeping — it is the chord rule.
+   * The full allocator groups two attacks inside `chordWindow` into ONE event, which stands on ONE
+   * position; a set of forbidden lines cannot express that, so the first version of this pass
+   * refused the frozen note's line unconditionally and pushed a genuinely simultaneous add a whole
+   * subdivision to the right. That is the owner's "the note went somewhere else" in its sharpest
+   * form: an anchored add (`edit/rollPerformance.ts` §reseatAnchoredAdd) is seated on the anchor's
+   * OWN recorded onset precisely so the two are simultaneous, and this pass then moved it off again.
+   * A line already occupied by a frozen note whose raw attack is within `chordWindow` of the
+   * authored one is therefore SHARED, exactly as the global allocator would have shared it.
+   *
+   * The earliest raw attack on the line is the one compared against, because that is the member the
+   * full allocator opens the event with and measures the window from.
    */
   const keyOf = (sec: number): number => Math.round(sec / finest);
-  const taken = new Set<number>();
-  for (const p of frozen.values()) taken.add(keyOf(p.startSec));
+  /** Line key -> the earliest RAW attack standing on it, and the pitches already there. */
+  const onLine = new Map<number, { rawMin: number; midis: Set<number> }>();
+  for (const [i, p] of frozen) {
+    const k = keyOf(p.startSec);
+    const raw = Number.isFinite(p.rawStartSec) ? p.rawStartSec : notes[i].startSec;
+    const at = onLine.get(k);
+    if (at) {
+      at.rawMin = Math.min(at.rawMin, raw);
+      at.midis.add(notes[i].midi);
+    } else {
+      onLine.set(k, { rawMin: raw, midis: new Set([notes[i].midi]) });
+    }
+  }
+
+  /**
+   * WHAT IT COSTS THIS EVENT TO STAND ON THIS LINE, in seconds, or null for "it may not".
+   *
+   * ============== WHY A COST AND NOT A YES/NO, AND WHAT THE YES/NO GOT WRONG ==============
+   *
+   * A saturated lattice has no free line anywhere near the pointer, and the first version of this
+   * pass answered that with an unbounded search: it walked outward until something was free and put
+   * the note there, which on a dense take is most of a bar from where the player clicked. There is
+   * no ordering of a boolean test that fixes this, because the choice is a TRADE — a line one cell
+   * further away that is empty, against the line under the pointer with a stranger already on it —
+   * and a trade needs a price.
+   *
+   * The price of sharing is HALF A SUBDIVISION. So an empty line up to half a cell further away
+   * wins, and past that the note stands where it was aimed and the two become a chord. That bounds
+   * the whole search: nothing can land further from the attack than the nearest line plus half a
+   * cell, whatever the take does, which is the property the "add lands where clicked" gate rests on.
+   * Half rather than a whole cell because a whole one makes a shared line and a free line exactly a
+   * cell away cost the SAME, and a tie is decided by the lattice rather than by the player.
+   *
+   * A CHORD OUTRANKS DISTANCE — WITHIN REACH OF THE POINTER, AND NO FURTHER. Two attacks inside
+   * `chordWindow` are ONE event to the full allocator and stand on one position by its own rule, so
+   * a line held by a note this event is simultaneous with is not a compromise, it is THE ANSWER: it
+   * is the rectangle the player was aiming above. Pricing it against distance is not enough — a
+   * frozen note whose own derivation moved it a subdivision off its recorded attack would lose to
+   * the empty line under the raw second, and the note the player stacked would appear one cell to
+   * the right of the note they stacked it on. That is what `edit/rollPerformance.ts`
+   * §reseatAnchoredAdd exists to prevent and what a plain nearest-line search undoes.
+   *
+   * BUT THE TIER IS CAPPED AT `chordReach`, and the cap is not caution — it is the difference
+   * between the two ways a line can be "simultaneous". An ANCHORED add is seated on its anchor's own
+   * recorded onset deliberately, and that anchor is drawn within a subdivision of it. A PLAIN add
+   * carries the second the pointer was over, and its landing within 20 ms of some frozen note's
+   * recorded attack is a COINCIDENCE — if that note's previous derivation had carried it a quarter
+   * of a bar away, an uncapped tier would take the new note with it, which is the owner's report
+   * exactly. Measured without the cap: 57 of 10,800 random dense cells landed 125–375 ms from the
+   * second asked for, every one of them a coincidental chord with a distant rectangle.
+   *
+   * THE ONE REFUSAL IS UNISON. A second note of the SAME PITCH on the same position is not a chord,
+   * it is a duplicate: one notehead where the player asked for two, and a tie the engraver cannot
+   * draw. That line is never offered, at any price or any tier.
+   */
+  const chordReach = cell + chordWindow;
+  const costOn = (
+    k: number,
+    sec: number,
+    rawStart: number,
+    midis: ReadonlyArray<number>
+  ): { tier: 0 | 1; extra: number } | null => {
+    const at = onLine.get(k);
+    if (!at) return { tier: 1, extra: 0 };
+    for (const m of midis) if (at.midis.has(m)) return null;
+    if (Math.abs(at.rawMin - rawStart) > chordWindow + EPS) return { tier: 1, extra: cell / 2 };
+    return Math.abs(sec - rawStart) <= chordReach + EPS ? { tier: 0, extra: 0 } : { tier: 1, extra: 0 };
+  };
+  /** …and the same line, once this pass has put something on it. */
+  const occupy = (k: number, rawStart: number, midis: ReadonlyArray<number>): void => {
+    const at = onLine.get(k);
+    if (at) {
+      at.rawMin = Math.min(at.rawMin, rawStart);
+      for (const m of midis) at.midis.add(m);
+    } else {
+      onLine.set(k, { rawMin: rawStart, midis: new Set(midis) });
+    }
+  };
 
   const out = new Array<InputNote>(notes.length);
   for (const [i, p] of frozen) out[i] = restate(notes[i], p.startSec, p.endSec, tempoBpm);
@@ -356,33 +447,82 @@ function snapIncrementally(
 
   for (const ev of events) {
     /*
-     * WHERE IT WANTS TO BE: its own nearest beat, exactly as rule 1 places a leader. Then, if that
-     * line is taken, the nearest FREE line on the halving ladder — the same ladder the cascade
-     * uses, so an authored note lands on a subdivision the player can already see. It searches
-     * outward from the beat it belongs to and never writes over a frozen neighbour.
+     * WHERE IT WANTS TO BE: THE NEAREST LINE TO THE ATTACK ITSELF, and then outward from there.
+     *
+     * ============================ THE WINDOW WAS ONE-SIDED ============================
+     *
+     * This used to sweep `b = beatIdx … beatIdx + 1`, and that is a bug with a name: `beatIdx` is
+     * the NEAREST beat, so an attack in the back half of a beat rounds UP and every candidate the
+     * search could see was then at or AFTER the following beat. A double-click at 0.30 s with a
+     * half-second pulse produced a note at 0.50 s — 200 ms, most of a beat, and in the direction
+     * nobody aimed. Measured before the fix over a 0–1000 ms sweep on a dense take: 87 of 123 cells
+     * landed further than half a subdivision from the second the player asked for, worst case
+     * 375 ms, while a FULL derivation of the same take was never worse than 100 ms. The search is
+     * symmetric now — the beat below, its own, and the beat above — so the lattice on both sides of
+     * the pointer is reachable and "nearest" means nearest.
+     *
+     * Then, if the line it wants is taken by a note it is not simultaneous with, the nearest FREE
+     * line on the halving ladder — the same ladder the cascade uses, so an authored note lands on a
+     * subdivision the player can already see. It never writes over a frozen neighbour, and it pays
+     * a bounded price to stand beside one rather than walking away to find room (see `costOn`).
+     *
+     * ==================== A CROWDED BEAT SUBDIVIDES, IT DOES NOT SPILL ====================
+     *
+     * The ladder used to be walked coarse rung first — every candidate at `cell` considered before
+     * any candidate at `cell/2` — so a beat whose two cell lines were both frozen sent the add a
+     * WHOLE BEAT away rather than onto the free half-cell line under the pointer. That is the
+     * opposite of what rule 2 of the full allocator does: it HALVES the beat's step until its own
+     * notes fit, and spilling to the next beat is its last resort, not its first. Measured over
+     * 7,200 random dense cells at a 1/8 ruler on a half-second pulse: 455 landed further than one
+     * subdivision from the second asked for, worst 979 ms — against a full derivation's worst of
+     * 431 ms on the same takes.
+     *
+     * So the whole ladder is ONE candidate list, ranked by what it costs this event to stand there:
+     * the distance from the attack, plus `costOn`'s price for sharing. Distance is the player's
+     * question — "put it where I pointed" — and the tie-break is the engraver's: where a cell line
+     * and a half-cell line are equally good, the note goes on the line the ruler is already drawing.
      */
     const beatIdx = Math.round((ev.rawStart - originSec) / beatSec);
+    const midis = ev.members.map((m) => notes[m].midi);
     let pos: number | null = null;
-    for (let step = cell; step >= finest - EPS && pos === null; step /= 2) {
+    // Every line the ladder can express within a beat either side, each remembered with the
+    // COARSEST step that states it. Keyed on the lattice so a line is offered exactly once.
+    const rungOf = new Map<number, { sec: number; step: number }>();
+    for (let step = cell; step >= finest - EPS; step /= 2) {
       const slots = Math.max(1, Math.round(beatSec / step));
-      // Nearest-first within the beat, then the beats either side, so a spill is short.
-      const candidates: number[] = [];
-      for (let b = beatIdx; b <= beatIdx + 1; b++) {
-        for (let k = 0; k < slots; k++) candidates.push(originSec + b * beatSec + k * step);
-      }
-      candidates.sort((a, b) => Math.abs(a - ev.rawStart) - Math.abs(b - ev.rawStart));
-      for (const c of candidates) {
-        if (c < 0) continue;
-        if (lastLine !== null && c > lastLine + EPS) continue;
-        if (taken.has(keyOf(c))) continue;
-        pos = c;
-        break;
+      for (let b = beatIdx - 1; b <= beatIdx + 1; b++) {
+        for (let k = 0; k < slots; k++) {
+          const sec = originSec + b * beatSec + k * step;
+          if (sec < 0) continue;
+          if (lastLine !== null && sec > lastLine + EPS) continue;
+          const k2 = keyOf(sec);
+          if (!rungOf.has(k2)) rungOf.set(k2, { sec, step });
+        }
       }
     }
-    // Every line this take can express is occupied — refuse the incremental road rather than
-    // stacking two events on one position, and let the full allocator subdivide properly.
+    let bestTier = 2;
+    let bestScore = Number.POSITIVE_INFINITY;
+    let bestStep = 0;
+    for (const c of rungOf.values()) {
+      const cost = costOn(keyOf(c.sec), c.sec, ev.rawStart, midis);
+      if (cost === null) continue;
+      const score = Math.abs(c.sec - ev.rawStart) + cost.extra;
+      const better =
+        cost.tier < bestTier ||
+        (cost.tier === bestTier &&
+          (score < bestScore - EPS || (Math.abs(score - bestScore) <= EPS && c.step > bestStep + EPS)));
+      if (better) {
+        bestTier = cost.tier;
+        bestScore = score;
+        bestStep = c.step;
+        pos = c.sec;
+      }
+    }
+    // Not one line in three beats this event may stand on — every one of them already holds its own
+    // pitch. Refuse the incremental road rather than author a unison, and let the full allocator
+    // subdivide properly.
     if (pos === null) return null;
-    taken.add(keyOf(pos));
+    occupy(keyOf(pos), ev.rawStart, midis);
     const stepSec = cell;
     for (const m of ev.members) {
       const n = notes[m];

@@ -806,6 +806,20 @@ const DBLCLICK_SLOP_PX = 6;
  */
 const ANCHOR_GRAB_PX = 6;
 /**
+ * …AND HOW MANY PITCH ROWS AWAY IT MAY STILL BE THE NOTE THAT ADD WAS AIMED BESIDE.
+ *
+ * The other half of `ANCHOR_GRAB_PX`, and it was missing. The recognition tested the time axis
+ * alone, so ANY rectangle sharing the pointer's column claimed the add however far up or down the
+ * keyboard it was — and an add that carries an identity is seated on that note's own recorded
+ * onset, not on the second the pointer was over. A stranger three octaves away could therefore
+ * decide where a double-click landed.
+ *
+ * Twelve rows, an octave: the gesture this exists for is stacking an interval on a note you can
+ * see, and there is no interval anybody lines up by eye that does not fit inside one. Past that the
+ * add is a plain add at the pointer's own second, which is what it always was.
+ */
+const ANCHOR_GRAB_ROWS = 12;
+/**
  * How long a micro-edit is held before it is taken to have been a gesture of its own.
  *
  * Longer than the platform's double-click interval (500 ms on macOS by default) so a slow
@@ -3568,10 +3582,19 @@ export class PianoRoll {
    * THE NOTE AN ADD WAS AIMED BESIDE, or null. See `RollEdit.add.anchorId`.
    *
    * "Beside" is: on ANOTHER pitch row (a point inside a rectangle is a delete, and never reaches
-   * here), and within `ANCHOR_GRAB_PX` of that rectangle's left edge — its onset, which is the
-   * thing the player is lining the new note up with. Nearest edge wins; a tie between two
-   * rectangles at the same displayed onset goes to the one the pointer is vertically closest to,
-   * because that is the one they were looking at.
+   * here), within `ANCHOR_GRAB_PX` of that rectangle's left edge — its onset, which is the thing the
+   * player is lining the new note up with — AND WITHIN `ANCHOR_GRAB_ROWS` OF IT VERTICALLY. Nearest
+   * edge wins; a tie between two rectangles at the same displayed onset goes to the one the pointer
+   * is vertically closest to, because that is the one they were looking at.
+   *
+   * THE VERTICAL BOUND IS NOT DECORATION. Without it this test read the time axis only, so a
+   * double-click on empty background could be claimed by a rectangle THREE OCTAVES AWAY that
+   * happened to share its column — and the add was then seated on that stranger's recorded onset
+   * rather than on the second the pointer was over (`edit/rollPerformance.ts` §reseatAnchoredAdd).
+   * "Aimed beside" is a claim about a place on the screen, and a note an octave and a half up the
+   * gutter is not beside anything. An octave is the band because the gesture the recognition exists
+   * for is stacking an interval on an existing note, and every interval anybody stacks by eye is
+   * inside one.
    *
    * Reads the last painted frame, so it agrees with the picture the gesture was aimed at.
    */
@@ -3586,6 +3609,7 @@ export class PianoRoll {
       const dx = Math.abs(r.x - x);
       if (dx > ANCHOR_GRAB_PX) continue;
       const dy = Math.abs(r.y + r.h / 2 - y);
+      if (dy > ANCHOR_GRAB_ROWS * Math.max(1, r.h)) continue;
       if (dx < bestDx - 0.5 || (Math.abs(dx - bestDx) <= 0.5 && dy < bestDy)) {
         best = id;
         bestDx = dx;

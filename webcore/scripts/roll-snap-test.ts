@@ -395,16 +395,45 @@ assert(
   onBeats.map((n) => `${n.id}@${n.startSec}`).join(' ') === 's0@1 s1@1.5 s2@2 s3@2.5',
   'each note goes to its NEAREST beat, counted from the origin'
 );
-// Ends are tidied to a cell so nothing rings a ragged 40 ms across the next beat, and the last
-// note — which has nothing after it to be capped by — keeps the length it rounded to.
+// Ends are tidied to a cell so nothing rings a ragged 40 ms across the next beat. EVERY note keeps
+// the length it rounded to — there is no longer a "last note" special case, because there is no
+// longer anything that caps any of the others.
 for (const note of onBeats) {
   const off = Math.abs((note.endSec - originSec) / CELL16 - Math.round((note.endSec - originSec) / CELL16));
   assert(off < 1e-9, `${note.id} must END on a subdivision line`);
   assert(note.endSec - note.startSec >= CELL16 - 1e-9, `${note.id} must be at least one cell long`);
 }
-// …and an end may not be pushed past the next attack, because the recording did not hold those
-// two together: s0 was released at 1.44 and s1 struck at 1.47.
-assert(onBeats[0].endSec <= onBeats[1].startSec + 1e-9, 'a tidied end may not swallow the next attack');
+/*
+ * REVOKED — "a tidied end may not swallow the next attack".
+ *
+ * This assertion is gone, and the claim it made is quoted here so the reversal is on the record
+ * rather than inferred from a diff:
+ *
+ *   "…and an end may not be pushed past the next attack, because the recording did not hold those
+ *    two together: s0 was released at 1.44 and s1 struck at 1.47."
+ *   assert(onBeats[0].endSec <= onBeats[1].startSec + 1e-9,
+ *          'a tidied end may not swallow the next attack');
+ *
+ * s0 and s1 are at DIFFERENT PITCHES, and that is the whole problem with it: the rule it was
+ * guarding could not see pitch at all, so it read "the next attack anywhere on the instrument" as
+ * "the end of this note". That is a monophonic bass assumption living in a polyphonic editor, and
+ * it cost an untouched note 20–50% of its painted length on the owner's own gesture. The cap is
+ * deleted (`app/snap.ts` §"the next-attack cap, and why it is gone"), so a note's end is now its own
+ * quantized length and nothing else.
+ *
+ * IT PASSED ON THIS FIXTURE EVEN AFTER THE CAP WAS DELETED — the quantized end happens not to
+ * overshoot here — which is exactly why it is being removed rather than left alone. An assertion
+ * that states a revoked law and happens to be satisfied is a trap for the next person to widen the
+ * fixture. What replaces it is the property that is actually true.
+ */
+for (const note of onBeats) {
+  const raw = sparse.find((r) => r.id === note.id)!;
+  const want = Math.max(CELL16, Math.round((raw.endSec - raw.startSec) / CELL16) * CELL16);
+  assert(
+    Math.abs(note.endSec - note.startSec - want) < 1e-9,
+    `${note.id} keeps its OWN measured length, quantized — no attack at another pitch may cut it`
+  );
+}
 
 // A note played shorter than a cell is widened to one rather than rounded out of existence.
 const stub = snapPerformanceToBeat([{ id: 'x', startSec: 1.02, endSec: 1.05, midi: 40 }], BEAT, CELL16, originSec, 120);
@@ -575,8 +604,39 @@ assert(
     0,
     120
   );
-  assert(apart[0].endSec <= apart[1].startSec + 1e-9, 'a tidied end may not swallow the follower after it');
-  // …and a sustain the recording itself held across the next attack is not capped by one.
+  /*
+   * REVOKED — "a tidied end may not swallow the follower after it".
+   *
+   * The claim that was here, quoted so the reversal is on the record:
+   *
+   *   assert(apart[0].endSec <= apart[1].startSec + 1e-9,
+   *          'a tidied end may not swallow the follower after it');
+   *
+   * g0 is midi 40 and g1 is midi 43 — a fourth apart, two different strings, sounding one after the
+   * other. Nothing about a bass guitar stops both ringing, and the rule that enforced this could not
+   * tell that pair from the same string struck twice. See `app/snap.ts` §"the next-attack cap, and
+   * why it is gone" and `scripts/roll-duration-ownership-test.ts`.
+   *
+   * WHAT IS ASSERTED INSTEAD is the property that replaced it: each of the two keeps its own
+   * measured length, quantized, whatever the other one does.
+   */
+  for (const [i, raw] of [
+    { id: 'g0', startSec: 2.01, endSec: 2.2 },
+    { id: 'g1', startSec: 2.26, endSec: 2.45 }
+  ].entries()) {
+    const want = Math.max(CELL16, Math.round((raw.endSec - raw.startSec) / CELL16) * CELL16);
+    assert(
+      Math.abs(apart[i].endSec - apart[i].startSec - want) < 1e-9,
+      `${raw.id} keeps its own quantized length; the note after it has no say in the matter`
+    );
+  }
+
+  /*
+   * …AND THE SUSTAIN CASE STAYS, because it was always asserting the RIGHT thing — it just used to
+   * be true for the wrong reason. It passed because the old cap exempted pairs the recording itself
+   * held together; it passes now because nothing caps anything. Keeping it means the day somebody
+   * reintroduces a cap "only where the take had no overlap", this still fails.
+   */
   const held = snapPerformanceToBeat(
     [
       { id: 'h0', startSec: 2.01, endSec: 2.9, midi: 40 },

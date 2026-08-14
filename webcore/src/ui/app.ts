@@ -303,9 +303,11 @@ import {
 // The snap layer's pure half. `App.performanceFeed()` is the only caller — see the tap point.
 import {
   mergeEditedOntoRaw,
+  placementsOf,
   rollSnapUnitSec,
   snapPerformanceToBeat,
   snapPerformanceToGrid,
+  type FrozenPlacement,
   type RollPerformanceNote
 } from '../app/snap';
 import {
@@ -9387,6 +9389,28 @@ class App {
    * — which is what a `return this.rippled(…)` on the last line alone would have done — leaves a
    * take with Snap on Off showing no ripple at all, on both surfaces.
    */
+  /*
+   * ================= THE DERIVED LAYER IS A PICTURE, NOT A RECOMPUTATION =================
+   *
+   * What the last Beat derivation placed each note at, and the derivation it belongs to. See
+   * `app/snap.ts` §"incremental edits freeze untouched placements" for the law; this is the half of
+   * it that decides WHICH KIND of derivation each call is.
+   *
+   * `snapDerivationKey` is every input that makes a derivation mean something different — the mode,
+   * the ruler, the pulse, the origin, the document length. When it changes, the user has asked for
+   * the take to be re-magnetised and the global allocator runs. When it does not, an edit carries
+   * every unauthored placement over verbatim.
+   *
+   * `snapAuthored` is the ids of the transaction currently being committed, handed over by
+   * `applyRollEdit` and consumed by the first derivation that follows it. Consumed rather than
+   * merely read, so that the second and later calls for the same commit freeze EVERYTHING and
+   * return the identical array — a derived layer that changed when nobody edited anything would be
+   * the very fault this machinery exists to stop.
+   */
+  private snapDerivationKey: string | null = null;
+  private snapPlacements: Map<string, FrozenPlacement> | null = null;
+  private snapAuthored: Set<string> | null = null;
+
   private snappedFeed(): InputNote[] {
     const source = this.editedSource();
     const raw = source?.detected?.notes ?? [];
@@ -9414,9 +9438,38 @@ class App {
     // doing on its own exactly what the guard has stopped doing — pulling every note an inserted
     // bar pushed past the old end back onto the last line inside the recording, in a heap.
     const boundSec = this.documentDurationSec();
-    return s.rollSnap === 'beat'
-      ? snapPerformanceToBeat(raw, basis.beatSec, unitSec, basis.originSec, basis.tempoBpm, boundSec)
-      : snapPerformanceToGrid(raw, unitSec, basis.originSec, basis.tempoBpm, boundSec);
+    if (s.rollSnap !== 'beat') {
+      // GRID maps every note independently, so it has no neighbour to disturb and needs none of
+      // the machinery below. Nothing an add does can reach a note it did not name.
+      this.snapPlacements = null;
+      this.snapDerivationKey = null;
+      this.snapAuthored = null;
+      return snapPerformanceToGrid(raw, unitSec, basis.originSec, basis.tempoBpm, boundSec);
+    }
+
+    /*
+     * FULL OR INCREMENTAL. A change of mode, ruler, pulse, origin or document length is the user
+     * asking for the whole take to be magnetised; anything else is an edit, and an edit freezes
+     * every placement it did not author.
+     *
+     * TAKE LOAD NEEDS NO GUARD OF ITS OWN, and that is worth saying because its absence looks like
+     * an omission. A placement is only carried over when the note's RECORDING matches the one it
+     * was derived from (`snap.ts` §FrozenPlacement), so a freshly loaded take matches nothing,
+     * `snapIncrementally` finds no frozen note and hands back to the global allocator. In the one
+     * case where a load DOES match — the same take reopened, same ids, same recorded spans — the
+     * two derivations agree by construction, so there is nothing for a guard to protect.
+     */
+    const key = [s.rollSnap, s.rollGrid, basis.beatSec, unitSec, basis.originSec, basis.tempoBpm, boundSec].join('|');
+    const authored = this.snapAuthored;
+    this.snapAuthored = null;
+    const previous = this.snapDerivationKey === key ? this.snapPlacements : null;
+    const derived = snapPerformanceToBeat(
+      raw, basis.beatSec, unitSec, basis.originSec, basis.tempoBpm, boundSec,
+      previous && previous.size ? { authored: authored ?? new Set<string>(), previous } : undefined
+    );
+    this.snapDerivationKey = key;
+    this.snapPlacements = placementsOf(raw, derived, unitSec);
+    return derived;
   }
 
   // =========================================================================
@@ -14476,6 +14529,13 @@ class App {
 
     // WHAT THIS TRANSACTION CLAIMS, recorded before it is made. See `commitLog`.
     this.commitIntent = { kind: edit.kind, authoredIds: [...touched] };
+    /*
+     * …AND THE SAME CLAIM TO THE DERIVED LAYER. Under Beat this is what makes the difference
+     * between an edit and a re-magnetisation: every note NOT in this set keeps the placement it
+     * already had, to the bit. See `snappedFeed` and `app/snap.ts` §"incremental edits freeze
+     * untouched placements".
+     */
+    this.snapAuthored = new Set(touched);
     this.commitPerformance(
       cuts.length
         ? mergeRollEditOntoCutTake(raw, edited, touched, cuts)

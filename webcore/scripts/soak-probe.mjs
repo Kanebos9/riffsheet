@@ -755,61 +755,49 @@ function checkInvariants(before, after, allowed, wide, projectionMayMove = false
    * by identity. Not asserted for `wide` bursts (undo/redo), and not for snap and grid flips —
    * those are the projection deliberately changing, which is the whole of what they do.
    */
-  const reallocated = [];
   if (!wide && !projectionMayMove) {
     /*
-     * WHAT BEAT IS ALLOWED TO DO TO A NOTE NOBODY TOUCHED, STATED EXACTLY.
+     * WHAT A TRANSACTION IS ALLOWED TO DO TO A NOTE NOBODY TOUCHED: NOTHING.
      *
-     * This law used to be all-or-nothing, and it had to be switched off (`--snap-modes=off,grid`)
-     * to hunt anywhere else, because Beat is a global allocator and fires it on almost every add.
-     * That is a real cost, but "almost every add" is not a law — it is a law nobody can read. The
-     * adjudicated distinction is sharper than the old one and strictly stronger where it matters:
+     * ===================== THE LAW AS IT NOW STANDS =====================
      *
-     *   AN ONSET MAY MOVE under Beat. The allocator hands out slots on the pulse, and adding or
-     *     removing an event genuinely changes which slot its neighbours get. That is the
-     *     documented global cost the app already exempts (`ui/app.ts §the Beat exemption`).
-     *     Counted and reported, never failed on.
-     *   AN ARTICULATION MAY NOT. An allocator decides where a note stands, not how long it is
-     *     held. A derived duration that changes for a note nobody edited is the collapse
-     *     conviction C1's release translation exists to stop (`app/snap.ts §the release follows
-     *     the attack it belongs to`), and it is a failure under every snap mode.
-     *   A PITCH MAY NOT, under any mode. No snap has an opinion about pitch.
+     *   FOR ANY NON-SHEET TRANSACTION WITH AUTHORED IDS A, EVERY PRE-EXISTING ID OUTSIDE A KEEPS
+     *   IDENTICAL startSec, endSec AND midi.
      *
-     * Off and Grid keep the whole law: they map each note independently, so nothing an add does
-     * may reach a neighbour at all.
+     * No mode carve-out, no articulation/onset split, no exemption. Under every snap mode, an edit
+     * changes the notes it names and nothing else.
+     *
+     * ===================== WHAT THAT REPLACES, QUOTED =====================
+     *
+     * This law had TWO liberties in it, and both are revoked. The first:
+     *
+     *   "AN ONSET MAY MOVE under Beat. The allocator hands out slots on the pulse, and adding or
+     *    removing an event genuinely changes which slot its neighbours get. That is the documented
+     *    global cost the app already exempts (`ui/app.ts §the Beat exemption`). Counted and
+     *    reported, never failed on."
+     *
+     * …and the second, which was the one that codified the owner's reported defect as a cost:
+     *
+     *   "…AND THE ONE SHORTENING THAT IS NOT A RESHAPING: A NOTE SQUEEZED BY ITS OWN SUCCESSOR.
+     *    Beat may move an onset. If it moves one FORWARD and the next attack does not follow it, the
+     *    gap between them closes, and a note held to its full length would now overlap a note the
+     *    RECORDING did not overlap… `app/snap.ts` refuses that (its next-attack rule…), so the note
+     *    ends exactly AT the next derived attack. That is the consequence of the permitted onset
+     *    move, not a second liberty: the note is not reshaped by an allocator, it is stopped by the
+     *    note after it."
+     *
+     * BOTH RESTED ON THE SAME MISTAKE. "The note after it" was the next attack AT ANY PITCH, so a
+     * rule written for a monophonic bass was cutting notes on other strings; and the onset liberty
+     * was justified by a re-magnetisation nobody had asked for. Adding a note is not a request to
+     * re-derive the take. The app no longer does: an edit carries every unauthored placement over
+     * verbatim and only the authored notes are allocated (`app/snap.ts` §"incremental edits freeze
+     * untouched placements"), so the liberties are not merely withdrawn from the law — there is
+     * nothing left in the app that needed them.
+     *
+     * A FULL DERIVATION IS STILL FREE, and that is where the exemption really belonged all along:
+     * `projectionMayMove` already excludes snap and grid flips, which are exactly the moments the
+     * user asks for the whole take to be magnetised.
      */
-    const beat = before.snapMode === 'beat' && after.snapMode === 'beat';
-    /*
-     * …AND THE ONE SHORTENING THAT IS NOT A RESHAPING: A NOTE SQUEEZED BY ITS OWN SUCCESSOR.
-     *
-     * Beat may move an onset. If it moves one FORWARD and the next attack does not follow it, the
-     * gap between them closes, and a note held to its full length would now overlap a note the
-     * RECORDING did not overlap — two notes sounding at once where the player played one after the
-     * other. `app/snap.ts` refuses that (its next-attack rule, which fires only where the raw take
-     * itself had no overlap), so the note ends exactly AT the next derived attack. That is the
-     * consequence of the permitted onset move, not a second liberty: the note is not reshaped by
-     * an allocator, it is stopped by the note after it.
-     *
-     * AND THE SAME RULE RELAXING IS THE SAME EVENT. A note the cap was holding short goes back to
-     * its own recorded length the moment the attack that was crowding it moves away — it is not
-     * being stretched, it is stopping being squeezed. Refusing that would make the exemption
-     * one-way and would fail the undo of every case it permits.
-     *
-     * Recognised, narrowly, by exactly that signature on the side it moved: SHORTER and now ending
-     * at the next derived attack, or LONGER and previously ending at the next derived attack. A
-     * length that changed while touching neither cap is a reshaping.
-     */
-    const attackFinder = (feed) => {
-      const starts = Object.values(feed ?? {})
-        .map((r) => r[0])
-        .sort((a, b) => a - b);
-      return (sec) => {
-        for (const s of starts) if (s > sec + 1e-6) return s;
-        return Number.POSITIVE_INFINITY;
-      };
-    };
-    const nextAttackAfter = attackFinder(after.feed);
-    const nextAttackBefore = attackFinder(before.feed);
     const drifted = [];
     for (const [id, row] of Object.entries(before.feed ?? {})) {
       if (allowed.includes(id)) continue;
@@ -818,22 +806,17 @@ function checkInvariants(before, after, allowed, wide, projectionMayMove = false
       if (JSON.stringify(row) === JSON.stringify(now)) continue;
       // A MILLISECOND OF SLACK, and it is about the PROBE rather than about the music: the feed is
       // published rounded to four decimals, so a note translated by a whole step reports its two
-      // ends rounded independently and its duration can differ in the last digit. A real
-      // articulation change is a whole snap step — tens of milliseconds at any grid this app
-      // offers — so a millisecond cannot hide one and does stop the rounding crying wolf.
-      const grew = (now[1] - now[0]) - (row[1] - row[0]);
-      const reshaped = Math.abs(grew) > 1e-3;
+      // ends rounded independently and its duration can differ in the last digit. A real change is
+      // a whole snap step — tens of milliseconds at any grid this app offers — so a millisecond
+      // cannot hide one and does stop the rounding crying wolf.
+      const movedOnset = Math.abs(now[0] - row[0]) > 1e-3;
+      const movedEnd = Math.abs(now[1] - row[1]) > 1e-3;
       const repitched = row[2] !== now[2];
-      const squeezed = grew < 0 && Math.abs(now[1] - nextAttackAfter(now[0])) <= 1e-3;
-      const released = grew > 0 && Math.abs(row[1] - nextAttackBefore(row[0])) <= 1e-3;
-      if (beat && !repitched && (!reshaped || squeezed || released)) {
-        reallocated.push({
-          id, before: row, after: now,
-          why: squeezed ? 'squeezed-by-next-attack' : released ? 'released-by-next-attack' : 'onset'
-        });
-        continue;
-      }
-      drifted.push({ id, before: row, after: now, why: repitched ? 'pitch' : reshaped ? 'articulation' : 'onset' });
+      if (!movedOnset && !movedEnd && !repitched) continue;
+      drifted.push({
+        id, before: row, after: now,
+        why: repitched ? 'pitch' : movedOnset && movedEnd ? 'onset+end' : movedOnset ? 'onset' : 'end'
+      });
     }
     if (drifted.length) {
       v.push({ law: 'a2/feed-row-moved', detail: drifted.slice(0, 12), count: drifted.length });
@@ -962,14 +945,10 @@ function checkInvariants(before, after, allowed, wide, projectionMayMove = false
   const stale = auth.filter((id) => !feedSet.has(id));
   if (stale.length) v.push({ law: 'd/selection-holds-dead-ids', detail: stale });
 
-  if (softNotes.length || reallocated.length) {
-    v.soft = [
-      ...softNotes,
-      ...(reallocated.length
-        ? [{ why: 'beat-reallocated-onsets', count: reallocated.length, detail: reallocated.slice(0, 6) }]
-        : [])
-    ];
-  }
+  // `beat-reallocated-onsets` used to be reported here as a soft note — the permitted-but-counted
+  // onset moves law (a2) allowed under Beat. There is no such category any more: an onset that
+  // moves on a note nobody authored is a violation, and it is in `drifted` above.
+  if (softNotes.length) v.soft = [...softNotes];
   return v;
 }
 
@@ -1894,19 +1873,27 @@ async function anchoredAddMatrix(cdp, opts) {
   const jitters = opts.jitters ?? (argOf('jitters', '') ? argOf('jitters', '').split(',').map(Number) : null) ?? [0, 5, 15, 25, 40];
   const directions = opts.directions ?? [1, -1];
   const frees = opts.frees ?? [false, true];
+  const phases = opts.phases ?? (argOf('phases', '') ? argOf('phases', '').split(',') : null) ?? ['onset'];
+  const lateOffsets = opts.lateOffsets
+    ?? (argOf('late-offsets', '') ? argOf('late-offsets', '').split(',').map(Number) : null)
+    ?? [null];
 
-  for (const snap of snaps) {
-    for (const jitterMs of jitters) {
-      for (const rows of directions) {
-        for (const free of frees) {
-          const cell = await anchoredCell(cdp, url, { snap, jitterMs, rows, free });
-          results.push(cell);
-          const tag = `snap=${snap} jitter=${jitterMs}ms rows=${rows > 0 ? '+' : ''}${rows} ${free ? 'free' : 'snapped'}`;
-          if (cell.error) console.log(`  ANCHOR  ${tag}: skipped — ${cell.error}`);
-          else if (cell.violations.length) {
-            console.log(`  ANCHOR  ${tag}: VIOLATION (achieved jitter ${cell.achievedJitterMs}ms)`);
-            for (const v of cell.violations) console.log(`      ${v.law}  ${JSON.stringify(v.detail ?? null).slice(0, 320)}`);
-          } else console.log(`  ANCHOR  ${tag}: clean (achieved jitter ${cell.achievedJitterMs}ms, added ${cell.addedId ?? 'nothing'})`);
+  for (const phase of phases) {
+    for (const snap of snaps) {
+      for (const jitterMs of jitters) {
+        for (const rows of directions) {
+          for (const free of frees) {
+           for (const lateOffsetPx of phase === 'late' ? lateOffsets : [null]) {
+            const cell = await anchoredCell(cdp, url, { snap, jitterMs, rows, free, phase, lateOffsetPx });
+            results.push(cell);
+            const tag = `${phase}${lateOffsetPx === null ? '' : `+${lateOffsetPx}px`} snap=${snap} jitter=${jitterMs}ms rows=${rows > 0 ? '+' : ''}${rows} ${free ? 'free' : 'snapped'}`;
+            if (cell.error) console.log(`  ANCHOR  ${tag}: skipped — ${cell.error}`);
+            else if (cell.violations.length) {
+              console.log(`  ANCHOR  ${tag}: VIOLATION (achieved jitter ${cell.achievedJitterMs}ms)`);
+              for (const v of cell.violations) console.log(`      ${v.law}  ${JSON.stringify(v.detail ?? null).slice(0, 320)}`);
+            } else console.log(`  ANCHOR  ${tag}: clean (achieved jitter ${cell.achievedJitterMs}ms, added ${cell.addedId ?? 'nothing'})`);
+           }
+          }
         }
       }
     }
@@ -1914,8 +1901,53 @@ async function anchoredAddMatrix(cdp, opts) {
   return results;
 }
 
+/**
+ * THE SECOND PHASE — "A NOTE'S DURATION BELONGS TO THE NOTE" (the owner's Aug 14 screenshot).
+ *
+ * The matrix above aims its add at the anchor's OWN ONSET, which is the gesture the owner reported
+ * in the first round. It is 60/60 green and it is blind to the second report, because the second
+ * report is a DIFFERENT GESTURE: the new note goes in at a LATER TIME than an existing note and on
+ * a DIFFERENT PITCH, and the existing note — untouched, on another row, sounding through the point
+ * the pointer landed on — comes back visibly SHORTER (measured off the screenshot: the low-row note
+ * lost about 30% of its painted width).
+ *
+ * `phase` is that axis.
+ *
+ *   'onset'  x = the anchor's left edge + 1px. What the matrix has always done.
+ *   'late'   x = just PAST the anchor's right edge — a later time at which the anchor has already
+ *            stopped, on a row several semitones away. Nothing about the anchor is edited, pointed
+ *            at, or selected.
+ *
+ * PAST THE END RATHER THAN INSIDE IT, and that difference is the whole experiment. An add INSIDE
+ * the anchor's span cannot reach it: the release rule in `app/snap.ts` fires only where the RAW
+ * take did not already hold the two together, and a note still ringing at the new attack held them
+ * together by definition. Measured, and worth recording so nobody re-aims it: twelve cells aimed
+ * 60% of the way along the anchor came back clean in all three snap modes. The REACHABLE
+ * configuration is the one the owner described — the anchor STOPS, a new note is added shortly
+ * after it at another pitch, the anchor's quantized end (its own measured length rounded up to a
+ * whole step) now overshoots the new note's derived attack, and it is cut back to it.
+ *
+ * AND THE ASSERTION IS DIFFERENT, on purpose, because the permitted liberties are different. At the
+ * anchor's own onset nothing may move at all, so the cell compares whole feed rows and whole
+ * rectangles. Later in the bar, under Beat, an allocator may legitimately re-slot a NEIGHBOUR'S
+ * ONSET — that is the documented Beat exemption, and a gate that failed on it would be failing on
+ * a law the app states. So the 'late' phase asserts the narrower, sharper claim and only it:
+ *
+ *     NO PRE-EXISTING NOTE'S DURATION MAY CHANGE, AND NO PRE-EXISTING NOTE'S PITCH MAY CHANGE,
+ *     UNDER ANY SNAP MODE, WHEN THE ONLY THING THAT HAPPENED IS AN ADD AT ANOTHER PITCH.
+ *
+ * Stated over the DERIVED layer (the feed row every consumer reads) and over the PAINTED layer (the
+ * rectangle the owner actually looked at) separately, because they can disagree and the screenshot
+ * is evidence about the second one.
+ *
+ * IT IS DELIBERATELY NOT ROUTED THROUGH LAW (a2). (a2) currently carries an exemption — "squeezed
+ * by its own successor's attack" — which would swallow exactly this fault under Beat and report the
+ * cell green. Whether that exemption survives is not this gate's business; the gate states the
+ * owner's sentence directly so that it is answerable either way.
+ */
+
 /** One cell of the matrix, from a fresh page: jitter the anchor, add beside it, compare. */
-async function anchoredCell(cdp, url, { snap, jitterMs, rows, free }) {
+async function anchoredCell(cdp, url, { snap, jitterMs, rows, free, phase = 'onset', lateOffsetPx = null }) {
   await boot(cdp, url);
   // The snap mode first, so the jitter drag and the add both happen under the mode being tested.
   await doAct(cdp, { kind: 'snap', value: snap });
@@ -1936,7 +1968,7 @@ async function anchoredCell(cdp, url, { snap, jitterMs, rows, free }) {
 
   let geo = await geometry(cdp);
   let snapBefore = await snapshot(cdp);
-  if (!geo || geo.painted.length < 4) return { snap, jitterMs, rows, free, error: 'not enough painted notes' };
+  if (!geo || geo.painted.length < 4) return { snap, jitterMs, rows, free, phase, lateOffsetPx, error: 'not enough painted notes' };
 
   /*
    * THE ANCHOR IS A NOTE WITH A NEIGHBOUR ON EITHER SIDE and an empty row above and below it, so
@@ -1948,18 +1980,30 @@ async function anchoredCell(cdp, url, { snap, jitterMs, rows, free }) {
     .slice()
     .sort((a, b) => a.x - b.x)
     .filter((r, i, all) => i > 0 && i < all.length - 1);
-  if (!mid.length) return { snap, jitterMs, rows, free, error: 'no interior note to anchor on' };
-  const anchor = mid[Math.floor(mid.length / 2)];
+  if (!mid.length) return { snap, jitterMs, rows, free, phase, lateOffsetPx, error: 'no interior note to anchor on' };
+  /*
+   * THE 'late' PHASE NEEDS A NOTE WITH A MIDDLE, so 60% along it is a genuinely later pixel and not
+   * a rounding of its own left edge. The WIDEST interior rectangle is picked rather than the middle
+   * one — it is the longest-held note on screen, which is the low sustained bass the owner's
+   * screenshot is about, and it is the one with the most painted width to lose.
+   */
+  const anchor =
+    phase === 'late'
+      ? mid.slice().sort((a, b) => b.w - a.w)[0]
+      : mid[Math.floor(mid.length / 2)];
+  if (phase === 'late' && !(anchor.w >= 10)) {
+    return { snap, jitterMs, rows, free, phase, lateOffsetPx, error: `widest interior note is only ${anchor.w}px — no room for a later attack inside it` };
+  }
 
   // --- the jitter, through the interface ------------------------------------
   let achievedJitterMs = 0;
   if (jitterMs !== 0) {
     const secPerPx = geo.secPerPx ?? null;
     if (!secPerPx || !Number.isFinite(secPerPx) || secPerPx <= 0) {
-      return { snap, jitterMs, rows, free, error: 'no time ruler to measure' };
+      return { snap, jitterMs, rows, free, phase, lateOffsetPx, error: 'no time ruler to measure' };
     }
     const dx = Math.round((jitterMs / 1000) / secPerPx);
-    if (dx === 0) return { snap, jitterMs, rows, free, error: `zoom too coarse for ${jitterMs}ms (secPerPx ${secPerPx})` };
+    if (dx === 0) return { snap, jitterMs, rows, free, phase, lateOffsetPx, error: `zoom too coarse for ${jitterMs}ms (secPerPx ${secPerPx})` };
     const y = Math.round(anchor.y + anchor.h / 2);
     // Alt, so the drag is FREE and the nudge is not swallowed by the very snap under test.
     await doAct(cdp, {
@@ -1991,56 +2035,132 @@ async function anchoredCell(cdp, url, { snap, jitterMs, rows, free }) {
   }
 
   const live = (geo.painted ?? []).find((r) => r.id === anchor.id);
-  if (!live) return { snap, jitterMs, rows, free, achievedJitterMs, error: 'the anchor left the frame' };
+  if (!live) return { snap, jitterMs, rows, free, phase, lateOffsetPx, achievedJitterMs, error: 'the anchor left the frame' };
 
-  // --- the add, directly above or below the anchor, at the anchor's own onset
+  // --- the add, directly above or below the anchor
   /*
-   * x IS THE ANCHOR'S OWN LEFT EDGE PLUS ONE PIXEL — the onset that is on screen, not one the
-   * harness computed from a clock. y is a whole number of rows away from the anchor's centre, and
-   * the roll is asked whether that row is empty before the gesture is aimed there.
+   * x IS READ OFF THE ANCHOR'S OWN RECTANGLE — an onset that is on screen, not one the harness
+   * computed from a clock. 'onset' takes its left edge plus one pixel; 'late' takes a quarter of the
+   * anchor's own width PAST its right edge, which is a later time at which the anchor has already
+   * stopped and is near enough that its quantized end can still overshoot the new attack. y is a
+   * whole number of rows away from the anchor's centre, and the roll is asked whether that row is
+   * empty before the gesture is aimed there.
    */
+  const addX = Math.round(
+    phase === 'late' ? live.x + live.w + (lateOffsetPx ?? Math.max(3, live.w * 0.25)) : live.x + 1
+  );
   const rowH = geo.rowH || 8;
   let y = null;
   for (let k = Math.abs(rows); k <= Math.abs(rows) + 6; k++) {
     const candidate = Math.round(live.y + live.h / 2 - Math.sign(rows) * k * rowH);
-    const occupied = await evalIn(cdp, `window.__SOAK.occupiedAt(${Math.round(live.x + 1)}, ${candidate})`);
+    const occupied = await evalIn(cdp, `window.__SOAK.occupiedAt(${addX}, ${candidate})`);
     if (occupied === false) { y = candidate; break; }
   }
-  if (y === null) return { snap, jitterMs, rows, free, achievedJitterMs, error: 'no empty row beside the anchor' };
+  if (y === null) return { snap, jitterMs, rows, free, phase, lateOffsetPx, achievedJitterMs, error: 'no empty row beside the anchor' };
 
   const idsBefore = new Set(Object.keys(snapBefore.feed ?? {}));
   await doAct(cdp, {
     kind: 'add', tag: 'anchored', anchorId: anchor.id,
-    x: Math.round(live.x + 1), y, alt: free, gapMs: 14, driftX: 0, driftY: 0
+    x: addX, y, alt: free, gapMs: 14, driftX: 0, driftY: 0
   });
   const q = await quiesce(cdp, 8000);
   const after = await snapshot(cdp);
   const addedId = Object.keys(after.feed ?? {}).find((id) => !idsBefore.has(id)) ?? null;
 
-  const violations = checkInvariants(snapBefore, after, addedId ? [addedId] : [], false, false);
+  /*
+   * (a2) IS SKIPPED IN THE 'late' PHASE, and skipped DELIBERATELY rather than by omission. It is the
+   * one law here with an opinion about neighbours, it permits an onset move under Beat, and it
+   * exempts "squeezed by its own successor's attack" — so under Beat it would both allow a move this
+   * phase does not care about AND swallow the exact shortening this phase exists to catch. The
+   * narrower law below replaces it for this phase and answers the owner's sentence directly. Every
+   * other invariant (raw corruption, painted-agrees-with-feed, phantom rectangles, selection,
+   * projection) is asserted unchanged.
+   */
+  const violations = checkInvariants(snapBefore, after, addedId ? [addedId] : [], false, phase === 'late');
   if (!q.ok) violations.push({ law: 'quiescence-timeout', detail: q.why });
   if (!addedId) violations.push({ law: 'anchored/add-did-nothing', detail: { feedBefore: idsBefore.size, feedAfter: Object.keys(after.feed ?? {}).length } });
 
-  /*
-   * THE PAINTED LAYER, COMPARED DIRECTLY AS WELL. `checkInvariants` already asserts that each
-   * rectangle agrees with its own feed row, which is a different claim: a rectangle can agree with
-   * a feed row that has itself moved. This is the owner's sentence — "the rectangles around it
-   * moved" — asserted as written.
-   */
-  const rectDrift = [];
-  for (const [id, was] of Object.entries(snapBefore.painted ?? {})) {
-    if (id === addedId) continue;
-    const now = (after.painted ?? {})[id];
-    if (!now) { rectDrift.push({ id, was, now: null, why: 'rectangle vanished' }); continue; }
-    if (JSON.stringify(was.slice(0, 3)) !== JSON.stringify(now.slice(0, 3))) rectDrift.push({ id, was, now });
-  }
-  if (rectDrift.length) {
-    violations.push({ law: 'anchored/neighbour-rect-moved', detail: rectDrift.slice(0, 10), count: rectDrift.length });
+  if (phase === 'late') {
+    /*
+     * THE LAW, STATED TWICE OVER BECAUSE THE TWO LAYERS CAN DISAGREE.
+     *
+     * DERIVED: every pre-existing id keeps its duration and its pitch. A millisecond of slack on the
+     * duration, for the same reason (a2) allows one — the feed is published rounded, so a note
+     * translated whole reports its two ends rounded independently. A real cut is a whole snap step,
+     * tens of milliseconds at any grid this app offers.
+     *
+     * PAINTED: every pre-existing id keeps its rectangle's WIDTH and its row. One pixel of slack,
+     * and for a different reason: an onset move that Beat is allowed to make re-rounds x, which can
+     * move the right edge by a pixel without the duration having changed at all. The owner's
+     * screenshot is about 30% of a width, not one pixel.
+     */
+    const cutDerived = [];
+    for (const [id, row] of Object.entries(snapBefore.feed ?? {})) {
+      if (id === addedId) continue;
+      const now = (after.feed ?? {})[id];
+      if (!now) { cutDerived.push({ id, was: row, now: null, why: 'note vanished' }); continue; }
+      const wasDur = row[1] - row[0];
+      const nowDur = now[1] - now[0];
+      if (Math.abs(nowDur - wasDur) > 1e-3) {
+        cutDerived.push({
+          id, was: row, now,
+          why: nowDur < wasDur ? 'shortened' : 'lengthened',
+          wasDurSec: Number(wasDur.toFixed(4)),
+          nowDurSec: Number(nowDur.toFixed(4)),
+          lostPct: Number((100 * (1 - nowDur / wasDur)).toFixed(1))
+        });
+      } else if (row[2] !== now[2]) {
+        cutDerived.push({ id, was: row, now, why: 'repitched' });
+      }
+    }
+    if (cutDerived.length) {
+      violations.push({ law: 'C4/derived-duration-cut-by-another-pitch', detail: cutDerived.slice(0, 10), count: cutDerived.length });
+    }
+
+    const cutPainted = [];
+    for (const [id, was] of Object.entries(snapBefore.painted ?? {})) {
+      if (id === addedId) continue;
+      const now = (after.painted ?? {})[id];
+      if (!now) { cutPainted.push({ id, was, now: null, why: 'rectangle vanished' }); continue; }
+      // [startSec, endSec, midi, x, w]
+      if (Math.abs(now[4] - was[4]) > 1 || was[2] !== now[2]) {
+        cutPainted.push({
+          id, was, now,
+          why: was[2] !== now[2] ? 'repitched' : now[4] < was[4] ? 'narrower' : 'wider',
+          wasW: was[4], nowW: now[4],
+          lostPct: was[4] > 0 ? Number((100 * (1 - now[4] / was[4])).toFixed(1)) : null
+        });
+      }
+    }
+    if (cutPainted.length) {
+      violations.push({ law: 'C4/painted-length-cut-by-another-pitch', detail: cutPainted.slice(0, 10), count: cutPainted.length });
+    }
+  } else {
+    /*
+     * THE PAINTED LAYER, COMPARED DIRECTLY AS WELL. `checkInvariants` already asserts that each
+     * rectangle agrees with its own feed row, which is a different claim: a rectangle can agree with
+     * a feed row that has itself moved. This is the owner's sentence — "the rectangles around it
+     * moved" — asserted as written.
+     */
+    const rectDrift = [];
+    for (const [id, was] of Object.entries(snapBefore.painted ?? {})) {
+      if (id === addedId) continue;
+      const now = (after.painted ?? {})[id];
+      if (!now) { rectDrift.push({ id, was, now: null, why: 'rectangle vanished' }); continue; }
+      if (JSON.stringify(was.slice(0, 3)) !== JSON.stringify(now.slice(0, 3))) rectDrift.push({ id, was, now });
+    }
+    if (rectDrift.length) {
+      violations.push({ law: 'anchored/neighbour-rect-moved', detail: rectDrift.slice(0, 10), count: rectDrift.length });
+    }
   }
 
   return {
-    snap, jitterMs, rows, free, achievedJitterMs, addedId,
+    snap, jitterMs, rows, free, phase, lateOffsetPx, achievedJitterMs, addedId,
     anchorId: anchor.id,
+    anchorRect: { x: Math.round(live.x), w: Math.round(live.w) },
+    addPoint: { x: addX, y, pastAnchorEnd: addX > live.x + live.w },
+    anchorPaintedBefore: snapBefore.painted?.[anchor.id] ?? null,
+    anchorPaintedAfter: after.painted?.[anchor.id] ?? null,
     anchorFeedBefore: snapBefore.feed[anchor.id] ?? null,
     anchorFeedAfter: after.feed[anchor.id] ?? null,
     addedFeed: addedId ? after.feed[addedId] ?? null : null,

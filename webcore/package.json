@@ -16,6 +16,7 @@
     "test:sampler-loop": "node scripts/run-ts-tests.mjs scripts/sampler-loop-test.ts",
     "test:transport-clock": "node scripts/run-ts-tests.mjs scripts/transport-clock-test.ts",
     "test:roll-snap": "node scripts/run-ts-tests.mjs scripts/roll-snap-test.ts",
+    "test:duration-ownership": "node scripts/run-ts-tests.mjs scripts/roll-duration-ownership-test.ts",
     "test:riffsheet-doc": "node scripts/run-ts-tests.mjs scripts/riffsheet-doc-test.ts",
     "test:view-units": "node scripts/run-ts-tests.mjs scripts/view-units-test.ts",
     "test:parts": "node scripts/run-ts-tests.mjs scripts/parts-test.ts",
@@ -30,7 +31,7 @@
     "probe:sheet-edit": "node scripts/sheet-edit-probe.mjs",
     "probe:notation-visual": "node scripts/notation-visual-probe.mjs",
     "probe:seam": "node scripts/seam-probe.mjs",
-    "test:regressions": "node scripts/run-ts-tests.mjs scripts/midi-import-test.ts scripts/grand-staff-test.ts scripts/sampler-loop-test.ts scripts/transport-clock-test.ts scripts/roll-snap-test.ts scripts/riffsheet-doc-test.ts scripts/view-units-test.ts scripts/parts-test.ts scripts/gesture-test.ts src/ui/theme.test.ts src/app/identity.test.ts src/edit/chordEvents.test.ts",
+    "test:regressions": "node scripts/run-ts-tests.mjs scripts/midi-import-test.ts scripts/grand-staff-test.ts scripts/sampler-loop-test.ts scripts/transport-clock-test.ts scripts/roll-snap-test.ts scripts/roll-duration-ownership-test.ts scripts/riffsheet-doc-test.ts scripts/view-units-test.ts scripts/parts-test.ts scripts/gesture-test.ts src/ui/theme.test.ts src/app/identity.test.ts src/edit/chordEvents.test.ts",
     "build:debug": "RIFFSHEET_SOURCEMAP=1 vite build"
   },
   "dependencies": {

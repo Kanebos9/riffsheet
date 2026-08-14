@@ -220,6 +220,214 @@ function restate(n: InputNote, startSec: number, endSec: number, tempoBpm: numbe
 }
 
 /**
+ * ==================== WHAT ONE NOTE'S DERIVATION CAME OUT AS, LAST TIME ====================
+ *
+ * The derived placement of a single note, kept so the next edit can carry it over VERBATIM rather
+ * than working it out again. `rawStartSec`/`rawEndSec` are the RECORDING this placement was derived
+ * from, and they are the licence to reuse it: a placement is only carried over while the recording
+ * underneath it is unchanged, which is what makes undo, redo, ripple write-back and every other
+ * road that rewrites the take without "authoring" anything re-derive correctly instead of freezing
+ * at a stale answer.
+ */
+export interface FrozenPlacement {
+  startSec: number;
+  endSec: number;
+  stepSec: number;
+  rawStartSec: number;
+  rawEndSec: number;
+}
+
+/**
+ * ======================= INCREMENTAL EDITS FREEZE UNTOUCHED PLACEMENTS =======================
+ *
+ * THE FAULT THIS EXISTS TO KILL, and it is the one a next-attack fix on its own would have missed.
+ *
+ * Beat is a GLOBAL allocator. Every beat gets a `step` chosen by how crowded that beat is — the
+ * ruler's cell, halved until everything standing on the beat fits (§2). That step is then written
+ * to every member of the bucket (`stepOf[m] = step`) and the release pass rounds each note's own
+ * measured length onto it. So adding ONE note to a beat can halve that beat's step, and every
+ * untouched note sharing the beat has its DURATION RE-QUANTIZED at the finer step — a note nobody
+ * named, whose recording never changed, comes back a different length. The next-attack cap and this
+ * are two independent roads to the same owner-visible symptom, and removing only the first would
+ * have left the second live.
+ *
+ * THE RULE NOW. A derivation is one of two things, and which one it is depends on what the user
+ * just did rather than on anything inside this file:
+ *
+ *   A FULL DERIVATION happens on an explicit MODE or RULER change, and on TAKE LOAD. Those are the
+ *     moments the user has asked for the whole take to be magnetised, so the global allocator runs
+ *     exactly as it always has and every note is placed against every other. Nothing below is used.
+ *
+ *   AN INCREMENTAL DERIVATION happens on a roll EDIT — add, move, resize, delete. Every note the
+ *     transaction did not author keeps the placement it already had, to the bit: same onset, same
+ *     end, same step. Only the authored notes are allocated, and they are fitted AROUND the frozen
+ *     ones — spilling to a free subdivision when the line they wanted is taken, NEVER displacing a
+ *     neighbour to make room.
+ *
+ * WHY THAT IS THE RIGHT SHAPE AND NOT A PATCH. "Adding a note re-magnetises the notes around it" is
+ * not a behaviour anybody asked for; it is an artefact of re-running a whole-take algorithm to
+ * answer a one-note question. The magnetisation is a thing the user REQUESTS (by turning the mode
+ * on, or by changing the ruler), and between requests the derived layer is a stable picture that
+ * edits change one note at a time. That is also what makes the law in `scripts/soak-probe.mjs`
+ * statable at all: for any non-sheet transaction with authored ids A, every pre-existing id outside
+ * A keeps identical startSec, endSec and midi.
+ *
+ * Returns null when the incremental road cannot be taken honestly — no previous derivation to build
+ * on, or a note with no id, in which case the caller falls back to the full allocator.
+ */
+export interface IncrementalSnap {
+  /** The ids this transaction authored. Only these are allowed to be (re)allocated. */
+  authored: ReadonlySet<string>;
+  /** What the previous derivation produced, by id. */
+  previous: ReadonlyMap<string, FrozenPlacement>;
+}
+
+function snapIncrementally(
+  notes: ReadonlyArray<InputNote>,
+  beatSec: number,
+  subdivisionSec: number,
+  originSec: number,
+  tempoBpm: number,
+  takeDurationSec: number | undefined,
+  { authored, previous }: IncrementalSnap
+): InputNote[] | null {
+  if (previous.size === 0) return null;
+  const quarterSec = 60 / (tempoBpm || 100);
+  const cell = Math.min(subdivisionSec > 0 ? subdivisionSec : quarterSec / 4, beatSec);
+  const finest = finestStepSec(cell, beatSec);
+  const chordWindow = Math.min(CHORD_WINDOW_SEC, cell / 2);
+  const EPS = 1e-9;
+  const lastLine = lastLineBefore(takeDurationSec, originSec, finest);
+
+  const order = notes
+    .map((n, i) => ({ n, i }))
+    .sort((a, b) => a.n.startSec - b.n.startSec || a.n.midi - b.n.midi || a.i - b.i);
+
+  /*
+   * WHO IS FROZEN. A note is carried over verbatim only when all three hold: it has an id, this
+   * transaction did not author it, and its RECORDING is byte-identical to the one its cached
+   * placement was derived from. The third is what keeps undo honest.
+   */
+  const frozen = new Map<number, FrozenPlacement>();
+  const loose: { n: InputNote; i: number }[] = [];
+  for (const entry of order) {
+    const id = entry.n.id;
+    const was = id ? previous.get(id) : undefined;
+    if (
+      id &&
+      was &&
+      !authored.has(id) &&
+      Math.abs(was.rawStartSec - entry.n.startSec) < EPS &&
+      Math.abs(was.rawEndSec - entry.n.endSec) < EPS
+    ) {
+      frozen.set(entry.i, was);
+    } else {
+      loose.push(entry);
+    }
+  }
+  // Nothing carried over means this is not an incremental edit at all — let the allocator run.
+  if (frozen.size === 0) return null;
+
+  /*
+   * THE LINES THAT ARE TAKEN. Two events on one position are ONE event to the engraver, so an
+   * authored note may not be placed where a frozen one already stands. Keyed on the finest lattice
+   * the cascade can reach, which is the resolution at which "the same line" is a meaningful claim.
+   */
+  const keyOf = (sec: number): number => Math.round(sec / finest);
+  const taken = new Set<number>();
+  for (const p of frozen.values()) taken.add(keyOf(p.startSec));
+
+  const out = new Array<InputNote>(notes.length);
+  for (const [i, p] of frozen) out[i] = restate(notes[i], p.startSec, p.endSec, tempoBpm);
+
+  /*
+   * THE AUTHORED NOTES, FITTED AROUND THEM. A chord is one event here exactly as it is in the full
+   * allocator, so a strummed triad claims one position and keeps it.
+   */
+  const events: { members: number[]; rawStart: number }[] = [];
+  for (const { n, i } of loose) {
+    const open = events[events.length - 1];
+    if (open && n.startSec - open.rawStart <= chordWindow + EPS) {
+      open.members.push(i);
+      continue;
+    }
+    events.push({ members: [i], rawStart: n.startSec });
+  }
+
+  for (const ev of events) {
+    /*
+     * WHERE IT WANTS TO BE: its own nearest beat, exactly as rule 1 places a leader. Then, if that
+     * line is taken, the nearest FREE line on the halving ladder — the same ladder the cascade
+     * uses, so an authored note lands on a subdivision the player can already see. It searches
+     * outward from the beat it belongs to and never writes over a frozen neighbour.
+     */
+    const beatIdx = Math.round((ev.rawStart - originSec) / beatSec);
+    let pos: number | null = null;
+    for (let step = cell; step >= finest - EPS && pos === null; step /= 2) {
+      const slots = Math.max(1, Math.round(beatSec / step));
+      // Nearest-first within the beat, then the beats either side, so a spill is short.
+      const candidates: number[] = [];
+      for (let b = beatIdx; b <= beatIdx + 1; b++) {
+        for (let k = 0; k < slots; k++) candidates.push(originSec + b * beatSec + k * step);
+      }
+      candidates.sort((a, b) => Math.abs(a - ev.rawStart) - Math.abs(b - ev.rawStart));
+      for (const c of candidates) {
+        if (c < 0) continue;
+        if (lastLine !== null && c > lastLine + EPS) continue;
+        if (taken.has(keyOf(c))) continue;
+        pos = c;
+        break;
+      }
+    }
+    // Every line this take can express is occupied — refuse the incremental road rather than
+    // stacking two events on one position, and let the full allocator subdivide properly.
+    if (pos === null) return null;
+    taken.add(keyOf(pos));
+    const stepSec = cell;
+    for (const m of ev.members) {
+      const n = notes[m];
+      // ITS OWN LENGTH, quantized on its own step, floored at one step. Identical to the release
+      // pass of the full allocator, and with no cap of any kind — see §"the next-attack cap".
+      const endSec = pos + Math.max(stepSec, Math.round((n.endSec - n.startSec) / stepSec) * stepSec);
+      out[m] = restate(n, pos, boundEnd(endSec, pos, takeDurationSec), tempoBpm);
+    }
+  }
+
+  for (let i = 0; i < out.length; i++) if (!out[i]) return null;
+  out.sort((a, b) => a.startSec - b.startSec || a.midi - b.midi);
+  return out;
+}
+
+/**
+ * The derived placements a derivation produced, in the shape the NEXT one needs to freeze them.
+ *
+ * `raw` and `derived` are the same take before and after the snap, in the caller's own order; they
+ * are matched by id, which is the only thing that survives a re-derivation.
+ */
+export function placementsOf(
+  raw: ReadonlyArray<InputNote>,
+  derived: ReadonlyArray<InputNote>,
+  stepSec: number
+): Map<string, FrozenPlacement> {
+  const rawById = new Map<string, InputNote>();
+  for (const n of raw) if (n.id) rawById.set(n.id, n);
+  const out = new Map<string, FrozenPlacement>();
+  for (const d of derived) {
+    if (!d.id) continue;
+    const r = rawById.get(d.id);
+    if (!r) continue;
+    out.set(d.id, {
+      startSec: d.startSec,
+      endSec: d.endSec,
+      stepSec,
+      rawStartSec: r.startSec,
+      rawEndSec: r.endSec
+    });
+  }
+  return out;
+}
+
+/**
  * How close two attacks have to be before the beat magnet reads them as ONE event.
  *
  * A chord is several notes and one attack, and the cascade below exists to stop two notes
@@ -317,11 +525,11 @@ function maxOf(slots: ReadonlyArray<number>): number {
  *    notes can never swap, and no two events can share a position — except a chord, which is
  *    one event (see `CHORD_WINDOW_SEC`).
  *
- * 3. CLEAN ENDS. The release goes to the nearest subdivision line with a floor of one cell, so
- *    nothing rings a ragged 40 ms across the next beat. It is then capped at the next attack —
- *    but ONLY where the recording did not already hold the two together, so a bass note
- *    sustained under a melody keeps sustaining and a snapped end cannot invent an overlap the
- *    player never played. The floor wins over the cap: one cell is the minimum note.
+ * 3. CLEAN ENDS. The note's OWN measured length is rounded to a whole number of steps, with a floor
+ *    of one cell, and hung off wherever its attack landed — so nothing rings a ragged 40 ms across
+ *    the next beat and the shape travels with the attack by construction. NOTHING ELSE TOUCHES IT.
+ *    There is no cap at the next attack: a note's duration belongs to the note, and no attack at
+ *    another pitch may cut it (see §"the next-attack cap, and why it is gone" at the release pass).
  *
  * MEASURED FROM THE RAW TAKE, ALWAYS, and nothing is mutated — the same contract grid mode
  * keeps, which is what makes Off/Grid/Beat/Off return the recording to the bit.
@@ -378,9 +586,16 @@ export function snapPerformanceToBeat(
   subdivisionSec: number,
   originSec: number,
   tempoBpm: number,
-  takeDurationSec?: number
+  takeDurationSec?: number,
+  incremental?: IncrementalSnap
 ): InputNote[] {
   if (!(beatSec > 0) || notes.length === 0) return notes as InputNote[];
+  if (incremental) {
+    const held = snapIncrementally(
+      notes, beatSec, subdivisionSec, originSec, tempoBpm, takeDurationSec, incremental
+    );
+    if (held) return held;
+  }
   const quarterSec = 60 / (tempoBpm || 100);
   // Where the subdivision STARTS — the ruler's own cell, so a beat that is not crowded puts its
   // notes on lines the player can already see. Never coarser than the beat itself: with Grid on
@@ -654,23 +869,45 @@ export function snapPerformanceToBeat(
      * is already a whole number of steps rounds to itself, so the second pass reproduces the
      * first exactly.
      *
-     * That is the purity distinction this file has to keep. Beat is a global allocator and moving
-     * an untouched neighbour's derived ONSET is a documented cost of it (`ui/app.ts §the Beat
-     * exemption`). Reshaping that neighbour's ARTICULATION is not, and never was — an allocator
-     * decides where a note stands, not how long it is held. Only three things may change a
-     * derived length: this quantization of the note's own measured length, a genuine overlap the
-     * take itself did not have (the next-attack rule below), and the end of the tape (`boundEnd`).
+     * That is the purity distinction this file has to keep. An allocator decides where a note
+     * stands, not how long it is held. Exactly TWO things may change a derived length: this
+     * quantization of the note's OWN measured length, and the end of the tape (`boundEnd`).
+     *
+     * ================= THE NEXT-ATTACK CAP, AND WHY IT IS GONE =================
+     *
+     * There used to be a third. After this line, a loop walked forward to the first later attack
+     * AT ANY PITCH and clamped the release to it, guarded by "only where the take itself did not
+     * hold them together". Quoting the claim it was kept under, from this file's own §3:
+     *
+     *   "CLEAN ENDS. The release goes to the nearest subdivision line with a floor of one cell, so
+     *    nothing rings a ragged 40 ms across the next beat. It is then capped at the next attack —
+     *    but ONLY where the recording did not already hold the two together, so a bass note
+     *    sustained under a melody keeps sustaining and a snapped end cannot invent an overlap the
+     *    player never played."
+     *
+     * …and from the rig, law (a2), which codified the consequence as a permitted cost:
+     *
+     *   "A note the cap was holding short goes back to its own recorded length the moment the
+     *    attack that was crowding it moves away… the note is not reshaped by an allocator, it is
+     *    stopped by the note after it."
+     *
+     * BOTH ARE REVOKED. The reasoning is a MONOPHONIC BASS assumption — one note ends when the
+     * next begins — and it was living inside a polyphonic editor, where the "next attack" is
+     * routinely a different string on a different row. It does not invent an overlap the player
+     * never played; it DELETES a sustain the player did play, because a note's quantized end
+     * legitimately runs a little past its recorded end, and any new attack landing in that
+     * overshoot cut the old note back to it. Measured on the owner's own gesture: adding a note at
+     * a LATER time and a DIFFERENT pitch took 20–50% off an untouched note's painted length, and a
+     * sweep of midi 21–100 against a midi-40 note found ALL EIGHTY pitches cutting it. The rule
+     * could not see pitch at all.
+     *
+     * A note's duration belongs to the note. Nothing at another pitch may cut it. Where two notes
+     * genuinely overlap, the roll paints them overlapping, which is what a piano roll is for; the
+     * single-voice merge the ENGRAVING needs is the engraving's business and lives in the pipeline
+     * (`chords.ts` §noOverlap, `simplify.ts`), where a staff really can only carry one note per
+     * voice at a time.
      */
-    let endSec = startSec + Math.max(step, Math.round((n.endSec - n.startSec) / step) * step);
-    // `positions` is non-decreasing along `order`, so the first later note standing anywhere
-    // past this one is the next attack — chords included, since they share this position.
-    for (let j = k + 1; j < order.length; j++) {
-      const next = order[j];
-      if (positions[next.i] <= startSec + EPS) continue;
-      // Only where the take itself did not hold them together.
-      if (n.endSec <= next.n.startSec + EPS) endSec = Math.max(startSec + step, Math.min(endSec, positions[next.i]));
-      break;
-    }
+    const endSec = startSec + Math.max(step, Math.round((n.endSec - n.startSec) / step) * step);
     out[k] = restate(n, startSec, boundEnd(endSec, startSec, takeDurationSec), tempoBpm);
   }
 

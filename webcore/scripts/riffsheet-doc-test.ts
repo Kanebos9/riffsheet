@@ -17,6 +17,8 @@
  */
 
 import { strToU8, zipSync } from 'fflate';
+import { applyDocumentSettings, DEFAULT_SETTINGS } from '../src/app/state';
+import { restoredLivePartName } from '../src/score/parts';
 
 import {
   MAX_DOCUMENT_AUDIO_BYTES,
@@ -160,7 +162,7 @@ const document: RiffsheetDocument = {
   savedAt: 1_700_000_000_000,
   name: 'take',
   source,
-  settings: { grid: 'free', rollSnapToGrid: true, rollGrid: 'eighth' },
+  settings: { grid: 'free', rollSnapToGrid: true, rollGrid: 'eighth', notationSpacingPx: 8 },
   edits: [],
   editCursor: -1,
   audio: { kind: 'file', name: 'take.wav', path: '/somewhere/take.wav', durationSec: 4.5 },
@@ -205,12 +207,25 @@ const reopened = readRiffsheetDocument(written);
  * value the player dragged it off), and it would print an imported guitar's tablature as a plain
  * notation staff. Both fields are omitted when empty, so a document that uses neither still
  * serialises to the bytes v5 wrote.
+ *
+ * AND AGAIN, 6 -> 7, FOR A NEW MUSIC SEMANTIC. The old claims, quoted:
+ *
+ *   assert(
+ *     reopened.version === RIFFSHEET_DOCUMENT_VERSION && RIFFSHEET_DOCUMENT_VERSION === 6,
+ *     'a document written by this build reports version 6'
+ *   );
+ *   assert(!!reopened.audioData, 'a v6 document comes back with its recording');
+ *
+ * v7 tags the new sheet-insert ripple kind and its fixed atom. A v6 reader would ignore those
+ * fields, apply the old inclusive release seam, shift the inserted note a second time, and save
+ * without the evidence needed to recover the intended music. The container and audio contract do
+ * not otherwise change; the second assertion below still proves the same recording round trip.
  */
 assert(
-  reopened.version === RIFFSHEET_DOCUMENT_VERSION && RIFFSHEET_DOCUMENT_VERSION === 6,
-  'a document written by this build reports version 6'
+  reopened.version === RIFFSHEET_DOCUMENT_VERSION && RIFFSHEET_DOCUMENT_VERSION === 7,
+  'a document written by this build reports version 7'
 );
-assert(!!reopened.audioData, 'a v6 document comes back with its recording');
+assert(!!reopened.audioData, 'a v7 document comes back with its recording');
 
 // THE CONTAINER: a real zip, recognisable to anything that reads them.
 assert(
@@ -494,7 +509,8 @@ const renamedTake = readRiffsheetDocument(
 assert(renamedTake.source.livePartName === 'Low end', 'the take keeps the name it was given');
 assert(renamedTake.version === RIFFSHEET_DOCUMENT_VERSION, 'a renamed take does not move the format version');
 
-// A take nobody has renamed writes no such key at all, so its bytes are what they always were.
+// A hostile/direct codec caller can still supply whitespace, and the codec keeps absence so App
+// can distinguish a legacy file from a new canonical `Take`. New sources never reach this shape.
 const unnamedTake = writeRiffsheetDocument({ ...document, source: { ...source, livePartName: '   ' } });
 assert(
   readRiffsheetDocument(unnamedTake).source.livePartName === undefined,
@@ -510,6 +526,28 @@ const hugeName = readRiffsheetDocument(
   writeRiffsheetDocument({ ...document, source: { ...source, livePartName: `  ${'x'.repeat(400)}  ` } })
 );
 assert((hugeName.source.livePartName ?? '').length === 40, 'an over-long stored name is bounded on the way back');
+
+// P4 migration order, through the real document payload: apply the SAVED settings first, then
+// reproduce the old derived word once. A current guitar profile must not rename this bass file.
+const legacyNameDoc = readRiffsheetDocument(
+  writeRiffsheetDocument({
+    ...document,
+    source: { ...source, livePartName: undefined },
+    settings: { ...DEFAULT_SETTINGS, instrument: 'bass', tabMode: 'bass' }
+  })
+);
+const legacyDocSettings = applyDocumentSettings(
+  { ...DEFAULT_SETTINGS, instrument: 'guitar', tabMode: 'guitar' },
+  legacyNameDoc.settings
+).effective;
+assert(
+  restoredLivePartName(legacyDocSettings, legacyNameDoc.source.livePartName) === 'Bass',
+  'a legacy document freezes its former name after its own saved settings become effective'
+);
+assert(
+  restoredLivePartName(legacyDocSettings, renamedTake.source.livePartName) === 'Low end',
+  'a document’s explicit canonical name survives migration unchanged'
+);
 
 // ---------------------------------------------------------------------------
 // 4d. THE STRUCTURAL SCORE-TIME LAYER (v5) — the ship-blocker and the ripple log
@@ -774,13 +812,20 @@ const blob: PersistedSession = {
   savedAt: 1_700_000_000_000,
   source: encodeSource(cutSource),
   audio: null,
-  settings: {},
+  settings: { notationSpacingPx: 8 },
   view: { blend: 0.35 },
   edits: [],
   editCursor: -1
 };
 const readBack = readSession(JSON.stringify(blob));
 assert(!!readBack, 'a session blob carrying cuts must still parse');
+assert(readBack!.settings.notationSpacingPx === 8, 'notation spacing survives a session round trip');
+const migratedV1 = readSession(JSON.stringify({ ...blob, v: 1 }));
+assert(!!migratedV1 && migratedV1.v === SESSION_VERSION, 'a legacy v1 session migrates to the gated current version');
+assert(
+  readSession(JSON.stringify({ ...blob, v: SESSION_VERSION + 1 })) === null,
+  'a future session is rejected instead of replayed under semantics this build cannot know'
+);
 const fromBlob = decodeSource(readBack!.source);
 assert(!!fromBlob, 'a session blob carrying cuts must still decode its take');
 assert(fromBlob!.cuts?.length === 2, `the cut list must survive a session round trip (got ${fromBlob!.cuts?.length})`);
@@ -788,6 +833,23 @@ assert(fromBlob!.cuts?.length === 2, `the cut list must survive a session round 
 assert(fromBlob!.cuts![0].fromSec === 0, 'the restored cuts are sorted by start');
 assert(fromBlob!.cuts![0].toSec === 1.4123456789, 'a cut boundary is not rounded — it is a clock');
 assert(fromBlob!.cuts![1].fromSec === 12.25 && fromBlob!.cuts![1].toSec === 14, 'the second cut survives whole');
+
+const legacyNameSession = readSession(
+  JSON.stringify({
+    ...blob,
+    settings: { ...DEFAULT_SETTINGS, instrument: 'guitar', tabMode: 'guitar' },
+    source: encodeSource({ ...cutSource, livePartName: undefined })
+  })
+);
+const legacySessionSource = decodeSource(legacyNameSession!.source);
+const legacySessionSettings = applyDocumentSettings(
+  { ...DEFAULT_SETTINGS, instrument: 'bass', tabMode: 'bass' },
+  legacyNameSession!.settings
+).effective;
+assert(
+  restoredLivePartName(legacySessionSettings, legacySessionSource?.livePartName) === 'Guitar',
+  'a legacy session freezes its former name only after its own saved settings are restored'
+);
 
 // -- the .riffsheet document ------------------------------------------------------------------
 const cutDoc = readRiffsheetDocument(

@@ -44,6 +44,8 @@ export interface StringLetter {
   stringIndex: number;
   /** Which system it belongs to, in render order. */
   system: number;
+  /** The alphaTab track whose tab line this labels; null only for the legacy implicit search. */
+  trackIndex: number | null;
 }
 
 /**
@@ -80,11 +82,18 @@ export function stringLettersFromBounds(
     let tab: { x: number; y: number; h: number } | null = null;
     for (const masterBar of staffSystem.bars) {
       const all = masterBar.bars ?? [];
-      const mine =
+      const bars =
         trackIndex === null ? all : all.filter((b) => b.bar?.staff?.track?.index === trackIndex);
-      // Never nothing: a legend that disappears because a back-reference went missing is a worse
-      // answer than the one this has always drawn.
-      const bars = mine.length > 0 ? mine : all;
+      /*
+       * AN EXPLICIT TRACK NEVER FALLS BACK TO SOMEBODY ELSE'S BARS (P3).
+       *
+       * The old claim was: "a legend that disappears because a back-reference went missing is a
+       * worse answer than the one this has always drawn." In a multi-part score that fallback is
+       * worse still: it prints the requested track's tuning on the first other tab it finds. A
+       * missing back-reference must now omit an unverifiable legend instead of confidently
+       * mislabelling another instrument.
+       */
+      if (bars.length === 0) continue;
       // One BarBounds per RENDERED stave, and which of them is the tablature is asked of the
       // staves themselves. It used to be index 1, which is the tab only when a single alphaTab
       // Staff shows notation and tab together. On a grand staff plus tab the tab is index 2 and
@@ -135,7 +144,8 @@ export function stringLettersFromBounds(
         y: tab.y + line * step,
         text: midiNoteName(tuningLowToHigh[stringIndex]),
         stringIndex,
-        system
+        system,
+        trackIndex
       });
     }
     system++;
@@ -152,7 +162,7 @@ export function stringLettersFromBounds(
  */
 export function tuningLowToHighFromScore(
   score: alphaTab.model.Score | null | undefined,
-  trackIndex = 0
+  trackIndex: number | null = 0
 ): number[] {
   // THE LIVE PART'S TRACK, NOT `tracks[0]` (Codex finding 8). Parts can be reordered, and an
   // imported MusicXML part moved above the take becomes track 0 — after which the legend down the
@@ -160,7 +170,10 @@ export function tuningLowToHighFromScore(
   // another instrument's strings, and it is silent about it, which is the worst shape a wrong
   // number comes in. The caller knows which track is live; the default keeps every single-part
   // caller exactly where it was.
-  const staves = score?.tracks?.[trackIndex]?.staves ?? score?.tracks?.[0]?.staves ?? [];
+  // An explicit part is an identity, not a preference: never caption it from track 0 if the
+  // model no longer contains it. `null` retains the legacy "first available track" lookup.
+  const track = trackIndex === null ? score?.tracks?.[0] : score?.tracks?.[trackIndex];
+  const staves = track?.staves ?? [];
   // The TAB staff's tuning, not `staves[0]`'s. On a grand staff plus tab, staves[0] is the
   // treble clef and carries no tuning at all, so the letters silently disappeared — which
   // reads exactly like "this score has no tab" rather than like a bug. A notation staff that

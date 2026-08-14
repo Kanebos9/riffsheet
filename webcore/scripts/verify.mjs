@@ -5673,10 +5673,17 @@ async function main() {
       ],
       ['names: switching them off empties the row', !!result.namesOff && result.namesOff.labels === 0],
       [
-        // STAFF_TAB_GAP, the whole of the reserved room, must come back out.
-        'names: switching them off closes the reserved gap',
+        /*
+         * The old assertion claimed: "STAFF_TAB_GAP, the whole of the reserved room, must come
+         * back out." That was the rejected between-staff placement. Names now sit above each
+         * part's own first staff, so hiding them may release top/inter-track headroom but must not
+         * collapse the staff-to-tab safety gap. Assert the monotone geometry actually promised.
+         */
+        'names: switching them off never adds reserved headroom',
         !!result.namesOff && !!result.namesLayout &&
-          result.namesLayout.tabTop - result.namesOff.tabTop >= 10
+          (result.namesOff.pagePadding?.[1] ?? 0) <= (result.namesLayout.pagePadding?.[1] ?? 0) &&
+          (result.namesOff.decorations?.trackStaffPaddingPx ?? 0) <=
+            (result.namesLayout.decorations?.trackStaffPaddingPx ?? 0)
       ],
       [
         'names: switching them back on restores the clearance',
@@ -6160,10 +6167,10 @@ async function main() {
        * picture, which is why every check below reads the PAINTED rectangles as well as the raw
        * recording, and names the ids that strayed rather than counting them.
        *
-       * SNAP OFF is the scope, adjudicated. Beat and Grid re-derive every event's placement from
-       * the whole take by design — a global allocator is what a snap IS — so the exact statement of
-       * the law is the Snap Off one, and the snap modes' own behaviour is covered by `snapFeed`
-       * above.
+       * SNAP OFF is the destructive edit baseline. Grid is independently projected per note and
+       * therefore retains the same locality; Beat is the one global allocator and may move an old
+       * note in the derived feed, never in the raw take. The snap modes' arithmetic is covered by
+       * `snapFeed` and `roll-snap-test`; this probe guards the write-back and painted layers.
        */
       ['purity: the probe ran', !!result.rollPurity && !result.rollPurity.error],
       [
@@ -6581,8 +6588,18 @@ async function main() {
         // exists to stop it — the rectangle snaps back to the value the player dragged it off —
         // and would print an imported guitar as a plain staff, then save both losses. Same test,
         // same answer. The READER still takes v1..v6.
+        //
+        // v7 SINCE SHEET INSERTION GAVE RIPPLE OPERATIONS EXPLICIT MUSIC SEMANTICS. The old claim,
+        // quoted exactly:
+        //   'document: the current writer stamps the current version',
+        //   !!result.document && result.document.version === 6
+        // `RippleOp.kind` and `RippleOp.fixedIds` distinguish a new half-open, fixed-atom sheet
+        // insertion from the legacy inclusive operation. A v6 reader would accept the rest of the
+        // document, ignore those fields, move the inserted atom again during replay, and then save
+        // away the evidence. That is a musical corruption boundary, so the current writer must
+        // stamp v7; `scripts/riffsheet-doc-test.ts` separately proves the reader keeps v1..v7.
         'document: the current writer stamps the current version',
-        !!result.document && result.document.version === 6
+        !!result.document && result.document.version === 7
       ],
       [
         // The container is the point of v3, so it is asserted rather than assumed, together
@@ -7504,8 +7521,8 @@ async function main() {
          * RENAME IS NO LONGER REFUSED, and this check has flipped with the feature (Z2b). It used
          * to assert `disabled === true` on the reasoning that the take's name is derived from the
          * instrument on every build, so a rename would be overwritten by the next engrave. There
-         * is a stored override now (`state.ts §SourceAudio.livePartName`) and the instrument only
-         * supplies the DEFAULT, so the one part on nearly every sheet this app makes is no longer
+         * is a stored canonical name now (`state.ts §SourceAudio.livePartName`) and the instrument
+         * supplies no name at all, so the one part on nearly every sheet this app makes is no longer
          * the one part nobody can name. What it does is checked in the `live name:` block below.
          */
         'parts: the take cannot be removed, and can be renamed',
@@ -7540,10 +7557,17 @@ async function main() {
           P.two.box.parts.some((o) => o.value === 'part:imp1' && /Guitar/.test(o.text ?? ''))
       ],
       [
-        // The SHEET. Two alphaTab tracks built, and two tracks actually engraved — the second
-        // number is the one that was wrong when the view rendered `[0]` alone.
-        'parts: a two-part score renders 2 track systems',
-        !!P && P.two?.tracks === 2 && P.two?.renderedTracks === 2
+        /*
+         * The old assertion claimed only: "a two-part score renders 2 track systems". P3 found
+         * that both systems could render while overlays still filtered to the live one, so the
+         * same check now requires one independent name lane per rendered track and one string
+         * lane per track that actually has tablature.
+         */
+        'parts: a two-part score renders and decorates both track systems',
+        !!P && P.two?.tracks === 2 && P.two?.renderedTracks === 2 &&
+          (P.two?.decorations?.nameLanes ?? []).length === 2 &&
+          (P.two?.decorations?.stringLanes ?? []).length ===
+            (P.two?.decorations?.tracks ?? []).filter((track) => track.hasTab).length
       ],
       [
         'parts: the imported track is flagged notation-only and the live one is not',
@@ -7623,9 +7647,10 @@ async function main() {
           (P.afterRemove?.box?.parts ?? []).length === 1
       ],
       [
-        // Four staves is the cap. Add goes dim and says why rather than disappearing.
+        // Four staves is the cap. The old assertion stopped at `P.full.tracks === 4`; P3 requires
+        // all four rendered parts to retain their own pitch-name lane as well.
         'parts: adding is limited to 4 parts and says why',
-        !!P && P.full?.tracks === 4 &&
+        !!P && P.full?.tracks === 4 && (P.full?.decorations?.nameLanes ?? []).length === 4 &&
           (P.full?.box?.verbs ?? []).some((v) => v.value === 'do:add' && v.disabled === true &&
             /at most 4 parts/i.test(v.title ?? '')) &&
           P.refusedFifth === true
@@ -7693,8 +7718,9 @@ async function main() {
             // A nudge slides an imported part AGAINST the take; the take is the clock both are
             // measured on, so it has none.
             L.menuShape.hasNudge === false &&
-            // The placeholder is the instrument's own word — what clearing the box goes back to.
-            L.menuShape.placeholder === 'Bass'
+            // P4: the old claim was "the placeholder is the instrument's own word". That was
+            // precisely the coupling being removed; clearing now means the stable canonical Take.
+            L.menuShape.placeholder === 'Take'
           );
         })()
       ],
@@ -7731,12 +7757,15 @@ async function main() {
         result.liveName?.roundTrip === 'Low end'
       ],
       [
-        // AN OVERRIDE, NOT A REPLACEMENT. Clearing the box goes back to the instrument's own
-        // word rather than leaving an unnamed staff, which is what makes it safe to clear.
-        'live name: clearing the name goes back to the instrument’s own word',
+        /*
+         * The old assertion claimed: "clearing the box goes back to the instrument's own word".
+         * P4 rejects that derivation: changing TAB must never rename the sheet, so clear stores
+         * and renders the canonical default `Take` instead of re-arming instrument coupling.
+         */
+        'live name: clearing the name resets the canonical name to Take',
         (() => {
           const a = result.liveName?.afterClear;
-          return !!a && /Bass/.test(a.box ?? '') && a.stored === null;
+          return !!a && /Take/.test(a.box ?? '') && a.stored === 'Take';
         })()
       ],
 
@@ -7761,9 +7790,11 @@ async function main() {
           const first = labels.slice(0, 2).map((l) => l.text);
           const rest = labels.slice(2).map((l) => l.text);
           return (
-            first.join(',') === 'Guitar,Bass' &&
+            // Old claim: the first system read `Guitar,Bass` and later systems allowed `Bass`.
+            // P4 freezes the live part as Take; changing its bass TAB must not rename the print.
+            first.join(',') === 'Guitar,Take' &&
             rest.length >= 2 &&
-            rest.every((t) => t === 'Gtr.' || t === 'Bass') &&
+            rest.every((t) => t === 'Gtr.' || t === 'Take') &&
             rest.some((t) => t === 'Gtr.')
           );
         })()
@@ -7863,7 +7894,22 @@ async function main() {
       // --- one origin (codex-critique §7) ---------------------------------------------
       ['origin: the probe ran on a take with real leading silence', !!OP && !OP.error && OP.appOrigin > 0.5],
       ['origin: the roll draws on the app’s origin and not its own', !!OP && Math.abs((OP.rollOrigin ?? 99) - OP.appOrigin) < 0.01],
-      ['origin: a double-click adds a note', !!OP && !!OP.addedNoteId, JSON.stringify(OP?.why ?? OP)],
+      [
+        /*
+         * The old assertion was "origin: a double-click adds a note". That remained true while
+         * the acknowledged provisional add was also painted as a second null-id rectangle — the
+         * owner's exact symptom. Keep the old claim and require the callback frame to contain
+         * only the authoritative publication, which is the lifecycle boundary the fix changes.
+         */
+        'origin: a double-click adds exactly one authoritative rectangle',
+        !!OP && !!OP.addedNoteId &&
+          OP.lifecycle?.afterCallback?.pendingEdit === null &&
+          OP.lifecycle?.afterCallback?.nullIdRects === 0 &&
+          OP.lifecycle?.afterCallback?.drawnRects === OP.lifecycle?.before?.drawnRects + 1 &&
+          OP.lifecycle?.afterSettle?.pendingEdit === null &&
+          OP.lifecycle?.afterSettle?.nullIdRects === 0,
+        JSON.stringify(OP?.why ?? OP?.lifecycle ?? OP)
+      ],
       [
         // WHAT THE RESIDUAL IS. An added note is a performance edit, so the sheet is rebuilt and
         // the pipeline QUANTIZES it onto a line it can print: the note lands on the nearest

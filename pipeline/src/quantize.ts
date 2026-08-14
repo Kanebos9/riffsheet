@@ -48,13 +48,15 @@ export interface QuantNote {
   /** Fractional tick from the time skeleton (per-bar origin already applied). */
   rawStartTick: number;
   rawOffTick: number;
+  /** Explicit editor-authored onset in IR ticks; only this note bypasses onset snapping. */
+  fixedStartTick?: number;
   /**
    * THE WRITTEN LENGTH THE CALLER DECLARED for this event, in IR ticks — the resolved form of
    * `InputNote.notationIntent` (see ir.ts `notationIntentTicks`). Absent on every note a detector
    * produced, which is why nothing below changes shape when it is not there.
    *
-   * The ONSET is quantized exactly as it always was: a declared duration is a statement about the
-   * note's written value, not about where it sits. Only the off-time stops being measured.
+   * A duration declaration says nothing about where the note sits. `fixedStartTick`, when present,
+   * is the separate and explicit onset authority.
    */
   intentTicks?: number;
 }
@@ -415,9 +417,9 @@ function quantizeFree(notes: QuantNote[]): QuantResult {
   const out: QuantResult['notes'] = [];
   let occupied = -Infinity;
   for (const { n } of ordered) {
-    let startTick = Math.round(n.rawStartTick / unit) * unit;
-    if (startTick <= occupied) startTick = occupied + unit;
-    occupied = startTick;
+    let startTick = n.fixedStartTick ?? Math.round(n.rawStartTick / unit) * unit;
+    if (n.fixedStartTick === undefined && startTick <= occupied) startTick = occupied + unit;
+    occupied = Math.max(occupied, startTick);
     const rawDur = Math.max(0, n.rawOffTick - n.rawStartTick);
     const units = Math.max(1, Math.round(rawDur / unit));
     // A DECLARED WRITTEN VALUE IS HONOURED HERE TOO. Free is a view of the input at notation's
@@ -604,7 +606,9 @@ export function quantizeOnsets(
     const origin = beat * windowTicks;
     const candidate = state.tuplet ? tupletByBeat.get(beat) : undefined;
     const unit = candidate ? candidate.unitTicks : state.grid;
-    const startTick = snapTo(n.rawStartTick, unit, origin);
+    // A sheet-authored attack is already a written position. Applying the inferred performance
+    // grid to it again is what moved a new 1/16 onto a neighbouring eighth after every rebuild.
+    const startTick = n.fixedStartTick ?? snapTo(n.rawStartTick, unit, origin);
     const rawDur = Math.max(0, n.rawOffTick - n.rawStartTick);
     // MEMBERSHIP FOLLOWS THE TICK THE NOTE LANDED ON, NOT THE BEAT IT WAS PLAYED IN.
     //
@@ -703,6 +707,7 @@ export function quantizeOnsets(
   // duration-weighted evidence, measured on the RAW length before any snapping rounded the
   // difference away; the earlier arrival keeps the slot on a tie.
   const rawDurById = new Map(notes.map((n) => [n.id, Math.max(0, n.rawOffTick - n.rawStartTick)]));
+  const fixedIds = new Set(notes.filter((n) => n.fixedStartTick !== undefined).map((n) => n.id));
   const deduped: QuantResult['notes'] = [];
   /**
    * EVERY ID THAT PASSED THROUGH EACH SLOT, parallel to `deduped`. The losers cannot be named
@@ -716,7 +721,11 @@ export function quantizeOnsets(
     if (prev && prev.startTick === n.startTick) {
       prev.offTick = Math.max(prev.offTick, n.offTick);
       slotIds[slotIds.length - 1].push(n.id);
-      if ((rawDurById.get(n.id) ?? 0) > (rawDurById.get(prev.id) ?? 0)) {
+      if (
+        (fixedIds.has(n.id) && !fixedIds.has(prev.id)) ||
+        (fixedIds.has(n.id) === fixedIds.has(prev.id) &&
+          (rawDurById.get(n.id) ?? 0) > (rawDurById.get(prev.id) ?? 0))
+      ) {
         prev.id = n.id;
         if (n.tupletId === undefined) delete prev.tupletId;
         else prev.tupletId = n.tupletId;

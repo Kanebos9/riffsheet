@@ -83,10 +83,11 @@
  * 8. THE ROLL REPORTS EDITS. IT NEVER PERFORMS THEM.
  *    A drag emits a `RollEdit` in WRITTEN seconds through `onEdit` and stops there. The
  *    integrator edits the performance (`source.detected.notes`), re-runs the pipeline and
- *    calls `refresh()`. That indirection is the reason add / lengthen / shorten are possible
+ *    publishes it through `setPerformanceNotes()` (or calls `refresh()` on the score-only path).
+ *    That indirection is the reason add / lengthen / shorten are possible
  *    at all — changing an alphaTab beat's duration in place would leave the bar over- or
  *    under-full. While a drag is in flight the roll draws the note where the gesture says it
- *    is, so it feels live; the next `refresh()` replaces the guess with the real thing.
+ *    is, so it feels live; the next authoritative publish replaces the guess with the real thing.
  *
  * 9. MANY NOTES AT ONCE, AND WHO OWNS THE BARE DRAG.
  *    The transcriber octave-doubles runs of notes. Fixing that one rectangle at a time is the
@@ -1154,9 +1155,10 @@ export class PianoRoll {
   /**
    * The edit just emitted, still drawn where the gesture left it.
    *
-   * Cleared by the next `refresh()`. Without it the rect snaps back to its old place for the
-   * frame between letting go and the pipeline finishing, which reads as "the drag did
-   * nothing" — the one thing a direct-manipulation gesture must never look like.
+   * Cleared by the next authoritative publish (`setPerformanceNotes()` or `refresh()`). Without
+   * it the rect snaps back to its old place for the frame between letting go and the pipeline
+   * finishing, which reads as "the drag did nothing" — the one thing a direct-manipulation
+   * gesture must never look like.
    */
   private pending: RollEdit | null = null;
   /** `pending`'s ids, pre-set. `provisional()` asks this once per rectangle per frame. */
@@ -1377,6 +1379,19 @@ export class PianoRoll {
    * The array is copied, so a caller may keep mutating theirs.
    */
   setPerformanceNotes(notes: ReadonlyArray<PerformanceNote> | null): void {
+    /*
+     * AN AUTHORITATIVE PERFORMANCE PUBLISH ACKNOWLEDGES THE PROVISIONAL GESTURE.
+     *
+     * `emit()` calls the app synchronously. The app commits, rebuilds, and comes back through
+     * this method before that callback returns. Keeping `pending` across this boundary made an
+     * add draw twice: once under its minted id in `notes`, then again as `layoutRects()`'s null-id
+     * provisional rectangle. Move and resize retained their provisional transforms too. The old
+     * score-only road cleared the guess through `refresh()`; a performance-backed roll never
+     * took that road, so its guess survived indefinitely. Clear before rebuilding or drawing so
+     * this frame contains one authority, not the authority plus its already-answered proposal.
+     */
+    this.pending = null;
+    this.pendingIds = new Set();
     this.performance = notes ? notes.map((note) => ({ ...note })) : null;
     if (this.performance) {
       // A performance can arrive before any audio duration has been measured, and an axis with
@@ -4376,7 +4391,7 @@ export class PianoRoll {
      * `add` is the one edit with no note behind it, so without this the double-click does
      * nothing at all for however long the pipeline takes and the player double-clicks again.
      * It carries `noteId: null`, so it cannot be selected or dragged in the meantime — the
-     * next `refresh()` brings back the real one, with a real id.
+     * next authoritative publish brings back the real one, with a real id.
      */
     const add = this.pending && this.pending.kind === 'add' ? this.pending : null;
     const source: PianoRollNote[] = add
@@ -4436,12 +4451,27 @@ export class PianoRoll {
     for (const row of byRow.values()) {
       if (row.length < 2) continue;
       row.sort((a, b) => a.x - b.x);
-      for (let i = 0; i < row.length - 1; i++) {
-        const a = row[i];
-        const b = row[i + 1];
-        if (a.x + a.w <= b.x - NOTE_GAP_PX) continue;
-        a.overlapped = true;
-        b.overlapped = true;
+      let furthest = row[0];
+      let furthestRight = furthest.x + furthest.w;
+      for (let i = 1; i < row.length; i++) {
+        const current = row[i];
+        /*
+         * Compare with the furthest ACTIVE release, not only the adjacent interval. With
+         * A=[0,10], B=[1,2], C=[3,4], B sits between A and C in start order but does not overlap
+         * C; the old adjacent-pair walk therefore painted C opaque over the still-sounding A.
+         * The maximum right edge is the interval-sweep witness that some earlier note remains
+         * underneath. Marking that owner and the current rect makes every member of a nested
+         * chain translucent without shortening or reordering any of them.
+         */
+        if (furthestRight > current.x - NOTE_GAP_PX) {
+          furthest.overlapped = true;
+          current.overlapped = true;
+        }
+        const currentRight = current.x + current.w;
+        if (currentRight > furthestRight) {
+          furthest = current;
+          furthestRight = currentRight;
+        }
       }
     }
     return out;

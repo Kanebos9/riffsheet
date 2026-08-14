@@ -156,10 +156,10 @@ export function importedPartTabProfile(
 /**
  * A slot in printed order, top to bottom.
  *
- * The live slot carries the player's NAME OVERRIDE when there is one (`SourceAudio.livePartName`),
+ * The live slot carries the document's canonical name (`SourceAudio.livePartName`),
  * so that everything downstream of `orderedPartSlots` — the menu, the build, the emitters — reads
  * one resolved list rather than each consumer having to remember to consult the document as well
- * as the settings. Absent means "no override", and `livePartName()` derives the name instead.
+ * as the settings. Absence is legacy input only; `livePartName()` safely resolves it to `Take`.
  */
 export type PartSlot = { kind: 'live'; name?: string } | { kind: 'imported'; part: ImportedPart };
 
@@ -253,19 +253,23 @@ export function partOrderOf(slots: ReadonlyArray<PartSlot>): string[] {
 /**
  * What the live part is CALLED — on its menu entry and on the page, which must be the same word.
  *
- * Deliberately short and derived from the settings rather than from the built IR: the part menu
- * is drawn before (and independently of) any build, and `defaultPartName(ir)` would give the
- * page a name the menu could not know.
- *
- * `override` IS THE PLAYER'S OWN WORD AND IT WINS. It is `SourceAudio.livePartName`, typed into
- * the same two fields an imported part is renamed from — the menu's Rename and the name printed
- * on the sheet — and stored on the document. Empty, missing, or whitespace falls through to the
- * derived word below, which is what makes "clear the box" mean "go back to following the
- * instrument" rather than "print an unnamed staff".
+ * `canonical` is the document's own word. Instrument, TAB, tuning and clef are descriptions of
+ * how that part is played or engraved; none of them is permission to rename it. New sources and
+ * cleared fields are stored as `Take`; the fallback here exists only for a hand-built or legacy
+ * caller that has not yet passed through App's migration door.
  */
-export function livePartName(settings: AppSettings, override?: string): string {
-  const chosen = cleanPartName(override);
-  if (chosen) return chosen;
+export function livePartName(_settings: AppSettings, canonical?: string): string {
+  return cleanPartName(canonical) || 'Take';
+}
+
+/**
+ * Reproduce the pre-P4 derived name exactly once while migrating a legacy document.
+ *
+ * Kept separate from `livePartName` so an instrument change can never accidentally call the old
+ * law. The app invokes this only after applying the document/session's effective saved settings,
+ * freezes the result into `SourceAudio.livePartName`, and normal persistence carries it forward.
+ */
+export function legacyDerivedLivePartName(settings: AppSettings): string {
   switch (settings.tabMode) {
     case 'bass':
       return 'Bass';
@@ -276,6 +280,11 @@ export function livePartName(settings: AppSettings, override?: string): string {
     default:
       return settings.instrument === 'guitar' ? 'Guitar' : settings.instrument === 'bass' ? 'Bass' : 'Take';
   }
+}
+
+/** Canonicalise a persisted value after its document/session settings have become effective. */
+export function restoredLivePartName(settings: AppSettings, stored?: string): string {
+  return cleanPartName(stored) || legacyDerivedLivePartName(settings);
 }
 
 /** A part name out of a MusicXML file: the track's own name, or the file name. */

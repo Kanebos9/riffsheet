@@ -141,22 +141,20 @@ async function withPrintRender<T>(
         return 0;
       }
     });
-    // THE LIVE PART'S TRACK, not `tracks[0]` — the same reordering assumption Codex finding 8
-    // closed on screen, closed here too. The legend captions the take's tab; with an imported
-    // chart moved above the take, track 0 is the chart and the printed sheet would carry the
-    // wrong instrument's open strings. The `parts` sidecar is the score's own answer, and a
-    // single-part score has neither a sidecar nor an ambiguity.
-    const liveTrack =
-      (score as { parts?: Array<{ role: string; trackIndex: number }> }).parts?.find(
-        (p) => p.role === 'live'
-      )?.trackIndex ?? 0;
-    const letters = stringLettersFromBounds(
-      api.renderer.boundsLookup,
-      tuningLowToHighFromScore(built.score, liveTrack),
-      undefined,
-      null,
-      liveTrack
-    );
+    // EVERY TAB TRACK'S OWN TUNING (P3), in printed order. The old live-only call fixed one
+    // reordering bug but left imported tablature entirely uncaptioned. Each exact track lookup
+    // is now independent, so a guitar above a bass prints six guitar letters above four bass
+    // letters and neither can fall back to the other's bounds or tuning.
+    const letters = built.score.tracks.flatMap((track, trackIndex) => {
+      if (!track.staves.some((staff) => staff.showTablature)) return [];
+      return stringLettersFromBounds(
+        api.renderer.boundsLookup,
+        tuningLowToHighFromScore(built.score, trackIndex),
+        undefined,
+        null,
+        trackIndex
+      );
+    });
 
     return await use(svgs, { offsets, inkLefts, letters });
   } finally {

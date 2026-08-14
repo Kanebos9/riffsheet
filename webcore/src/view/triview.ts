@@ -20,6 +20,7 @@
 import * as alphaTab from '@coderline/alphatab';
 import {
   applyStaffTabGap,
+  applyTrackNameGap,
   createSettings,
   setLeftPadding,
   setTopPadding,
@@ -125,6 +126,8 @@ export interface TriViewOptions {
   view?: Partial<ViewSettings>;
   namesPlacement?: NamesPlacement;
   showNames?: boolean;
+  /** Extra global notation whitespace in screen px; clamped by AppSettings to 0..16. */
+  notationSpacingPx?: number;
   /**
    * The app's native export door, for the DEBUG gesture recorder only (D2).
    *
@@ -308,6 +311,10 @@ export interface RenderInfo {
 interface NameLabel {
   el: HTMLElement;
   x: number;
+  y?: number;
+  trackIndex?: number;
+  systemIndex?: number;
+  lane?: string;
 }
 
 /**
@@ -328,6 +335,10 @@ interface WantedName {
   text: string;
   uncertain: boolean;
   noteId: string | null;
+  /** Part/system identity keeps equal-x chords in different vertical lanes independent. */
+  trackIndex: number;
+  systemIndex: number;
+  lane: string;
 }
 
 /**
@@ -335,7 +346,8 @@ interface WantedName {
  * 10.5px/1 with 1px padding), kept here because the placement maths needs them and a
  * silent disagreement between the two is exactly how the row ended up on top of the tab.
  */
-const NAME_HEIGHT = 13;
+export const NAME_LABEL_HEIGHT_PX = 13;
+const NAME_HEIGHT = NAME_LABEL_HEIGHT_PX;
 /**
  * Half the on-screen width of a label, in px, without measuring it.
  *
@@ -361,10 +373,29 @@ function labelSpan(className: string, tip?: string): HTMLSpanElement {
   if (tip) el.setAttribute('title', tip);
   return el;
 }
-/** Chord names stack upward from the anchor by this much per extra note. */
-const NAME_STACK_STEP = 12;
-/** How far above the top of the system the LOWEST name of an 'above' row sits. */
+/** Chord names stack upward without their 13px boxes touching. */
+export const NAME_LABEL_STACK_STEP_PX = NAME_LABEL_HEIGHT_PX;
+const NAME_STACK_STEP = NAME_LABEL_STACK_STEP_PX;
+/** How far above the top of a PART'S first staff the LOWEST name sits. */
 const NAMES_ABOVE_GAP = 16;
+
+/**
+ * Top coordinate of one part's lowest pitch-name label.
+ *
+ * The first rendered part must clear the WHOLE system bound, not merely its staff's five lines:
+ * on Grand+TAB the staff bar begins below the treble/bass overflow, which was exactly how labels
+ * ended up inside the bass-stem/TAB lane. Lower parts use their own first staff because the
+ * between-track reserve creates a genuinely separate lane there.
+ */
+export function pitchNameLaneY(
+  staffTop: number,
+  systemTop: number,
+  firstPart: boolean,
+  spacingPx: number
+): number {
+  const anchor = firstPart ? Math.min(staffTop, systemTop) : staffTop;
+  return Math.max(0, anchor - NAMES_ABOVE_GAP - Math.max(0, spacingPx) - NAME_HEIGHT);
+}
 
 /**
  * The tallest stack of NAMES any beat in this score will ask for. See `reserveTopRoom`.
@@ -395,15 +426,6 @@ function maxChordSize(score: alphaTab.model.Score): number {
   }
   return most;
 }
-/**
- * The tallest chord the headroom is sized for (P5).
- *
- * The owner's own number: "stacks are 3–5 max" on the material this app is for. It is a CAP and
- * not an assumption — `reserveTopRoomFor` takes the smaller of this and the tallest stack the
- * score actually contains, so an ordinary single-note riff reserves nothing at all and a
- * pathological twelve-note cluster reserves five names' worth rather than half the pane.
- */
-const MAX_STACK_FOR_HEADROOM = 5;
 /**
  * How far tab fret digits rise above the y that `BarBounds.visualBounds` calls the top of
  * the tab staff. They are centred ON the top line, so that y is the MIDDLE of the topmost
@@ -662,8 +684,9 @@ export class TriView {
   private hoverGroup: SVGGElement;
   private ghostGroup: SVGGElement;
   private lastRenderInfo: RenderInfo | null = null;
-  private namesPlacement: NamesPlacement;
   private showNames: boolean;
+  /** Player-requested extra whitespace, kept in physical screen px across engraving zoom. */
+  private notationSpacingPx: number;
   /**
    * Which note ids are highlighted RIGHT NOW — a render input, and no longer an authority.
    *
@@ -827,7 +850,6 @@ export class TriView {
   /** True when the score renders more than one stave — a grand staff, or grand staff + tab. */
   private multiStaff = false;
   /** Does the engraved score show tablature at all? See `reserveTopRoom`. */
-  private hasTabStave = false;
   /** Highest playable fret. Only used to decide whether a drag is possible. */
   private maxFret: number;
   /** The key signature, for turning staff positions into semitones. */
@@ -848,8 +870,10 @@ export class TriView {
 
   constructor(opts: TriViewOptions) {
     this.opts = opts;
-    this.namesPlacement = opts.namesPlacement ?? 'between';
+    // P3/P5's one placement law: every pitch-name lane is above its own part. The public setter
+    // remains for old embedders, but the product no longer starts in the ambiguous between lane.
     this.showNames = opts.showNames ?? true;
+    this.notationSpacingPx = Math.max(0, Math.min(16, Number(opts.notationSpacingPx) || 0));
 
     // THE GESTURE RECORDER (D2), behind its flag and inert without it. Installed from here
     // because this is the first thing built for the screen the gestures happen on; it listens on
@@ -955,7 +979,8 @@ export class TriView {
       // is already aligned. tuneLeftInset() trims it to the pixel afterwards.
       leftPadPx: LEFT_INSET_PX + leftInkOverhangPerScale * (opts.view?.scale ?? 1),
       ...opts.view,
-      namesGap: this.needsGap()
+      namesGap: this.needsGap(),
+      notationSpacingPx: this.notationSpacingPx
     });
     this.api = new alphaTab.AlphaTabApi(this.host, settings);
 
@@ -1119,23 +1144,8 @@ export class TriView {
     // Same measurement, second consumer: a braced system is also the one whose staves need more
     // air between them (F2b). Recorded before the render so the first frame already has it.
     this.multiStaff = staves > 1;
-    /*
-     * Third consumer, and the one `reserveTopRoom` reads: with no tablature there is no staff/tab
-     * band for the names row to sit in, so it goes above the system and needs headroom.
-     *
-     * THE LIVE TRACK'S TABLATURE, NOT THE SCORE'S (per-part TAB, critique §D). The note names are
-     * the LIVE part's decoration — they are placed against the live staves, by `liveBars()`, for
-     * the same reordering reason as the string legend. `score.tracks.some(…)` was safe only while
-     * an imported part could not have tablature at all; now that it can, an imported guitar with
-     * its tab on would tell the live staff it has an inter-staff band to sit in when it does not,
-     * and the names would be laid into a lane that is not there.
-     *
-     * The two other consumers above stay score-wide on purpose: the reserved left column and the
-     * staff gap are properties of the SYSTEM, and a system is as braced as its most braced part.
-     */
-    const liveTrack = score.tracks[this.liveTrackIndex()] ?? score.tracks[0];
-    this.hasTabStave = !!liveTrack && liveTrack.staves.some((s) => s.showTablature);
-    applyStaffTabGap(this.api.settings, this.needsGap(), this.multiStaff);
+    this.maxChordSize = maxChordSize(score);
+    this.applyNotationSpacing();
     const overhang = this.multiStaff
       ? Math.max(leftInkOverhangPerScale, BRACED_LEFT_OVERHANG_PER_SCALE)
       : leftInkOverhangPerScale;
@@ -1143,7 +1153,6 @@ export class TriView {
     if (Math.abs(wanted - (this.api.settings.display.padding[0] ?? 0)) >= 0.5) {
       setLeftPadding(this.api.settings, wanted);
     }
-    this.maxChordSize = maxChordSize(score);
     this.reserveTopRoom();
     // Unconditional: the gap above may have changed even when the padding did not, and there is
     // no render in flight yet — `load()` starts one immediately after this returns.
@@ -1168,9 +1177,8 @@ export class TriView {
    * reserved here would have been silently destroyed by the next pinch (`atSettings.ts`).
    *
    * WHAT IT COSTS WHEN IT IS NOT NEEDED: nothing. The reserved height is derived from the score's
-   * own tallest chord, capped at `MAX_STACK_FOR_HEADROOM`, and floored at alphaTab's own
-   * `PAGE_PADDING_PX` — so a single-note riff, a names-off view, and the notation-plus-tab shape
-   * whose row lives in the staff/tab band all keep exactly the padding they had before.
+   * own tallest chord and floored at alphaTab's own `PAGE_PADDING_PX`. It is deliberately not
+   * capped: rendering six labels while reserving room for five is a collision by construction.
    *
    * NOT SCALED by `display.scale`: alphaTab divides page padding by the scale during layout and
    * multiplies the finished coordinates back (measured in 1.8.4, see `PAGE_PADDING_PX`), and the
@@ -1178,18 +1186,35 @@ export class TriView {
    * either. Both sides of the sum are screen pixels, at every zoom.
    */
   private reserveTopRoom(): void {
-    const stack = Math.max(1, Math.min(MAX_STACK_FOR_HEADROOM, this.maxChordSize));
-    // Only the row that sits ABOVE the system needs it. The 'between' row lives in a gap that is
-    // already reserved (`applyStaffTabGap`), and 'below' hangs off the bottom.
-    const above =
-      this.showNames &&
-      (this.namesPlacement === 'above' ||
-        (this.namesPlacement === 'between' && (this.multiStaff || !this.hasTabStave)));
-    const wanted = above
-      ? Math.max(PAGE_PADDING_PX, NAMES_ABOVE_GAP + (stack - 1) * NAME_STACK_STEP + NAME_HEIGHT / 2)
+    // RENDER-ALL MEANS RESERVE-ALL. The old code rendered every name but capped the reserve at
+    // five, so a six-note imported piano chord was guaranteed to clip. The maximum comes from
+    // exactly the same tie-filtered model walk as the renderer and is intentionally uncapped.
+    const stack = Math.max(1, this.maxChordSize);
+    const wanted = this.showNames
+      ? Math.max(PAGE_PADDING_PX, this.nameLaneHeightPx(stack))
       : PAGE_PADDING_PX;
     if (Math.abs(wanted - (this.api.settings.display.padding[1] ?? PAGE_PADDING_PX)) < 0.5) return;
     setTopPadding(this.api.settings, wanted);
+  }
+
+  /** Physical height owed to one pitch-name lane, including the friendly spacing preference. */
+  private nameLaneHeightPx(stack = Math.max(1, this.maxChordSize)): number {
+    return NAMES_ABOVE_GAP + this.notationSpacingPx + (stack - 1) * NAME_STACK_STEP + NAME_HEIGHT;
+  }
+
+  /** Apply within-part and between-part spacing in alphaTab's pre-scale layout units. */
+  private applyNotationSpacing(): void {
+    applyStaffTabGap(
+      this.api.settings,
+      this.needsGap(),
+      this.multiStaff,
+      this.notationSpacingPx
+    );
+    applyTrackNameGap(
+      this.api.settings,
+      this.showNames ? this.nameLaneHeightPx() : 0,
+      this.notationSpacingPx
+    );
   }
 
   /**
@@ -1259,6 +1284,128 @@ export class TriView {
     return bySystem.map((s) => s ?? []);
   }
 
+  /** Per-part overlay geometry for the browser acceptance probe (P3/P5/P6). */
+  decorationProbe(): {
+    spacingPx: number;
+    notationStaffPaddingPx: number;
+    trackStaffPaddingPx: number;
+    nameLanes: Array<{
+      lane: string;
+      system: number;
+      trackIndex: number;
+      labels: number;
+      top: number;
+      bottom: number;
+      staffTop: number | null;
+      clearance: number | null;
+      overlaps: number;
+      texts: string[];
+    }>;
+    stringLanes: Array<{
+      lane: string;
+      system: number;
+      trackIndex: number | null;
+      letters: number;
+      texts: string[];
+    }>;
+    tracks: Array<{ trackIndex: number; hasTab: boolean; strings: number }>;
+  } {
+    const staffTops = this.nameLaneStaffTops();
+
+    const names = new Map<string, typeof this.labels>();
+    for (const label of this.labels) {
+      if (!label.lane) continue;
+      const lane = names.get(label.lane) ?? [];
+      lane.push(label);
+      names.set(label.lane, lane);
+    }
+    const nameLanes = [...names.entries()].map(([lane, labels]) => {
+      const [system, trackIndex] = lane.split(':').map(Number);
+      const top = Math.min(...labels.map((label) => label.y ?? 0));
+      const bottom = Math.max(...labels.map((label) => (label.y ?? 0) + NAME_HEIGHT));
+      const staffTop = staffTops.get(lane) ?? null;
+      const boxes = labels.map((label) => ({
+        left: label.x - nameHalfWidth(label.el.textContent ?? ''),
+        right: label.x + nameHalfWidth(label.el.textContent ?? ''),
+        top: label.y ?? 0,
+        bottom: (label.y ?? 0) + NAME_HEIGHT
+      }));
+      let overlaps = 0;
+      for (let i = 0; i < boxes.length; i++) {
+        for (let j = i + 1; j < boxes.length; j++) {
+          const a = boxes[i];
+          const b = boxes[j];
+          if (a.left < b.right && a.right > b.left && a.top < b.bottom && a.bottom > b.top) overlaps++;
+        }
+      }
+      return {
+        lane,
+        system,
+        trackIndex,
+        labels: labels.length,
+        top,
+        bottom,
+        staffTop,
+        clearance: staffTop === null ? null : staffTop - bottom,
+        overlaps,
+        texts: labels.map((label) => label.el.textContent ?? '')
+      };
+    });
+
+    const strings = new Map<string, typeof this.stringLetters>();
+    for (const letter of this.stringLetters) {
+      if (!letter.lane) continue;
+      const lane = strings.get(letter.lane) ?? [];
+      lane.push(letter);
+      strings.set(letter.lane, lane);
+    }
+    const stringLanes = [...strings.entries()].map(([lane, letters]) => ({
+      lane,
+      system: letters[0]?.systemIndex ?? 0,
+      trackIndex: letters[0]?.trackIndex ?? null,
+      letters: letters.length,
+      texts: letters.map((letter) => letter.el.textContent ?? '')
+    }));
+    const scale = Math.max(0.01, this.api.settings.display.scale || 1);
+    return {
+      spacingPx: this.notationSpacingPx,
+      notationStaffPaddingPx: this.api.settings.display.notationStaffPaddingTop * scale,
+      trackStaffPaddingPx: this.api.settings.display.trackStaffPaddingBetween * scale,
+      nameLanes,
+      stringLanes,
+      tracks: (this.builtModel?.tracks ?? []).map((track, trackIndex) => ({
+        trackIndex,
+        hasTab: track.staves.some((staff) => staff.showTablature),
+        strings: tuningLowToHighFromScore(this.builtModel, trackIndex).length
+      }))
+    };
+  }
+
+  /** The top bound used to position each system/part pitch-name lane. */
+  private nameLaneStaffTops(
+    lookup = this.api.renderer.boundsLookup
+  ): Map<string, number> {
+    const staffTops = new Map<string, number>();
+    if (!lookup) return staffTops;
+    for (let systemIndex = 0; systemIndex < lookup.staffSystems.length; systemIndex++) {
+      const first = lookup.staffSystems[systemIndex].bars[0];
+      if (!first) continue;
+      const groups = this.partBarGroups(first.bars ?? []);
+      for (let groupIndex = 0; groupIndex < groups.length; groupIndex++) {
+        const [trackIndex, bars] = groups[groupIndex];
+        let top = Number.POSITIVE_INFINITY;
+        for (const bar of bars) top = Math.min(top, bar.visualBounds.y);
+        if (Number.isFinite(top)) {
+          staffTops.set(
+            `${systemIndex}:${trackIndex}`,
+            groupIndex === 0 ? Math.min(top, lookup.staffSystems[systemIndex].visualBounds.y) : top
+          );
+        }
+      }
+    }
+    return staffTops;
+  }
+
   /**
    * WHICH ALPHATAB TRACK IS THE TAKE (Codex finding 8). Not `0` — parts can be reordered.
    *
@@ -1289,6 +1436,26 @@ export class TriView {
     return mine.length > 0 ? mine : barBoundsList;
   }
 
+  /** Render-order groups of stave bounds, one exact alphaTab track per pitch-name lane. */
+  private partBarGroups(
+    barBoundsList: alphaTab.rendering.BarBounds[]
+  ): Array<[number, alphaTab.rendering.BarBounds[]]> {
+    const groups = new Map<number, alphaTab.rendering.BarBounds[]>();
+    for (const bar of barBoundsList) {
+      const trackIndex = bar.bar?.staff?.track?.index;
+      if (trackIndex === undefined || trackIndex === null) continue;
+      const group = groups.get(trackIndex) ?? [];
+      group.push(bar);
+      groups.set(trackIndex, group);
+    }
+    // Preserve the one-part road if alphaTab ever omits the back-reference; there is no second
+    // part to misidentify there. Multi-part ambiguity is refused instead of guessed.
+    if (groups.size === 0 && (this.builtModel?.tracks.length ?? 1) < 2 && barBoundsList.length > 0) {
+      groups.set(0, barBoundsList);
+    }
+    return [...groups.entries()];
+  }
+
   get renderInfo(): RenderInfo | null {
     return this.lastRenderInfo;
   }
@@ -1302,9 +1469,8 @@ export class TriView {
     if (visible) this.rebuildOverlays();
   }
 
-  setNamesPlacement(placement: NamesPlacement): void {
-    this.namesPlacement = placement;
-    if (this.applyGap()) return;
+  setNamesPlacement(_placement: NamesPlacement): void {
+    // Kept as a compatibility door for embedders; P3/P5 deliberately has one placement law.
     this.rebuildOverlays();
   }
 
@@ -1317,7 +1483,7 @@ export class TriView {
    * twice is how a hole opens under a row that is somewhere else.
    */
   private needsGap(): boolean {
-    return this.showNames && this.namesPlacement === 'between' && !this.multiStaff;
+    return false;
   }
 
   /**
@@ -1327,15 +1493,16 @@ export class TriView {
    * postRenderFinished, so the caller must not also rebuild them).
    */
   private applyGap(): boolean {
-    const wanted = this.needsGap();
     const before = this.api.settings.display.notationStaffPaddingTop;
+    const beforeTrack = this.api.settings.display.trackStaffPaddingBetween;
     const beforeTop = this.api.settings.display.padding[1];
-    applyStaffTabGap(this.api.settings, wanted, this.multiStaff);
+    this.applyNotationSpacing();
     // Turning the names off, or moving the row out of the band, changes how much headroom the
     // page owes it — the same decision, so the same re-render. See `reserveTopRoom`.
     this.reserveTopRoom();
     if (
       this.api.settings.display.notationStaffPaddingTop === before &&
+      this.api.settings.display.trackStaffPaddingBetween === beforeTrack &&
       this.api.settings.display.padding[1] === beforeTop
     ) {
       return false;
@@ -1518,32 +1685,35 @@ export class TriView {
     const wanted: Array<WantedName> = [];
     const wantedMarks: Array<{ x: number; y: number; text: string }> = [];
 
-    for (const system of lookup.staffSystems) {
+    for (let systemIndex = 0; systemIndex < lookup.staffSystems.length; systemIndex++) {
+      const system = lookup.staffSystems[systemIndex];
       for (const masterBar of system.bars) {
-        // THE LIVE PART'S STAVES ONLY (Codex finding 8). `masterBar.bars` is every rendered
-        // stave of every TRACK, so on a two-part score this list is the take's staves and the
-        // imported chart's, interleaved. Unfiltered, the note-name row labelled the imported
-        // part's notes as if they were the player's, and `namesYFor` placed the row against
-        // whichever pair of staves happened to come first — which, with the import reordered
-        // above the take, is a gap in somebody else's system. See `liveBars`.
-        const barBoundsList = this.liveBars(masterBar.bars ?? []);
-        // With one staff showing both notation and tab, alphaTab produces one BarBounds
-        // per rendered stave. Two entries => we know where the gap between them is.
-        const split = barBoundsList.length >= 2;
-        if (split) hasStaffTabSplit = true;
-        const namesY = this.namesYFor(barBoundsList, system);
+        // ONE LANE PER PART (P3/P5). The old loop filtered this list to `liveBars`, which is why
+        // every imported part had engraved notes but no names. Grouping by the model's track
+        // back-reference keeps reordered parts distinct and gives pruning a stable lane id.
+        const groups = this.partBarGroups(masterBar.bars ?? []);
+        for (let groupIndex = 0; groupIndex < groups.length; groupIndex++) {
+          const [trackIndex, barBoundsList] = groups[groupIndex];
+          // With one staff showing both notation and tab, alphaTab produces one BarBounds
+          // per rendered stave. Two entries => we know where the gap between them is.
+          const split = barBoundsList.length >= 2;
+          if (split) hasStaffTabSplit = true;
+          const namesY = this.namesYFor(
+            barBoundsList,
+            groupIndex === 0 ? system.visualBounds.y : null
+          );
 
         // Octave-folded tab positions get a marker on the TAB stave's own glyph. Which stave
         // that is comes from `tabStaveIndex`, not from the number 1: on a grand staff with a
         // tab the tab is the THIRD rendered stave, and index 1 is the bass clef.
-        const tabIndex = tabStaveIndex(staveKindsFromBars(barBoundsList));
-        if (tabIndex >= 0 && this.tabShifts.size > 0) {
-          for (const tabBeat of barBoundsList[tabIndex].beats) {
-            for (const nb of tabBeat.notes ?? []) {
-              const id = this.index.noteToInfo.get(nb.note)?.id;
-              const shift = id ? this.tabShifts.get(id) : undefined;
-              if (!shift) continue;
-              const r = nb.noteHeadBounds;
+          const tabIndex = tabStaveIndex(staveKindsFromBars(barBoundsList));
+          if (tabIndex >= 0 && this.tabShifts.size > 0) {
+            for (const tabBeat of barBoundsList[tabIndex].beats) {
+              for (const nb of tabBeat.notes ?? []) {
+                const id = this.index.noteToInfo.get(nb.note)?.id;
+                const shift = id ? this.tabShifts.get(id) : undefined;
+                if (!shift) continue;
+                const r = nb.noteHeadBounds;
               // CENTRED OVER ITS OWN DIGIT, not hung off the digit's right edge (H10).
               //
               // Hung to the right, an "8va" is ~14px of ink starting 1px after a fret digit —
@@ -1552,14 +1722,14 @@ export class TriView {
               // reads "1 8va 1" with the marker between two numbers it does not belong to.
               // Above the digit it can only ever cover the digit it is about, and the row above
               // the tab is empty by construction — `TAB_DIGIT_RISE` is already reserved there.
-              wantedMarks.push({
-                x: r.x + r.w / 2,
-                y: r.y - TAB_MARK_RISE,
-                text: octaveMarkText(shift)
-              });
+                wantedMarks.push({
+                  x: r.x + r.w / 2,
+                  y: r.y - TAB_MARK_RISE,
+                  text: octaveMarkText(shift)
+                });
+              }
             }
           }
-        }
 
         // EVERY STAVE'S BEATS, DEDUPED — not `bars[0]`'s.
         //
@@ -1571,13 +1741,13 @@ export class TriView {
         // switched to Grand, which is a row of information disappearing with no message.
         //
         // Deduped by Beat IDENTITY, so the notation+tab case still labels each beat once.
-        for (const beatBounds of dedupeBeats(barBoundsList)) {
-          beatCount++;
-          const beat = beatBounds.beat;
-          if (beat.isEmpty || beat.notes.length === 0) continue;
-          if (!this.showNames) continue;
+          for (const beatBounds of dedupeBeats(barBoundsList)) {
+            beatCount++;
+            const beat = beatBounds.beat;
+            if (beat.isEmpty || beat.notes.length === 0) continue;
+            if (!this.showNames) continue;
 
-          const names = beat.notes
+            const names = beat.notes
             // A NAME BELONGS TO AN ATTACK, NOT TO A NOTEHEAD.
             //
             // A note held across a bar line or a beat is engraved as several noteheads joined by
@@ -1613,15 +1783,19 @@ export class TriView {
               noteId: n.noteId
             }));
 
-          names.forEach((n, i) => {
-            wanted.push({
-              x: beatBounds.onNotesX,
-              y: namesY - i * NAME_STACK_STEP,
-              text: n.text,
-              uncertain: n.uncertain,
-              noteId: n.noteId
+            names.forEach((n, i) => {
+              wanted.push({
+                x: beatBounds.onNotesX,
+                y: namesY - i * NAME_STACK_STEP,
+                text: n.text,
+                uncertain: n.uncertain,
+                noteId: n.noteId,
+                trackIndex,
+                systemIndex,
+                lane: `${systemIndex}:${trackIndex}`
+              });
             });
-          });
+          }
         }
       }
     }
@@ -1630,15 +1804,17 @@ export class TriView {
     this.syncTabMarks(wantedMarks);
     // The tab's own legend. Derived from the SAME bounds as everything else above, so it
     // re-places itself on every render — a zoom, an edit or a re-flow cannot leave it behind.
-    this.syncStringLetters(
-      stringLettersFromBounds(
+    const letters = (this.builtModel?.tracks ?? []).flatMap((track, trackIndex) => {
+      if (!track.staves.some((staff) => staff.showTablature)) return [];
+      return stringLettersFromBounds(
         lookup,
-        tuningLowToHighFromScore(this.builtModel, this.liveTrackIndex()),
+        tuningLowToHighFromScore(this.builtModel, trackIndex),
         STRING_LETTER_GAP_PX,
         this.stringLetterColumnX(),
-        this.liveTrackIndex()
-      )
-    );
+        trackIndex
+      );
+    });
+    this.syncStringLetters(letters);
     // The one thing in this sweep that is not drawn by this file: a target over a name alphaTab
     // engraved. Same trigger as everything else here — the bounds it is matched against have
     // just changed, so the targets have to move with them.
@@ -1651,58 +1827,27 @@ export class TriView {
     return { beatCount, hasStaffTabSplit };
   }
 
-  /**
-   * Where the names row sits.
-   *
-   * 'between' needs the staff/tab split, which we get when a master bar reports two
-   * BarBounds. If it does not (single-stave score, or a future alphaTab change), we fall
-   * back to 'above' rather than guessing a y — a wrong y is worse than a different row order.
-   */
+  /** The one pitch-name placement law: above this part's own first visible staff group. */
   private namesYFor(
     barBoundsList: alphaTab.rendering.BarBounds[],
-    system: alphaTab.rendering.StaffSystemBounds
+    firstPartSystemTop: number | null
   ): number {
-    if (this.namesPlacement === 'above') {
-      return Math.max(0, system.visualBounds.y - NAMES_ABOVE_GAP);
-    }
-    if (this.namesPlacement === 'below') {
-      return system.realBounds.y + system.realBounds.h - 14;
-    }
     /*
-     * A GRAND STAFF HAS NO LABEL LANE, so 'between' means 'above' on one (B7).
-     *
-     * Photographed by the owner on Clef: Grand + Tab: Bass — the names crammed into the gap
-     * between the BASS staff and the tablature, sharing pixels with the bass stems that hang down
-     * into it and with the fret digits below. `bandStaves` picks "the tab and whatever is directly
-     * above it", which on a grand-plus-tab system is the bass staff, and that gap is not a lane:
-     * it is where the bass staff's own downward stems, beams and ledger lines go, and `pruneNames`
-     * deliberately ignores music glyphs (Bravura's em box is about four times its ink, so
-     * intersecting against it would delete the whole row) — so nothing downstream could catch it.
-     *
-     * The lane only genuinely exists on the one shape it was designed for: a SINGLE notation
-     * stave engraved directly above its own tablature, where `applyStaffTabGap` reserves the
-     * room for it. Anywhere else the row goes above the whole system, which is the placement
-     * already proven on single-stave scores — and `reserveTopRoomFor` reserves the headroom it
-     * needs there.
+     * The old implementation chose among "between", "above" and "below", then silently changed
+     * "between" for grand-staff and no-tab shapes. In a multi-part score its system-wide anchor
+     * could also belong to another track. This input is one exact track group, so its topmost
+     * visible bound is the stable lane anchor. The matching room comes from `reserveTopRoom` for
+     * the first part and `applyTrackNameGap` for every part below it.
      */
-    if (this.multiStaff) {
-      return Math.max(0, system.visualBounds.y - NAMES_ABOVE_GAP);
-    }
-    if (barBoundsList.length >= 2) {
-      const band = this.nameBand(barBoundsList);
-      if (!band) return Math.max(0, system.visualBounds.y - NAMES_ABOVE_GAP);
-      // Sit LOW in the band, not centred. Tuplet brackets, staccato dots and stem
-      // descenders all hang below the staff into the top of it; a centred row collides
-      // with the "3" of every triplet, and a chord stacks UPWARD from this anchor anyway.
-      const anchor = band.bottom - NAME_HEIGHT;
-      if (anchor >= band.top) return anchor;
-      // Not enough room for even one label — a tiny scale, or a future alphaTab that lays
-      // the two staves out differently. Centre what there is rather than pick a side to
-      // collide with. The reserved padding (atSettings.applyStaffTabGap) makes this the
-      // path that should never run.
-      return Math.max(0, (band.top + band.bottom) / 2 - NAME_HEIGHT / 2);
-    }
-    return Math.max(0, system.visualBounds.y - NAMES_ABOVE_GAP);
+    let top = Number.POSITIVE_INFINITY;
+    for (const bar of barBoundsList) top = Math.min(top, bar.visualBounds.y);
+    if (!Number.isFinite(top)) return 0;
+    return pitchNameLaneY(
+      top,
+      firstPartSystemTop ?? top,
+      firstPartSystemTop !== null,
+      this.notationSpacingPx
+    );
   }
 
   /**
@@ -1976,8 +2121,10 @@ export class TriView {
       const r = label.el.getBoundingClientRect();
       if (r.width === 0 && r.height === 0) continue;
       labelRects.push(r);
-      labelTop = Math.min(labelTop, fromHostTop(r.top));
-      labelBottom = Math.max(labelBottom, fromHostTop(r.bottom));
+      const top = fromHostTop(r.top);
+      const bottom = fromHostTop(r.bottom);
+      labelTop = Math.min(labelTop, top);
+      labelBottom = Math.max(labelBottom, bottom);
     }
     if (labelRects.length === 0) {
       labelTop = band.top;
@@ -2026,7 +2173,10 @@ export class TriView {
       labels: labelRects.length,
       labelTop: Math.round(labelTop),
       labelBottom: Math.round(labelBottom),
-      clearAboveStaff: Math.round(labelTop - staffBottom),
+      // Keep the legacy probe's stronger whole-system witness. Per-part clearance is published
+      // by `decorationProbe`; substituting it here masked labels inside a Grand system instead of
+      // moving those labels out of the bass-stem/TAB lane.
+      clearAboveStaff: Math.round((this.systemTop() ?? labelBottom) - labelBottom),
       clearBelowTab: Math.round(tabTop - labelBottom),
       textOverlaps,
       textOverlapSample,
@@ -2588,6 +2738,10 @@ export class TriView {
     // The overhang scales with the engraving, so the padding has to be recomputed for the
     // new scale or the reserved column would come out wider or narrower than the roll's.
     setLeftPadding(this.api.settings, LEFT_INSET_PX + leftInkOverhangPerScale * next);
+    // Staff paddings are pre-scale alphaTab units; restate the physical preference so 8px stays
+    // 8px instead of becoming 4.8px at 0.6x or 24px at 3x.
+    this.applyNotationSpacing();
+    this.reserveTopRoom();
     this.api.updateSettings();
     // A new scale is a new measurement problem, so the corrective budget is refilled.
     this.insetTuneBudget = INSET_TUNE_PASSES;
@@ -2935,37 +3089,41 @@ export class TriView {
     }
 
     const kept: Array<WantedName> = [];
-    const keptBoxes: Array<{ left: number; right: number; top: number; bottom: number }> = [];
-    let droppedAnchorX: number | null = null;
-    let keptAnchorX: number | null = null;
+    const keptBoxes = new Map<string, Array<{ left: number; right: number; top: number; bottom: number }>>();
+    let droppedAnchor: string | null = null;
+    let keptAnchor: string | null = null;
     for (const w of wanted) {
       // One decision per anchor, reused by every name stacked on it.
-      if (droppedAnchorX !== null && w.x === droppedAnchorX) continue;
+      const anchor = `${w.lane}:${w.x}`;
+      if (droppedAnchor === anchor) continue;
       const box = {
         left: w.x - nameHalfWidth(w.text),
         right: w.x + nameHalfWidth(w.text),
         top: w.y,
-        bottom: w.y + NAME_HEIGHT
+        bottom: w.y + NAME_HEIGHT,
+        lane: w.lane
       };
-      const sameAnchor = keptAnchorX !== null && w.x === keptAnchorX;
+      const sameAnchor = keptAnchor === anchor;
       const hits =
         blockers.some((b) => box.left < b.right && box.right > b.left && box.top < b.bottom && box.bottom > b.top) ||
         // Only the last few: `wanted` is built in engraving order, so a label can only ever
         // collide with its immediate neighbours, and comparing every pair is quadratic on a row
         // that can hold four hundred of them.
         (!sameAnchor &&
-          keptBoxes
+          (keptBoxes.get(w.lane) ?? [])
             .slice(-6)
             .some(
               (b) => box.left < b.right && box.right > b.left && box.top < b.bottom && box.bottom > b.top
             ));
       if (hits) {
-        droppedAnchorX = w.x;
+        droppedAnchor = anchor;
         continue;
       }
-      keptAnchorX = w.x;
+      keptAnchor = anchor;
       kept.push(w);
-      keptBoxes.push(box);
+      const laneBoxes = keptBoxes.get(w.lane) ?? [];
+      laneBoxes.push(box);
+      keptBoxes.set(w.lane, laneBoxes);
     }
     return kept;
   }
@@ -3010,7 +3168,14 @@ export class TriView {
       // there is none, so `dataset.noteId` is absent exactly when the answer is unknown.
       if (w.noteId) l.el.dataset.noteId = w.noteId;
       else delete l.el.dataset.noteId;
+      l.el.dataset.track = String(w.trackIndex);
+      l.el.dataset.system = String(w.systemIndex);
+      l.el.dataset.lane = w.lane;
       l.x = w.x;
+      l.y = w.y;
+      l.trackIndex = w.trackIndex;
+      l.systemIndex = w.systemIndex;
+      l.lane = w.lane;
     }
   }
 
@@ -3170,7 +3335,9 @@ export class TriView {
    * line from being a D, and a legend you have to scroll back to is the thing this row replaced.
    * `restringLetterPositions()` re-applies it on every scroll.
    */
-  private syncStringLetters(wanted: Array<{ x: number; y: number; text: string }>): void {
+  private syncStringLetters(
+    wanted: Array<{ x: number; y: number; text: string; system: number; trackIndex: number | null }>
+  ): void {
     while (this.stringLetters.length < wanted.length) {
       // The plate the pinned row needs to be readable over music lives in `.string-letter`
       // (ui/styles.css). It was set inline here while the row was being built; nothing about
@@ -3189,6 +3356,13 @@ export class TriView {
       if (m.el.textContent !== w.text) m.el.textContent = w.text;
       m.x = w.x;
       m.y = w.y;
+      m.trackIndex = w.trackIndex ?? undefined;
+      m.systemIndex = w.system;
+      m.lane = `${w.system}:${w.trackIndex ?? 'implicit'}`;
+      if (w.trackIndex === null) delete m.el.dataset.track;
+      else m.el.dataset.track = String(w.trackIndex);
+      m.el.dataset.system = String(w.system);
+      m.el.dataset.lane = m.lane;
     }
     this.placeStringLetters();
   }
@@ -3208,13 +3382,20 @@ export class TriView {
      * a very tight staff shrinks them rather than making them illegible. Measured off the letters
      * that are actually there, so nothing here has to know how many strings the instrument has.
      */
-    let minGap = Number.POSITIVE_INFINITY;
-    for (let i = 1; i < this.stringLetters.length; i++) {
-      const gap = Math.abs(this.stringLetters[i].y - this.stringLetters[i - 1].y);
-      if (gap > 0) minGap = Math.min(minGap, gap);
+    const minGapByLane = new Map<string, number>();
+    const previousY = new Map<string, number>();
+    for (const letter of this.stringLetters) {
+      const lane = letter.lane ?? 'implicit';
+      const previous = previousY.get(lane);
+      if (previous !== undefined) {
+        const gap = Math.abs(letter.y - previous);
+        if (gap > 0) minGapByLane.set(lane, Math.min(minGapByLane.get(lane) ?? gap, gap));
+      }
+      previousY.set(lane, letter.y);
     }
-    const size = Number.isFinite(minGap) ? Math.max(6, Math.min(9, minGap * 0.68)) : 9;
     for (const m of this.stringLetters) {
+      const minGap = minGapByLane.get(m.lane ?? 'implicit');
+      const size = minGap === undefined ? 9 : Math.max(6, Math.min(9, minGap * 0.68));
       m.el.style.fontSize = `${size.toFixed(2)}px`;
       m.el.style.transform = `translate(${m.x + left}px, ${m.y}px) translate(-100%, -50%)`;
     }

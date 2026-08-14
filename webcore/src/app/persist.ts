@@ -43,8 +43,13 @@ import { normalizeCuts, type CutSpan } from '../edit/cuts';
 import { rational, type Rational, type RippleOp } from '../edit/ripple';
 import { MAX_DOCUMENT_BARS } from '../edit/performanceEdit';
 
-/** Raise this AND add a case in `readSession()` when the shape has to change under people. */
-export const SESSION_VERSION = 1;
+/**
+ * v2 gates the half-open sheet-insertion replay law (`PersistedRippleOp.kind/fixedIds`). An old
+ * v1 reader would ignore those fields, move the insertion atom through its own splice, and then
+ * save the corrupted result without the evidence needed to recover it. New readers migrate v1
+ * (which cannot contain that operation kind) and write v2 so old builds reject rather than guess.
+ */
+export const SESSION_VERSION = 2;
 
 /** How the take can be got back. See the file header. */
 export interface PersistedAudio {
@@ -84,8 +89,12 @@ export interface PersistedRippleOp {
   id: string;
   seam: [number, number];
   delta: [number, number];
+  /** Document v7 / session v2: selects the half-open sheet-insertion replay law. */
+  kind?: 'sheet-insert';
   chordIds?: string[];
   chordEnd?: [number, number];
+  /** Document v7 / session v2: insertion atoms already stated in the op's output coordinates. */
+  fixedIds?: string[];
   split?: boolean;
   dropSpan?: boolean;
   label?: string;
@@ -371,8 +380,10 @@ function encodeRippleOp(op: RippleOp): PersistedRippleOp {
     id: op.id,
     seam: [op.seamTick.n, op.seamTick.d],
     delta: [op.deltaTick.n, op.deltaTick.d],
+    ...(op.kind === 'sheet-insert' ? { kind: op.kind } : {}),
     ...(op.chordIds?.length ? { chordIds: op.chordIds.slice() } : {}),
     ...(op.chordEndTick ? { chordEnd: [op.chordEndTick.n, op.chordEndTick.d] as [number, number] } : {}),
+    ...(op.kind === 'sheet-insert' && op.fixedIds?.length ? { fixedIds: op.fixedIds.slice() } : {}),
     ...(op.split ? { split: true } : {}),
     ...(op.dropSpan ? { dropSpan: true } : {}),
     ...(op.label ? { label: op.label } : {})
@@ -410,10 +421,14 @@ function decodeRippleOps(value: unknown): RippleOp[] | undefined {
       id: op.id,
       seamTick,
       deltaTick,
+      ...(op.kind === 'sheet-insert' ? { kind: op.kind } : {}),
       ...(Array.isArray(op.chordIds)
         ? { chordIds: op.chordIds.filter((id): id is string => typeof id === 'string' && !!id) }
         : {}),
       ...(chordEndTick ? { chordEndTick } : {}),
+      ...(op.kind === 'sheet-insert' && Array.isArray(op.fixedIds)
+        ? { fixedIds: op.fixedIds.filter((id): id is string => typeof id === 'string' && !!id) }
+        : {}),
       ...(op.split === true ? { split: true as const } : {}),
       ...(op.dropSpan === true ? { dropSpan: true as const } : {}),
       ...(typeof op.label === 'string' && op.label ? { label: op.label } : {})
@@ -567,8 +582,14 @@ function validTimeSignature(value: unknown): { numerator: number; denominator: n
  *
  * Both are omitted entirely when there is nothing to say, so a document with neither serialises to
  * the bytes v5 wrote — the bump costs old readers only the documents that actually need it.
+ *
+ * v7 is v6 plus the TAGGED SHEET-INSERT OPERATION. Its release seam is half-open and its inserted
+ * atom is fixed in the output coordinates. A v6 reader would ignore both facts, replay the op with
+ * the legacy inclusive endpoint rule, move a release that must stay, and shift the new note a
+ * second time before saving the file without the tags. That is wrong music plus evidence loss, so
+ * this is exactly the case the format gate exists for.
  */
-export const RIFFSHEET_DOCUMENT_VERSION = 6;
+export const RIFFSHEET_DOCUMENT_VERSION = 7;
 
 /**
  * THE CONTAINER, and why it changed twice.
@@ -1563,8 +1584,9 @@ export function readSession(json: string | null | undefined): PersistedSession |
   try {
     const parsed = JSON.parse(json) as Partial<PersistedSession>;
     if (!parsed || parsed.app !== 'riffsheet') return null;
-    // No migration cases yet. When v2 arrives, convert here rather than at the call site.
-    if (parsed.v !== SESSION_VERSION) return null;
+    // v1 has the same outer shape but predates sheet-insert semantics. Its absent kind/fixedIds
+    // decode through the legacy inclusive law; returning v2 makes the next normal save gated.
+    if (parsed.v !== 1 && parsed.v !== SESSION_VERSION) return null;
     return {
       v: SESSION_VERSION,
       app: 'riffsheet',

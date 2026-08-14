@@ -88,7 +88,7 @@
  * AFTER the ripple, so re-applying against it would move the same note again on every build.
  */
 
-import type { InputNote } from '@pipeline';
+import { notationIntentTicks, type InputNote, type NotationIntent } from '@pipeline';
 
 // ---------------------------------------------------------------------------
 // Rationals — small, exact, and only as much of them as this needs
@@ -195,6 +195,12 @@ export interface RippleOp {
   seamTick: Rational;
   deltaTick: Rational;
   /**
+   * Absent means the persisted v5/v6 law, byte for byte. `sheet-insert` is deliberately tagged:
+   * its half-open release seam differs from the legacy endpoint rule, so old operations must not
+   * silently acquire the new meaning when a document is reopened.
+   */
+  kind?: 'sheet-insert';
+  /**
    * A DURATION RIPPLE'S ATOM: the chord that was edited.
    *
    * Excluded from the shift — its attack does not move — and re-ended at `chordEndTick` instead,
@@ -203,6 +209,13 @@ export interface RippleOp {
    */
   chordIds?: string[];
   chordEndTick?: Rational;
+  /**
+   * A sheet insertion's atom. It is already stated in the operation's output coordinates and is
+   * therefore skipped by its own shift. Kept separate from `chordIds`: those ids carry the legacy
+   * duration assertion above, while these ids must keep the exact span the insertion planner gave
+   * them without changing how any stored duration operation replays.
+   */
+  fixedIds?: string[];
   /**
    * BAR INSERT: a note sounding across the seam is SPLIT there rather than sustained through the
    * inserted time. That is what makes an inserted bar genuinely empty, and it is the one place the
@@ -274,6 +287,30 @@ export interface RippleTickMap {
   toSec(tick: number): number;
 }
 
+/**
+ * The roll window after one structural operation.
+ *
+ * Edges at or after the seam follow displaced score material; earlier edges stay put. This is a
+ * score-view operation only — callers must not apply it to the waveform's audio window.
+ */
+export function rippleWindow(
+  window: Readonly<{ fromSec: number; toSec: number }>,
+  op: RippleOp,
+  map: RippleTickMap
+): { fromSec: number; toSec: number } | null {
+  const seam = ratValue(op.seamTick);
+  const delta = ratValue(op.deltaTick);
+  const restate = (sec: number): number => {
+    const tick = map.toTick(sec);
+    return tick >= seam - TICK_EPS ? map.toSec(tick + delta) : sec;
+  };
+  const fromSec = restate(window.fromSec);
+  const toSec = restate(window.toSec);
+  return Number.isFinite(fromSec) && Number.isFinite(toSec) && toSec > fromSec
+    ? { fromSec, toSec }
+    : null;
+}
+
 export interface RippleApplyContext {
   map: RippleTickMap;
   /** The IR's ticks per quarter — the denominator of the source-tick restatement. */
@@ -285,6 +322,19 @@ export interface RippleApplyContext {
   splitId?(opId: string, noteId: string): string;
   /** Canonical overrides, by note id. See `RollPlacement`. Absent on every un-edited document. */
   placements?: RollPlacements;
+}
+
+/**
+ * Share a structural splice with another part without leaking the live part's id namespace.
+ *
+ * The seam, delta, endpoint law and label are document-wide. Atom declarations are not: an
+ * imported part is free to contain an unrelated note with the same raw id. Returning the same
+ * object for atom-free operations keeps the common bar-op path allocation-free.
+ */
+export function rippleOpForForeignPart(op: RippleOp): RippleOp {
+  if (!op.chordIds?.length && !op.fixedIds?.length && !op.chordEndTick) return op;
+  const { chordIds: _chordIds, chordEndTick: _chordEndTick, fixedIds: _fixedIds, ...structural } = op;
+  return structural;
 }
 
 /** The default split name. Contains a colon, which no minted or engine id can produce. */
@@ -417,6 +467,221 @@ export function planDurationRipple(input: DurationRippleInput): DurationRipplePl
 }
 
 // ---------------------------------------------------------------------------
+// Planning an always-forward sheet insertion
+// ---------------------------------------------------------------------------
+
+/** One distinct event as the current engraving writes it, in IR ticks. */
+export interface SheetInsertionEvent {
+  startTick: number;
+  endTick: number;
+  memberIds: ReadonlyArray<string>;
+  midis: ReadonlyArray<number>;
+}
+
+export interface SheetInsertionPlan {
+  /** The exact canonical span the new note receives. */
+  startTick: Rational;
+  endTick: Rational;
+  /** Appended only when the desired span needs room made in front of the next event. */
+  op: RippleOp | null;
+  /** Existing same-pitch member at an exact engraved onset; no duplicate is authored. */
+  duplicateId: string | null;
+  /** Existing event joined at exact engraved onset. Empty for a new event. */
+  joinedEventIds: string[];
+}
+
+export interface SheetInsertionInput {
+  /** The clicked slot after the sheet's active-subdivision snap, in current IR ticks. */
+  startTick: number;
+  /** One local meter beat, in IR ticks. */
+  durationTicks: number;
+  midi: number;
+  newNoteId: string;
+  events: ReadonlyArray<SheetInsertionEvent>;
+  opId: string;
+  label?: string;
+}
+
+/** The minimal bar shape needed to interpret a clicked sheet slot. */
+export interface SheetInsertionBar {
+  startTick: number;
+  durTicks: number;
+  timeSig?: readonly [number, number];
+}
+
+export type SheetInsertionGrid =
+  | 'auto'
+  | 'quarter'
+  | 'eighth'
+  | 'sixteenth'
+  | 'thirtysecond'
+  | 'triplet'
+  | 'free';
+
+/** Active notation-grid unit for sheet placement; non-sized modes use the 1/16 default. */
+export function sheetInsertionGridTicks(grid: SheetInsertionGrid, divisions: number): number {
+  const quarter = Math.max(1, divisions || 12);
+  switch (grid) {
+    case 'quarter':
+      return quarter;
+    case 'eighth':
+      return quarter / 2;
+    case 'triplet':
+      return quarter / 3;
+    case 'thirtysecond':
+      return quarter / 8;
+    case 'sixteenth':
+    case 'auto':
+    case 'free':
+      return quarter / 4;
+  }
+}
+
+/**
+ * The bar whose meter owns an insertion slot.
+ *
+ * Bar intervals are half-open everywhere inside the score, so an ordinary barline belongs to
+ * the bar on its right. The document's final right edge has no bar on its right; it inherits the
+ * final bar's meter instead of falling through to an unrelated 4/4 default. This is deliberately
+ * a separate rule from ripple's half-open release seam: it answers which meter labels a point,
+ * not which endpoints move through inserted time.
+ */
+export function sheetInsertionBarAtTick<T extends SheetInsertionBar>(
+  bars: ReadonlyArray<T>,
+  tick: number
+): T | null {
+  for (const bar of bars) {
+    if (tick >= bar.startTick - TICK_EPS && tick < bar.startTick + bar.durTicks - TICK_EPS) {
+      return bar;
+    }
+  }
+  const last = bars[bars.length - 1];
+  return last && Math.abs(tick - (last.startTick + last.durTicks)) <= TICK_EPS ? last : null;
+}
+
+/** One beat in the bar's own denominator, in IR ticks. */
+export function sheetInsertionBeatTicks(
+  bar: SheetInsertionBar | null | undefined,
+  divisions: number
+): number {
+  const denominator = bar?.timeSig?.[1] || 4;
+  return Math.max(1, Math.round(((divisions || 12) * 4) / denominator));
+}
+
+/** Snap within one bar and clamp to its exact right edge, even when the grid does not divide it. */
+export function sheetInsertionSnapTick(
+  bar: SheetInsertionBar,
+  tick: number,
+  stepTicks: number
+): number {
+  const step = Math.max(1 / 1000, stepTicks);
+  const offset = Math.round((tick - bar.startTick) / step) * step;
+  return bar.startTick + Math.max(0, Math.min(bar.durTicks, offset));
+}
+
+/** A declared glyph only when it represents the planner's complete canonical span exactly. */
+export function notationIntentMatchingSpan(
+  intent: NotationIntent | null | undefined,
+  spanTicks: number,
+  divisions: number
+): NotationIntent | null {
+  const declared = notationIntentTicks(intent ?? undefined, divisions);
+  return declared !== null && Math.abs(declared - spanTicks) <= TICK_EPS ? intent! : null;
+}
+
+/**
+ * Mint a ripple id after every numeric id already carried by a restored document.
+ *
+ * `RollPlacement.afterOpId` names a position in the operation log, so duplicate ids are not a
+ * cosmetic problem: its lookup would stop at the first match and replay the intervening ops over
+ * a note a second time. The counter is therefore seeded from BOTH `r…` and `b…` ids on every mint,
+ * which also makes hand-edited/restored logs safe without a separate restore-time lifecycle hook.
+ */
+export function nextRippleOperationId(
+  ops: ReadonlyArray<RippleOp>,
+  currentSequence: number,
+  prefix: 'r' | 'b'
+): { id: string; sequence: number } {
+  let sequence = Math.max(0, Math.floor(Number.isFinite(currentSequence) ? currentSequence : 0));
+  const used = new Set(ops.map((op) => op.id));
+  for (const op of ops) {
+    const match = /^[rb](\d+)$/.exec(op.id);
+    if (match) sequence = Math.max(sequence, Number(match[1]) || 0);
+  }
+  let id = '';
+  do id = `${prefix}${++sequence}`;
+  while (used.has(id));
+  return { id, sequence };
+}
+
+/**
+ * Plan one note that never loses to a narrow gap.
+ *
+ * Events, not individual notes, decide the suffix seam. Exact-onset insertion joins that event
+ * without a ripple; otherwise the desired one-beat interval is kept whole and the next event plus
+ * everything after it moves by only the missing amount. The returned op is positive-only by
+ * construction: sheet insertion never pulls material backward.
+ */
+export function planSheetInsertion(input: SheetInsertionInput): SheetInsertionPlan {
+  const startTick = ratFromTick(Math.max(0, input.startTick));
+  const wantedLength = ratFromTick(Math.max(MIN_SPAN_TICKS, input.durationTicks));
+  const desiredEndTick = ratAdd(startTick, wantedLength);
+  const start = ratValue(startTick);
+  const ordered = [...input.events].sort((a, b) => a.startTick - b.startTick || a.endTick - b.endTick);
+
+  const exact = ordered.find((event) => Math.abs(event.startTick - start) <= TICK_EPS);
+  if (exact) {
+    const duplicateAt = exact.midis.findIndex((midi) => Math.round(midi) === Math.round(input.midi));
+    const eventEnd = ratFromTick(Math.max(exact.startTick + MIN_SPAN_TICKS, exact.endTick));
+    return {
+      startTick: ratFromTick(exact.startTick),
+      endTick: eventEnd,
+      op: null,
+      duplicateId: duplicateAt >= 0 ? (exact.memberIds[duplicateAt] ?? exact.memberIds[0] ?? null) : null,
+      joinedEventIds: [...exact.memberIds]
+    };
+  }
+
+  const next = ordered.find((event) => event.startTick > start + TICK_EPS);
+  if (!next) {
+    return {
+      startTick,
+      endTick: desiredEndTick,
+      op: null,
+      duplicateId: null,
+      joinedEventIds: []
+    };
+  }
+
+  const seamTick = ratFromTick(next.startTick);
+  const deltaTick = ratSub(desiredEndTick, seamTick);
+  if (ratCmp(deltaTick, RAT_ZERO) <= 0) {
+    return {
+      startTick,
+      endTick: desiredEndTick,
+      op: null,
+      duplicateId: null,
+      joinedEventIds: []
+    };
+  }
+
+  return {
+    startTick,
+    endTick: desiredEndTick,
+    op: {
+      id: input.opId,
+      kind: 'sheet-insert',
+      seamTick,
+      deltaTick,
+      fixedIds: [input.newNoteId],
+      ...(input.label ? { label: input.label } : {})
+    },
+    duplicateId: null,
+    joinedEventIds: []
+  };
+}
+
+// ---------------------------------------------------------------------------
 // Applying the log
 // ---------------------------------------------------------------------------
 
@@ -485,6 +750,13 @@ function place(
 
   for (let i = from; i < ops.length; i++) {
     const op = ops[i];
+    const isFixed =
+      op.kind === 'sheet-insert' && id !== undefined && !!op.fixedIds && op.fixedIds.includes(id);
+    if (isFixed) {
+      // The insertion atom already occupies the new time. Applying its own splice would move its
+      // release a second time; later operations still see it normally.
+      continue;
+    }
     const isMate = id !== undefined && !!op.chordIds && op.chordIds.includes(id);
     if (isMate) {
       // THE ATOM. Its attack does not move for its own operation and its release is stated, not
@@ -503,7 +775,12 @@ function place(
     }
 
     const startsAfter = ratCmp(startTick, op.seamTick) >= 0;
-    const endsAfter = ratCmp(endTick, op.seamTick) >= 0;
+    // Sheet insertion is half-open at RELEASES: a note ending exactly where the inserted space
+    // begins stays put. Legacy operations keep their persisted `>=` rule unchanged.
+    const endsAfter =
+      op.kind === 'sheet-insert'
+        ? ratCmp(endTick, op.seamTick) > 0
+        : ratCmp(endTick, op.seamTick) >= 0;
 
     if (!startsAfter && endsAfter && op.split) {
       /*
@@ -566,6 +843,22 @@ function shiftedTiming(
   return { startTick, endTick, ppq: timing.ppq };
 }
 
+/** Restate an editor-authored onset through the same exact displacement as the note's attack. */
+function shiftedNotationOnset(
+  onset: InputNote['notationOnset'],
+  startShift: Rational,
+  divisions: number
+): InputNote['notationOnset'] {
+  if (!onset || !(onset.ppq > 0) || !(divisions > 0) || ratIsZero(startShift)) return onset;
+  return {
+    startTick: Math.max(
+      0,
+      onset.startTick + Math.round(ratValue(ratScale(startShift, onset.ppq, divisions)))
+    ),
+    ppq: onset.ppq
+  };
+}
+
 /**
  * THE LOG, APPLIED. Notes in, notes out, nothing mutated.
  *
@@ -588,9 +881,23 @@ export function applyRippleOps(
     const endSec = ctx.map.toSec(ratValue(placed.endTick));
     const moved = startSec !== note.startSec || endSec !== note.endSec;
     const timing = shiftedTiming(note.sourceTiming, placed.startShift, placed.endShift, ctx.divisions);
+    /*
+     * Only an onset the player explicitly authored travels as onset authority. Deriving one from
+     * `placed.startTick` for every detector note would promote performance jitter to notation:
+     * the shifted raw attack is not necessarily the tick the current page had quantized it to.
+     * Unmarked suffix notes still move by the exact ripple in seconds and remain measured on the
+     * next build; inserted and sheet-dragged notes arrive here with their marker already present.
+     */
+    const onset = shiftedNotationOnset(note.notationOnset, placed.startShift, ctx.divisions);
     out.push(
-      moved || timing !== note.sourceTiming
-        ? { ...note, startSec, endSec, ...(timing ? { sourceTiming: timing } : {}) }
+      moved || timing !== note.sourceTiming || onset !== note.notationOnset
+        ? {
+            ...note,
+            startSec,
+            endSec,
+            ...(timing ? { sourceTiming: timing } : {}),
+            ...(onset ? { notationOnset: onset } : {})
+          }
         : note
     );
     if (placed.tail && note.id) {
@@ -600,7 +907,10 @@ export function applyRippleOps(
         id: splitId(placed.tail.opId, note.id),
         startSec: ctx.map.toSec(ratValue(placed.tail.startTick)),
         endSec: ctx.map.toSec(ratValue(placed.tail.endTick)),
-        ...(tailTiming ? { sourceTiming: tailTiming } : {})
+        ...(tailTiming ? { sourceTiming: tailTiming } : {}),
+        ...(ctx.divisions > 0
+          ? { notationOnset: { startTick: Math.round(ratValue(placed.tail.startTick)), ppq: ctx.divisions } }
+          : {})
       };
       // The tail is a NEW note: the written value the player chose was chosen for a note of a
       // different length, so it does not travel.
@@ -643,23 +953,54 @@ export function applyRippleOps(
 export function unrippleNotes(
   notes: ReadonlyArray<InputNote>,
   ops: ReadonlyArray<RippleOp>,
-  map: RippleTickMap
+  map: RippleTickMap,
+  /** Restate symbolic source timing backwards too. Omit only for legacy callers with none. */
+  divisions = 0
 ): InputNote[] {
   if (!ops.length || !notes.length) return notes as InputNote[];
   return notes.map((note) => {
     const id = note.id;
-    let startTick = ratFromTick(map.toTick(note.startSec));
-    let endTick = ratFromTick(map.toTick(note.endSec));
+    const shownStartTick = ratFromTick(map.toTick(note.startSec));
+    const shownEndTick = ratFromTick(map.toTick(note.endSec));
+    let startTick = shownStartTick;
+    let endTick = shownEndTick;
     for (let i = ops.length - 1; i >= 0; i--) {
       const op = ops[i];
-      if (id !== undefined && op.chordIds?.includes(id)) continue;
+      if (
+        id !== undefined &&
+        (op.chordIds?.includes(id) || (op.kind === 'sheet-insert' && op.fixedIds?.includes(id)))
+      ) {
+        continue;
+      }
       startTick = undoShift(startTick, op);
       endTick = undoShift(endTick, op);
     }
     const startSec = map.toSec(ratValue(startTick));
     const endSec = map.toSec(ratValue(endTick));
-    if (startSec === note.startSec && endSec === note.endSec) return note;
-    return { ...note, startSec, endSec: Math.max(startSec, endSec) };
+    const timing = shiftedTiming(
+      note.sourceTiming,
+      ratSub(startTick, shownStartTick),
+      ratSub(endTick, shownEndTick),
+      divisions
+    );
+    const onset = shiftedNotationOnset(
+      note.notationOnset,
+      ratSub(startTick, shownStartTick),
+      divisions
+    );
+    if (
+      startSec === note.startSec &&
+      endSec === note.endSec &&
+      timing === note.sourceTiming &&
+      onset === note.notationOnset
+    ) return note;
+    return {
+      ...note,
+      startSec,
+      endSec: Math.max(startSec, endSec),
+      ...(timing ? { sourceTiming: timing } : {}),
+      ...(onset ? { notationOnset: onset } : {})
+    };
   });
 }
 

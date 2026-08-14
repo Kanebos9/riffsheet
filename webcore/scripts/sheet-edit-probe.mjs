@@ -382,8 +382,8 @@ const main = async () => {
       //   1. THE ENGRAVING. The new note's notehead is read back out of alphaTab's bounds lookup
       //      and compared with the pixel that was right-clicked. Nothing in that path shares a
       //      line of code with the seconds arithmetic under test.
-      //   2. THE METER. Its attack must sit exactly on a beat line of the bar it is in, off the
-      //      app's own bar list in seconds — which is what "the nearest beat" means.
+      //   2. THE METER. Its attack must sit exactly on the active add subdivision of the bar it
+      //      is in. Auto uses the adjudicated 1/16 default: four slots per local meter beat.
       {
         const after = await sheet();
         const added = after.notes.find((n) => !idsBefore.has(n.id));
@@ -392,12 +392,21 @@ const main = async () => {
           (b) => added && added.startSec >= b.startSec - 1e-3 && added.startSec < b.startSec + b.durSec - 1e-3
         );
         const beatDur = bar ? bar.durSec / bar.beats : 0;
-        const offBeat = bar ? Math.abs(((added.startSec - bar.startSec) / beatDur) % 1) : 1;
-        say('added note', { added, head, bar, offBeat: Number(offBeat.toFixed(6)) });
+        const subdivisionDur = beatDur / 4;
+        const offSubdivision = bar
+          ? Math.abs(((added.startSec - bar.startSec) / subdivisionDur) % 1)
+          : 1;
+        say('added note', { added, head, bar, offSubdivision: Number(offSubdivision.toFixed(6)) });
+        /*
+         * THE OLD ASSERTION, quoted: "add note: it lands on a BEAT of the bar it was dropped in,
+         * exactly". That claim encoded the bug: it allowed a click aimed at an eighth or
+         * sixteenth to be relocated to a quarter boundary before the insertion planner ran.
+         * Auto now means a 1/16 add lattice, so the same meter witness checks four slots per beat.
+         */
         check(
-          'add note: it lands on a BEAT of the bar it was dropped in, exactly',
-          !!bar && (offBeat < 1e-3 || offBeat > 1 - 1e-3),
-          `start=${added?.startSec}s, bar ${bar?.index} starts ${bar?.startSec}s, beat=${beatDur}s`
+          'add note: it lands on the active 1/16 subdivision exactly',
+          !!bar && (offSubdivision < 1e-3 || offSubdivision > 1 - 1e-3),
+          `start=${added?.startSec}s, bar ${bar?.index} starts ${bar?.startSec}s, subdivision=${subdivisionDur}s`
         );
         check(
           'add note: and it is ENGRAVED under the pixel that was clicked (the 40x tick bug)',
@@ -417,12 +426,31 @@ const main = async () => {
       })()`);
       await settle(700);
       const countAfter = (await rects()).length;
+      const tightInsertion = await json(
+        'JSON.stringify(window.__RIFFSHEET_SHEETINSERTPROBE__ ? window.__RIFFSHEET_SHEETINSERTPROBE__() : null)'
+      );
       say('after add', await sheet().then((x) => ({ raw: x.rawNotes, feed: x.feedNotes, undo: x.undoTitle })));
+      say('tight insertion transaction', tightInsertion);
       await shot('03-after-add');
+      /*
+       * The old assertion was "add note: the roll gained a rectangle, so the performance really
+       * changed". That proves an unconstrained add only. The same one check now also drives a
+       * guaranteed tight gap through the App adapter and requires its ripple/log, roll, engraving,
+       * raw-locality and one-Undo answers; the total probe floor remains exactly 63.
+       */
       check(
-        'add note: the roll gained a rectangle, so the performance really changed',
-        addPicked === 'picked' && countAfter === countBefore + 1,
-        `pick=${addPicked}, rects ${countBefore} -> ${countAfter}`
+        'add note: the roll changes, and a tight-gap add is one exact forward-ripple transaction',
+        addPicked === 'picked' && countAfter === countBefore + 1 &&
+          !!tightInsertion && !tightInsertion.error && tightInsertion.applied === true &&
+          tightInsertion.rawOldStable === true && tightInsertion.opKind === 'sheet-insert' &&
+          tightInsertion.fixed === true &&
+          Math.abs(tightInsertion.deltaTick - tightInsertion.expectedDelta) < 1e-6 &&
+          JSON.stringify(tightInsertion.feedSpan) === JSON.stringify(tightInsertion.expectedSpan) &&
+          JSON.stringify(tightInsertion.rollSpan) === JSON.stringify(tightInsertion.expectedSpan) &&
+          JSON.stringify(tightInsertion.writtenSpan) === JSON.stringify(tightInsertion.expectedSpan) &&
+          tightInsertion.suffixMoved === true && /add note/i.test(tightInsertion.undoTitle) &&
+          tightInsertion.undoExact === true,
+        JSON.stringify({ pick: addPicked, rects: [countBefore, countAfter], tightInsertion })
       );
     } else {
       check('add note: a point of empty notation staff was found', false, 'no probe point');

@@ -48,7 +48,6 @@ import {
   type TranscribeResult
 } from '../bridge';
 import {
-  buildRiffScore,
   buildTickSecondsMap,
   scoreOriginSec,
   notationIntentTicks,
@@ -62,6 +61,7 @@ import { TriView, MIN_ZOOM, MAX_ZOOM, type NoteHit, type SheetTarget } from '../
 import {
   absoluteSheetScale,
   alignOriginSec,
+  clampWindow,
   engravedPxPerSec,
   fullViewport,
   intersectLimits,
@@ -76,6 +76,7 @@ import {
   TIME_ZOOM_OUT_FACTOR,
   type RebuildViewportPolicy,
   type TimeLimits,
+  type TimeWindow,
   type TimelineViewport,
   type ViewportCommand
 } from '../view/timeAxis';
@@ -89,7 +90,7 @@ import {
   type RollEdit,
   type SheetMap
 } from '../view/pianoroll';
-import { applyRollEditToNotes } from '../edit/rollPerformance';
+import { addedTiming, applyRollEditToNotes } from '../edit/rollPerformance';
 // THE SHEET'S WRITE-THROUGH ROAD. Not `commitPerformance` directly — see the file's own note
 // for what that costs on a snapped or a cut take, and why the victims of a collision have to be
 // named rather than inferred from the command.
@@ -112,12 +113,21 @@ import {
  */
 import {
   applyRippleOps,
+  nextRippleOperationId,
+  notationIntentMatchingSpan,
   planDurationRipple,
+  planSheetInsertion,
   ratFromTick,
   ratValue,
   rational,
+  rippleOpForForeignPart,
   rippleEndTick,
   rippleMovedIds,
+  rippleWindow,
+  sheetInsertionBarAtTick,
+  sheetInsertionBeatTicks,
+  sheetInsertionGridTicks,
+  sheetInsertionSnapTick,
   spliceSourceBars,
   unrippleNotes,
   withRollPlacements,
@@ -125,6 +135,7 @@ import {
   type RippleOp,
   type RippleTickMap,
   type RollPlacements,
+  type SheetInsertionEvent,
   type WrittenSpan
 } from '../edit/ripple';
 import { closeSheetMenu, showSheetMenu, sheetMenuProbe, type SheetMenuItem } from '../edit/sheetMenu';
@@ -206,6 +217,7 @@ import {
   nudgeStepMs,
   orderedPartSlots,
   partOrderOf,
+  restoredLivePartName,
   scoreParts,
   snapNudgeMs,
   type ImportedPart,
@@ -584,6 +596,14 @@ class App {
    */
   private viewport: TimelineViewport | null = null;
   /**
+   * A score-only window while a structural edit has made the written document longer or shorter.
+   * The sheet keeps the scale the hand acted against and the waveform keeps photographing the
+   * same audio; the roll alone reveals the displaced suffix until the next view command.
+   */
+  private structuralRollWindow: TimeWindow | null = null;
+  /** The waveform's audio-only window; structural score time must never rescale this photograph. */
+  private waveformWindow: TimeWindow | null = null;
+  /**
    * What the sheet was doing at the last settled render: how many content pixels it spends on a
    * second, and at what `display.scale`. The ONE thing the engraving is still asked for.
    *
@@ -608,7 +628,12 @@ class App {
    * anchor in seconds would name a different bar on the other side of the rebuild; a tick names
    * the same note before and after.
    */
-  private pendingRebuild: { generation: number; anchorTick: number; anchorFrac: number } | null = null;
+  private pendingRebuild: {
+    generation: number;
+    anchorTick: number;
+    anchorFrac: number;
+    preserveAuxiliaryWindows: boolean;
+  } | null = null;
   /** True while `applyViewport` is writing the window into the panes. Guards re-entry. */
   private applyingViewport = false;
   /** Every command that reached the reducer, in order. Read by `__RIFFSHEET_VIEWPORT__`. */
@@ -2344,7 +2369,11 @@ class App {
     // The document's settings, for the document. NOT for the player's preferences file — see
     // `applyDocumentSettingsToStore`, which is the whole of the fix for the reported clobber.
     this.applyDocumentSettingsToStore(document.settings);
-    this.setSource({ ...source, name: document.name || name.replace(/\.riffsheet$/i, '') });
+    // P4 MIGRATION HAPPENS AFTER SETTINGS. A legacy file has no canonical name, and its old name
+    // depended on these effective saved settings; freezing it before this line would freeze the
+    // current profile's instrument instead of the document's.
+    const migratedSource = this.freezeLegacyLivePartName(source);
+    this.setSource({ ...migratedSource, name: document.name || name.replace(/\.riffsheet$/i, '') });
     // A document made before documents carried a take, or made from a symbolic import, still
     // gets the old stub: no audio, and everything that depends on audio correctly switched off.
     this.audioRef = document.audio ?? { kind: 'midi', name, path: '', durationSec: source.durationSec };
@@ -3689,7 +3718,18 @@ class App {
     return TUNING_PRESETS.find((preset) => preset.instrument === s.tabMode)?.midiLowToHigh ?? [];
   }
 
+  /** Freeze the old instrument-derived label for a document/session that predates canonical names. */
+  private freezeLegacyLivePartName(source: SourceAudio): SourceAudio {
+    if (cleanPartName(source.livePartName)) return source;
+    return { ...source, livePartName: restoredLivePartName(this.settings.get(), source.livePartName) };
+  }
+
   private setSource(source: SourceAudio): void {
+    // Every NEW source gets a real canonical part name immediately. Import/restore paths freeze
+    // legacy derivation before entering here; anything else with an absent/blank field is new.
+    const namedSource = cleanPartName(source.livePartName)
+      ? source
+      : { ...source, livePartName: 'Take' };
     this.selection = null;
     this.tunerSelection = null;
     // A NEW TAKE IS A NEW TIMELINE. The window names seconds of the last recording and the
@@ -3697,6 +3737,8 @@ class App {
     // that the first settled render SEEDS from the new sheet — the one place a span is allowed
     // to come from the engraving. A rebuild of the SAME take deliberately does not do this.
     this.viewport = null;
+    this.structuralRollWindow = null;
+    this.waveformWindow = null;
     this.sheetRef = null;
     // A new take is a new question for the cut gesture too (G8): a span swept out of the last
     // recording names seconds this one does not have.
@@ -3707,7 +3749,7 @@ class App {
     // A new take is a new question (F16): whoever waved the offer away did so about the LAST
     // recording, and this one may be four seconds of hiss before the first note.
     this.trimChipDismissed = false;
-    this.runtime.set({ source, selection: [] });
+    this.runtime.set({ source: namedSource, selection: [] });
     this.transport.setLoop(false);
     this.transport.setLoopRange(null, null);
     this.loopBarNumber = null;
@@ -3904,13 +3946,16 @@ class App {
       // the player's preferences file, and without a blob's own version number re-arming a
       // migration this profile has already been through.
       this.applyDocumentSettingsToStore(blob.settings);
+      // Same ordering as a .riffsheet open: the legacy name is a function of the SAVED effective
+      // settings, never of whichever instrument happened to be in the profile before restore.
+      const migratedSource = this.freezeLegacyLivePartName(source);
       this.audioRef = blob.audio;
       try {
         this.sourceMidi = blob.sourceMidi ? base64ToBytes(blob.sourceMidi) : null;
       } catch {
         this.sourceMidi = null;
       }
-      this.runtime.set({ source, score: null, selection: [] });
+      this.runtime.set({ source: migratedSource, score: null, selection: [] });
       this.resetHistories();
       this.undoStack.clear();
       this.editLog = [];
@@ -4317,10 +4362,11 @@ class App {
      *   RAW      `source.detected.notes` — the recording, which is what a write-back can corrupt.
      *   PAINTED  `PianoRoll.paintedRects()` — what the player is actually looking at.
      *
-     * SNAP OFF, and that is the adjudicated scope. Beat and Grid are GLOBAL PROJECTIONS by design:
-     * a snap allocator re-derives every event's placement from the whole take, so adding an event
-     * legitimately changes where an untouched one is drawn. That is a property of asking for a
-     * snap, not a purity violation, and it is the mode in which the law is stated exactly.
+     * SNAP OFF is the destructive edit baseline. Grid is a LOCAL projection (`snap.ts` maps each
+     * note independently), so adding an event cannot relocate an old one there either. Beat is the
+     * GLOBAL allocator: it may legitimately change an old note's derived placement, but never its
+     * raw recording record. The browser matrix and `roll-snap-test` state those two scopes
+     * separately rather than treating every kind of snap as one policy.
      *
      * Everything is put back before returning: the take leaves this function as it arrived.
      */
@@ -5216,9 +5262,11 @@ class App {
          */
         rippleOps: (rt.source?.rippleOps ?? []).map((op) => ({
           id: op.id,
+          kind: op.kind ?? null,
           seam: r4(ratValue(op.seamTick)),
           delta: r4(ratValue(op.deltaTick)),
           chordIds: op.chordIds ?? null,
+          fixedIds: op.fixedIds ?? null,
           split: !!op.split,
           dropSpan: !!op.dropSpan
         })),
@@ -5233,6 +5281,101 @@ class App {
         /** What the ROLL is drawing, from the same feed — so "the roll mirrors the sheet" is testable. */
         rollNotes: this.rollFeedNotes().map((n) => ({ id: n.id, startSec: r4(n.startSec), endSec: r4(n.endSec) }))
       };
+    };
+
+    /**
+     * A deterministic tight-gap insertion through the REAL App transaction, followed by Undo.
+     *
+     * The ordinary sheet probe right-clicks whatever empty point alphaTab happens to expose; it
+     * proves the gesture but cannot promise that fixture leaves less than one beat before the next
+     * event. This chooses an empty active-grid slot immediately before an engraved event, calls
+     * the same private adapter the menu calls, and reads the raw/log/roll/sheet state on both sides
+     * of the app's interleaved history. Nothing remains changed when it returns.
+     */
+    (window as unknown as Record<string, unknown>).__RIFFSHEET_SHEETINSERTPROBE__ = () => {
+      const source = this.runtime.get().source;
+      const score = this.runtime.get().score;
+      const map = this.rippleMap();
+      if (!source?.detected || !score || !map) return { error: 'no score' };
+
+      const events = this.sheetInsertionEvents();
+      const step = this.sheetInsertionStepTicks(score);
+      let target: { startTick: number; beatTicks: number; next: SheetInsertionEvent } | null = null;
+      for (const next of events) {
+        for (let units = 1; units <= 8; units++) {
+          const startTick = next.startTick - units * step;
+          const bar = sheetInsertionBarAtTick(score.ir.bars, startTick);
+          if (!bar || startTick < bar.startTick - 1e-6) continue;
+          const beatTicks = sheetInsertionBeatTicks(bar, score.ir.divisions || 12);
+          if (startTick + beatTicks <= next.startTick + 1e-6) continue;
+          if (events.some((event) => Math.abs(event.startTick - startTick) <= 1e-6)) continue;
+          target = { startTick, beatTicks, next };
+          break;
+        }
+        if (target) break;
+      }
+      if (!target) return { error: 'fixture has no empty tight-grid slot', step };
+
+      const sourceFingerprint = () => {
+        const at = this.runtime.get().source;
+        return JSON.stringify({
+          notes: at?.detected?.notes ?? null,
+          rippleOps: at?.rippleOps ?? null,
+          rollPlacements: at?.rollPlacements ?? null,
+          documentEndTick: at?.documentEndTick ?? null,
+          timelineDetached: at?.timelineDetached ?? false,
+          importedParts: at?.importedParts ?? null
+        });
+      };
+      const beforeFingerprint = sourceFingerprint();
+      const beforeRaw = new Map(
+        source.detected.notes.filter((note) => !!note.id).map((note) => [note.id!, JSON.stringify(note)])
+      );
+      const beforeFeed = new Map(
+        this.performanceFeed()
+          .filter((note) => !!note.id)
+          .map((note) => [note.id!, { start: map.toTick(note.startSec), end: map.toTick(note.endSec) }])
+      );
+      const idsBefore = new Set(beforeRaw.keys());
+      const occupied = new Set(target.next.midis.map((midi) => Math.round(midi)));
+      let midi = 72;
+      while (occupied.has(midi) && midi < 127) midi++;
+
+      const applied = this.applySheetInsertion(midi, target.startTick, target.beatTicks);
+      const afterSource = this.runtime.get().source;
+      const newNote = afterSource?.detected?.notes.find((note) => !!note.id && !idsBefore.has(note.id));
+      const op = afterSource?.rippleOps?.[afterSource.rippleOps.length - 1] ?? null;
+      const afterFeed = this.performanceFeed();
+      const fed = afterFeed.find((note) => note.id === newNote?.id) ?? null;
+      const rolled = this.rollFeedNotes().find((note) => note.id === newNote?.id) ?? null;
+      const written = newNote?.id ? this.writtenSpans().get(newNote.id) ?? null : null;
+      const oldRawStable = [...beforeRaw].every(
+        ([id, bytes]) => JSON.stringify(afterSource?.detected?.notes.find((note) => note.id === id)) === bytes
+      );
+      const nextId = target.next.memberIds[0] ?? null;
+      const nextBefore = nextId ? beforeFeed.get(nextId) ?? null : null;
+      const nextAfter = nextId ? afterFeed.find((note) => note.id === nextId) ?? null : null;
+      const expectedEnd = target.startTick + target.beatTicks;
+      const expectedDelta = expectedEnd - target.next.startTick;
+      const after = {
+        applied,
+        newNoteId: newNote?.id ?? null,
+        rawOldStable: oldRawStable,
+        opKind: op?.kind ?? null,
+        fixed: !!newNote?.id && op?.fixedIds?.includes(newNote.id) === true,
+        deltaTick: op ? ratValue(op.deltaTick) : null,
+        expectedDelta,
+        feedSpan: fed ? [map.toTick(fed.startSec), map.toTick(fed.endSec)] : null,
+        rollSpan: rolled ? [map.toTick(rolled.startSec), map.toTick(rolled.endSec)] : null,
+        writtenSpan: written ? [written.startTick, written.endTick] : null,
+        expectedSpan: [target.startTick, expectedEnd],
+        suffixMoved:
+          !!nextBefore && !!nextAfter && map.toTick(nextAfter.startSec) > nextBefore.start + 1e-6,
+        undoTitle: this.undoTitle()
+      };
+
+      if (applied) this.undo();
+      return { ...after, undoExact: sourceFingerprint() === beforeFingerprint };
     };
 
     /**
@@ -5291,8 +5434,11 @@ class App {
       };
     };
 
-    (window as unknown as Record<string, unknown>).__RIFFSHEET_LAYOUT__ = () =>
-      this.triview?.layoutProbe() ?? null;
+    (window as unknown as Record<string, unknown>).__RIFFSHEET_LAYOUT__ = () => {
+      const view = this.triview;
+      const layout = view?.layoutProbe() ?? null;
+      return layout ? { ...layout, decorations: view!.decorationProbe() } : null;
+    };
     // The piano roll's own view of itself, plus the transport position so a synthetic
     // click on the roll can be checked end to end.
     (window as unknown as Record<string, unknown>).__RIFFSHEET_PIANOROLL__ = () => {
@@ -6411,6 +6557,17 @@ class App {
         const canvas = this.root.querySelector<HTMLCanvasElement>('canvas.pianoroll');
         if (!canvas) return { error: 'no roll canvas', appOrigin };
         const idsBefore = new Set(rects.map((r) => r.noteId));
+        const lifecycleSnapshot = () => {
+          const probe = roll.probe();
+          const painted = roll.paintedRects();
+          return {
+            pendingEdit: probe.pendingEdit,
+            drawnRects: probe.drawnRects,
+            nullIdRects: painted.filter((r) => r.noteId === null).length,
+            noteIds: painted.map((r) => r.noteId)
+          };
+        };
+        const lifecycleBefore = lifecycleSnapshot();
         // LOGICAL -> VISUAL on the way out (G1). `targetX` and `emptyY` come from the roll's own
         // painted geometry, which is in the design's pixels; a `MouseEvent`'s client coordinates
         // are visual ones and are converted back by `canvasPoint()` on the way in. Adding the two
@@ -6476,6 +6633,10 @@ class App {
         const posAfterFirst = Number(this.transport.state.positionSec.toFixed(4));
         await press(2);
         at('dblclick', 2);
+        // `onEdit` is synchronous. This is therefore the first frame after the callback has
+        // published its authoritative performance through `setPerformanceNotes`, before a timer
+        // or another user action can hide a provisional-lifecycle error.
+        const lifecycleAfterCallback = lifecycleSnapshot();
 
         /*
          * WAIT FOR THE REBUILD, DO NOT GUESS AT IT.
@@ -6500,6 +6661,7 @@ class App {
           (n) => n.id !== undefined && !idsBefore.has(n.id) && (n.id ?? '').startsWith('add')
         );
         const lastFrame = roll.probe();
+        const lifecycleAfterSettle = lifecycleSnapshot();
         return {
           why: added
             ? null
@@ -6546,6 +6708,11 @@ class App {
             pitchMovedSemitones: Number(
               Math.abs((afterFirst.scrollTopMidi ?? 0) - (rollProbe.scrollTopMidi ?? 0)).toFixed(3)
             )
+          },
+          lifecycle: {
+            before: lifecycleBefore,
+            afterCallback: lifecycleAfterCallback,
+            afterSettle: lifecycleAfterSettle
           }
         };
       } finally {
@@ -8216,6 +8383,7 @@ class App {
           // What the SHEET actually engraved: alphaTab renders one staff system per track it
           // was given, so this is the count a screenshot would show.
           renderedTracks: this.triview?.api.tracks?.length ?? 0,
+          decorations: this.triview?.decorationProbe() ?? null,
           midiBytes: score ? score.midi(true).length : 0
         };
       };
@@ -8533,8 +8701,7 @@ class App {
      *      label and in the exported `<part-name>` — read back from three independent places, so
      *      a rename that reached one of them and not the others fails;
      *   3. the same again from the LABEL ON THE SHEET, which is the other door;
-     *   4. clearing the field goes back to the instrument's own word rather than to a blank
-     *      staff label — the override is an override, not a replacement;
+     *   4. clearing the field stores the stable default `Take`, never an instrument-derived word;
      *   5. the document carries it: `encodeSource`/`decodeSource` round-trip through the same
      *      call the session save makes.
      *
@@ -8619,7 +8786,7 @@ class App {
         const source = this.runtime.get().source;
         const roundTrip = source ? decodeSource(encodeSource(source))?.livePartName ?? null : null;
 
-        // (4) …and clearing it goes back to the instrument's word.
+        // (4) …and clearing it goes back to the stable canonical default.
         choose('do:rename');
         typeInto('part-rename', '   ');
         await settle(80);
@@ -8660,6 +8827,46 @@ class App {
         return { tracks: score?.data.tracks.length ?? 0, parts: scoreParts(score).length };
       } catch (e) {
         return { error: String(e) };
+      }
+    };
+
+    /** Build the exact mixed-tuning or live TAB-only page used by the visual overlay proof. */
+    (window as unknown as Record<string, unknown>).__RIFFSHEET_PARTSVISUAL__ = async (
+      asked: number,
+      tabOnly = false
+    ) => {
+      try {
+        const count = Math.max(1, Math.min(MAX_SCORE_PARTS, Math.round(Number(asked)) || 1));
+        const current = this.settings.get();
+        this.settings.set({
+          showStaff: !tabOnly,
+          // A TAB-only request must have a TAB to retain. Normal calls keep the current instrument.
+          ...(current.tabMode === 'off' ? { tabMode: 'bass' as const } : {})
+        });
+        this.activePartKey = LIVE_PART_ID;
+        this.setParts([], [LIVE_PART_ID], { quiet: true });
+        for (let i = 1; i < count; i++) {
+          const xml = GUITAR_PART_MUSICXML.replace('<part-name>Guitar</part-name>', `<part-name>Part ${i + 1}</part-name>`);
+          await this.addPartFromMusicXml(`Part ${i + 1}.musicxml`, new TextEncoder().encode(xml));
+        }
+        const tunings = [
+          [40, 45, 50, 55, 59, 64],
+          [28, 33, 38, 43],
+          [35, 40, 45, 50, 55]
+        ];
+        const imported = (this.runtime.get().source?.importedParts ?? []).map((part, index) => ({
+          ...part,
+          tab: {
+            ...defaultPartTabProfile(this.settings.get()),
+            tabMode: 'custom' as const,
+            customTuningMidi: [...tunings[index % tunings.length]]
+          }
+        }));
+        this.setParts(imported, [...imported.map((part) => part.id), LIVE_PART_ID], { quiet: true });
+        await new Promise<void>((done) => requestAnimationFrame(() => requestAnimationFrame(() => done())));
+        return this.triview?.decorationProbe() ?? null;
+      } catch (e) {
+        return { error: String((e as Error).stack ?? e) };
       }
     };
 
@@ -8845,27 +9052,14 @@ class App {
       timeSignature: source.timeSignature,
       keyFifths: source.keyFifths
     };
-    // ONE PART IS NOT A SPECIAL CASE OF TWO — it is the path this app has always taken, and it
-    // is left on it. The pipeline guarantees `buildMultiPartScore([one])` is byte-identical to
-    // `buildScore`, so routing everything through the multi-part door would be defensible; not
-    // routing it there is stronger, because a take with no imported parts then executes not one
-    // line of the parts code and cannot be changed by it.
-    //
-    // WITH ONE EXCEPTION, AND IT IS THE ONLY WAY A NAME CAN REACH THE PAGE (Z2b). `buildScore`
-    // takes no part name: a single-part build calls the part whatever the pipeline's
-    // `defaultPartName(ir)` calls it, derived from the instrument and the tuning, with nothing in
-    // the request that could override it. `buildPartedRiffScore` DOES take one — it is how the
-    // live part is already named on a two-part sheet — so a take the player has renamed goes
-    // through that door instead, and the sheet, the PDF, the `<part-name>` and the menu all read
-    // the word that was typed.
-    //
-    // NARROW BY DESIGN: `livePartName` is absent on every document until somebody types a name, so
-    // the ordinary take is on exactly the path it was on before this existed. What the renamed one
-    // gains beyond its name is the pipeline's byte-identity guarantee plus one extra diagnostics
-    // line ("1 parts on one sheet") and a one-entry `parts` sidecar — both of which the two-part
-    // case has carried since parts shipped.
+    // THE CANONICAL NAME MUST REACH THE COMMON ONE-PART PATH (P4). `buildScore` has no part-name
+    // input and therefore asks pipeline `defaultPartName(ir)`, re-deriving Bass/Guitar from the
+    // instrument even after the app stopped doing so. The established one-entry multipart door
+    // does carry a name, and the pipeline contract plus `scripts/parts-test.ts` prove its IR,
+    // rational timing, MIDI and engraving content are identical apart from that requested label.
+    // Using it for every document closes the last independent derivation instead of adding a
+    // second naming seam to the single-part adapter.
     const slots = this.partSlots(source);
-    if (slots.length < 2 && !cleanPartName(source.livePartName)) return buildRiffScore(request, settings);
     return buildPartedRiffScore(request, settings, slots);
   }
 
@@ -8880,8 +9074,8 @@ class App {
   }
 
   /**
-   * WHAT THE LIVE PART IS CALLED RIGHT NOW: the player's name if they typed one, the instrument's
-   * if they did not (`score/parts.ts §livePartName`).
+   * WHAT THE LIVE PART IS CALLED RIGHT NOW: the document's canonical name, or `Take` only for a
+   * legacy/in-memory source that has not yet crossed its migration door.
    *
    * One reader for the whole file. Every place the take's name appears — the menu entry, the
    * tooltips on the verbs that act on it, the popover's own label — used to call `livePartName`
@@ -8894,20 +9088,19 @@ class App {
   }
 
   /**
-   * Store (or clear) the live part's name and re-engrave.
+   * Store the live part's canonical name and re-engrave.
    *
    * ON THE DOCUMENT, through `runtime.source`, for the reason written out at
    * `state.ts §SourceAudio.livePartName`: a part name belongs to the piece and not to the plugin.
    * The rest of this is `setParts` verbatim — a rebuild so the page and the exports carry the new
    * word, a render so the menu does, and a save so the document does.
    *
-   * AN EMPTY NAME IS A CLEAR, not a blank label: the field goes back to `undefined`, and the next
-   * build derives the name from the instrument again.
+   * AN EMPTY NAME MEANS `Take`, not a blank label and not permission to follow the instrument.
    */
   private setLivePartName(name: string): void {
     const source = this.runtime.get().source;
     if (!source) return;
-    const next = cleanPartName(name) || undefined;
+    const next = cleanPartName(name) || 'Take';
     if ((source.livePartName ?? undefined) === next) return;
     this.runtime.set({ source: { ...source, livePartName: next } });
     // Nothing about the PERFORMANCE changed — same notes, same ids — so the edits still apply.
@@ -9263,7 +9456,8 @@ class App {
     const ops = this.rippleOps();
     if (!ops.length) return notes;
     const map = this.rippleMap();
-    return map ? unrippleNotes(notes, ops, map) : notes;
+    const divisions = this.runtime.get().score?.ir.divisions || 12;
+    return map ? unrippleNotes(notes, ops, map, divisions) : notes;
   }
 
   /**
@@ -9323,13 +9517,15 @@ class App {
       barCount?: number;
       /** A bar operation also splices the ruler an imported symbolic part is engraved against. */
       barSplice?: { kind: 'insertBar' | 'deleteBar'; seamSec: number };
+      /** Canonical placement of a newly inserted atom, in this operation's output coordinates. */
+      placements?: RollPlacements;
     } = {}
   ): boolean {
     const source = this.runtime.get().source;
     const score = this.runtime.get().score;
     const map = this.rippleMap();
     if (!source?.detected || !score || !map) return false;
-
+    const previousDurationSec = this.documentDurationSec();
     const ops = [...this.rippleOps(), op];
     const contentEnd = this.contentEndTick();
     const baseEnd = source.documentEndTick ?? ratFromTick(Math.max(contentEnd, map.toTick(source.durationSec)));
@@ -9348,7 +9544,16 @@ class App {
       // moved them. Measuring afterwards would locate the seam against positions the operation
       // itself had just displaced, which is a seam a bar further on for every insert.
       const seamSourceTick = splice ? this.sourceTickAt(part.notes, splice.seamSec) : 0;
-      const notes = applyRippleOps(part.notes, [op], { map, divisions: score.ir.divisions || 12 });
+      /*
+       * ATOM IDS ARE LOCAL TO THE LIVE PART.
+       *
+       * Imported files choose their own ids, so `n7` in one part may be unrelated to `n7` in
+       * the take. Passing live `chordIds`/`fixedIds` into every part made that accidental match
+       * exempt the imported note from the shift. The structural seam and kind are shared; only
+       * the live atom declarations are namespaced away at the part boundary.
+       */
+      const partOp = rippleOpForForeignPart(op);
+      const notes = applyRippleOps(part.notes, [partOp], { map, divisions: score.ir.divisions || 12 });
       if (!splice) return { ...part, notes };
       return {
         ...part,
@@ -9370,10 +9575,17 @@ class App {
         // a freshly rippled tail would be clamped against a length the document no longer has.
         timelineDetached: true,
         ...(options.barCount !== undefined ? { documentBars: options.barCount } : {}),
-        ...(importedParts ? { importedParts } : {})
+        ...(importedParts ? { importedParts } : {}),
+        ...(Object.prototype.hasOwnProperty.call(options, 'placements')
+          ? { rollPlacements: options.placements }
+          : {})
       }
     });
-    this.commitPerformance(options.notes ?? source.detected.notes, label);
+    this.followStructuralRollWindow(previousDurationSec, op);
+    this.commitPerformance(options.notes ?? source.detected.notes, label, this.cuts(), {
+      viewportPolicy: 'preserve-sheet-scale',
+      preserveAuxiliaryWindows: true
+    });
     return true;
   }
 
@@ -9485,7 +9697,11 @@ class App {
      */
   }
 
-  private rebuildNotation(options?: { keepEdits?: boolean; viewportPolicy?: RebuildViewportPolicy }): void {
+  private rebuildNotation(options?: {
+    keepEdits?: boolean;
+    viewportPolicy?: RebuildViewportPolicy;
+    preserveAuxiliaryWindows?: boolean;
+  }): void {
     // A MENU DESCRIBES NOTES THAT ARE ABOUT TO BE REPLACED. Every id it closes over belongs to
     // the graph this rebuild throws away, so it goes with it rather than acting on a note that
     // is no longer there. Picking an item already closes it; this is for every other rebuild.
@@ -9544,7 +9760,13 @@ class App {
        * one to obey, and unconditionally, so an ordinary rebuild CLEARS a policy that was never
        * answered rather than letting it hang over an engraving it was not asked about.
        */
-      this.pendingRebuild = anchor ? { generation: this.revision, ...anchor } : null;
+      this.pendingRebuild = anchor
+        ? {
+            generation: this.revision,
+            ...anchor,
+            preserveAuxiliaryWindows: options?.preserveAuxiliaryWindows === true
+          }
+        : null;
       this.chordEventTable = collectChordEvents(feed, beatPeriodOf(score));
       this.projection = adoptProjection(this.revision, feed, score.projection);
       // A written value the page could not carry is a stale claim, not a preference. Cleared here
@@ -9742,28 +9964,41 @@ class App {
     this.updateScrollbar();
   }
 
-  /** The window into the two canvases. Silent, idempotent, and never near the sheet. */
+  /** Clamp a view onto the recording only; score/document duration is intentionally irrelevant. */
+  private audioWindowFor(win: TimeWindow): TimeWindow {
+    const durationSec = Math.max(0.001, this.editedSource()?.durationSec ?? 0.001);
+    return clampWindow(win, {
+      durationSec,
+      minSpanSec: Math.min(MIN_WINDOW_SEC, durationSec)
+    });
+  }
+
+  /** The windows into the two canvases. Silent, idempotent, and never near the sheet. */
   private pushWindowToStrips(): void {
     const v = this.viewport;
     if (!v) return;
-    const win = viewportWindow(v);
-    this.pianoRoll?.setViewport(win);
-    // THE STRIP TAKES THE ROLL'S APPLIED WINDOW, and this is a mirror rather than a derivation.
+    const base = viewportWindow(v);
+    const rollTarget = this.structuralRollWindow ?? base;
+    this.pianoRoll?.setViewport(rollTarget);
+    // Ordinarily the strip takes the roll's APPLIED window, preserving the gesture freeze below.
+    // During a structural edit it keeps its own audio-only window: the roll is showing newly
+    // created score time which has no waveform pixels and must not rescale the photograph.
     //
-    // The two are stacked edge to edge drawing the same seconds across the same pixels, so a
-    // frame in which they disagree puts a rectangle over the wrong sound — the single most
-    // misleading thing either pane can do. They can disagree for exactly one reason: the roll
-    // FREEZES its window while the player has the pointer down on a note (`setViewport`), so
-    // that a re-engrave cannot move every other rectangle out from under a hand mid-edit. The
-    // strip has no such gesture and would otherwise move alone.
+    // Ordinarily the two are stacked edge to edge drawing the same seconds across the same
+    // pixels. The roll FREEZES its window while the player has a pointer down; the strip mirrors
+    // that applied answer. Structural score time is the deliberate exception: it has no audio,
+    // so alignment beyond the recording is impossible and the photograph stays unchanged.
     //
     // Reading the roll back is not the old `syncViewports` read-back in disguise: what is read
     // is the roll's own state, never the ENGRAVING, and it cannot change the authoritative
     // window — nothing here writes `this.viewport`. When the gesture ends the roll flushes and
     // the next repaint puts both on the authoritative window again.
-    const applied = this.pianoRoll?.getTimeWindow() ?? win;
-    this.waveform?.setTimeAnchors(this.alignAnchors(applied));
-    this.waveform?.setViewportRange(applied.fromSec, applied.toSec);
+    const applied = this.pianoRoll?.getTimeWindow() ?? rollTarget;
+    const waveTarget =
+      this.waveformWindow ?? this.audioWindowFor(this.structuralRollWindow ? base : applied);
+    this.waveformWindow = waveTarget;
+    this.waveform?.setTimeAnchors(this.alignAnchors(waveTarget));
+    this.waveform?.setViewportRange(waveTarget.fromSec, waveTarget.toSec);
   }
 
   /**
@@ -9774,13 +10009,20 @@ class App {
    * wheel and pinch; the horizontal scrollbar under the sheet. There is no other writer, which
    * is what makes "the three panes agree" a property of the code rather than a thing to test for.
    */
-  private dispatchViewport(cmd: ViewportCommand): void {
+  private dispatchViewport(cmd: ViewportCommand, syncAuxiliaryWindows = true): void {
     // Re-entry is not a race to be tolerated, it is a bug: a command raised while the previous
     // one is still being written into the panes would be reducing against a state that is half
     // applied. The only way it can happen is a pane reporting during a programmatic write, which
     // is exactly what the silent setters are there to prevent — so this is a belt, and it is
     // also the assertion that they work.
     if (this.applyingViewport) return;
+    const hadStructuralRollWindow = this.structuralRollWindow !== null;
+    if (syncAuxiliaryWindows) {
+      this.structuralRollWindow = null;
+      // The next push reads the roll's actually applied answer (including its gesture freeze)
+      // and clamps that answer against audio duration before publishing it to the waveform.
+      this.waveformWindow = null;
+    }
     const limits = this.viewportLimits();
     const current = this.viewport ?? fullViewport(limits);
     const next = reduceViewport(current, cmd, limits);
@@ -9790,6 +10032,9 @@ class App {
     if (next === this.viewport) {
       this.viewportLog.push({ rev: current.revision, kind: cmd.kind, source: cmd.source, from: current.fromSec, to: current.toSec, applied: false });
       if (this.viewportLog.length > 400) this.viewportLog.shift();
+      // An explicit view gesture also ends the score-only roll reveal, even when the requested
+      // pan/zoom is saturated and the timeline reducer itself returns identity.
+      if (syncAuxiliaryWindows && hadStructuralRollWindow) this.applyViewport();
       return;
     }
     this.viewport = next;
@@ -9839,6 +10084,46 @@ class App {
       return Math.max(audioSec, scoreSec, structuralSec);
     }
     return rt.source ? audioSec : scoreSec;
+  }
+
+  /**
+   * Follow structural score time in the roll only.
+   *
+   * The click was resolved against the sheet's current scale, so widening the sheet viewport
+   * before its rebuild makes `absoluteSheetScale` shrink that same tick away from the hand. The
+   * recording has an even stronger reason not to follow: no audio pixel was inserted. The roll,
+   * however, must reveal the shifted suffix, so it carries this separate score window until the
+   * next explicit view command.
+   */
+  private followStructuralRollWindow(previousDurationSec: number, op?: RippleOp): void {
+    const current =
+      this.structuralRollWindow ?? (this.viewport ? viewportWindow(this.viewport) : null);
+    if (!current) return;
+    const nextDurationSec = Math.max(0.001, this.documentDurationSec());
+    const clampToScore = (win: TimeWindow): TimeWindow =>
+      clampWindow(win, {
+        durationSec: nextDurationSec,
+        minSpanSec: Math.min(MIN_WINDOW_SEC, nextDurationSec)
+      });
+
+    const map = this.rippleMap();
+    if (op && map) {
+      const moved = rippleWindow(current, op, map);
+      if (moved) this.structuralRollWindow = clampToScore(moved);
+      return;
+    }
+
+    if (!(nextDurationSec > previousDurationSec + 1e-6)) return;
+    const atTail =
+      current.toSec >= previousDurationSec - Math.max(1e-4, previousDurationSec * 1e-4);
+    const wasFull =
+      current.fromSec <= 1e-6 &&
+      current.toSec >= previousDurationSec - Math.max(1e-4, previousDurationSec * 1e-4);
+    if (!atTail && !wasFull) return;
+    this.structuralRollWindow = clampToScore({
+      fromSec: current.fromSec,
+      toSec: current.toSec + (nextDurationSec - previousDurationSec)
+    });
   }
 
   /** `documentEndTick` in seconds, or 0 when the document declares no structural end. */
@@ -9912,11 +10197,14 @@ class App {
     if (!tv || !score || !view) return;
     const tick = tv.contentXToTick(view.scrollLeft + TIMELINE_GUTTER_PX);
     if (tick === null) return;
-    this.dispatchViewport({
-      kind: 'sheetScroll',
-      fromSec: tickToSeconds(score, tick, this.originSec(score)),
-      source: 'sheet'
-    });
+    this.dispatchViewport(
+      {
+        kind: 'sheetScroll',
+        fromSec: tickToSeconds(score, tick, this.originSec(score)),
+        source: 'sheet'
+      },
+      this.structuralRollWindow === null
+    );
   }
 
   /**
@@ -9963,7 +10251,11 @@ class App {
    * honest answer at full-take saturation is that the size moves. Published through
    * `__RIFFSHEET_VIEWPORT__.rebuildRebase` so a probe can see which of the two happened.
    */
-  private rebaseViewportAtSheetScale(pending: { anchorTick: number; anchorFrac: number }): boolean {
+  private rebaseViewportAtSheetScale(pending: {
+    anchorTick: number;
+    anchorFrac: number;
+    preserveAuxiliaryWindows: boolean;
+  }): boolean {
     const tv = this.triview;
     const score = this.runtime.get().score;
     const ref = this.sheetRef;
@@ -9990,7 +10282,10 @@ class App {
       sizeHeld: Math.abs(win.toSec - win.fromSec - wantedSpan) < Math.max(1e-6, wantedSpan * 0.005)
     };
     const before = this.viewport?.revision;
-    this.dispatchViewport({ kind: 'showSpan', fromSec: win.fromSec, toSec: win.toSec, source: 'system' });
+    this.dispatchViewport(
+      { kind: 'showSpan', fromSec: win.fromSec, toSec: win.toSec, source: 'system' },
+      !pending.preserveAuxiliaryWindows
+    );
     // A tempo that happens to land on the window already held is an identity in the reducer, and
     // an identity raises no command — but the ENGRAVING still moved under it, so the scroll owed
     // to the re-engrave is still owed. Re-assert it exactly as an ordinary rebuild would.
@@ -10412,6 +10707,9 @@ class App {
     // 0 on a take nobody has dragged the marker on, so a double-click-add on a take with leading
     // silence emitted a written second measured from second 0 while `edit/rollPerformance.ts`
     // added the app's first-attack origin back on. The note landed one leading silence late.
+    // Structural edits can make the score longer than its recording. Publish that extent on
+    // every rebuild (including undo, which can shrink it again) before any roll mapping reads it.
+    this.pianoRoll?.setDuration(this.documentDurationSec());
     this.pianoRoll?.setOriginSec(this.originSec(score));
     // Bar 1 is the roll's time origin — without it a count-in slides the whole roll off
     // the waveform above it. See view/pianoroll.ts.
@@ -10441,6 +10739,10 @@ class App {
     // set standing, so ids it no longer had rectangles for stayed "selected" in a Set nothing
     // could draw.
     this.pianoRoll?.setSelection([...selection]);
+    // `TriView.load` can settle before the new score duration reaches the roll. Re-assert after
+    // both duration and authoritative rectangles are current, so a structural target is not
+    // clamped once against the old take and left short thereafter.
+    this.pushWindowToStrips();
     this.pushScoreNotes(score);
     this.transport.setVoice(this.settings.get().playbackVoice);
     this.syncKeyPicker();
@@ -11075,8 +11377,7 @@ class App {
     const shown = part ? part.name : this.liveName();
     const commitName = (value: string) => {
       if (!part) {
-        // Empty is allowed here and only here: it is how the take goes back to being named after
-        // its instrument. An imported part has no derived name to fall back to.
+        // Empty is allowed here and only here: it resets the canonical name to `Take`.
         this.setLivePartName(value);
         return;
       }
@@ -11093,10 +11394,9 @@ class App {
       ...(part
         ? {}
         : {
-            placeholder: livePartName(this.settings.get()),
+            placeholder: 'Take',
             title: t(
-              'What this part is called on the page and in every export. Clear it and the take goes ' +
-                'back to being named after its instrument.'
+              'What this part is called on the page and in every export. Clear it to reset to Take.'
             )
           }),
       onKeyDown: (e: KeyboardEvent) => {
@@ -11234,8 +11534,8 @@ class App {
       const name = cleanPartName(value);
       this.closePartLabelEdit();
       if (!commit) return;
-      // An empty name clears the take's override — the same "go back to the instrument" the
-      // popover offers — and is refused for an imported part, which has nothing to fall back to.
+      // An empty live name resets to Take; it is refused for an imported part, which has no
+      // canonical fallback of its own.
       if (!part) {
         this.setLivePartName(name);
         return;
@@ -11251,7 +11551,7 @@ class App {
       maxlength: String(MAX_PART_NAME_LENGTH),
       spellcheck: 'false',
       'aria-label': 'Part name',
-      ...(part ? {} : { placeholder: livePartName(this.settings.get()) }),
+      ...(part ? {} : { placeholder: 'Take' }),
       onKeyDown: (e: KeyboardEvent) => {
         if (e.key === 'Enter') {
           e.preventDefault();
@@ -11683,6 +11983,12 @@ class App {
               this.renderMain();
               return;
             }
+            if (raw.startsWith('spacing:')) {
+              this.settings.set({ notationSpacingPx: Number(raw.slice('spacing:'.length)) });
+              this.onViewSettingsChanged();
+              this.renderMain();
+              return;
+            }
             rebuild({ clefMode: raw as AppSettings['clefMode'], showStaff: true });
           }
         },
@@ -11713,6 +12019,25 @@ class App {
             el('option', {
               value: on ? 'names:on' : 'names:off',
               text: `${s.showNoteNames === on ? '✓ ' : '   '}Note names: ${on ? 'On' : 'Off'}`
+            })
+          )
+        ),
+        el(
+          'optgroup',
+          {
+            label: 'Spacing',
+            'data-setting': 'notationSpacingPx',
+            'data-role': 'clef-spacing'
+          },
+          ...([
+            [0, 'Tight'],
+            [4, 'Normal'],
+            [8, 'Roomy'],
+            [16, 'Extra']
+          ] as const).map(([px, label]) =>
+            el('option', {
+              value: `spacing:${px}`,
+              text: `${s.notationSpacingPx === px ? '✓ ' : '   '}Spacing: ${label}`
             })
           )
         )
@@ -12622,8 +12947,9 @@ class App {
       // of the viewport. Measured cost of turning it off: a whole 32-bar render is 7-27 ms on
       // the UI thread (Phase 0 spike).
       view: { horizontal: true, lazyLoading: false, useWorkers: false, player: 'external-media' },
-      namesPlacement: 'between',
+      namesPlacement: 'above',
       showNames: this.settings.get().showNoteNames,
+      notationSpacingPx: this.settings.get().notationSpacingPx,
       // A string move is only offered where the neck can reach it, so the renderer needs the
       // same fret limit the edit actions are checked against — one number, two users.
       maxFret: this.settings.get().maxFret,
@@ -14049,6 +14375,75 @@ class App {
     return from + Math.max(0, Math.min(maxBeats, beats)) * beatTicks;
   }
 
+  /**
+   * The sheet-add lattice, in IR ticks.
+   *
+   * The notation grid is the active reading of rhythmic detail, so a named value is honoured.
+   * Auto and Free do not name a placement unit; both use the adjudicated 1/16 default. This is
+   * intentionally finer than `nearestBeatIrTick`: a hand aimed at the second or fourth sixteenth
+   * of a beat must not be relocated onto a quarter-note boundary before insertion even begins.
+   */
+  private sheetInsertionStepTicks(score: RiffScore): number {
+    return sheetInsertionGridTicks(this.settings.get().grid, score.ir.divisions || 12);
+  }
+
+  /** A sheet tick snapped inside its own bar to the active add lattice. */
+  private nearestSheetInsertionIrTick(score: RiffScore, alphaTick: number): number | null {
+    const bars = score.ir.bars;
+    if (!bars.length) return null;
+    const clamped = Math.max(0, alphaTickToIrTick(score, alphaTick));
+    let bar = bars[0];
+    for (const candidate of bars) {
+      if (clamped >= candidate.startTick) bar = candidate;
+      else break;
+    }
+    /*
+     * Clamp the snapped OFFSET, not a rounded number of units. A coarse grid need not divide an
+     * odd bar: 5/8 is 60 ticks at divisions 24, while a quarter grid is 24. Rounding 60/24 to
+     * three units returned tick 72 — outside the score — and the duration lookup then fell back
+     * to 4/4. The exact final edge is a legal structural insertion point and keeps the last bar's
+     * own meter through `sheetInsertionBarAtTick`.
+     */
+    return sheetInsertionSnapTick(bar, clamped, this.sheetInsertionStepTicks(score));
+  }
+
+  /**
+   * The distinct attack events the CURRENT PAGE prints, grouped by exact engraved tick.
+   *
+   * Tied continuations are releases, not new attacks. Grouping across voices at one tick keeps
+   * the insertion law about visible rhythmic events rather than individual note objects. The
+   * event end is the union of its members' tied spans, so exact-onset chord insertion inherits
+   * the complete canonical value rather than only the first glyph.
+   */
+  private sheetInsertionEvents(): SheetInsertionEvent[] {
+    const score = this.runtime.get().score;
+    if (!score) return [];
+    const spans = this.writtenSpans();
+    const grouped = new Map<number, { startTick: number; endTick: number; memberIds: string[]; midis: number[] }>();
+    for (const bar of score.ir.bars) {
+      for (const voice of bar.voices) {
+        for (const beat of voice.beats) {
+          if (beat.isRest) continue;
+          const startTick = bar.startTick + beat.startTick;
+          let event = grouped.get(startTick);
+          if (!event) {
+            event = { startTick, endTick: startTick + beat.durTicks, memberIds: [], midis: [] };
+            grouped.set(startTick, event);
+          }
+          for (const note of beat.notes) {
+            if (note.tieStop || event.memberIds.includes(note.id)) continue;
+            event.memberIds.push(note.id);
+            event.midis.push(note.midi);
+            event.endTick = Math.max(event.endTick, spans.get(note.id)?.endTick ?? startTick + beat.durTicks);
+          }
+        }
+      }
+    }
+    return [...grouped.values()]
+      .filter((event) => event.memberIds.length > 0)
+      .sort((a, b) => a.startTick - b.startTick || a.endTick - b.endTick);
+  }
+
   /** A sheet (alphaTab) tick, rounded to the nearest beat and stated in FEED seconds. */
   private beatSecAtTick(alphaTick: number): number | null {
     const score = this.runtime.get().score;
@@ -14123,18 +14518,61 @@ class App {
     });
     if (!result) return false;
 
+    /*
+     * A horizontal sheet drag names a WRITTEN onset, not another noisy performance sample.
+     * The seconds are still written through for the roll/playback, while this one-note marker
+     * prevents Auto quantization from moving the rebuilt glyph onto a neighbour. The marker is
+     * stated before `unrippled`, so the inverse below carries it into the raw coordinate domain.
+     */
+    const map = this.rippleMap();
+    let editedFeed = result.notes;
+    if (edit.kind === 'moveNote' && map) {
+      const divisions = score.ir.divisions || 12;
+      editedFeed = result.notes.map((note) =>
+        note.id === edit.noteId
+          ? {
+              ...note,
+              notationOnset: {
+                startTick: Math.round(map.toTick(note.startSec)),
+                ppq: divisions
+              }
+            }
+          : note
+      );
+    }
+
     // The player has decided about every note this edit named — including the victims — so the
     // auto-edit pass leaves them alone from here on. See `userTouchedIds`.
     for (const id of result.touchedIds) this.userTouchedIds.add(id);
 
     const cuts = this.cuts();
+    /*
+     * A point inside time created by an earlier insert has no raw pre-image: the mathematical
+     * inverse collapses it onto the seam. Sheet drags therefore need the same canonical override
+     * roll drags already install. It is stored before the history snapshot, so one Undo removes
+     * the placement together with the timing edit.
+     */
+    if (map && this.rippleOps().length) {
+      const before = this.rollPlacements();
+      const placements = withRollPlacements(
+        before,
+        editedFeed,
+        [...result.touchedIds],
+        this.rippleOps(),
+        map
+      );
+      if (placements !== before) {
+        const current = this.runtime.get().source;
+        if (current) this.runtime.set({ source: { ...current, rollPlacements: placements } });
+      }
+    }
     // …AND THE SAME INVERSE THE ROLL'S ROAD TAKES. One rule, two roads. See `unrippled`.
-    const edited = this.unrippled(result.notes);
+    const edited = this.unrippled(editedFeed);
     this.commitPerformance(
       cuts.length
         ? mergePerformanceEditOntoCutTake(raw, edited, result.touchedIds, cuts)
-        : feed === raw && edited === result.notes
-          ? result.notes
+        : feed === raw && edited === editedFeed
+          ? editedFeed
           : mergeEditedOntoRaw(raw, edited, result.touchedIds),
       result.label
     );
@@ -14213,7 +14651,7 @@ class App {
       newLengthTicks,
       written,
       map,
-      opId: `r${++this.rippleSeq}`,
+      opId: this.mintRippleOpId('r'),
       label: durationLabel(intent)
     });
     if (plan.rejected) {
@@ -14244,8 +14682,14 @@ class App {
     return this.commitRipple(plan.op, durationLabel(intent), { notes });
   }
 
-  /** Names for ripple operations, monotone within a session. Ids are opaque — see identity.ts. */
+  /** Names for ripple operations, monotone across restored and current logs. */
   private rippleSeq = 0;
+
+  private mintRippleOpId(prefix: 'r' | 'b'): string {
+    const minted = nextRippleOperationId(this.rippleOps(), this.rippleSeq, prefix);
+    this.rippleSeq = minted.sequence;
+    return minted.id;
+  }
   /**
    * Every id the last ripple MOVED — the `writebackIds` half of the split contract.
    *
@@ -14374,7 +14818,7 @@ class App {
     if (!(barTicks > 0)) return false;
 
     const rippleOp: RippleOp = {
-      id: `b${++this.rippleSeq}`,
+      id: this.mintRippleOpId('b'),
       seamTick: ratFromTick(seamTick),
       deltaTick: rational(insert ? barTicks : -barTicks),
       ...(insert ? { split: true } : { dropSpan: true }),
@@ -14526,11 +14970,158 @@ class App {
   }
 
   /**
-   * Draw a note where the player right-clicked: their pitch, the nearest beat, one beat long.
+   * Add one structural note to the sheet, making room only in the forward direction.
    *
-   * ONE BEAT is the default length and the collision law then trims it — a note drawn in front
-   * of an existing one becomes as long as the room it was given, which is what a player means by
-   * putting a note there. See edit/performanceEdit.ts.
+   * This deliberately bypasses `performanceEdit.ts`'s generic add collision reducer. That road
+   * settles a long add by shortening it at the next attack; a sheet insertion is a rhythmic atom
+   * and keeps its whole default beat while the exact shortfall becomes a rational ripple op.
+   */
+  private applySheetInsertion(midi: number, startTick: number, durationTicks: number): boolean {
+    const source = this.runtime.get().source;
+    const score = this.runtime.get().score;
+    const map = this.rippleMap();
+    if (!source?.detected || !score || !map) return false;
+
+    const events = this.sheetInsertionEvents();
+    const exact = events.find((event) => Math.abs(event.startTick - startTick) <= 1e-6);
+    if (exact) {
+      const duplicateAt = exact.midis.findIndex((pitch) => Math.round(pitch) === Math.round(midi));
+      if (duplicateAt >= 0) {
+        const duplicateId = exact.memberIds[duplicateAt] ?? exact.memberIds[0];
+        if (duplicateId) this.selectNoteIds([duplicateId]);
+        this.toast('info', 'Note already here', 'That pitch is already part of this written event.');
+        return false;
+      }
+    }
+
+    const newNoteId = this.noteIds.next('add');
+    const candidateOpId = this.mintRippleOpId('r');
+    const plan = planSheetInsertion({
+      startTick,
+      durationTicks,
+      midi,
+      newNoteId,
+      events,
+      opId: candidateOpId,
+      label: 'Add note'
+    });
+    if (plan.duplicateId) {
+      this.selectNoteIds([plan.duplicateId]);
+      this.toast('info', 'Note already here', 'That pitch is already part of this written event.');
+      return false;
+    }
+
+    const startSec = map.toSec(ratValue(plan.startTick));
+    const endSec = map.toSec(ratValue(plan.endTick));
+    if (!Number.isFinite(startSec) || !Number.isFinite(endSec) || !(endSec > startSec)) return false;
+
+    const feed = this.performanceFeed();
+    const spanTicks = ratValue(plan.endTick) - ratValue(plan.startTick);
+    /*
+     * An exact-onset join inherits a GLYPH only when that glyph names the complete joined span.
+     * `intentOf()` reads the attack beat; for a tied or tuplet event that can be only the first
+     * piece. Attaching that shorter declaration to the new member gives pipeline `intentTicksOf`
+     * authority over the full raw off-time and shortens the whole chord on the next build. An
+     * unrepresentable compound value therefore carries no intent and the canonical start/end the
+     * planner just computed remain authoritative.
+     */
+    const inheritedIntent = notationIntentMatchingSpan(
+      plan.joinedEventIds.length ? this.intentOf(plan.joinedEventIds[0]) : null,
+      spanTicks,
+      score.ir.divisions || 12
+    );
+    const bar = sheetInsertionBarAtTick(score.ir.bars, startTick);
+    const denominator = bar?.timeSig?.[1];
+    const defaultIntentCandidate =
+      denominator !== undefined && [1, 2, 4, 8, 16, 32].includes(denominator)
+        ? ({ denominator, dots: 0 } as NotationIntent)
+        : null;
+    const defaultIntent = notationIntentMatchingSpan(
+      defaultIntentCandidate,
+      spanTicks,
+      score.ir.divisions || 12
+    );
+    const timing = addedTiming([...feed], startSec, endSec - startSec, score.tempoBpm, {
+      toTick: map.toTick,
+      divisions: score.ir.divisions || 12
+    });
+    const added: InputNote = {
+      id: newNoteId,
+      startSec,
+      endSec,
+      midi: Math.max(0, Math.min(127, Math.round(midi))),
+      // The click already selected a legal written slot. Without this authority the next Auto
+      // build treats it as detector jitter and can engrave it on the neighbouring eighth.
+      notationOnset: {
+        startTick: Math.round(ratValue(plan.startTick)),
+        ppq: score.ir.divisions || 12
+      },
+      ...(timing ? { sourceTiming: timing } : {}),
+      ...(inheritedIntent ?? defaultIntent ? { notationIntent: inheritedIntent ?? defaultIntent! } : {})
+    };
+    const feedWithNew = [...feed, added].sort(
+      (a, b) => a.startSec - b.startSec || a.midi - b.midi
+    );
+    const edited = this.unrippled(feedWithNew);
+    const touched = new Set([newNoteId]);
+    const cuts = this.cuts();
+    const raw = source.detected.notes;
+    const notes = cuts.length
+      ? mergePerformanceEditOntoCutTake(raw, edited, touched, cuts)
+      : feed === raw && edited === feedWithNew
+        ? feedWithNew
+        : mergeEditedOntoRaw(raw, edited, touched);
+
+    const resultingOps = plan.op ? [...this.rippleOps(), plan.op] : this.rippleOps();
+    const placements = resultingOps.length
+      ? withRollPlacements(this.rollPlacements(), feedWithNew, [newNoteId], resultingOps, map)
+      : this.rollPlacements();
+
+    // The player authored only the insertion atom. A shifted suffix stays eligible for automatic
+    // review, exactly like a duration ripple's tail.
+    this.userTouchedIds.add(newNoteId);
+    this.lastRippleWriteback = plan.op
+      ? rippleMovedIds(feedWithNew, [plan.op], map, placements)
+      : new Set<string>();
+
+    if (plan.op) return this.commitRipple(plan.op, 'Add note', { notes, placements });
+
+    /*
+     * NO SHORTFALL, STILL ONE TRANSACTION. A note added after the old tail may extend a detached
+     * score without needing an op. Placements (when an older log exists) and that structural end
+     * are written before `commitPerformance`, so its history snapshot captures them beside the
+     * new raw note and one Undo removes the whole insertion.
+     */
+    const contentEnd = this.contentEndTick();
+    const currentEnd =
+      source.documentEndTick ?? ratFromTick(Math.max(contentEnd, map.toTick(source.durationSec)));
+    const grows = ratValue(plan.endTick) > ratValue(currentEnd) + 1e-6;
+    const previousDurationSec = this.documentDurationSec();
+    if (placements !== source.rollPlacements || grows) {
+      this.runtime.set({
+        source: {
+          ...source,
+          ...(placements !== source.rollPlacements ? { rollPlacements: placements } : {}),
+          ...(grows ? { documentEndTick: plan.endTick, timelineDetached: true } : {})
+        }
+      });
+    }
+    if (grows) this.followStructuralRollWindow(previousDurationSec);
+    this.commitPerformance(notes, 'Add note', this.cuts(), {
+      viewportPolicy: 'preserve-sheet-scale',
+      preserveAuxiliaryWindows: true
+    });
+    return true;
+  }
+
+  /**
+   * Draw a note where the player right-clicked: their pitch, the active subdivision, one beat long.
+   *
+   * The former claim was: "the collision law then trims it — a note drawn in front of an existing
+   * one becomes as long as the room it was given." That is the silent failure the owner reported:
+   * a narrow gap either produced a near-invisible note or looked inert. One beat remains the
+   * deterministic default, but `applySheetInsertion` now preserves it and ripples the suffix
+   * forward by exactly the missing room.
    */
   private addNoteAt(target: SheetTarget): void {
     const score = this.runtime.get().score;
@@ -14538,18 +15129,12 @@ class App {
     // IR ticks from here to the two `tickToSeconds` calls, which take alphaTab's — the bar list
     // and the beat lattice below are the IR's own, so this arithmetic happens in the IR's domain
     // and converts once, at the end. See §"THE TWO TICK DOMAINS".
-    const irBeat = this.nearestBeatIrTick(score, target.tick);
-    if (irBeat === null) return;
-    const origin = this.originSec(score);
+    const irStart = this.nearestSheetInsertionIrTick(score, target.tick);
+    if (irStart === null) return;
     const divisions = score.ir.divisions || 12;
-    const bar = score.ir.bars.find(
-      (b) => irBeat >= b.startTick && irBeat < b.startTick + b.durTicks
-    );
-    const beatTicks = Math.max(1, Math.round((divisions * 4) / (bar?.timeSig?.[1] || 4)));
-    const startSec = tickToSeconds(score, irTickToAlphaTick(score, irBeat), origin);
-    const durationSec =
-      tickToSeconds(score, irTickToAlphaTick(score, irBeat + beatTicks), origin) - startSec;
-    this.applySheetEdit({ kind: 'addNote', midi: target.midi, startSec, durationSec });
+    const bar = sheetInsertionBarAtTick(score.ir.bars, irStart);
+    const beatTicks = sheetInsertionBeatTicks(bar, divisions);
+    this.applySheetInsertion(target.midi, irStart, beatTicks);
   }
 
   // -------------------------------------------------------------------------
@@ -15135,7 +15720,15 @@ class App {
    * changes the notes and leaves the cut list alone — and the two cut gestures (F16) push a
    * step that does the reverse. Both are ordinary performance edits either way.
    */
-  private commitPerformance(notes: InputNote[], label: string, cuts: CutSpan[] = this.cuts()): void {
+  private commitPerformance(
+    notes: InputNote[],
+    label: string,
+    cuts: CutSpan[] = this.cuts(),
+    rebuild: {
+      viewportPolicy?: RebuildViewportPolicy;
+      preserveAuxiliaryWindows?: boolean;
+    } = {}
+  ): void {
     const source = this.runtime.get().source;
     if (!source?.detected) return;
 
@@ -15155,7 +15748,7 @@ class App {
     this.history.push('perf');
     this.historyIndex = this.history.length - 1;
 
-    this.setPerformance(notes, cuts);
+    this.setPerformance(notes, cuts, rebuild);
     this.refreshUndoRedo();
   }
 
@@ -15225,7 +15818,14 @@ class App {
   }
 
   /** Put a performance on screen: new notes in, pipeline re-run, notation edits replayed. */
-  private setPerformance(notes: InputNote[], cuts: CutSpan[] = this.cuts()): void {
+  private setPerformance(
+    notes: InputNote[],
+    cuts: CutSpan[] = this.cuts(),
+    rebuild: {
+      viewportPolicy?: RebuildViewportPolicy;
+      preserveAuxiliaryWindows?: boolean;
+    } = {}
+  ): void {
     const source = this.runtime.get().source;
     if (!source?.detected) return;
     this.runtime.set({
@@ -15235,7 +15835,8 @@ class App {
         ...(cuts.length ? { cuts } : { cuts: undefined })
       }
     });
-    this.rebuildNotation({ keepEdits: true });
+    if (!rebuild.preserveAuxiliaryWindows) this.structuralRollWindow = null;
+    this.rebuildNotation({ keepEdits: true, ...rebuild });
     // The rebuild replaces the roll's model, and with it every mark it was drawing. Restated
     // here rather than inside the roll, because the marks belong to the pass and not to the
     // view: the roll is told what to highlight, it does not remember it.

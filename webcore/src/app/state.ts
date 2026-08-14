@@ -205,6 +205,8 @@ export interface AppSettings {
   playbackVoice: SynthVoice;
   midiExportMode: MidiExportMode;
   showNoteNames: boolean;
+  /** Extra physical whitespace around notation groups and pitch-name lanes, clamped to 0..16px. */
+  notationSpacingPx: number;
   /** The piano-roll strip under the waveform. Owned by view/pianoroll.ts (W1). */
   showPianoRoll: boolean;
   /**
@@ -406,6 +408,9 @@ export const DEFAULT_SETTINGS: AppSettings = {
   // their session, not filing a tidy chart. The tidied-up one is one click away in the menu.
   midiExportMode: 'as-played',
   showNoteNames: true,
+  // The collision-safe layout is the baseline. Friendly presets add air without making existing
+  // documents silently grow after update; zero therefore means Tight, not "no safety margin".
+  notationSpacingPx: 0,
   showPianoRoll: true,
   pianoRollHeight: DEFAULT_ROLL_HEIGHT_PX,
   // TRUE AND NO LONGER CHOOSABLE, both of them. See the field comments: the roll names every
@@ -677,22 +682,21 @@ export interface SourceAudio {
   /** Printed order, top to bottom: `LIVE_PART_ID` and imported part ids. */
   partOrder?: string[];
   /**
-   * WHAT THE PLAYER CALLED THE LIVE PART, when they have called it anything.
+   * THE CANONICAL LIVE-PART NAME.
    *
-   * An OVERRIDE and nothing more. Absent — which is every take until somebody types a name — the
-   * live part is called what it has always been called: a word derived from the instrument on
-   * every build (`score/parts.ts §livePartName`). Set, that word is replaced everywhere the name
-   * appears, which is the whole point: the box on the notation bar, the name engraved down the
-   * left of the system, the `<part-name>` in the exported MusicXML and the saved document.
+   * New takes store `Take` immediately. Renaming replaces it; clearing stores `Take` again.
+   * Instrument, TAB, tuning and clef changes never write this field and therefore never rename
+   * the part. Absence is accepted only as legacy input and is frozen once, after the legacy
+   * document/session's effective settings have been applied (`ui/app.ts
+   * §freezeLegacyLivePartName`).
    *
    * ON THE DOCUMENT AND NOT IN `AppSettings`, deliberately. A part name belongs to the piece, the
    * same way `tempoBpm` and `timeSignature` above do — not to the plugin. Storing it as a
    * preference would carry one song's "Rhythm gtr" onto the next take somebody recorded, which is
    * the bug `tempoBpm` is a document field to avoid.
    *
-   * EMPTY IS ABSENT. The rename commits a trimmed string and clears the field when nothing is
-   * left of it, so "" can never be stored and there is exactly one way to say "no override":
-   * `livePartName()` then falls back to the derived name rather than printing a blank staff label.
+   * Empty is never stored: the rename door normalises it to `Take`, and persistence still cleans
+   * hostile/legacy whitespace on the way in.
    */
   livePartName?: string;
 }
@@ -1146,6 +1150,13 @@ function migrate(settings: AppSettings, stored: Partial<AppSettings>, floor = 0)
   if (!(ROLL_SNAP_MODES as readonly string[]).includes(settings.rollSnap)) {
     settings.rollSnap = DEFAULT_SETTINGS.rollSnap;
   }
+
+  // Physical pixels, not an alphaTab unit. Fractional values are accepted for forwards
+  // compatibility; the current UI happens to offer four whole-number presets.
+  const notationSpacing = Number(settings.notationSpacingPx);
+  settings.notationSpacingPx = Number.isFinite(notationSpacing)
+    ? Math.max(0, Math.min(16, notationSpacing))
+    : DEFAULT_SETTINGS.notationSpacingPx;
 
   if (!(FINGERING_STYLES as readonly string[]).includes(settings.fingering)) {
     settings.fingering = DEFAULT_SETTINGS.fingering;

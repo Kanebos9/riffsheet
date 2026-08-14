@@ -33,6 +33,14 @@ export interface InputNote {
    * pipeline converts these ticks directly instead of quantizing reconstructed seconds.
    */
   sourceTiming?: { startTick: number; endTick: number; ppq: number };
+  /**
+   * A written ATTACK explicitly authored on an editing surface.
+   *
+   * Unlike `sourceTiming`, this does not turn a detected take into a symbolic import and it says
+   * nothing about duration. It only prevents the quantizer from relocating the attack the player
+   * placed on the sheet. Structural edit layers must restate it when they move the note.
+   */
+  notationOnset?: { startTick: number; ppq: number };
   /** Source staff clef, when the importer supplied an unambiguous G2/F4 clef. */
   sourceClef?: 'treble' | 'bass';
   /** Source structure, retained so an importer does not have to encode it into note ids. */

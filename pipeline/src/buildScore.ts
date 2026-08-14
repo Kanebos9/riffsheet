@@ -181,6 +181,17 @@ function intentTicksOf(chord: ChordEvent): number | undefined {
   return longest ?? undefined;
 }
 
+/** The chord's editor-authored onset and the exact member second that substantiates it. */
+function notationOnsetOf(chord: ChordEvent): { tick: number; memberStartSec: number } | undefined {
+  for (const note of chord.notes) {
+    const onset = note.notationOnset;
+    if (!onset || !Number.isFinite(onset.startTick) || !(onset.ppq > 0)) continue;
+    const tick = Math.round((onset.startTick * DIVISIONS) / onset.ppq);
+    if (Number.isFinite(tick) && tick >= 0) return { tick, memberStartSec: note.startSec };
+  }
+  return undefined;
+}
+
 /**
  * EVERY INPUT ID THE CHORD LAW ADMITTED, printable members first and then the duplicate pitches
  * it could not give a notehead to. Both halves belong to the event: when the event is fused away
@@ -382,12 +393,23 @@ export function buildScore(input: BuildInput, settings: BuildSettings, options: 
     // source already carries written ticks for every note in the score, so there is nothing for a
     // declaration to decide there and the exact path is left untouched (types.ts says so).
     const intentTicks = exactSymbolicTiming ? undefined : intentTicksOf(c);
+    const authoredOnset = exactSymbolicTiming ? undefined : notationOnsetOf(c);
+    const measuredStart = exact ? exact.startTick * scale : skel.secondsToTick(c.onsetSec);
+    // A stale marker must never pin a note after another layer has moved its seconds without
+    // restating the marker. Half an IR tick admits the rounding error of converting an authored
+    // integral tick through seconds, but rejects even the smallest whole-tick timing edit.
+    const fixedStartTick =
+      authoredOnset !== undefined &&
+      Math.abs(authoredOnset.tick - skel.secondsToTick(authoredOnset.memberStartSec)) <= 0.500001
+        ? authoredOnset.tick
+        : undefined;
     return {
       id: `e${i}`,
-      rawStartTick: exact ? exact.startTick * scale : skel.secondsToTick(c.onsetSec),
+      rawStartTick: measuredStart,
       rawOffTick: exact
         ? Math.max(exact.startTick * scale + 1, exact.endTick * scale)
         : skel.secondsToTick(Math.max(c.endSec, c.onsetSec + 1e-4)),
+      ...(fixedStartTick !== undefined ? { fixedStartTick } : {}),
       ...(intentTicks !== undefined ? { intentTicks } : {})
     };
   });
@@ -452,7 +474,8 @@ export function buildScore(input: BuildInput, settings: BuildSettings, options: 
     return buildBarMetric(b.timeSig[0], b.timeSig[1], compound);
   });
   const chordById = new Map(quantInput.map((q, i) => [q.id, chords[i]]));
-  if (qNotes.length && !exactSymbolicTiming) {
+  const fixedOnsetIds = new Set(quantInput.filter((q) => q.fixedStartTick !== undefined).map((q) => q.id));
+  if (qNotes.length && !exactSymbolicTiming && !fixedOnsetIds.has(qNotes[0].id)) {
     qNotes[0].startTick = snapLeadingOnset(qNotes[0].startTick, skel.bars[0].startTick, DIVISIONS);
   }
 
@@ -1255,4 +1278,3 @@ function buildBars(
   stats.restDensity = total ? stats.restGlyphs / total : 0;
   return { bars, stats };
 }
-

@@ -22,11 +22,13 @@ import {
   buildPartedRiffScore,
   cleanPartName,
   importedPartName,
+  legacyDerivedLivePartName,
   LIVE_PART_ID,
   livePartName,
   MAX_PART_NAME_LENGTH,
   nudgeStepMs,
   orderedPartSlots,
+  restoredLivePartName,
   type ImportedPart
 } from '../src/score/parts';
 import { parseScoreFile } from '../src/import/scoreFile';
@@ -64,13 +66,19 @@ const guitar: ImportedPart = { id: 'imp1', name: 'Guitar', nudgeMs: 0, notes: pa
 // 1. Two parts, live on top
 // ---------------------------------------------------------------------------
 
-const liveFirst = buildPartedRiffScore(request, settings, orderedPartSlots([guitar], [LIVE_PART_ID, 'imp1']));
+const liveFirst = buildPartedRiffScore(
+  request,
+  settings,
+  orderedPartSlots([guitar], [LIVE_PART_ID, 'imp1'], 'Take')
+);
 
 assert(liveFirst.data.tracks.length === 2, 'two parts produce two alphaTab tracks');
 assert(liveFirst.data.tracks[0].notationOnly !== true, 'the live track is playable');
 assert(liveFirst.data.tracks[1].notationOnly === true, 'the imported track is notation-only');
 assert(liveFirst.parts.map((p) => p.role).join(',') === 'live,imported', 'the roles are in printed order');
-assert(liveFirst.parts[0].name === 'Bass' && liveFirst.parts[1].name === 'Guitar', 'both parts are named');
+// Old claim: "both parts are named" meant `Bass,Guitar`, because the live name followed TAB.
+// P4 makes the first word canonical; instrument settings cannot rename it.
+assert(liveFirst.parts[0].name === 'Take' && liveFirst.parts[1].name === 'Guitar', 'both parts are named');
 assert(liveFirst.parts[0].idPrefix === '' && liveFirst.parts[1].idPrefix === 'imp1~', 'prefixes are per part');
 
 const idsOf = (score: typeof liveFirst, track: number): string[] => {
@@ -96,7 +104,9 @@ assert(
 
 const xml = liveFirst.musicxml();
 const names = [...xml.matchAll(/<part-name>([^<]*)<\/part-name>/g)].map((m) => m[1]);
-assert(names.length === 2 && names[0] === 'Bass' && names[1] === 'Guitar', `MusicXML lists both parts (${names})`);
+// Old claim: MusicXML listed `Bass,Guitar`; it must now carry the same canonical `Take,Guitar`
+// pair the page and part control use.
+assert(names.length === 2 && names[0] === 'Take' && names[1] === 'Guitar', `MusicXML lists both parts (${names})`);
 assert(liveFirst.midi(true).byteLength > 0, 'the MIDI export writes every part');
 
 // ---------------------------------------------------------------------------
@@ -106,7 +116,11 @@ assert(liveFirst.midi(true).byteLength > 0, 'the MIDI export writes every part')
 // This is the check the whole file exists for. The pipeline would have given the live take the
 // prefix `p2-` here, because it is the second row.
 
-const guitarFirst = buildPartedRiffScore(request, settings, orderedPartSlots([guitar], ['imp1', LIVE_PART_ID]));
+const guitarFirst = buildPartedRiffScore(
+  request,
+  settings,
+  orderedPartSlots([guitar], ['imp1', LIVE_PART_ID], 'Take')
+);
 
 assert(guitarFirst.parts[0].name === 'Guitar', 'a dragged chip changes the printed order');
 assert(
@@ -140,7 +154,14 @@ assert(
 // same take, at the same tempo, with the same ids, as the parts path would.
 
 const alone = buildRiffScore(request, settings);
+const aloneNamed = buildPartedRiffScore(request, settings, orderedPartSlots(undefined, undefined, 'Take'));
 assert(alone.data.tracks.length === 1, 'a take on its own is one track');
+assert(JSON.stringify(aloneNamed.ir) === JSON.stringify(alone.ir), 'the named one-part path keeps the IR byte-identical');
+assert(
+  JSON.stringify(aloneNamed.data.tracks[0].staves) === JSON.stringify(alone.data.tracks[0].staves),
+  'the named one-part path keeps every engraved bar, beat and rational duration byte-identical'
+);
+assert(aloneNamed.musicxml().includes('<part-name>Take</part-name>'), 'the named one-part path exports its canonical name');
 assert(alone.tempoBpm === liveFirst.tempoBpm, 'adding a part does not change the take’s tempo');
 assert(
   JSON.stringify(alone.data.tracks[0].staves.map((s) => s.bars.length)) ===
@@ -290,13 +311,30 @@ assert(
 );
 
 // ---------------------------------------------------------------------------
-// 6. The live part's NAME — derived by default, overridden when the player types one (Z2b)
+// 6. The live part's NAME — canonical, with old derivation isolated to legacy migration (P4)
 // ---------------------------------------------------------------------------
 
-assert(livePartName(settings) === 'Bass', 'a bass take is called Bass when nobody has said otherwise');
+// Old claim: "a bass take is called Bass when nobody has said otherwise". Instrument choice no
+// longer owns naming; an absent canonical value is the safe fixed default.
+assert(livePartName(settings) === 'Take', 'an absent canonical name resolves safely to Take');
 assert(livePartName(settings, 'Rhythm gtr') === 'Rhythm gtr', 'a stored name wins over the instrument');
-assert(livePartName(settings, '   ') === 'Bass', 'a name of nothing but spaces is no name at all');
-assert(livePartName(settings, undefined) === 'Bass', 'an absent override falls back');
+assert(
+  livePartName({ ...settings, tabMode: 'guitar', clefMode: 'grand' }, 'Rhythm gtr') === 'Rhythm gtr',
+  'instrument, TAB and clef changes cannot rename a canonical live part'
+);
+// Old claim: whitespace fell back to `Bass`; clearing now resets to the stable `Take` default.
+assert(livePartName(settings, '   ') === 'Take', 'a name of nothing but spaces resets to Take');
+// Old claim: an absent override fell back to `Bass`; absence now exists only before migration.
+assert(livePartName(settings, undefined) === 'Take', 'an absent legacy value has a stable fallback');
+assert(legacyDerivedLivePartName(settings) === 'Bass', 'legacy migration can reproduce the former Bass name once');
+assert(
+  restoredLivePartName(settings, undefined) === 'Bass',
+  'an absent legacy document name freezes only after its saved bass settings are effective'
+);
+assert(
+  restoredLivePartName({ ...settings, tabMode: 'guitar' }, 'Low end') === 'Low end',
+  'an explicit persisted name survives different effective instrument settings exactly'
+);
 assert(
   livePartName(settings, 'x'.repeat(200)).length === MAX_PART_NAME_LENGTH,
   'an over-long name is bounded rather than printed'

@@ -132,6 +132,14 @@ export interface ViewSettings {
    */
   namesGap: boolean;
   /**
+   * Extra whitespace requested by the player, in SCREEN pixels.
+   *
+   * alphaTab consumes its staff paddings before applying `display.scale`, so callers must not
+   * copy this value directly into those settings. `applyStaffTabGap` performs the conversion and
+   * keeps a 12px preference looking like 12px at both 0.6x and 3x engraving zoom.
+   */
+  notationSpacingPx: number;
+  /**
    * Empty space kept at the LEFT of the engraving, in px.
    *
    * This is alphaTab's `display.padding[0]`. The default here is alphaTab's own 35, which
@@ -149,6 +157,7 @@ export const DEFAULT_VIEW_SETTINGS: ViewSettings = {
   useWorkers: false,
   player: 'external-media',
   namesGap: true,
+  notationSpacingPx: 0,
   leftPadPx: PAGE_PADDING_PX
 };
 
@@ -197,6 +206,9 @@ export const STAFF_TAB_GAP = 12;
  */
 export const MULTI_STAFF_GAP = 26;
 
+/** alphaTab's own default between two tracks, retained when no name lane needs more room. */
+export const TRACK_STAFF_GAP = 5;
+
 /**
  * Apply the staff<->staff gap for the current names state. Safe to call on a live Settings.
  *
@@ -208,14 +220,35 @@ export const MULTI_STAFF_GAP = 26;
 export function applyStaffTabGap(
   settings: alphaTab.Settings,
   namesGap: boolean,
-  multiStaff = false
+  multiStaff = false,
+  spacingPx = 0
 ): void {
   // 0 is alphaTab's own default, which still leaves the 48px of overflow — plenty for two
   // staves to read as two once there is no row to fit between them.
+  const scale = Math.max(0.01, settings.display.scale || 1);
+  const extra = Math.max(0, spacingPx) / scale;
   settings.display.notationStaffPaddingTop = Math.max(
     namesGap ? STAFF_TAB_GAP : 0,
     multiStaff ? MULTI_STAFF_GAP : 0
-  );
+  ) + extra;
+}
+
+/**
+ * Reserve the lane ABOVE each track's first staff without spending that room between every staff.
+ *
+ * `notationStaffPaddingTop` is global to all non-first staves. alphaTab 1.8 also exposes the
+ * narrower `trackStaffPaddingBetween`, added only when the next staff belongs to a different
+ * track; that is the exact boundary a per-part pitch-name lane occupies. `lanePx` already
+ * includes the player's extra spacing and the tallest rendered name stack.
+ */
+export function applyTrackNameGap(
+  settings: alphaTab.Settings,
+  lanePx: number,
+  spacingPx = 0
+): void {
+  const scale = Math.max(0.01, settings.display.scale || 1);
+  const preferred = (Math.max(0, lanePx) || Math.max(0, spacingPx)) / scale;
+  settings.display.trackStaffPaddingBetween = Math.max(TRACK_STAFF_GAP, preferred);
 }
 
 /**
@@ -275,7 +308,7 @@ export function createSettings(view: Partial<ViewSettings> = {}): alphaTab.Setti
   settings.display.staveProfile = alphaTab.StaveProfile.Default;
   settings.display.scale = v.scale;
   applyTabRhythm(settings);
-  applyStaffTabGap(settings, v.namesGap);
+  applyStaffTabGap(settings, v.namesGap, false, v.notationSpacingPx);
   setLeftPadding(settings, v.leftPadPx);
 
   // Hide the chrome a riff sheet does not need. EffectDynamics matters most: alphaTab

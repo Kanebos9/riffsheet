@@ -366,6 +366,10 @@ target_sources(Riffsheet PRIVATE
     Source/engines/sidecar/SidecarMidi.cpp    # notes back out of a Standard MIDI File
 )
 
+if(APPLE)
+    target_sources(Riffsheet PRIVATE Source/ui/PluginEditor_mac.mm)
+endif()
+
 # Everything that needs ONNX Runtime, in one block: the flag means "no inference
 # runtime at all", which since wave 4 takes beat tracking with it.
 if(NOT RIFFSHEET_WITHOUT_BASIC_PITCH)

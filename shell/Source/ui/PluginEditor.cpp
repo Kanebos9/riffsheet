@@ -73,10 +73,18 @@ RiffsheetAudioProcessorEditor::RiffsheetAudioProcessorEditor (RiffsheetAudioProc
     setResizable (true, true);
     setResizeLimits (floorWidth, floorHeight, 4096, 2600);
     setSize (juce::jmax (floorWidth, restoredWidth), juce::jmax (floorHeight, restoredHeight));
+
+   #if JUCE_MAC
+    // REAPER can resize its native FX container without resizing the JUCE editor.
+    // Track that container too, including the initial attachment to the host.
+    if (! standalone)
+        startTimerHz (30);
+   #endif
 }
 
 RiffsheetAudioProcessorEditor::~RiffsheetAudioProcessorEditor()
 {
+    stopTimer();
     // Member destruction is reverse declaration order, so webView would die
     // before bridge. Drain bridge workers and invalidate JUCE completions here,
     // while the WebView's native-function provider is still alive.
@@ -121,9 +129,27 @@ void RiffsheetAudioProcessorEditor::filesDropped (const juce::StringArray& files
 
 void RiffsheetAudioProcessorEditor::resized()
 {
+    updateWebViewBounds();
+
+    // Persist the requested editor size, not the portion currently visible in
+    // the FX chain, so opening a floating editor still restores the user's size.
+    proc.setEditorSize ({ getWidth(), getHeight() });
+}
+
+void RiffsheetAudioProcessorEditor::updateWebViewBounds()
+{
     // The WebView is the entire editor and must track every intermediate size
     // during a live drag, or the host is left painting stale pixels in the gap.
-    const auto bounds = getLocalBounds();
+    auto bounds = getLocalBounds();
+
+   #if JUCE_MAC
+    if (proc.wrapperType != juce::AudioProcessor::wrapperType_Standalone)
+        bounds = bounds.getIntersection (getHostVisibleBounds());
+   #endif
+
+    // A hidden or not-yet-attached host view has no useful viewport to apply.
+    if (bounds.isEmpty())
+        return;
 
     if (webView.getBounds() != bounds)
     {
@@ -136,8 +162,4 @@ void RiffsheetAudioProcessorEditor::resized()
                                              juce::JSON::parse ("{\"width\":" + juce::String (bounds.getWidth())
                                                                 + ",\"height\":" + juce::String (bounds.getHeight()) + "}"));
     }
-
-    // Remember it on the processor so reopening the window (or reloading the
-    // session) comes back the same size.
-    proc.setEditorSize ({ getWidth(), getHeight() });
 }

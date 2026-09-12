@@ -9,7 +9,8 @@ class RiffsheetAudioProcessor;
     every pixel comes from the webcore bundle.
 */
 class RiffsheetAudioProcessorEditor final : public juce::AudioProcessorEditor,
-                                            public juce::FileDragAndDropTarget
+                                            public juce::FileDragAndDropTarget,
+                                            private juce::Timer
 {
 public:
     explicit RiffsheetAudioProcessorEditor (RiffsheetAudioProcessor&);
@@ -83,6 +84,13 @@ public:
     static constexpr int minEditorHeight = 280;
 
 private:
+    void updateWebViewBounds();
+    void timerCallback() override { updateWebViewBounds(); }
+
+   #if JUCE_MAC
+    juce::Rectangle<int> getHostVisibleBounds() const;
+   #endif
+
     /** Keeps the WebView on our own single page: a stray link or a redirect
         must not be able to navigate the plugin UI somewhere else. */
     struct SinglePageBrowser final : juce::WebBrowserComponent
